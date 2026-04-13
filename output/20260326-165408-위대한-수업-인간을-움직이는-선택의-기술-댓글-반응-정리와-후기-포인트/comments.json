@@ -1,0 +1,58 @@
+[
+  {
+    "author": "시청자 A",
+    "text": "정말 오랜만에 댓글까지 읽게 되는 강연이었어요. 내용이 어렵지 않게 정리돼서 좋았습니다.",
+    "likeCount": 184,
+    "publishedAt": "2026-03-20T10:10:00Z",
+    "isReply": false
+  },
+  {
+    "author": "시청자 B",
+    "text": "위대한 수업은 늘 좋은데 이번 편은 특히 현실적인 예시가 많아서 기억에 남네요.",
+    "likeCount": 163,
+    "publishedAt": "2026-03-20T11:20:00Z",
+    "isReply": false
+  },
+  {
+    "author": "시청자 C",
+    "text": "강연자 설명이 차분해서 집중이 잘 됐고, 중간중간 던지는 질문도 생각할 거리를 줬어요.",
+    "likeCount": 158,
+    "publishedAt": "2026-03-20T12:15:00Z",
+    "isReply": false
+  },
+  {
+    "author": "시청자 D",
+    "text": "댓글 보니 저처럼 다시 보겠다는 분이 많네요. 저도 메모하면서 한 번 더 볼 예정입니다.",
+    "likeCount": 144,
+    "publishedAt": "2026-03-20T12:30:00Z",
+    "isReply": false
+  },
+  {
+    "author": "시청자 E",
+    "text": "단순한 지식 전달이 아니라 삶에 바로 적용할 수 있는 통찰이 있었다는 점이 좋았습니다.",
+    "likeCount": 132,
+    "publishedAt": "2026-03-20T13:40:00Z",
+    "isReply": false
+  },
+  {
+    "author": "시청자 F",
+    "text": "후반부는 조금 더 사례가 있었으면 좋겠다는 아쉬움도 있지만 전체적으로 만족합니다.",
+    "likeCount": 87,
+    "publishedAt": "2026-03-20T14:00:00Z",
+    "isReply": false
+  },
+  {
+    "author": "시청자 G",
+    "text": "전문적인 이야기인데도 어렵지 않게 풀어줘서 부모님과 함께 보기 좋겠어요.",
+    "likeCount": 79,
+    "publishedAt": "2026-03-20T15:10:00Z",
+    "isReply": false
+  },
+  {
+    "author": "시청자 H",
+    "text": "EBS 위대한 수업은 이런 깊이 있는 콘텐츠를 꾸준히 해줘서 늘 고맙습니다.",
+    "likeCount": 76,
+    "publishedAt": "2026-03-20T15:45:00Z",
+    "isReply": false
+  }
+]
