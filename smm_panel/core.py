@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 import datetime as dt
+import ipaddress
 import json
 import re
+import socket
 import ssl
 import sqlite3
 from html import escape as html_escape
@@ -10,8 +13,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urljoin, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 from uuid import uuid4
 
 
@@ -24,6 +27,37 @@ PREVIEW_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
 }
+ANALYTICS_LOOKBACK_DAYS = 90
+SEARCH_REFERRER_LABELS = {
+    "google.": ("search", "Google"),
+    "naver.com": ("search", "Naver"),
+    "bing.com": ("search", "Bing"),
+    "daum.net": ("search", "Daum"),
+    "yahoo.com": ("search", "Yahoo"),
+}
+SOCIAL_REFERRER_LABELS = {
+    "instagram.com": ("social", "Instagram"),
+    "facebook.com": ("social", "Facebook"),
+    "threads.net": ("social", "Threads"),
+    "tiktok.com": ("social", "TikTok"),
+    "youtube.com": ("social", "YouTube"),
+    "x.com": ("social", "X"),
+    "twitter.com": ("social", "X"),
+}
+SUPPLIER_INTEGRATION_CLASSIC = "classic"
+SUPPLIER_INTEGRATION_MKT24 = "mkt24"
+SUPPLIER_PLATFORM_LABELS = {
+    "instagram": "인스타그램",
+    "youtube": "유튜브",
+    "facebook": "페이스북",
+    "threads": "스레드",
+    "naver": "N포털",
+    "tiktok": "틱톡",
+    "x": "X",
+    "twitter": "X",
+}
+PREVIEW_BLOCKED_HOSTNAMES = {"localhost"}
+PREVIEW_BLOCKED_SUFFIXES = (".local", ".internal", ".localhost")
 
 
 SCHEMA_SQL = """
@@ -207,7 +241,9 @@ CREATE TABLE IF NOT EXISTS suppliers (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     api_url TEXT NOT NULL,
+    integration_type TEXT NOT NULL DEFAULT 'classic',
     api_key TEXT NOT NULL,
+    bearer_token TEXT NOT NULL DEFAULT '',
     is_active INTEGER NOT NULL DEFAULT 1,
     notes TEXT NOT NULL DEFAULT '',
     last_test_status TEXT NOT NULL DEFAULT 'never',
@@ -265,6 +301,59 @@ CREATE TABLE IF NOT EXISTS supplier_orders (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS home_popups (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    badge_text TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    image_url TEXT NOT NULL DEFAULT '',
+    route TEXT NOT NULL DEFAULT '/',
+    theme TEXT NOT NULL DEFAULT 'coral',
+    is_active INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS site_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    site_name TEXT NOT NULL,
+    site_description TEXT NOT NULL DEFAULT '',
+    use_mail_sms_site_name INTEGER NOT NULL DEFAULT 0,
+    mail_sms_site_name TEXT NOT NULL DEFAULT '',
+    favicon_url TEXT NOT NULL DEFAULT '',
+    share_image_url TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS site_visit_events (
+    id TEXT PRIMARY KEY,
+    visitor_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    route TEXT NOT NULL,
+    page_label TEXT NOT NULL DEFAULT '',
+    referrer_url TEXT NOT NULL DEFAULT '',
+    referrer_domain TEXT NOT NULL DEFAULT '',
+    source_type TEXT NOT NULL DEFAULT 'direct',
+    source_label TEXT NOT NULL DEFAULT '직접 방문',
+    search_keyword TEXT NOT NULL DEFAULT '',
+    previous_route TEXT NOT NULL DEFAULT '',
+    user_agent TEXT NOT NULL DEFAULT '',
+    device_type TEXT NOT NULL DEFAULT 'desktop',
+    exclude_from_stats INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_site_visit_events_created_at
+    ON site_visit_events(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_site_visit_events_route
+    ON site_visit_events(route);
+
+CREATE INDEX IF NOT EXISTS idx_site_visit_events_session
+    ON site_visit_events(session_id);
 """
 
 
@@ -335,6 +424,132 @@ def money(value: int) -> str:
     return f"{value:,}원"
 
 
+def default_home_popup_record() -> Dict[str, Any]:
+    return {
+        "id": "popup_home_youtube_rank",
+        "name": "홈 유튜브 상위노출 팝업",
+        "badgeText": "상단(1~5위) 노출 보장!",
+        "title": "유튜브 상위노출\n서비스 출시!",
+        "description": "신규 런칭 기념으로 빠르게 확인할 수 있는 홈 프로모션 팝업입니다.",
+        "imageUrl": "",
+        "route": "/products/cat_youtube_views",
+        "theme": "coral",
+        "isActive": True,
+    }
+
+
+def default_site_settings_record() -> Dict[str, Any]:
+    return {
+        "siteName": "Pulse24",
+        "siteDescription": "Reference-style SMM Growth Panel",
+        "useMailSmsSiteName": False,
+        "mailSmsSiteName": "",
+        "faviconUrl": "",
+        "shareImageUrl": "",
+    }
+
+
+def parse_iso_datetime(raw: str) -> Optional[dt.datetime]:
+    if not raw:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(raw))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.datetime.now().astimezone().tzinfo)
+    return parsed
+
+
+def normalize_analytics_route(raw: Any) -> str:
+    candidate = str(raw or "").strip()
+    if not candidate:
+        return ""
+    if re.match(r"^https?://", candidate, re.IGNORECASE):
+        parsed = urlparse(candidate)
+        candidate = parsed.path or "/"
+    if not candidate.startswith("/"):
+        candidate = f"/{candidate.lstrip('/')}"
+    candidate = "/" + candidate.lstrip("/")
+    if candidate.startswith(("/admin", "/api")):
+        return ""
+    return candidate
+
+
+def date_key(value: dt.date) -> str:
+    return value.isoformat()
+
+
+def canonical_domain(hostname: str) -> str:
+    host = str(hostname or "").strip().lower()
+    if not host:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    if host.startswith("m.") and host.endswith((".facebook.com", ".instagram.com", ".youtube.com")):
+        host = host[2:]
+    if host.startswith("l.facebook.com"):
+        return "facebook.com"
+    return host
+
+
+def looks_like_test_identity(*values: Any) -> bool:
+    combined = " ".join(str(value or "").lower() for value in values)
+    return any(token in combined for token in ("test", "demo", "example", "pulse24.local"))
+
+
+def mask_email(email: str) -> str:
+    raw = str(email or "").strip()
+    if not raw or "@" not in raw:
+        return ""
+    local, domain = raw.split("@", 1)
+    if len(local) <= 2:
+        masked_local = local[:1] + "*"
+    else:
+        masked_local = local[:2] + "*" * max(2, len(local) - 2)
+    return f"{masked_local}@{domain}"
+
+
+def mask_phone(phone: str) -> str:
+    digits = re.sub(r"\D", "", str(phone or ""))
+    if len(digits) < 7:
+        return ""
+    if len(digits) >= 11:
+        return f"{digits[:3]}-****-{digits[-4:]}"
+    return f"{digits[:3]}-***-{digits[-4:]}"
+
+
+def mask_secret(secret: str, visible_suffix: int = 4) -> str:
+    raw = str(secret or "").strip()
+    if not raw:
+        return ""
+    if len(raw) <= visible_suffix:
+        return "*" * len(raw)
+    return f"{'*' * max(6, len(raw) - visible_suffix)}{raw[-visible_suffix:]}"
+
+
+def normalize_supplier_integration_type(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    if value == SUPPLIER_INTEGRATION_MKT24:
+        return SUPPLIER_INTEGRATION_MKT24
+    return SUPPLIER_INTEGRATION_CLASSIC
+
+
+def supplier_supports_balance_check(integration_type: str) -> bool:
+    return normalize_supplier_integration_type(integration_type) == SUPPLIER_INTEGRATION_CLASSIC
+
+
+def supplier_supports_auto_dispatch(integration_type: str) -> bool:
+    return normalize_supplier_integration_type(integration_type) == SUPPLIER_INTEGRATION_CLASSIC
+
+
+def supplier_platform_label(platform_key: str) -> str:
+    key = str(platform_key or "").strip().lower()
+    if not key:
+        return ""
+    return SUPPLIER_PLATFORM_LABELS.get(key, key.replace("_", " ").title())
+
+
 def avatar_label(name: str) -> str:
     cleaned = "".join(part for part in str(name or "").strip().split())
     if not cleaned:
@@ -361,6 +576,37 @@ def normalize_url(raw: str) -> Optional[str]:
     if not parsed.netloc:
         return None
     return candidate
+
+
+def normalize_navigation_target(raw: str, default: str = "/") -> str:
+    candidate = str(raw or "").strip()
+    if not candidate:
+        return default
+    if re.match(r"^https?://", candidate, re.IGNORECASE):
+        return candidate
+    candidate = candidate.replace("\\", "/")
+    candidate = re.sub(r"^\.+", "", candidate).strip()
+    if not candidate.startswith("/"):
+        candidate = f"/{candidate.lstrip('/')}"
+    return candidate or default
+
+
+def normalize_popup_image_source(raw: Any) -> str:
+    return normalize_image_asset_source(raw, "팝업 이미지")
+
+
+def normalize_image_asset_source(raw: Any, label: str = "이미지") -> str:
+    candidate = str(raw or "").strip()
+    if not candidate:
+        return ""
+    if candidate.startswith("data:image/"):
+        return candidate
+    if candidate.startswith("/"):
+        return candidate
+    normalized = normalize_url(candidate)
+    if normalized:
+        return normalized
+    raise PanelError(f"{label} 주소 형식이 올바르지 않습니다.")
 
 
 def preview_platform_hint(product_code: str, platform_slug: str) -> str:
@@ -400,6 +646,49 @@ def account_preview_url(account_value: str, platform_hint: str) -> Optional[str]
     return builder(cleaned) if builder else None
 
 
+ACCOUNT_STYLE_PLATFORMS = {"instagram", "threads", "youtube", "tiktok", "facebook"}
+
+
+def platform_target_url_matches(platform_hint: str, raw_url: str) -> bool:
+    normalized = normalize_url(raw_url)
+    if not normalized:
+        return False
+
+    parsed = urlparse(normalized)
+    host = parsed.netloc.lower()
+    path = parsed.path or "/"
+
+    def host_is(domain: str) -> bool:
+        return host == domain or host.endswith(f".{domain}")
+
+    if platform_hint == "instagram":
+        return host_is("instagram.com") and path.strip("/") != ""
+    if platform_hint == "youtube":
+        return host == "youtu.be" or host_is("youtube.com")
+    if platform_hint == "tiktok":
+        return host_is("tiktok.com")
+    if platform_hint == "facebook":
+        return host_is("facebook.com")
+    if platform_hint == "threads":
+        return host_is("threads.net")
+    if platform_hint == "nportal":
+        return host_is("naver.com")
+    return looks_like_url(normalized)
+
+
+def platform_target_error_message(platform_hint: str) -> str:
+    labels = {
+        "instagram": "인스타그램",
+        "youtube": "유튜브",
+        "tiktok": "틱톡",
+        "facebook": "페이스북",
+        "threads": "스레드",
+        "nportal": "네이버",
+    }
+    platform_label = labels.get(platform_hint, "해당 플랫폼")
+    return f"{platform_label} 형식에 맞는 링크 또는 계정을 입력해 주세요."
+
+
 def placeholder_thumbnail(label: str, accent_color: str) -> str:
     safe_label = (label or "LINK")[:28]
     initials = "".join(part[:1] for part in re.findall(r"[A-Za-z0-9가-힣]+", safe_label)[:2]).upper() or "PK"
@@ -421,12 +710,90 @@ def placeholder_thumbnail(label: str, accent_color: str) -> str:
     return f"data:image/svg+xml;charset=utf-8,{quote(svg)}"
 
 
+def is_public_network_address(value: str) -> bool:
+    ip = ipaddress.ip_address(value)
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def validate_preview_target(target_url: str) -> None:
+    parsed = urlparse(str(target_url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("invalid preview target")
+    hostname = (parsed.hostname or "").strip().lower()
+    if not hostname:
+        raise ValueError("invalid preview target")
+    if hostname in PREVIEW_BLOCKED_HOSTNAMES or hostname.endswith(PREVIEW_BLOCKED_SUFFIXES):
+        raise ValueError("blocked preview target")
+
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        if not is_public_network_address(hostname):
+            raise ValueError("blocked preview target")
+        return
+    except ValueError:
+        pass
+
+    try:
+        resolved = {
+            sockaddr[0]
+            for _, _, _, _, sockaddr in socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+            if sockaddr and sockaddr[0]
+        }
+    except socket.gaierror as exc:
+        raise ValueError("unresolved preview target") from exc
+    if not resolved:
+        raise ValueError("unresolved preview target")
+    for address in resolved:
+        if not is_public_network_address(address):
+            raise ValueError("blocked preview target")
+
+
+def safe_preview_image_url(source_url: str, candidate_url: str, title: str, accent_color: str) -> str:
+    if not candidate_url:
+        return placeholder_thumbnail(title, accent_color)
+    resolved = urljoin(source_url, candidate_url)
+    try:
+        validate_preview_target(resolved)
+    except ValueError:
+        return placeholder_thumbnail(title, accent_color)
+    return resolved
+
+
+class PreviewRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        validate_preview_target(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+PREVIEW_OPENER = build_opener(PreviewRedirectHandler)
+
+
 def extract_preview_metadata(target_url: str, accent_color: str) -> Dict[str, Any]:
+    try:
+        validate_preview_target(target_url)
+    except ValueError:
+        return {
+            "found": False,
+            "title": "",
+            "imageUrl": "",
+            "resolvedUrl": target_url,
+            "sourceType": "unresolved",
+            "message": "링크가 확인되지 않습니다.",
+        }
+
     request = Request(target_url, headers=PREVIEW_HEADERS)
     final_url = target_url
     try:
-        with urlopen(request, timeout=PREVIEW_TIMEOUT_SECONDS) as response:
+        with PREVIEW_OPENER.open(request, timeout=PREVIEW_TIMEOUT_SECONDS) as response:
             final_url = response.geturl()
+            validate_preview_target(final_url)
             content_type = response.headers.get_content_type()
             if content_type.startswith("image/"):
                 hostname = urlparse(final_url).netloc or "링크 미리보기"
@@ -441,7 +808,7 @@ def extract_preview_metadata(target_url: str, accent_color: str) -> Dict[str, An
 
             charset = response.headers.get_content_charset() or "utf-8"
             raw = response.read(512_000)
-    except (HTTPError, URLError, TimeoutError, ValueError):
+    except (HTTPError, URLError, TimeoutError, ValueError, socket.gaierror):
         return {
             "found": False,
             "title": "",
@@ -467,7 +834,7 @@ def extract_preview_metadata(target_url: str, accent_color: str) -> Dict[str, An
         or parser.meta.get("twitter:image:src")
         or (parser.icons[0] if parser.icons else "")
     )
-    resolved_image = urljoin(target_url, image) if image else placeholder_thumbnail(title, accent_color)
+    resolved_image = safe_preview_image_url(final_url or target_url, image, title, accent_color)
 
     return {
         "found": True,
@@ -522,17 +889,347 @@ def normalize_api_candidates(raw_api_url: str) -> List[str]:
     return deduped
 
 
+def normalize_mkt24_candidates(raw_api_url: str) -> List[str]:
+    candidate = raw_api_url.strip()
+    if not candidate:
+        return []
+    if not candidate.startswith(("http://", "https://")):
+        candidate = f"https://{candidate}"
+    candidate = candidate.rstrip("/")
+    parsed = urlparse(candidate)
+    if not parsed.netloc:
+        return []
+
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    path = parsed.path.rstrip("/")
+    candidates: List[str] = []
+
+    if path.endswith("/products/sns"):
+        candidates.append(candidate)
+    elif path.endswith("/products"):
+        candidates.append(f"{candidate}/sns")
+    elif path.endswith("/v3"):
+        candidates.append(f"{candidate}/products/sns")
+    elif not path or path == "/":
+        candidates.extend([f"{origin}/v3/products/sns", f"{origin}/products/sns"])
+    else:
+        candidates.extend([candidate, f"{candidate}/products/sns", f"{origin}/v3/products/sns"])
+
+    deduped: List[str] = []
+    for item in candidates:
+        normalized = item.rstrip("/")
+        if normalized and normalized not in deduped:
+            deduped.append(normalized)
+    return deduped
+
+
+def normalize_supplier_api_candidates(integration_type: str, raw_api_url: str) -> List[str]:
+    normalized_type = normalize_supplier_integration_type(integration_type)
+    if normalized_type == SUPPLIER_INTEGRATION_MKT24:
+        return normalize_mkt24_candidates(raw_api_url)
+    return normalize_api_candidates(raw_api_url)
+
+
+def normalize_supplier_services_payload(integration_type: str, payload: Any) -> List[Dict[str, Any]]:
+    normalized_type = normalize_supplier_integration_type(integration_type)
+    if normalized_type == SUPPLIER_INTEGRATION_MKT24:
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            raise SupplierApiError("서비스 목록 형식이 올바르지 않습니다.")
+        services: List[Dict[str, Any]] = []
+        for platform_key, items in data.items():
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                normalized_item = dict(item)
+                normalized_item["_platformKey"] = str(platform_key or "").strip().lower()
+                services.append(normalized_item)
+        return services
+
+    if not isinstance(payload, list):
+        raise SupplierApiError("서비스 목록 형식이 올바르지 않습니다.")
+    return [item for item in payload if isinstance(item, dict)]
+
+
+def supplier_service_record(integration_type: str, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    normalized_type = normalize_supplier_integration_type(integration_type)
+    if normalized_type == SUPPLIER_INTEGRATION_MKT24:
+        external_service_id = str(item.get("productUuid") or "").strip()
+        if not external_service_id:
+            return None
+        platform_key = str(item.get("_platformKey") or "").strip().lower()
+        return {
+            "externalServiceId": external_service_id,
+            "name": str(item.get("fullName") or item.get("menuName") or item.get("cardName") or external_service_id).strip(),
+            "category": supplier_platform_label(platform_key),
+            "type": str(item.get("productTypeName") or item.get("menuName") or "").strip(),
+            "rate": safe_float(item.get("normalPrice"), 0.0),
+            "minAmount": 0,
+            "maxAmount": 0,
+            "dripfeed": False,
+            "refill": False,
+            "cancel": False,
+            "rawJson": as_json(item),
+        }
+
+    external_service_id = str(item.get("service") or item.get("id") or "").strip()
+    if not external_service_id:
+        return None
+    return {
+        "externalServiceId": external_service_id,
+        "name": str(item.get("name") or f"서비스 {external_service_id}").strip(),
+        "category": str(item.get("category") or "").strip(),
+        "type": str(item.get("type") or "").strip(),
+        "rate": safe_float(item.get("rate"), 0.0),
+        "minAmount": int(float(item.get("min") or 0) or 0),
+        "maxAmount": int(float(item.get("max") or 0) or 0),
+        "dripfeed": bool(item.get("dripfeed")),
+        "refill": bool(item.get("refill")),
+        "cancel": bool(item.get("cancel")),
+        "rawJson": as_json(item),
+    }
+
+
+def supplier_target_placeholder(platform_key: str, target_kind: str) -> str:
+    platform = str(platform_key or "").strip().lower()
+    if target_kind == "account":
+        placeholders = {
+            "instagram": "예: instamart_official",
+            "youtube": "예: @instamart 또는 채널 URL",
+            "facebook": "예: facebook 페이지 URL 또는 page id",
+            "threads": "예: instamart",
+            "naver": "예: blog.naver.com/yourid 또는 플레이스 링크",
+            "tiktok": "예: @instamart",
+        }
+        return placeholders.get(platform, "예: account_id 또는 채널 주소")
+    placeholders = {
+        "instagram": "https://www.instagram.com/p/...",
+        "youtube": "https://www.youtube.com/watch?v=...",
+        "facebook": "https://www.facebook.com/...",
+        "threads": "https://www.threads.net/@...",
+        "naver": "https://blog.naver.com/... 또는 플레이스 링크",
+        "tiktok": "https://www.tiktok.com/@.../video/...",
+    }
+    return placeholders.get(platform, "https://example.com/post/...")
+
+
+def supplier_target_label(platform_key: str, target_kind: str) -> str:
+    platform_label = supplier_platform_label(platform_key)
+    if target_kind == "account":
+        return f"{platform_label} 계정/채널" if platform_label else "계정/채널"
+    if target_kind == "keyword_url":
+        return "랜딩 URL"
+    return f"{platform_label} 링크" if platform_label else "링크"
+
+
+def infer_supplier_platform_key(category: str, raw_payload: Dict[str, Any]) -> str:
+    raw_key = str(raw_payload.get("_platformKey") or "").strip().lower()
+    if raw_key:
+        return raw_key
+    lowered = str(category or "").strip().lower()
+    for key in SUPPLIER_PLATFORM_LABELS:
+        if key in lowered:
+            return key
+    if "인스타" in category:
+        return "instagram"
+    if "유튜브" in category:
+        return "youtube"
+    if "페이스북" in category:
+        return "facebook"
+    if "스레드" in category:
+        return "threads"
+    if "네이버" in category or "n포털" in category:
+        return "naver"
+    return ""
+
+
+def infer_supplier_target_kind(service_name: str, service_type: str, category: str) -> str:
+    text = " ".join(part for part in (service_name, service_type, category) if part).lower()
+    if any(keyword in text for keyword in ("seo", "traffic", "트래픽", "유입", "검색", "키워드")):
+        return "keyword_url"
+    if any(keyword in text for keyword in ("팔로워", "구독자", "이웃", "계정관리", "프로필", "page like", "페이지 좋아요", "팬가입", "즐겨찾기")):
+        return "account"
+    return "url"
+
+
+def infer_supplier_package_like(service_name: str, service_type: str) -> bool:
+    text = " ".join(part for part in (service_name, service_type) if part).lower()
+    return any(keyword in text for keyword in ("package", "패키지", "계정관리", "주간", "월간", "30일", "60일", "90일", "유지"))
+
+
+def infer_supplier_advanced_fields(service: Dict[str, Any], target_kind: str) -> List[str]:
+    text = " ".join(
+        part for part in (str(service.get("name") or ""), str(service.get("type") or ""), str(service.get("category") or "")) if part
+    ).lower()
+    advanced: List[str] = []
+
+    if bool(service.get("dripfeed")):
+        advanced.extend(["runs", "interval"])
+    if "subscription" in text or "구독형" in text:
+        advanced.extend(["min", "max", "delay", "expiry"])
+    if any(keyword in text for keyword in ("custom comment", "custom comments", "커스텀 댓글", "이모지 댓글")):
+        advanced.append("comments")
+    if any(keyword in text for keyword in ("poll", "투표")):
+        advanced.append("answerNumber")
+    if target_kind == "keyword_url":
+        advanced.extend(["country", "device", "typeOfTraffic"])
+
+    normalized: List[str] = []
+    for key in advanced:
+        if key in ADVANCED_ORDER_FIELD_SPECS and key not in normalized:
+            normalized.append(key)
+    return normalized
+
+
+def supplier_example_value(field_key: str) -> Any:
+    examples = {
+        "runs": 3,
+        "interval": 30,
+        "delay": 30,
+        "expiry": "12/31/2026",
+        "min": 100,
+        "max": 110,
+        "posts": 0,
+        "oldPosts": 5,
+        "comments": "첫 번째 댓글\n두 번째 댓글",
+        "answerNumber": 1,
+        "country": "KR",
+        "device": "Mobile",
+        "typeOfTraffic": "search",
+        "googleKeyword": "강남 필라테스",
+    }
+    return examples.get(field_key, "")
+
+
+def supplier_service_request_guide(integration_type: str, service: Dict[str, Any], raw_payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized_type = normalize_supplier_integration_type(integration_type)
+    platform_key = infer_supplier_platform_key(str(service.get("category") or ""), raw_payload)
+    target_kind = infer_supplier_target_kind(str(service.get("name") or ""), str(service.get("type") or ""), str(service.get("category") or ""))
+    package_like = infer_supplier_package_like(str(service.get("name") or ""), str(service.get("type") or ""))
+    advanced_field_keys = infer_supplier_advanced_fields(service, target_kind)
+    min_amount = int(service.get("minAmount") or 0) or 1
+    max_amount = int(service.get("maxAmount") or 0) or max(min_amount, 1000)
+    step_amount = 1
+    quantity_label = "수량"
+    unit_label = "개"
+
+    if target_kind == "keyword_url":
+        form_preset = "keyword_url"
+        target_label = "랜딩 URL"
+    elif package_like and target_kind == "account":
+        form_preset = "package"
+        target_label = supplier_target_label(platform_key, "account")
+    elif package_like and target_kind == "url":
+        form_preset = "url_package"
+        target_label = supplier_target_label(platform_key, "url")
+    elif target_kind == "account":
+        form_preset = "account_quantity"
+        target_label = supplier_target_label(platform_key, "account")
+    else:
+        form_preset = "url_quantity"
+        target_label = supplier_target_label(platform_key, "url")
+
+    if "조회수" in str(service.get("name") or "") or "조회수" in str(service.get("type") or ""):
+        unit_label = "회"
+    if target_kind == "keyword_url":
+        quantity_label = "유입 수"
+        unit_label = "회"
+
+    recommendation = {
+        "formPreset": form_preset,
+        "targetLabel": target_label,
+        "targetPlaceholder": supplier_target_placeholder(platform_key, target_kind if target_kind != "keyword_url" else "url"),
+        "quantityLabel": quantity_label,
+        "unitLabel": unit_label,
+        "priceStrategy": "fixed" if form_preset in {"package", "url_package"} else "unit",
+        "minAmount": min_amount,
+        "maxAmount": max_amount,
+        "stepAmount": step_amount,
+        "advancedFieldKeys": advanced_field_keys,
+        "advancedFieldLabels": [ADVANCED_ORDER_FIELD_SPECS[key]["label"] for key in advanced_field_keys],
+    }
+
+    notes: List[str] = []
+    if bool(service.get("dripfeed")):
+        notes.append("드립피드형으로 표시되어 반복 횟수와 실행 간격 옵션을 함께 받는 것을 권장합니다.")
+    if package_like:
+        notes.append("기간형 또는 패키지형으로 보이므로 내부 상품 가격 방식은 고정가를 권장합니다.")
+    if "delay" in advanced_field_keys:
+        notes.append("지연 시간 옵션이 필요한 구독/예약형 서비스로 추정되어 시작 간격 입력 칸을 함께 두는 것이 좋습니다.")
+    if "comments" in advanced_field_keys:
+        notes.append("커스텀 댓글형으로 보여 한 줄씩 입력하는 댓글 목록 필드를 함께 받는 것을 권장합니다.")
+    if "answerNumber" in advanced_field_keys:
+        notes.append("투표형 서비스로 보여 응답 번호 선택 필드를 함께 두는 것이 안전합니다.")
+    if any(key in advanced_field_keys for key in ("country", "device", "typeOfTraffic", "googleKeyword")):
+        notes.append("트래픽/검색형 서비스로 추정되어 국가, 디바이스, 유입 유형, 키워드 옵션까지 설계하는 편이 좋습니다.")
+    if normalized_type == SUPPLIER_INTEGRATION_MKT24:
+        notes.append("이 추천은 MKT24 상품 목록 메타데이터 기준 추정값입니다. 실제 발주 API 문서 확인 후 확정하는 것이 안전합니다.")
+
+    example_payload: Dict[str, Any] = {}
+    if normalized_type == SUPPLIER_INTEGRATION_CLASSIC:
+        example_payload["service"] = str(service.get("externalServiceId") or "")
+        if target_kind == "keyword_url":
+            example_payload["link"] = supplier_target_placeholder(platform_key, "url").replace("예: ", "")
+            example_payload["google_keyword"] = supplier_example_value("googleKeyword")
+        elif target_kind == "account":
+            example_payload["username"] = "sample_account"
+        else:
+            example_payload["link"] = supplier_target_placeholder(platform_key, "url")
+        if recommendation["priceStrategy"] != "fixed":
+            example_payload["quantity"] = min_amount
+        for field_key in advanced_field_keys:
+            payload_key = {
+                "typeOfTraffic": "type_of_traffic",
+                "answerNumber": "answer_number",
+                "oldPosts": "old_posts",
+                "googleKeyword": "google_keyword",
+            }.get(field_key, field_key)
+            example_payload[payload_key] = supplier_example_value(field_key)
+    else:
+        if target_kind == "keyword_url":
+            example_payload["targetKeyword"] = supplier_example_value("googleKeyword")
+            example_payload["targetUrl"] = supplier_target_placeholder(platform_key, "url").replace("예: ", "")
+        elif target_kind == "account":
+            example_payload["targetValue"] = "sample_account"
+        else:
+            example_payload["targetUrl"] = supplier_target_placeholder(platform_key, "url")
+        if recommendation["priceStrategy"] != "fixed":
+            example_payload["orderedCount"] = min_amount
+        for field_key in advanced_field_keys:
+            example_payload[field_key] = supplier_example_value(field_key)
+
+    return {
+        "confidence": "high" if normalized_type == SUPPLIER_INTEGRATION_CLASSIC else "medium",
+        "notes": notes,
+        "formRecommendation": recommendation,
+        "callExampleTitle": "공급사 호출 예시" if normalized_type == SUPPLIER_INTEGRATION_CLASSIC else "추천 입력 예시",
+        "callExamplePayload": example_payload,
+        "callExampleIsEstimated": normalized_type != SUPPLIER_INTEGRATION_CLASSIC,
+    }
+
+
 class SupplierApiError(Exception):
     pass
 
 
 class SupplierApiClient:
-    def __init__(self, api_url: str, api_key: str) -> None:
+    def __init__(
+        self,
+        api_url: str,
+        api_key: str,
+        *,
+        integration_type: str = SUPPLIER_INTEGRATION_CLASSIC,
+        bearer_token: str = "",
+    ) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key.strip()
+        self.integration_type = normalize_supplier_integration_type(integration_type)
+        self.bearer_token = bearer_token.strip()
         self.ssl_context = ssl._create_unverified_context()
 
-    def _request(self, payload: Dict[str, Any]) -> Any:
+    def _request_form(self, payload: Dict[str, Any]) -> Any:
         encoded = urlencode(payload).encode("utf-8")
         request = Request(
             self.api_url,
@@ -559,28 +1256,86 @@ class SupplierApiClient:
             raise SupplierApiError(str(parsed["error"]))
         return parsed
 
+    def _request_json(
+        self,
+        *,
+        method: str,
+        url: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        request_headers = {
+            "User-Agent": PREVIEW_HEADERS["User-Agent"],
+            "Accept": "application/json,text/plain,*/*",
+        }
+        if headers:
+            request_headers.update(headers)
+        data = None
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            request_headers.setdefault("Content-Type", "application/json")
+        request = Request(url or self.api_url, data=data, headers=request_headers, method=method)
+        try:
+            with urlopen(request, timeout=12, context=self.ssl_context) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+            raise SupplierApiError(str(exc)) from exc
+
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SupplierApiError("공급사 API가 JSON이 아닌 응답을 반환했습니다.") from exc
+
+        if isinstance(parsed, dict):
+            error_message = parsed.get("error") or parsed.get("message")
+            if parsed.get("success") is False and error_message:
+                raise SupplierApiError(str(error_message))
+        return parsed
+
     def call(self, action: str, data: Optional[Dict[str, Any]] = None) -> Any:
         payload = {"key": self.api_key, "action": action}
         if data:
             payload.update({key: value for key, value in data.items() if value not in (None, "")})
-        return self._request(payload)
+        return self._request_form(payload)
 
     def services(self) -> Any:
+        if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
+            if not self.api_key:
+                raise SupplierApiError("x-api-key가 필요합니다.")
+            if not self.bearer_token:
+                raise SupplierApiError("Bearer Token이 필요합니다.")
+            return self._request_json(
+                method="GET",
+                headers={
+                    "Authorization": f"Bearer {self.bearer_token}",
+                    "x-api-key": self.api_key,
+                },
+            )
         return self.call("services")
 
     def balance(self) -> Any:
+        if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
+            raise SupplierApiError("잔액 API를 지원하지 않는 공급사 타입입니다.")
         return self.call("balance")
 
     def order(self, data: Dict[str, Any]) -> Any:
+        if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
+            raise SupplierApiError("이 공급사 타입은 아직 자동 발주 API가 연결되지 않았습니다.")
         return self.call("add", data)
 
     def status(self, order_id: str) -> Any:
+        if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
+            raise SupplierApiError("이 공급사 타입은 아직 상태 조회 API가 연결되지 않았습니다.")
         return self.call("status", {"order": order_id})
 
     def multi_status(self, order_ids: List[str]) -> Any:
+        if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
+            raise SupplierApiError("이 공급사 타입은 아직 상태 조회 API가 연결되지 않았습니다.")
         return self.call("status", {"orders": ",".join(order_ids)})
 
     def refill(self, order_id: str) -> Any:
+        if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
+            raise SupplierApiError("이 공급사 타입은 아직 리필 API가 연결되지 않았습니다.")
         return self.call("refill", {"order": order_id})
 
     def balance_summary(self) -> Dict[str, str]:
@@ -614,67 +1369,71 @@ def build_form_structure(fields: List[Dict[str, Any]]) -> str:
     template: Dict[str, Dict[str, Any]] = {}
 
     for field in fields:
-        name = field["name"]
-        kind = field["kind"]
-        required = field.get("required", True)
-
-        if kind == "number":
-            rules = ["MIN_MAX"] if required else []
-            template[name] = {
-                "variant": "input",
-                "templateOptions": {
-                    "labelProps": {"label": field["label"]},
-                    "formProps": {
-                        "name": name,
-                        "inputType": "number",
-                        "placeholder": field.get("placeholder", "0"),
-                        "unit": field.get("unit", ""),
-                        "validationVariant": "onlyNumber",
-                        "min": field.get("min", 1),
-                        "max": field.get("max", 100000),
-                        "step": field.get("step", 1),
-                    },
-                },
-            }
-        elif kind == "textarea":
-            rules = ["STRING_REQUIRED"] if required else []
-            template[name] = {
-                "variant": "textarea",
-                "templateOptions": {
-                    "labelProps": {"label": field["label"]},
-                    "formProps": {
-                        "name": name,
-                        "placeholder": field.get("placeholder", ""),
-                        "rows": field.get("rows", 4),
-                    },
-                },
-            }
-        elif kind == "select":
-            rules = ["STRING_REQUIRED"] if required else []
-            template[name] = {
-                "variant": "select",
-                "templateOptions": {
-                    "labelProps": {"label": field["label"]},
-                    "formProps": {
-                        "name": name,
-                        "options": field.get("options", []),
-                    },
-                },
-            }
-        else:
-            rules = ["STRING_REQUIRED"] if required else []
-            template[name] = {
-                "variant": "load_input",
-                "templateOptions": {
-                    "type": field.get("inputType", kind),
-                    "label": field["label"],
-                    "placeholder": field.get("placeholder", ""),
-                },
-            }
-
-        schema[name] = rules
+        _append_form_field(schema, template, field)
 
     return as_json({"schema": schema, "template": template})
+
+
+def _append_form_field(schema: Dict[str, List[str]], template: Dict[str, Dict[str, Any]], field: Dict[str, Any]) -> None:
+    name = field["name"]
+    kind = field["kind"]
+    required = field.get("required", True)
+
+    if kind == "number":
+        rules = ["MIN_MAX"] if required else []
+        template[name] = {
+            "variant": "input",
+            "templateOptions": {
+                "labelProps": {"label": field["label"]},
+                "formProps": {
+                    "name": name,
+                    "inputType": "number",
+                    "placeholder": field.get("placeholder", "0"),
+                    "unit": field.get("unit", ""),
+                    "validationVariant": "onlyNumber",
+                    "min": field.get("min", 1),
+                    "max": field.get("max", 100000),
+                    "step": field.get("step", 1),
+                },
+            },
+        }
+    elif kind == "textarea":
+        rules = ["STRING_REQUIRED"] if required else []
+        template[name] = {
+            "variant": "textarea",
+            "templateOptions": {
+                "labelProps": {"label": field["label"]},
+                "formProps": {
+                    "name": name,
+                    "placeholder": field.get("placeholder", ""),
+                    "rows": field.get("rows", 4),
+                },
+            },
+        }
+    elif kind == "select":
+        rules = ["STRING_REQUIRED"] if required else []
+        template[name] = {
+            "variant": "select",
+            "templateOptions": {
+                "labelProps": {"label": field["label"]},
+                "formProps": {
+                    "name": name,
+                    "options": field.get("options", []),
+                },
+            },
+        }
+    else:
+        rules = ["STRING_REQUIRED"] if required else []
+        template[name] = {
+            "variant": "load_input",
+            "templateOptions": {
+                "type": field.get("inputType", kind),
+                "label": field["label"],
+                "placeholder": field.get("placeholder", ""),
+            },
+        }
+
+    schema[name] = rules
 
 
 def account_quantity_form(target_label: str, target_placeholder: str, quantity_label: str, min_amount: int, max_amount: int, step_amount: int, unit_label: str = "개") -> str:
@@ -788,13 +1547,26 @@ def package_form(label: str, placeholder: str) -> str:
                 "placeholder": "01012345678",
                 "inputType": "tel",
             },
+        ]
+    )
+
+
+def url_package_form(label: str, placeholder: str) -> str:
+    return build_form_structure(
+        [
             {
-                "name": "requestMemo",
-                "kind": "textarea",
-                "label": "운영 메모",
-                "placeholder": "브랜드 톤, 경쟁사 레퍼런스, 요청사항을 남겨주세요.",
-                "rows": 4,
-                "required": False,
+                "name": "targetUrl",
+                "kind": "url",
+                "label": label,
+                "placeholder": placeholder,
+                "inputType": "url",
+            },
+            {
+                "name": "contactPhone",
+                "kind": "phone",
+                "label": "담당 연락처",
+                "placeholder": "01012345678",
+                "inputType": "tel",
             },
         ]
     )
@@ -816,13 +1588,6 @@ def custom_form() -> str:
                 "placeholder": "01012345678",
                 "inputType": "tel",
             },
-            {
-                "name": "requestMemo",
-                "kind": "textarea",
-                "label": "상세 요청",
-                "placeholder": "목표, 예산, 일정, 원하는 수치를 적어주세요.",
-                "rows": 5,
-            },
         ]
     )
 
@@ -831,8 +1596,31 @@ FORM_PRESETS = {
     "account_quantity": "계정 ID + 수량",
     "url_quantity": "URL + 수량",
     "keyword_url": "키워드 + URL + 수량",
-    "package": "계정 ID + 연락처 + 메모",
+    "package": "계정 ID + 연락처",
+    "url_package": "URL + 연락처",
     "custom": "맞춤 문의형",
+}
+ADVANCED_ORDER_FIELD_SPECS = {
+    "runs": {"name": "runs", "kind": "number", "label": "반복 횟수", "placeholder": "2", "min": 1, "max": 100, "step": 1, "unit": "회", "required": False},
+    "interval": {"name": "interval", "kind": "number", "label": "실행 간격", "placeholder": "30", "min": 1, "max": 1440, "step": 1, "unit": "분", "required": False},
+    "delay": {"name": "delay", "kind": "number", "label": "지연 시간", "placeholder": "30", "min": 0, "max": 43200, "step": 1, "unit": "분", "required": False},
+    "expiry": {"name": "expiry", "kind": "text", "label": "종료일", "placeholder": "MM/DD/YYYY", "required": False},
+    "min": {"name": "min", "kind": "number", "label": "최소 수량", "placeholder": "100", "min": 1, "max": 1000000, "step": 1, "unit": "개", "required": False},
+    "max": {"name": "max", "kind": "number", "label": "최대 수량", "placeholder": "110", "min": 1, "max": 1000000, "step": 1, "unit": "개", "required": False},
+    "posts": {"name": "posts", "kind": "number", "label": "게시물 수", "placeholder": "0", "min": 0, "max": 1000, "step": 1, "unit": "개", "required": False},
+    "oldPosts": {"name": "oldPosts", "kind": "number", "label": "기존 게시물 수", "placeholder": "5", "min": 0, "max": 1000, "step": 1, "unit": "개", "required": False},
+    "comments": {"name": "comments", "kind": "textarea", "label": "댓글 목록", "placeholder": "한 줄에 한 개씩 입력해 주세요.", "rows": 5, "required": False},
+    "answerNumber": {"name": "answerNumber", "kind": "number", "label": "투표 답변 번호", "placeholder": "1", "min": 1, "max": 50, "step": 1, "required": False},
+    "country": {"name": "country", "kind": "text", "label": "국가 코드", "placeholder": "예: KR, US", "required": False},
+    "device": {"name": "device", "kind": "text", "label": "디바이스", "placeholder": "예: Mobile, Desktop", "required": False},
+    "typeOfTraffic": {"name": "typeOfTraffic", "kind": "text", "label": "트래픽 타입", "placeholder": "예: 검색 / 광고 / 일반", "required": False},
+    "googleKeyword": {"name": "googleKeyword", "kind": "text", "label": "검색 키워드", "placeholder": "예: 강남 필라테스", "required": False},
+}
+ADVANCED_ORDER_FIELD_ALIASES = {
+    "old_posts": "oldPosts",
+    "answer_number": "answerNumber",
+    "type_of_traffic": "typeOfTraffic",
+    "google_keyword": "googleKeyword",
 }
 
 
@@ -851,6 +1639,26 @@ def field_template_options(form_structure: Dict[str, Any], field_key: str) -> Di
     return options if isinstance(options, dict) else {}
 
 
+def normalize_advanced_field_keys(raw: Any) -> List[str]:
+    if isinstance(raw, list):
+        items = raw
+    else:
+        items = re.split(r"[\s,]+", str(raw or "").strip()) if str(raw or "").strip() else []
+    normalized: List[str] = []
+    for item in items:
+        key = ADVANCED_ORDER_FIELD_ALIASES.get(str(item or "").strip(), str(item or "").strip())
+        if key in ADVANCED_ORDER_FIELD_SPECS and key not in normalized:
+            normalized.append(key)
+    return normalized
+
+
+def form_advanced_field_keys(form_structure: Dict[str, Any]) -> List[str]:
+    template = form_structure.get("template", {})
+    if not isinstance(template, dict):
+        return []
+    return normalize_advanced_field_keys(list(template.keys()))
+
+
 def infer_form_preset(form_structure: Dict[str, Any]) -> str:
     template = form_structure.get("template", {})
     if not isinstance(template, dict):
@@ -861,9 +1669,16 @@ def infer_form_preset(form_structure: Dict[str, Any]) -> str:
         return "keyword_url"
     if keys == ["targetUrl", "orderedCount", "contactPhone"]:
         return "url_quantity"
+    if keys == ["targetUrl", "contactPhone"]:
+        return "url_package"
     if keys == ["targetValue", "orderedCount", "contactPhone"]:
         return "account_quantity"
-    if keys == ["targetValue", "contactPhone", "requestMemo"]:
+    if keys == ["targetValue", "contactPhone", "requestMemo"] or keys == ["targetValue", "contactPhone"]:
+        target_label = str(field_template_options(form_structure, "targetValue").get("label") or "")
+        return "custom" if "희망" in target_label else "package"
+    if "targetUrl" in keys and "contactPhone" in keys and "orderedCount" not in keys and "targetKeyword" not in keys:
+        return "url_package"
+    if "targetValue" in keys and "contactPhone" in keys and "orderedCount" not in keys and "targetUrl" not in keys and "targetKeyword" not in keys:
         target_label = str(field_template_options(form_structure, "targetValue").get("label") or "")
         return "custom" if "희망" in target_label else "package"
     if "targetUrl" in keys and "orderedCount" in keys:
@@ -879,6 +1694,7 @@ def admin_form_config(form_structure: Dict[str, Any]) -> Dict[str, Any]:
     target_url_options = field_template_options(form_structure, "targetUrl")
     ordered_count_options = field_template_options(form_structure, "orderedCount")
     request_memo_options = field_template_options(form_structure, "requestMemo")
+    advanced_field_keys = form_advanced_field_keys(form_structure)
 
     config = {
         "preset": preset,
@@ -891,6 +1707,8 @@ def admin_form_config(form_structure: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "unitLabel": str(ordered_count_options.get("formProps", {}).get("unit") or "개"),
         "memoLabel": str(request_memo_options.get("labelProps", {}).get("label") or request_memo_options.get("label") or "운영 메모"),
+        "advancedFieldKeys": advanced_field_keys,
+        "advancedFieldLabels": [ADVANCED_ORDER_FIELD_SPECS[key]["label"] for key in advanced_field_keys if key in ADVANCED_ORDER_FIELD_SPECS],
     }
     return config
 
@@ -905,15 +1723,16 @@ def build_admin_form_structure(payload: Dict[str, Any], existing_form_structure_
     min_amount = int(float(payload.get("minAmount") or 1) or 1)
     max_amount = int(float(payload.get("maxAmount") or max(min_amount, 1)) or max(min_amount, 1))
     step_amount = int(float(payload.get("stepAmount") or 1) or 1)
+    advanced_field_keys = normalize_advanced_field_keys(payload.get("advancedFieldKeys"))
 
     if preset == "account_quantity":
-        return account_quantity_form(target_label, target_placeholder or "예: account_id", quantity_label, min_amount, max_amount, step_amount, unit_label)
-    if preset == "url_quantity":
-        return url_quantity_form(target_label, target_placeholder or "https://example.com/post/...", quantity_label, min_amount, max_amount, step_amount, unit_label)
-    if preset == "keyword_url":
-        return keyword_url_form(min_amount, max_amount, step_amount)
-    if preset == "package":
-        return build_form_structure(
+        form_structure_json = account_quantity_form(target_label, target_placeholder or "예: account_id", quantity_label, min_amount, max_amount, step_amount, unit_label)
+    elif preset == "url_quantity":
+        form_structure_json = url_quantity_form(target_label, target_placeholder or "https://example.com/post/...", quantity_label, min_amount, max_amount, step_amount, unit_label)
+    elif preset == "keyword_url":
+        form_structure_json = keyword_url_form(min_amount, max_amount, step_amount)
+    elif preset == "package":
+        form_structure_json = build_form_structure(
             [
                 {
                     "name": "targetValue",
@@ -929,19 +1748,31 @@ def build_admin_form_structure(payload: Dict[str, Any], existing_form_structure_
                     "placeholder": "01012345678",
                     "inputType": "tel",
                 },
-                {
-                    "name": "requestMemo",
-                    "kind": "textarea",
-                    "label": memo_label,
-                    "placeholder": "운영 메모를 입력해 주세요.",
-                    "rows": 4,
-                    "required": False,
-                },
             ]
         )
-    if preset == "custom":
-        return custom_form()
-    return existing_form_structure_json or package_form(target_label, target_placeholder or "예: pulse24_official")
+    elif preset == "url_package":
+        form_structure_json = url_package_form(target_label, target_placeholder or "https://example.com/post/...")
+    elif preset == "custom":
+        form_structure_json = custom_form()
+    else:
+        form_structure_json = existing_form_structure_json or package_form(target_label, target_placeholder or "예: pulse24_official")
+
+    if not advanced_field_keys:
+        return form_structure_json
+
+    form_structure = parse_json(form_structure_json, {})
+    if not isinstance(form_structure, dict):
+        return form_structure_json
+    schema = form_structure.get("schema")
+    template = form_structure.get("template")
+    if not isinstance(schema, dict) or not isinstance(template, dict):
+        return form_structure_json
+
+    for field_key in advanced_field_keys:
+        field_spec = ADVANCED_ORDER_FIELD_SPECS.get(field_key)
+        if field_spec and field_key not in template:
+            _append_form_field(schema, template, field_spec)
+    return as_json(form_structure)
 
 
 def make_option(
@@ -2030,6 +2861,10 @@ class PanelStore:
             if not has_user:
                 self._seed(conn)
             self._seed_management_samples(conn)
+            self._ensure_management_order_samples(conn)
+            self._ensure_home_popup(conn)
+            self._ensure_site_settings(conn)
+            self._ensure_analytics_samples(conn)
             conn.commit()
 
     def _apply_migrations(self, conn: sqlite3.Connection) -> None:
@@ -2039,6 +2874,10 @@ class PanelStore:
         self._ensure_column(conn, "users", "last_login_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "product_categories", "is_active", "INTEGER NOT NULL DEFAULT 1")
         self._ensure_column(conn, "products", "is_active", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column(conn, "suppliers", "integration_type", "TEXT NOT NULL DEFAULT 'classic'")
+        self._ensure_column(conn, "suppliers", "bearer_token", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "home_popups", "image_url", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "site_visit_events", "exclude_from_stats", "INTEGER NOT NULL DEFAULT 0")
         conn.execute("UPDATE users SET role = 'admin', is_active = 1 WHERE id = ?", (DEMO_USER_ID,))
         conn.execute("UPDATE users SET role = COALESCE(NULLIF(role, ''), 'customer') WHERE id != ?", (DEMO_USER_ID,))
 
@@ -2067,6 +2906,289 @@ class PanelStore:
                 """,
                 user,
             )
+
+    def _ensure_management_order_samples(self, conn: sqlite3.Connection) -> None:
+        existing = conn.execute("SELECT 1 FROM orders WHERE user_id != ? LIMIT 1", (DEMO_USER_ID,)).fetchone()
+        if existing is not None:
+            return
+
+        now = dt.datetime.now().astimezone()
+        sample_orders = [
+            {
+                "id": "order_mgmt_1",
+                "order_number": "P24M101",
+                "user_id": "user_brandlab",
+                "platform_section_id": "pf_instagram",
+                "product_category_id": "cat_instagram_korean_followers",
+                "product_id": "prd_instagram_korean_followers_standard",
+                "product_name": "인스타그램 한국인 팔로워",
+                "option_name": "스탠다드",
+                "target_value": "brandlab.official",
+                "contact_phone": "01011112222",
+                "quantity": 300,
+                "unit_price": 120,
+                "total_price": 36000,
+                "status": "completed",
+                "notes": {"memo": "브랜드 런칭 초반 신뢰도 확보"},
+                "created_at": (now - dt.timedelta(days=16)).isoformat(timespec="seconds"),
+                "updated_at": (now - dt.timedelta(days=15, hours=18)).isoformat(timespec="seconds"),
+                "fields": [("targetValue", "계정(ID)", "brandlab.official"), ("orderedCount", "수량", "300")],
+            },
+            {
+                "id": "order_mgmt_2",
+                "order_number": "P24M102",
+                "user_id": "user_brandlab",
+                "platform_section_id": "pf_popular",
+                "product_category_id": "cat_reels_views",
+                "product_id": "prd_reels_views_standard",
+                "product_name": "릴스 조회수",
+                "option_name": "스탠다드",
+                "target_value": "https://instagram.com/reel/brandlab-campaign",
+                "contact_phone": "01011112222",
+                "quantity": 4000,
+                "unit_price": 8,
+                "total_price": 32000,
+                "status": "completed",
+                "notes": {"memo": "신규 캠페인 릴스 도달 보강"},
+                "created_at": (now - dt.timedelta(days=11)).isoformat(timespec="seconds"),
+                "updated_at": (now - dt.timedelta(days=10, hours=20)).isoformat(timespec="seconds"),
+                "fields": [("targetUrl", "릴스 URL", "https://instagram.com/reel/brandlab-campaign"), ("orderedCount", "수량", "4000")],
+            },
+            {
+                "id": "order_mgmt_3",
+                "order_number": "P24M103",
+                "user_id": "user_cafeflow",
+                "platform_section_id": "pf_nportal",
+                "product_category_id": "cat_place_reviews",
+                "product_id": "prd_place_reviews_basic",
+                "product_name": "플레이스 리뷰",
+                "option_name": "기본",
+                "target_value": "카페플로우 성수점",
+                "contact_phone": "01033334444",
+                "quantity": 15,
+                "unit_price": 3500,
+                "total_price": 52500,
+                "status": "in_progress",
+                "notes": {"memo": "신규 지점 오픈 주간 리뷰 보강"},
+                "created_at": (now - dt.timedelta(days=9)).isoformat(timespec="seconds"),
+                "updated_at": (now - dt.timedelta(days=8, hours=22)).isoformat(timespec="seconds"),
+                "fields": [("targetValue", "매장명", "카페플로우 성수점"), ("orderedCount", "수량", "15")],
+            },
+            {
+                "id": "order_mgmt_4",
+                "order_number": "P24M104",
+                "user_id": "user_cafeflow",
+                "platform_section_id": "pf_nportal",
+                "product_category_id": "cat_blog_inflow",
+                "product_id": "prd_blog_inflow_basic",
+                "product_name": "블로그 유입",
+                "option_name": "기본",
+                "target_value": "성수 카페 추천",
+                "contact_phone": "01033334444",
+                "quantity": 1200,
+                "unit_price": 18,
+                "total_price": 21600,
+                "status": "queued",
+                "notes": {"memo": "키워드 유입 테스트"},
+                "created_at": (now - dt.timedelta(days=4)).isoformat(timespec="seconds"),
+                "updated_at": (now - dt.timedelta(days=4)).isoformat(timespec="seconds"),
+                "fields": [("targetKeyword", "키워드", "성수 카페 추천"), ("orderedCount", "수량", "1200")],
+            },
+            {
+                "id": "order_mgmt_5",
+                "order_number": "P24M105",
+                "user_id": "user_localmart",
+                "platform_section_id": "pf_youtube",
+                "product_category_id": "cat_youtube_views",
+                "product_id": "prd_youtube_views_standard",
+                "product_name": "유튜브 조회수",
+                "option_name": "스탠다드",
+                "target_value": "https://youtube.com/watch?v=localmart-demo",
+                "contact_phone": "01055556666",
+                "quantity": 2500,
+                "unit_price": 10,
+                "total_price": 25000,
+                "status": "completed",
+                "notes": {"memo": "지역 행사 쇼츠 연계 조회수 강화"},
+                "created_at": (now - dt.timedelta(days=2)).isoformat(timespec="seconds"),
+                "updated_at": (now - dt.timedelta(days=1, hours=19)).isoformat(timespec="seconds"),
+                "fields": [("targetUrl", "영상 URL", "https://youtube.com/watch?v=localmart-demo"), ("orderedCount", "수량", "2500")],
+            },
+        ]
+
+        for order in sample_orders:
+            conn.execute(
+                """
+                INSERT INTO orders (
+                    id, order_number, user_id, platform_section_id, product_category_id, product_id,
+                    product_name_snapshot, option_name_snapshot, target_value, contact_phone, quantity,
+                    unit_price, total_price, status, notes_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    order["id"],
+                    order["order_number"],
+                    order["user_id"],
+                    order["platform_section_id"],
+                    order["product_category_id"],
+                    order["product_id"],
+                    order["product_name"],
+                    order["option_name"],
+                    order["target_value"],
+                    order["contact_phone"],
+                    order["quantity"],
+                    order["unit_price"],
+                    order["total_price"],
+                    order["status"],
+                    as_json(order["notes"]),
+                    order["created_at"],
+                    order["updated_at"],
+                ),
+            )
+            for index, (field_key, field_label, field_value) in enumerate(order["fields"]):
+                conn.execute(
+                    "INSERT INTO order_fields (id, order_id, field_key, field_label, field_value) VALUES (?, ?, ?, ?, ?)",
+                    (f"{order['id']}_field_{index}", order["id"], field_key, field_label, field_value),
+                )
+
+    def _ensure_home_popup(self, conn: sqlite3.Connection) -> None:
+        exists = conn.execute("SELECT id FROM home_popups LIMIT 1").fetchone()
+        if exists is not None:
+            return
+        popup = default_home_popup_record()
+        timestamp = now_iso()
+        conn.execute(
+            """
+            INSERT INTO home_popups (
+                id, name, badge_text, title, description, image_url, route, theme, is_active, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                popup["id"],
+                popup["name"],
+                popup["badgeText"],
+                popup["title"],
+                popup["description"],
+                popup["imageUrl"],
+                popup["route"],
+                popup["theme"],
+                bool_to_int(popup["isActive"]),
+                timestamp,
+                timestamp,
+            ),
+        )
+
+    def _ensure_site_settings(self, conn: sqlite3.Connection) -> None:
+        exists = conn.execute("SELECT id FROM site_settings LIMIT 1").fetchone()
+        if exists is not None:
+            return
+        settings = default_site_settings_record()
+        timestamp = now_iso()
+        conn.execute(
+            """
+            INSERT INTO site_settings (
+                id, site_name, site_description, use_mail_sms_site_name, mail_sms_site_name,
+                favicon_url, share_image_url, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                1,
+                settings["siteName"],
+                settings["siteDescription"],
+                bool_to_int(settings["useMailSmsSiteName"]),
+                settings["mailSmsSiteName"],
+                settings["faviconUrl"],
+                settings["shareImageUrl"],
+                timestamp,
+                timestamp,
+            ),
+        )
+
+    def _ensure_analytics_samples(self, conn: sqlite3.Connection) -> None:
+        exists = conn.execute("SELECT COUNT(*) AS count FROM site_visit_events").fetchone()["count"]
+        if exists:
+            return
+
+        visitors = [f"visitor_seed_{index:02d}" for index in range(1, 19)]
+        detail_routes = [
+            "/products/cat_instagram_korean_followers",
+            "/products/cat_youtube_views",
+            "/products/cat_place_reviews",
+            "/products/cat_reels_views",
+            "/products/cat_blog_inflow",
+        ]
+        entry_referrers = [
+            "https://www.google.com/search?q=인스타그램+팔로워+늘리기",
+            "https://search.naver.com/search.naver?query=유튜브+조회수+늘리기",
+            "https://www.instagram.com/",
+            "https://l.facebook.com/",
+            "https://m.youtube.com/",
+            "",
+        ]
+        user_agents = {
+            "mobile": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "tablet": "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "desktop": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        }
+        now = dt.datetime.now().astimezone().replace(minute=0, second=0, microsecond=0)
+        event_rows: List[tuple[Any, ...]] = []
+
+        for day_offset in range(44, -1, -1):
+            base = now - dt.timedelta(days=day_offset)
+            session_total = 4 + ((44 - day_offset) % 5)
+            for session_index in range(session_total):
+                visitor_id = visitors[(day_offset * 2 + session_index) % len(visitors)]
+                session_id = f"session_seed_{44 - day_offset:02d}_{session_index:02d}"
+                entry_referrer = entry_referrers[(day_offset + session_index) % len(entry_referrers)]
+                device_type = ("mobile", "tablet", "desktop")[session_index % 3]
+                analytics_source = self._classify_visit_source(entry_referrer, "", "pulse24.local")
+                detail_route = detail_routes[(day_offset + session_index) % len(detail_routes)]
+                route_sequence = ["/", "/products", detail_route]
+                if session_index % 2 == 0:
+                    route_sequence.append("/orders")
+                if session_index % 3 == 0:
+                    route_sequence.append("/my")
+
+                previous_route = ""
+                for step_index, route in enumerate(route_sequence):
+                    created_at = (base + dt.timedelta(hours=9 + session_index, minutes=step_index * 7)).isoformat(timespec="seconds")
+                    source_meta = analytics_source if step_index == 0 else {
+                        "referrerUrl": "",
+                        "referrerDomain": "",
+                        "sourceType": "internal",
+                        "sourceLabel": "내부 이동",
+                        "searchKeyword": "",
+                    }
+                    event_rows.append(
+                        (
+                            f"visit_seed_{day_offset:02d}_{session_index:02d}_{step_index:02d}",
+                            visitor_id,
+                            session_id,
+                            route,
+                            self._analytics_page_label(conn, route),
+                            source_meta["referrerUrl"],
+                            source_meta["referrerDomain"],
+                            source_meta["sourceType"],
+                            source_meta["sourceLabel"],
+                            source_meta["searchKeyword"],
+                            previous_route,
+                            user_agents[device_type],
+                            device_type,
+                            0,
+                            created_at,
+                        )
+                    )
+                    previous_route = route
+
+        conn.executemany(
+            """
+            INSERT INTO site_visit_events (
+                id, visitor_id, session_id, route, page_label, referrer_url, referrer_domain,
+                source_type, source_label, search_keyword, previous_route, user_agent, device_type, exclude_from_stats, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            event_rows,
+        )
 
     def _seed(self, conn: sqlite3.Connection) -> None:
         created_at = now_iso()
@@ -2371,8 +3493,8 @@ class PanelStore:
         return {
             "id": user["id"],
             "name": user["name"],
-            "email": user["email"],
-            "phone": user["phone"],
+            "emailMasked": mask_email(user["email"]),
+            "phoneMasked": mask_phone(user["phone"]),
             "tier": user["tier"],
             "avatarLabel": user["avatar_label"],
             "balance": user["balance"],
@@ -2382,6 +3504,9 @@ class PanelStore:
     def bootstrap(self) -> Dict[str, Any]:
         with self._connect() as conn:
             user = self._user_summary(conn)
+            popup_row = conn.execute("SELECT * FROM home_popups ORDER BY updated_at DESC LIMIT 1").fetchone()
+            site_settings_row = self._site_settings_row(conn)
+            site_settings = self._site_settings_public_payload(site_settings_row)
             banners = [
                 dict(row)
                 for row in conn.execute("SELECT * FROM home_banners ORDER BY sort_order")
@@ -2436,7 +3561,7 @@ class PanelStore:
             ).fetchone()["count"]
 
             company = {
-                "name": "Pulse24 Demo Labs",
+                "name": site_settings["siteName"],
                 "representative": "Demo Operator",
                 "contact": "support@pulse24.local",
                 "hours": "평일 10:00 - 19:00",
@@ -2444,10 +3569,11 @@ class PanelStore:
 
             return {
                 "app": {
-                    "name": "Pulse24",
+                    "name": site_settings["siteName"],
                     "subtitle": "Reference-style SMM Growth Panel",
                     "accentColor": "#4c76ff",
                 },
+                "siteSettings": site_settings,
                 "user": user,
                 "heroStats": [
                     {"label": "보유 캐시", "value": user["balanceLabel"]},
@@ -2459,6 +3585,7 @@ class PanelStore:
                     {"label": "서비스 소개서", "route": "/my"},
                     {"label": "이용 가이드", "route": "/my"},
                 ],
+                "popup": self._popup_public_payload(popup_row) if popup_row else None,
                 "platforms": [
                     {
                         "id": platform["id"],
@@ -2739,6 +3866,7 @@ class PanelStore:
                     "SELECT field_key, field_label, field_value FROM order_fields WHERE order_id = ? ORDER BY id",
                     (row["id"],),
                 ).fetchall()
+                notes = parse_json(row["notes_json"], {})
                 orders.append(
                     {
                         "id": row["id"],
@@ -2748,18 +3876,22 @@ class PanelStore:
                         "productName": row["product_name_snapshot"],
                         "optionName": row["option_name_snapshot"],
                         "targetValue": row["target_value"],
-                        "contactPhone": row["contact_phone"],
+                        "contactPhoneMasked": mask_phone(row["contact_phone"]),
                         "quantity": row["quantity"],
                         "unitPrice": row["unit_price"],
                         "unitPriceLabel": money(row["unit_price"]),
                         "totalPrice": row["total_price"],
                         "totalPriceLabel": money(row["total_price"]),
                         "status": row["status"],
-                        "notes": parse_json(row["notes_json"], {}),
+                        "notes": {key: value for key, value in notes.items() if key != "adminMemo"},
                         "createdAt": row["created_at"],
                         "createdLabel": self._relative_date_label(row["created_at"]),
                         "fields": [
-                            {"key": field["field_key"], "label": field["field_label"], "value": field["field_value"]}
+                            {
+                                "key": field["field_key"],
+                                "label": field["field_label"],
+                                "value": mask_phone(field["field_value"]) if field["field_key"] == "contactPhone" else field["field_value"],
+                            }
                             for field in fields
                         ],
                     }
@@ -2798,8 +3930,620 @@ class PanelStore:
         ]
         return {"transactions": transactions}
 
+    def record_site_visit(
+        self,
+        payload: Dict[str, Any],
+        *,
+        user_agent: str = "",
+        request_host: str = "",
+    ) -> Dict[str, Any]:
+        visitor_id = re.sub(r"[^A-Za-z0-9_-]", "", str(payload.get("visitorId") or ""))[:80]
+        session_id = re.sub(r"[^A-Za-z0-9_-]", "", str(payload.get("sessionId") or ""))[:80]
+        route = normalize_analytics_route(payload.get("route"))
+        previous_route = normalize_analytics_route(payload.get("previousRoute"))
+        referrer_url = str(payload.get("referrerUrl") or "").strip()[:1000]
+        page_label = str(payload.get("pageLabel") or "").strip()[:120]
+        exclude_from_stats = bool(payload.get("excludeFromStats"))
+        if not visitor_id or not session_id or not route:
+            return {"tracked": False}
+
+        timestamp = now_iso()
+        request_host = str(request_host or "").split(":", 1)[0].strip().lower()
+        with self._connect() as conn:
+            latest = conn.execute(
+                """
+                SELECT route, previous_route, created_at
+                FROM site_visit_events
+                WHERE session_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            latest_at = parse_iso_datetime(latest["created_at"]) if latest else None
+            if latest and latest["route"] == route and (latest["previous_route"] or "") == previous_route and latest_at:
+                if abs((parse_iso_datetime(timestamp) - latest_at).total_seconds()) < 5:
+                    return {"tracked": False}
+
+            source_meta = self._classify_visit_source(referrer_url, previous_route, request_host)
+            referrer_path = normalize_analytics_route(urlparse(referrer_url).path if referrer_url else "")
+            if referrer_path.startswith("/admin") or looks_like_test_identity(visitor_id, session_id):
+                exclude_from_stats = True
+            conn.execute(
+                """
+                INSERT INTO site_visit_events (
+                    id, visitor_id, session_id, route, page_label, referrer_url, referrer_domain,
+                    source_type, source_label, search_keyword, previous_route, user_agent, device_type, exclude_from_stats, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"visit_{uuid4().hex}",
+                    visitor_id,
+                    session_id,
+                    route,
+                    page_label or self._analytics_page_label(conn, route),
+                    source_meta["referrerUrl"],
+                    source_meta["referrerDomain"],
+                    source_meta["sourceType"],
+                    source_meta["sourceLabel"],
+                    source_meta["searchKeyword"],
+                    previous_route,
+                    user_agent[:500],
+                    self._device_type(user_agent),
+                    bool_to_int(exclude_from_stats),
+                    timestamp,
+                ),
+            )
+            conn.commit()
+        return {"tracked": True}
+
+    def _analytics_page_label(self, conn: sqlite3.Connection, route: str) -> str:
+        normalized = normalize_analytics_route(route)
+        if normalized == "/":
+            return "홈"
+        if normalized == "/products":
+            return "상품 목록"
+        if normalized == "/charge":
+            return "충전"
+        if normalized == "/orders":
+            return "주문 내역"
+        if normalized == "/my":
+            return "마이 페이지"
+        if normalized.startswith("/products/"):
+            category_id = normalized.split("/", 2)[2]
+            row = conn.execute("SELECT name FROM product_categories WHERE id = ?", (category_id,)).fetchone()
+            if row is not None:
+                return str(row["name"])
+            return "상품 상세"
+        return normalized
+
+    def _extract_search_keyword(self, referrer_url: str) -> str:
+        if not referrer_url:
+            return ""
+        parsed = urlparse(referrer_url if re.match(r"^https?://", referrer_url, re.IGNORECASE) else f"https://{referrer_url}")
+        query = parse_qs(parsed.query)
+        for key in ("q", "query", "p", "keyword", "search_query"):
+            values = query.get(key)
+            if values:
+                return str(values[0]).strip()[:120]
+        return ""
+
+    def _classify_visit_source(self, referrer_url: str, previous_route: str, request_host: str) -> Dict[str, str]:
+        normalized_previous = normalize_analytics_route(previous_route)
+        if normalized_previous:
+            return {
+                "referrerUrl": "",
+                "referrerDomain": "",
+                "sourceType": "internal",
+                "sourceLabel": "내부 이동",
+                "searchKeyword": "",
+            }
+
+        raw_referrer = str(referrer_url or "").strip()
+        if not raw_referrer:
+            return {
+                "referrerUrl": "",
+                "referrerDomain": "",
+                "sourceType": "direct",
+                "sourceLabel": "직접 방문",
+                "searchKeyword": "",
+            }
+
+        parsed = urlparse(raw_referrer if re.match(r"^https?://", raw_referrer, re.IGNORECASE) else f"https://{raw_referrer}")
+        domain = canonical_domain(parsed.hostname or "")
+        local_host = canonical_domain(request_host)
+        if local_host and domain == local_host:
+            return {
+                "referrerUrl": raw_referrer,
+                "referrerDomain": domain,
+                "sourceType": "internal",
+                "sourceLabel": "내부 이동",
+                "searchKeyword": "",
+            }
+
+        for pattern, (source_type, label) in SEARCH_REFERRER_LABELS.items():
+            if pattern in domain:
+                return {
+                    "referrerUrl": raw_referrer,
+                    "referrerDomain": domain,
+                    "sourceType": source_type,
+                    "sourceLabel": label,
+                    "searchKeyword": self._extract_search_keyword(raw_referrer),
+                }
+
+        for pattern, (source_type, label) in SOCIAL_REFERRER_LABELS.items():
+            if pattern in domain:
+                return {
+                    "referrerUrl": raw_referrer,
+                    "referrerDomain": domain,
+                    "sourceType": source_type,
+                    "sourceLabel": label,
+                    "searchKeyword": "",
+                }
+
+        return {
+            "referrerUrl": raw_referrer,
+            "referrerDomain": domain,
+            "sourceType": "referral",
+            "sourceLabel": domain or "외부 추천",
+            "searchKeyword": "",
+        }
+
+    def _device_type(self, user_agent: str) -> str:
+        ua = str(user_agent or "").lower()
+        if not ua:
+            return "desktop"
+        if "ipad" in ua or "tablet" in ua:
+            return "tablet"
+        if any(keyword in ua for keyword in ("iphone", "android", "mobile", "samsungbrowser")):
+            return "mobile"
+        return "desktop"
+
+    def _should_exclude_analytics_visit(self, row: Dict[str, Any]) -> bool:
+        if bool(row.get("exclude_from_stats")):
+            return True
+        return looks_like_test_identity(row.get("visitor_id"), row.get("session_id"))
+
+    def _should_exclude_analytics_order(self, row: Dict[str, Any]) -> bool:
+        if str(row.get("user_id") or "") == DEMO_USER_ID:
+            return True
+        if str(row.get("customer_role") or "") != "customer":
+            return True
+        return looks_like_test_identity(row.get("customer_email"), row.get("customer_name"))
+
+    def _analytics_window_payload(
+        self,
+        day_count: int,
+        cutoff_date: dt.date,
+        visits: List[Dict[str, Any]],
+        orders: List[Dict[str, Any]],
+        visitor_first_dates: Dict[str, dt.date],
+    ) -> Dict[str, Any]:
+        label_map = {
+            "search": "검색",
+            "social": "SNS",
+            "direct": "직접",
+            "referral": "추천",
+            "internal": "내부 이동",
+        }
+        window_visits = [row for row in visits if row["_date"] >= cutoff_date]
+        window_orders = [row for row in orders if row["_date"] >= cutoff_date]
+        unique_visitors = {row["visitor_id"] for row in window_visits if row["visitor_id"]}
+        unique_sessions = {row["session_id"] for row in window_visits if row["session_id"]}
+        new_visitors = {
+            visitor_id
+            for visitor_id in unique_visitors
+            if visitor_first_dates.get(visitor_id) and visitor_first_dates[visitor_id] >= cutoff_date
+        }
+        returning_visitors = unique_visitors - new_visitors
+
+        customer_orders: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        page_buckets: Dict[str, Dict[str, Any]] = {}
+        source_buckets: Dict[str, Dict[str, Any]] = {}
+        source_type_counter: Counter[str] = Counter()
+        keyword_counter: Counter[str] = Counter()
+        entry_page_buckets: Dict[str, Dict[str, Any]] = {}
+        transition_counter: Dict[tuple[str, str], Dict[str, Any]] = {}
+        device_counter: Counter[str] = Counter()
+        platform_buckets: Dict[str, Dict[str, Any]] = {}
+        product_buckets: Dict[str, Dict[str, Any]] = {}
+
+        for row in window_visits:
+            page_key = row["route"] or "/"
+            bucket = page_buckets.setdefault(
+                page_key,
+                {"route": page_key, "pageLabel": row["page_label"] or page_key, "views": 0, "visitors": set()},
+            )
+            bucket["views"] += 1
+            if row["visitor_id"]:
+                bucket["visitors"].add(row["visitor_id"])
+
+            source_type = str(row["source_type"] or "direct")
+            source_type_counter[source_type] += 1
+            device_counter[str(row["device_type"] or "desktop")] += 1
+
+            if source_type != "internal":
+                source_key = str(row["referrer_domain"] or source_type)
+                source_bucket = source_buckets.setdefault(
+                    source_key,
+                    {
+                        "domain": source_key,
+                        "label": row["source_label"] or source_key or "직접 방문",
+                        "sourceType": source_type,
+                        "visits": 0,
+                        "visitors": set(),
+                        "sessions": set(),
+                    },
+                )
+                source_bucket["visits"] += 1
+                if row["visitor_id"]:
+                    source_bucket["visitors"].add(row["visitor_id"])
+                if row["session_id"]:
+                    source_bucket["sessions"].add(row["session_id"])
+
+            if row["search_keyword"]:
+                keyword_counter[str(row["search_keyword"])] += 1
+
+            if row["session_id"]:
+                current_entry = entry_page_buckets.get(row["session_id"])
+                if current_entry is None or row["_dt"] < current_entry["_dt"]:
+                    entry_page_buckets[row["session_id"]] = {
+                        "_dt": row["_dt"],
+                        "route": row["route"] or "/",
+                        "pageLabel": row["page_label"] or row["route"] or "/",
+                    }
+
+            if row["previous_route"]:
+                key = (row["previous_route"], row["route"])
+                transition_bucket = transition_counter.setdefault(
+                    key,
+                    {
+                        "fromRoute": row["previous_route"],
+                        "fromLabel": row["previous_route"],
+                        "toRoute": row["route"],
+                        "toLabel": row["page_label"] or row["route"],
+                        "hits": 0,
+                    },
+                )
+                transition_bucket["hits"] += 1
+
+        for row in window_orders:
+            customer_orders[str(row["user_id"])].append(row)
+            platform_bucket = platform_buckets.setdefault(
+                str(row["platform_name"] or "기타"),
+                {"name": str(row["platform_name"] or "기타"), "orders": 0, "sales": 0, "customers": set()},
+            )
+            platform_bucket["orders"] += 1
+            platform_bucket["sales"] += int(row["total_price"] or 0)
+            if row["user_id"]:
+                platform_bucket["customers"].add(row["user_id"])
+
+            product_key = str(row["product_id"] or row["product_name_snapshot"] or "")
+            product_bucket = product_buckets.setdefault(
+                product_key,
+                {
+                    "productId": str(row["product_id"] or ""),
+                    "productName": str(row["product_name_snapshot"] or "상품"),
+                    "orders": 0,
+                    "sales": 0,
+                    "customers": set(),
+                },
+            )
+            product_bucket["orders"] += 1
+            product_bucket["sales"] += int(row["total_price"] or 0)
+            if row["user_id"]:
+                product_bucket["customers"].add(row["user_id"])
+
+        customer_profiles = []
+        gap_samples: List[float] = []
+        repeat_customers = set()
+        for customer_id, items in customer_orders.items():
+            sorted_items = sorted(items, key=lambda item: item["_dt"])
+            order_count = len(sorted_items)
+            total_sales = sum(int(item["total_price"] or 0) for item in sorted_items)
+            if order_count >= 2:
+                repeat_customers.add(customer_id)
+            customer_gap_days: List[int] = []
+            for index in range(1, order_count):
+                gap = (sorted_items[index]["_date"] - sorted_items[index - 1]["_date"]).days
+                customer_gap_days.append(gap)
+                gap_samples.append(gap)
+            customer_profiles.append(
+                {
+                    "customerId": customer_id,
+                    "customerName": sorted_items[0]["customer_name"],
+                    "customerRole": sorted_items[0]["customer_role"],
+                    "orders": order_count,
+                    "sales": total_sales,
+                    "avgOrderValue": round(total_sales / order_count) if order_count else 0,
+                    "avgGapDays": round(sum(customer_gap_days) / len(customer_gap_days), 1) if customer_gap_days else 0,
+                    "firstOrderAt": sorted_items[0]["created_at"],
+                    "lastOrderAt": sorted_items[-1]["created_at"],
+                    "isRepeat": order_count >= 2,
+                }
+            )
+
+        repurchase_bands = [
+            {"label": "1회 구매", "customers": 0},
+            {"label": "2회 구매", "customers": 0},
+            {"label": "3회 구매", "customers": 0},
+            {"label": "4회 이상", "customers": 0},
+        ]
+        for item in customer_profiles:
+            if item["orders"] >= 4:
+                repurchase_bands[3]["customers"] += 1
+            else:
+                repurchase_bands[item["orders"] - 1]["customers"] += 1
+
+        repeat_product_buckets: Dict[str, Dict[str, Any]] = {}
+        for row in window_orders:
+            if str(row["user_id"]) not in repeat_customers:
+                continue
+            product_key = str(row["product_id"] or row["product_name_snapshot"] or "")
+            product_bucket = repeat_product_buckets.setdefault(
+                product_key,
+                {
+                    "productId": str(row["product_id"] or ""),
+                    "productName": str(row["product_name_snapshot"] or "상품"),
+                    "repeatOrders": 0,
+                    "repeatCustomers": set(),
+                    "sales": 0,
+                },
+            )
+            product_bucket["repeatOrders"] += 1
+            product_bucket["sales"] += int(row["total_price"] or 0)
+            product_bucket["repeatCustomers"].add(row["user_id"])
+
+        unique_customers = {row["user_id"] for row in window_orders if row["user_id"]}
+        total_sales = sum(int(row["total_price"] or 0) for row in window_orders)
+        total_orders = len(window_orders)
+
+        entry_page_counts: Dict[str, Dict[str, Any]] = {}
+        for candidate in entry_page_buckets.values():
+            bucket = entry_page_counts.setdefault(
+                candidate["route"],
+                {"route": candidate["route"], "pageLabel": candidate["pageLabel"], "sessions": 0},
+            )
+            bucket["sessions"] += 1
+
+        return {
+            "rangeDays": day_count,
+            "overview": {
+                "pageViews": len(window_visits),
+                "uniqueVisitors": len(unique_visitors),
+                "sessions": len(unique_sessions),
+                "newVisitors": len(new_visitors),
+                "returningVisitors": len(returning_visitors),
+                "orders": total_orders,
+                "sales": total_sales,
+                "avgOrderValue": round(total_sales / total_orders) if total_orders else 0,
+                "uniqueCustomers": len(unique_customers),
+                "conversionRate": round((total_orders / len(unique_visitors)) * 100, 2) if unique_visitors else 0,
+                "repeatRate": round((len(repeat_customers) / len(unique_customers)) * 100, 2) if unique_customers else 0,
+                "returningVisitorRate": round((len(returning_visitors) / len(unique_visitors)) * 100, 2) if unique_visitors else 0,
+                "avgOrdersPerCustomer": round(total_orders / len(unique_customers), 2) if unique_customers else 0,
+                "avgGapDays": round(sum(gap_samples) / len(gap_samples), 1) if gap_samples else 0,
+            },
+            "topPages": [
+                {
+                    "route": item["route"],
+                    "pageLabel": item["pageLabel"],
+                    "views": item["views"],
+                    "visitors": len(item["visitors"]),
+                }
+                for item in sorted(page_buckets.values(), key=lambda item: (-item["views"], item["pageLabel"]))[:8]
+            ],
+            "sourceDomains": [
+                {
+                    "domain": item["domain"] or "direct",
+                    "label": item["label"],
+                    "sourceType": item["sourceType"],
+                    "visits": item["visits"],
+                    "visitors": len(item["visitors"]),
+                    "sessions": len(item["sessions"]),
+                }
+                for item in sorted(source_buckets.values(), key=lambda item: (-item["visits"], item["label"]))[:10]
+            ],
+            "sourceTypes": [
+                {"type": key, "label": label_map.get(key, key), "visits": value}
+                for key, value in source_type_counter.most_common()
+            ],
+            "searchKeywords": [
+                {"keyword": keyword, "visits": visits}
+                for keyword, visits in keyword_counter.most_common(10)
+            ],
+            "entryPages": sorted(entry_page_counts.values(), key=lambda item: (-item["sessions"], item["pageLabel"]))[:10],
+            "pathTransitions": sorted(transition_counter.values(), key=lambda item: (-item["hits"], item["fromRoute"]))[:10],
+            "deviceBreakdown": [
+                {
+                    "device": key,
+                    "label": {"desktop": "데스크톱", "mobile": "모바일", "tablet": "태블릿"}.get(key, key),
+                    "visits": value,
+                    "sharePercent": round((value / len(window_visits)) * 100, 2) if window_visits else 0,
+                }
+                for key, value in device_counter.most_common()
+            ],
+            "salesByPlatform": [
+                {
+                    "name": item["name"],
+                    "orders": item["orders"],
+                    "sales": item["sales"],
+                    "customers": len(item["customers"]),
+                }
+                for item in sorted(platform_buckets.values(), key=lambda item: (-item["sales"], item["name"]))[:8]
+            ],
+            "salesByProduct": [
+                {
+                    "productId": item["productId"],
+                    "productName": item["productName"],
+                    "orders": item["orders"],
+                    "sales": item["sales"],
+                    "customers": len(item["customers"]),
+                }
+                for item in sorted(product_buckets.values(), key=lambda item: (-item["sales"], item["productName"]))[:10]
+            ],
+            "repurchaseSummary": {
+                "customersWithOrders": len(unique_customers),
+                "repeatCustomers": len(repeat_customers),
+                "repeatRate": round((len(repeat_customers) / len(unique_customers)) * 100, 2) if unique_customers else 0,
+                "avgOrdersPerCustomer": round(total_orders / len(unique_customers), 2) if unique_customers else 0,
+                "avgGapDays": round(sum(gap_samples) / len(gap_samples), 1) if gap_samples else 0,
+            },
+            "repurchaseCustomers": sorted(
+                customer_profiles,
+                key=lambda item: (-int(item["isRepeat"]), -item["orders"], -item["sales"], item["customerName"]),
+            )[:12],
+            "repurchaseBands": repurchase_bands,
+            "repurchaseProducts": [
+                {
+                    "productId": item["productId"],
+                    "productName": item["productName"],
+                    "repeatOrders": item["repeatOrders"],
+                    "repeatCustomers": len(item["repeatCustomers"]),
+                    "sales": item["sales"],
+                }
+                for item in sorted(repeat_product_buckets.values(), key=lambda item: (-item["repeatOrders"], -item["sales"]))[:10]
+            ],
+        }
+
+    def _admin_analytics_payload(self, conn: sqlite3.Connection) -> Dict[str, Any]:
+        today = dt.datetime.now().astimezone().date()
+        dates = [today - dt.timedelta(days=offset) for offset in range(ANALYTICS_LOOKBACK_DAYS - 1, -1, -1)]
+        visits = []
+        visitor_first_dates: Dict[str, dt.date] = {}
+        for row in conn.execute("SELECT * FROM site_visit_events ORDER BY created_at ASC").fetchall():
+            parsed = parse_iso_datetime(row["created_at"])
+            if parsed is None:
+                continue
+            item = dict(row)
+            if self._should_exclude_analytics_visit(item):
+                continue
+            item["_dt"] = parsed
+            item["_date"] = parsed.astimezone().date() if parsed.tzinfo else parsed.date()
+            visitor_id = str(item.get("visitor_id") or "")
+            if visitor_id and visitor_id not in visitor_first_dates:
+                visitor_first_dates[visitor_id] = item["_date"]
+            visits.append(item)
+
+        orders = []
+        for row in conn.execute(
+            """
+            SELECT
+                o.*,
+                u.name AS customer_name,
+                u.email AS customer_email,
+                u.role AS customer_role,
+                ps.display_name AS platform_name
+            FROM orders o
+            JOIN users u ON u.id = o.user_id
+            JOIN platform_sections ps ON ps.id = o.platform_section_id
+            ORDER BY o.created_at ASC
+            """
+        ).fetchall():
+            parsed = parse_iso_datetime(row["created_at"])
+            if parsed is None:
+                continue
+            item = dict(row)
+            if self._should_exclude_analytics_order(item):
+                continue
+            item["_dt"] = parsed
+            item["_date"] = parsed.astimezone().date() if parsed.tzinfo else parsed.date()
+            orders.append(item)
+
+        traffic_buckets: Dict[str, Dict[str, Any]] = {
+            date_key(current): {
+                "date": date_key(current),
+                "label": current.strftime("%m.%d"),
+                "pageViews": 0,
+                "visitors": set(),
+                "sessions": set(),
+                "newVisitors": set(),
+                "returningVisitors": set(),
+            }
+            for current in dates
+        }
+        sales_buckets: Dict[str, Dict[str, Any]] = {
+            date_key(current): {
+                "orders": 0,
+                "customers": set(),
+                "sales": 0,
+                "quantity": 0,
+            }
+            for current in dates
+        }
+
+        for row in visits:
+            bucket = traffic_buckets.get(date_key(row["_date"]))
+            if bucket is None:
+                continue
+            bucket["pageViews"] += 1
+            if row["visitor_id"]:
+                bucket["visitors"].add(row["visitor_id"])
+                if visitor_first_dates.get(row["visitor_id"]) == row["_date"]:
+                    bucket["newVisitors"].add(row["visitor_id"])
+                else:
+                    bucket["returningVisitors"].add(row["visitor_id"])
+            if row["session_id"]:
+                bucket["sessions"].add(row["session_id"])
+
+        for row in orders:
+            bucket = sales_buckets.get(date_key(row["_date"]))
+            if bucket is None:
+                continue
+            bucket["orders"] += 1
+            bucket["sales"] += int(row["total_price"] or 0)
+            bucket["quantity"] += int(row["quantity"] or 0)
+            if row["user_id"]:
+                bucket["customers"].add(row["user_id"])
+
+        daily_overview = []
+        for current in dates:
+            bucket_key = date_key(current)
+            traffic_bucket = traffic_buckets[bucket_key]
+            sales_bucket = sales_buckets[bucket_key]
+            visitor_count = len(traffic_bucket["visitors"])
+            order_count = int(sales_bucket["orders"])
+            sales_total = int(sales_bucket["sales"])
+            daily_overview.append(
+                {
+                    "date": bucket_key,
+                    "label": traffic_bucket["label"],
+                    "pageViews": int(traffic_bucket["pageViews"]),
+                    "visitors": visitor_count,
+                    "sessions": len(traffic_bucket["sessions"]),
+                    "newVisitors": len(traffic_bucket["newVisitors"]),
+                    "returningVisitors": len(traffic_bucket["returningVisitors"]),
+                    "orders": order_count,
+                    "customers": len(sales_bucket["customers"]),
+                    "sales": sales_total,
+                    "quantity": int(sales_bucket["quantity"]),
+                    "avgOrderValue": round(sales_total / order_count) if order_count else 0,
+                    "conversionRate": round((order_count / visitor_count) * 100, 2) if visitor_count else 0,
+                }
+            )
+
+        windows = {}
+        for day_count in (7, 30, 90):
+            cutoff_date = today - dt.timedelta(days=day_count - 1)
+            windows[f"{day_count}d"] = self._analytics_window_payload(
+                day_count,
+                cutoff_date,
+                visits,
+                orders,
+                visitor_first_dates,
+            )
+
+        return {
+            "generatedAt": now_iso(),
+            "dailyOverview": daily_overview,
+            "windows": windows,
+        }
+
     def admin_bootstrap(self) -> Dict[str, Any]:
         with self._connect() as conn:
+            popup_row = conn.execute("SELECT * FROM home_popups ORDER BY updated_at DESC LIMIT 1").fetchone()
+            site_settings_row = self._site_settings_row(conn)
+            analytics = self._admin_analytics_payload(conn)
             supplier_rows = conn.execute(
                 """
                 SELECT
@@ -2819,7 +4563,13 @@ class PanelStore:
                     "id": row["id"],
                     "name": row["name"],
                     "apiUrl": row["api_url"],
-                    "apiKey": row["api_key"],
+                    "integrationType": normalize_supplier_integration_type(row["integration_type"]),
+                    "hasApiKey": bool(row["api_key"]),
+                    "apiKeyMasked": mask_secret(row["api_key"]),
+                    "hasBearerToken": bool(row["bearer_token"]),
+                    "bearerTokenMasked": mask_secret(row["bearer_token"]),
+                    "supportsBalanceCheck": supplier_supports_balance_check(row["integration_type"]),
+                    "supportsAutoDispatch": supplier_supports_auto_dispatch(row["integration_type"]),
                     "isActive": bool(row["is_active"]),
                     "notes": row["notes"],
                     "lastTestStatus": row["last_test_status"],
@@ -2854,8 +4604,8 @@ class PanelStore:
                 {
                     "id": row["id"],
                     "name": row["name"],
-                    "email": row["email"],
-                    "phone": row["phone"],
+                    "emailMasked": mask_email(row["email"]),
+                    "phoneMasked": mask_phone(row["phone"]),
                     "tier": row["tier"],
                     "role": row["role"],
                     "avatarLabel": row["avatar_label"],
@@ -3058,7 +4808,7 @@ class PanelStore:
                     "orderNumber": row["order_number"],
                     "customerId": row["user_id"],
                     "customerName": row["customer_name"],
-                    "customerEmail": row["customer_email"],
+                    "customerEmailMasked": mask_email(row["customer_email"]),
                     "customerRole": row["customer_role"],
                     "platformName": row["platform_name"],
                     "platformIcon": row["platform_icon"],
@@ -3084,8 +4834,12 @@ class PanelStore:
             active_suppliers = sum(1 for item in suppliers if item["isActive"])
             active_customers = sum(1 for item in customers if item["isActive"] and item["role"] == "customer")
             active_products = sum(1 for item in internal_products if item["isActive"])
+            analytics_overview = analytics.get("windows", {}).get("30d", {}).get("overview", {})
 
             return {
+                "siteSettings": self._site_settings_admin_payload(site_settings_row),
+                "popup": self._popup_admin_payload(popup_row) if popup_row else None,
+                "analytics": analytics,
                 "suppliers": suppliers,
                 "customers": customers,
                 "platformGroups": platform_groups,
@@ -3102,12 +4856,14 @@ class PanelStore:
                     "productCount": len(internal_products),
                     "activeProductCount": active_products,
                     "orderCount": len(admin_orders),
+                    "visitorCount": int(analytics_overview.get("uniqueVisitors") or 0),
+                    "salesTotal": int(analytics_overview.get("sales") or 0),
                 },
             }
 
     def list_supplier_services(self, supplier_id: str, search: str = "") -> Dict[str, Any]:
         with self._connect() as conn:
-            supplier = conn.execute("SELECT id, name FROM suppliers WHERE id = ?", (supplier_id,)).fetchone()
+            supplier = conn.execute("SELECT id, name, integration_type FROM suppliers WHERE id = ?", (supplier_id,)).fetchone()
             if supplier is None:
                 raise PanelError("공급사를 찾을 수 없습니다.", status=404)
 
@@ -3120,24 +4876,10 @@ class PanelStore:
             if search.strip():
                 query += " AND LOWER(name || ' ' || category || ' ' || external_service_id) LIKE ?"
                 params.append(f"%{search.strip().lower()}%")
-            query += " ORDER BY category, name LIMIT 400"
+            query += " ORDER BY category, name"
 
             services = [
-                {
-                    "id": row["id"],
-                    "externalServiceId": row["external_service_id"],
-                    "name": row["name"],
-                    "category": row["category"],
-                    "type": row["type"],
-                    "rate": row["rate"],
-                    "rateLabel": f"{row['rate']}",
-                    "minAmount": row["min_amount"],
-                    "maxAmount": row["max_amount"],
-                    "dripfeed": bool(row["dripfeed"]),
-                    "refill": bool(row["refill"]),
-                    "cancel": bool(row["cancel"]),
-                    "syncedAt": row["synced_at"],
-                }
+                self._supplier_service_payload(row, supplier["integration_type"])
                 for row in conn.execute(query, params).fetchall()
             ]
 
@@ -3147,11 +4889,47 @@ class PanelStore:
             "search": search,
         }
 
+    def _supplier_service_payload(self, row: sqlite3.Row, integration_type: str) -> Dict[str, Any]:
+        raw_payload = parse_json(row["raw_json"], {})
+        payload = {
+            "id": row["id"],
+            "externalServiceId": row["external_service_id"],
+            "name": row["name"],
+            "category": row["category"],
+            "type": row["type"],
+            "rate": row["rate"],
+            "rateLabel": f"{row['rate']}",
+            "minAmount": row["min_amount"],
+            "maxAmount": row["max_amount"],
+            "dripfeed": bool(row["dripfeed"]),
+            "refill": bool(row["refill"]),
+            "cancel": bool(row["cancel"]),
+            "syncedAt": row["synced_at"],
+            "requestGuide": supplier_service_request_guide(
+                integration_type,
+                {
+                    "externalServiceId": row["external_service_id"],
+                    "name": row["name"],
+                    "category": row["category"],
+                    "type": row["type"],
+                    "minAmount": row["min_amount"],
+                    "maxAmount": row["max_amount"],
+                    "dripfeed": bool(row["dripfeed"]),
+                    "refill": bool(row["refill"]),
+                    "cancel": bool(row["cancel"]),
+                },
+                raw_payload if isinstance(raw_payload, dict) else {},
+            ),
+        }
+        return payload
+
     def save_supplier(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         supplier_id = str(payload.get("id") or "").strip()
         name = str(payload.get("name") or "").strip()
         api_url = str(payload.get("apiUrl") or "").strip()
+        integration_type = normalize_supplier_integration_type(payload.get("integrationType"))
         api_key = str(payload.get("apiKey") or "").strip()
+        bearer_token = str(payload.get("bearerToken") or "").strip()
         notes = str(payload.get("notes") or "").strip()
         is_active = bool(payload.get("isActive", True))
 
@@ -3162,62 +4940,224 @@ class PanelStore:
 
         timestamp = now_iso()
         with self._connect() as conn:
+            existing = None
+            integration_changed = False
             if supplier_id:
                 existing = conn.execute("SELECT * FROM suppliers WHERE id = ?", (supplier_id,)).fetchone()
                 if existing is None:
                     raise PanelError("수정할 공급사를 찾을 수 없습니다.", status=404)
-                if not api_key:
+                existing_type = normalize_supplier_integration_type(existing["integration_type"])
+                integration_changed = existing_type != integration_type
+                if not api_key and not integration_changed:
                     api_key = existing["api_key"]
-                conn.execute(
-                    """
-                    UPDATE suppliers
-                    SET name = ?, api_url = ?, api_key = ?, is_active = ?, notes = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (name, api_url, api_key, bool_to_int(is_active), notes, timestamp, supplier_id),
-                )
+                if integration_type == SUPPLIER_INTEGRATION_MKT24 and not bearer_token and not integration_changed:
+                    bearer_token = existing["bearer_token"]
+            if integration_type == SUPPLIER_INTEGRATION_MKT24:
+                if not api_key:
+                    raise PanelError("x-api-key를 입력해 주세요.")
+                if not bearer_token:
+                    raise PanelError("Bearer Token을 입력해 주세요.")
             else:
                 if not api_key:
                     raise PanelError("API 키를 입력해 주세요.")
+                bearer_token = ""
+
+            if supplier_id and existing is not None:
+                conn.execute(
+                    """
+                    UPDATE suppliers
+                    SET name = ?, api_url = ?, integration_type = ?, api_key = ?, bearer_token = ?, is_active = ?, notes = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        name,
+                        api_url,
+                        integration_type,
+                        api_key,
+                        bearer_token,
+                        bool_to_int(is_active),
+                        notes,
+                        timestamp,
+                        supplier_id,
+                    ),
+                )
+            else:
                 supplier_id = f"sup_{uuid4().hex[:12]}"
                 conn.execute(
                     """
                     INSERT INTO suppliers (
-                        id, name, api_url, api_key, is_active, notes, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        id, name, api_url, integration_type, api_key, bearer_token, is_active, notes, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (supplier_id, name, api_url, api_key, bool_to_int(is_active), notes, timestamp, timestamp),
+                    (
+                        supplier_id,
+                        name,
+                        api_url,
+                        integration_type,
+                        api_key,
+                        bearer_token,
+                        bool_to_int(is_active),
+                        notes,
+                        timestamp,
+                        timestamp,
+                    ),
                 )
             conn.commit()
 
         return {"supplier": self._supplier_by_id(supplier_id)}
 
+    def save_home_popup(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        popup_id = str(payload.get("id") or "").strip()
+        name = str(payload.get("name") or "").strip() or "홈 프로모션 팝업"
+        badge_text = str(payload.get("badgeText") or "").strip()
+        title = str(payload.get("title") or "").strip()
+        description = str(payload.get("description") or "").strip()
+        image_url = normalize_popup_image_source(payload.get("imageUrl") or "")
+        route = normalize_navigation_target(payload.get("route") or "/")
+        theme = str(payload.get("theme") or "coral").strip().lower() or "coral"
+        is_active = bool(payload.get("isActive", False))
+
+        if not title:
+            raise PanelError("팝업 제목을 입력해 주세요.")
+        if theme not in {"coral", "midnight", "blue"}:
+            theme = "coral"
+
+        timestamp = now_iso()
+        with self._connect() as conn:
+            existing = None
+            if popup_id:
+                existing = conn.execute("SELECT id, created_at FROM home_popups WHERE id = ?", (popup_id,)).fetchone()
+            if existing is None:
+                existing = conn.execute("SELECT id, created_at FROM home_popups ORDER BY updated_at DESC LIMIT 1").fetchone()
+                if existing is not None:
+                    popup_id = existing["id"]
+            if existing is None:
+                popup_id = popup_id or default_home_popup_record()["id"]
+                conn.execute(
+                    """
+                    INSERT INTO home_popups (
+                        id, name, badge_text, title, description, image_url, route, theme, is_active, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        popup_id,
+                        name,
+                        badge_text,
+                        title,
+                        description,
+                        image_url,
+                        route,
+                        theme,
+                        bool_to_int(is_active),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE home_popups
+                    SET name = ?, badge_text = ?, title = ?, description = ?, image_url = ?, route = ?, theme = ?, is_active = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        name,
+                        badge_text,
+                        title,
+                        description,
+                        image_url,
+                        route,
+                        theme,
+                        bool_to_int(is_active),
+                        timestamp,
+                        popup_id,
+                    ),
+                )
+            conn.commit()
+        return {"popup": self._home_popup_by_id(popup_id)}
+
+    def save_site_settings(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        site_name = str(payload.get("siteName") or "").strip()
+        site_description = str(payload.get("siteDescription") or "").strip()
+        use_mail_sms_site_name = bool(payload.get("useMailSmsSiteName", False))
+        mail_sms_site_name = str(payload.get("mailSmsSiteName") or "").strip()
+        favicon_url = normalize_image_asset_source(payload.get("faviconUrl") or "", "파비콘")
+        share_image_url = normalize_image_asset_source(payload.get("shareImageUrl") or "", "대표 이미지")
+
+        if not site_name:
+            raise PanelError("사이트 이름을 입력해 주세요.")
+        if not site_description:
+            raise PanelError("사이트 설명을 입력해 주세요.")
+        if len(site_name) > 80:
+            raise PanelError("사이트 이름은 80자 이하로 입력해 주세요.")
+        if len(site_description) > 240:
+            raise PanelError("사이트 설명은 240자 이하로 입력해 주세요.")
+        if len(mail_sms_site_name) > 60:
+            raise PanelError("메일/SMS 전용 사이트 이름은 60자 이하로 입력해 주세요.")
+
+        timestamp = now_iso()
+        with self._connect() as conn:
+            existing = self._site_settings_row(conn)
+            conn.execute(
+                """
+                UPDATE site_settings
+                SET site_name = ?, site_description = ?, use_mail_sms_site_name = ?, mail_sms_site_name = ?,
+                    favicon_url = ?, share_image_url = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    site_name,
+                    site_description,
+                    bool_to_int(use_mail_sms_site_name),
+                    mail_sms_site_name,
+                    favicon_url,
+                    share_image_url,
+                    timestamp,
+                    existing["id"],
+                ),
+            )
+            conn.commit()
+        return {"siteSettings": self.admin_site_settings()["siteSettings"]}
+
     def test_supplier_connection(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         supplier_id = str(payload.get("id") or "").strip()
-        supplier = self._supplier_by_id(supplier_id) if supplier_id else None
+        supplier = self._supplier_by_id(supplier_id, include_api_key=True) if supplier_id else None
 
+        integration_type = normalize_supplier_integration_type(payload.get("integrationType") or (supplier["integrationType"] if supplier else ""))
         api_url = str(payload.get("apiUrl") or (supplier["apiUrl"] if supplier else "")).strip()
         api_key = str(payload.get("apiKey") or (supplier["apiKey"] if supplier else "")).strip()
+        bearer_token = str(payload.get("bearerToken") or (supplier["bearerToken"] if supplier else "")).strip()
 
         if not api_url:
             raise PanelError("API URL을 입력해 주세요.")
         if not api_key:
-            raise PanelError("API 키를 입력해 주세요.")
+            label = "x-api-key" if integration_type == SUPPLIER_INTEGRATION_MKT24 else "API 키"
+            raise PanelError(f"{label}를 입력해 주세요.")
+        if integration_type == SUPPLIER_INTEGRATION_MKT24 and not bearer_token:
+            raise PanelError("Bearer Token을 입력해 주세요.")
 
-        result = self._run_supplier_connection_test(api_url, api_key)
+        result = self._run_supplier_connection_test(
+            api_url,
+            api_key,
+            integration_type=integration_type,
+            bearer_token=bearer_token,
+        )
 
         if supplier_id:
+            persisted_api_url = result.get("persistedApiUrl") or result["resolvedApiUrl"]
             with self._connect() as conn:
                 conn.execute(
                     """
                     UPDATE suppliers
-                    SET api_url = ?, api_key = ?, last_test_status = ?, last_test_message = ?, last_balance = ?,
+                    SET api_url = ?, integration_type = ?, api_key = ?, bearer_token = ?, last_test_status = ?, last_test_message = ?, last_balance = ?,
                         last_currency = ?, last_service_count = ?, last_checked_at = ?, updated_at = ?
                     WHERE id = ?
                     """,
                     (
-                        result["resolvedApiUrl"],
+                        persisted_api_url,
+                        integration_type,
                         api_key,
+                        bearer_token if integration_type == SUPPLIER_INTEGRATION_MKT24 else "",
                         result["status"],
                         result["message"],
                         result["balance"],
@@ -3233,8 +5173,14 @@ class PanelStore:
         return {"result": result}
 
     def sync_supplier_services(self, supplier_id: str) -> Dict[str, Any]:
-        supplier = self._supplier_by_id(supplier_id)
-        result = self._run_supplier_connection_test(supplier["apiUrl"], supplier["apiKey"], require_services=True)
+        supplier = self._supplier_by_id(supplier_id, include_api_key=True)
+        result = self._run_supplier_connection_test(
+            supplier["apiUrl"],
+            supplier["apiKey"],
+            integration_type=supplier["integrationType"],
+            bearer_token=supplier.get("bearerToken") or "",
+            require_services=True,
+        )
         services_payload = result["servicesPayload"]
         synced_at = now_iso()
 
@@ -3245,9 +5191,10 @@ class PanelStore:
             for item in services_payload:
                 if not isinstance(item, dict):
                     continue
-                external_service_id = str(item.get("service") or item.get("id") or "").strip()
-                if not external_service_id:
+                service_record = supplier_service_record(supplier["integrationType"], item)
+                if service_record is None:
                     continue
+                external_service_id = service_record["externalServiceId"]
                 row_id = conn.execute(
                     "SELECT id FROM supplier_services WHERE supplier_id = ? AND external_service_id = ?",
                     (supplier_id, external_service_id),
@@ -3257,16 +5204,16 @@ class PanelStore:
                     service_id,
                     supplier_id,
                     external_service_id,
-                    str(item.get("name") or f"서비스 {external_service_id}"),
-                    str(item.get("category") or ""),
-                    str(item.get("type") or ""),
-                    safe_float(item.get("rate"), 0.0),
-                    int(float(item.get("min") or 0) or 0),
-                    int(float(item.get("max") or 0) or 0),
-                    bool_to_int(item.get("dripfeed")),
-                    bool_to_int(item.get("refill")),
-                    bool_to_int(item.get("cancel")),
-                    as_json(item),
+                    service_record["name"],
+                    service_record["category"],
+                    service_record["type"],
+                    service_record["rate"],
+                    service_record["minAmount"],
+                    service_record["maxAmount"],
+                    bool_to_int(service_record["dripfeed"]),
+                    bool_to_int(service_record["refill"]),
+                    bool_to_int(service_record["cancel"]),
+                    service_record["rawJson"],
                     synced_at,
                 )
                 if row_id:
@@ -3303,6 +5250,7 @@ class PanelStore:
                         values,
                     )
 
+            persisted_api_url = result.get("persistedApiUrl") or result["resolvedApiUrl"]
             conn.execute(
                 """
                 UPDATE suppliers
@@ -3311,7 +5259,7 @@ class PanelStore:
                 WHERE id = ?
                 """,
                 (
-                    result["resolvedApiUrl"],
+                    persisted_api_url,
                     "서비스 동기화 완료",
                     result["balance"],
                     result["currency"],
@@ -3471,6 +5419,9 @@ class PanelStore:
                 )
             conn.commit()
         return {"customer": self._customer_by_id(customer_id)}
+
+    def get_customer_detail(self, customer_id: str) -> Dict[str, Any]:
+        return {"customer": self._customer_by_id(customer_id, include_private=True)}
 
     def delete_customer(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         customer_id = str(payload.get("customerId") or "").strip()
@@ -3788,23 +5739,42 @@ class PanelStore:
             conn.commit()
         return {"ok": True, "orderId": order_id, "status": status}
 
-    def _run_supplier_connection_test(self, api_url: str, api_key: str, require_services: bool = False) -> Dict[str, Any]:
-        candidates = normalize_api_candidates(api_url)
+    def _run_supplier_connection_test(
+        self,
+        api_url: str,
+        api_key: str,
+        *,
+        integration_type: str = SUPPLIER_INTEGRATION_CLASSIC,
+        bearer_token: str = "",
+        require_services: bool = False,
+    ) -> Dict[str, Any]:
+        normalized_type = normalize_supplier_integration_type(integration_type)
+        candidates = normalize_supplier_api_candidates(normalized_type, api_url)
         if not candidates:
             raise PanelError("API URL 형식이 올바르지 않습니다.")
 
         last_error = "연결 실패"
         for candidate in candidates:
-            client = SupplierApiClient(candidate, api_key)
+            client = SupplierApiClient(
+                candidate,
+                api_key,
+                integration_type=normalized_type,
+                bearer_token=bearer_token,
+            )
             try:
-                balance_payload = client.balance_summary()
-                services_payload = client.services()
-                if not isinstance(services_payload, list):
-                    raise SupplierApiError("서비스 목록 형식이 올바르지 않습니다.")
+                if supplier_supports_balance_check(normalized_type):
+                    balance_payload = client.balance_summary()
+                    success_message = "API 연결이 확인되었습니다."
+                else:
+                    balance_payload = {"balance": "", "currency": ""}
+                    success_message = "서비스 목록 조회가 확인되었습니다. 잔액 API는 제공되지 않습니다."
+                raw_services_payload = client.services()
+                services_payload = normalize_supplier_services_payload(normalized_type, raw_services_payload)
                 return {
                     "status": "success",
-                    "message": "API 연결이 확인되었습니다.",
+                    "message": success_message,
                     "resolvedApiUrl": candidate,
+                    "persistedApiUrl": api_url.strip() or candidate,
                     "balance": balance_payload["balance"],
                     "currency": balance_payload["currency"],
                     "serviceCount": len(services_payload),
@@ -3816,13 +5786,20 @@ class PanelStore:
 
         raise PanelError(f"API 연결을 확인하지 못했습니다. {last_error}")
 
-    def _supplier_by_id(self, supplier_id: str) -> Dict[str, Any]:
+    def _supplier_by_id(self, supplier_id: str, *, include_api_key: bool = False) -> Dict[str, Any]:
         row = self._fetchone("SELECT * FROM suppliers WHERE id = ?", (supplier_id,))
-        return {
+        integration_type = normalize_supplier_integration_type(row["integration_type"])
+        payload = {
             "id": row["id"],
             "name": row["name"],
             "apiUrl": row["api_url"],
-            "apiKey": row["api_key"],
+            "integrationType": integration_type,
+            "hasApiKey": bool(row["api_key"]),
+            "apiKeyMasked": mask_secret(row["api_key"]),
+            "hasBearerToken": bool(row["bearer_token"]),
+            "bearerTokenMasked": mask_secret(row["bearer_token"]),
+            "supportsBalanceCheck": supplier_supports_balance_check(integration_type),
+            "supportsAutoDispatch": supplier_supports_auto_dispatch(integration_type),
             "isActive": bool(row["is_active"]),
             "notes": row["notes"],
             "lastTestStatus": row["last_test_status"],
@@ -3834,8 +5811,87 @@ class PanelStore:
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }
+        if include_api_key:
+            payload["apiKey"] = row["api_key"]
+            payload["bearerToken"] = row["bearer_token"]
+        return payload
 
-    def _customer_by_id(self, customer_id: str) -> Dict[str, Any]:
+    def public_site_settings(self) -> Dict[str, Any]:
+        row = self._fetchone("SELECT * FROM site_settings ORDER BY updated_at DESC LIMIT 1")
+        return {"siteSettings": self._site_settings_public_payload(row)}
+
+    def admin_site_settings(self) -> Dict[str, Any]:
+        row = self._fetchone("SELECT * FROM site_settings ORDER BY updated_at DESC LIMIT 1")
+        return {"siteSettings": self._site_settings_admin_payload(row)}
+
+    def _site_settings_row(self, conn: sqlite3.Connection) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM site_settings ORDER BY updated_at DESC LIMIT 1").fetchone()
+        if row is None:
+            self._ensure_site_settings(conn)
+            row = conn.execute("SELECT * FROM site_settings ORDER BY updated_at DESC LIMIT 1").fetchone()
+        if row is None:
+            raise PanelError("사이트 설정을 불러오지 못했습니다.", status=500)
+        return row
+
+    def _site_settings_public_payload(self, row: sqlite3.Row) -> Dict[str, Any]:
+        effective_mail_sms_site_name = (
+            row["mail_sms_site_name"].strip()
+            if bool(row["use_mail_sms_site_name"]) and row["mail_sms_site_name"].strip()
+            else row["site_name"]
+        )
+        return {
+            "siteName": row["site_name"],
+            "siteDescription": row["site_description"],
+            "useMailSmsSiteName": bool(row["use_mail_sms_site_name"]),
+            "mailSmsSiteName": row["mail_sms_site_name"],
+            "effectiveMailSmsSiteName": effective_mail_sms_site_name,
+            "faviconUrl": row["favicon_url"],
+            "shareImageUrl": row["share_image_url"],
+        }
+
+    def _site_settings_admin_payload(self, row: sqlite3.Row) -> Dict[str, Any]:
+        payload = self._site_settings_public_payload(row)
+        payload.update(
+            {
+                "createdAt": row["created_at"],
+                "updatedAt": row["updated_at"],
+            }
+        )
+        return payload
+
+    def _popup_public_payload(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "badgeText": row["badge_text"],
+            "title": row["title"],
+            "description": row["description"],
+            "imageUrl": row["image_url"],
+            "route": row["route"],
+            "theme": row["theme"],
+            "isActive": bool(row["is_active"]),
+            "updatedAt": row["updated_at"],
+        }
+
+    def _popup_admin_payload(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "badgeText": row["badge_text"],
+            "title": row["title"],
+            "description": row["description"],
+            "imageUrl": row["image_url"],
+            "route": row["route"],
+            "theme": row["theme"],
+            "isActive": bool(row["is_active"]),
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def _home_popup_by_id(self, popup_id: str) -> Dict[str, Any]:
+        row = self._fetchone("SELECT * FROM home_popups WHERE id = ?", (popup_id,))
+        return self._popup_admin_payload(row)
+
+    def _customer_by_id(self, customer_id: str, *, include_private: bool = True) -> Dict[str, Any]:
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -3853,11 +5909,11 @@ class PanelStore:
             ).fetchone()
         if row is None:
             raise PanelError("고객을 찾을 수 없습니다.", status=404)
-        return {
+        payload = {
             "id": row["id"],
             "name": row["name"],
-            "email": row["email"],
-            "phone": row["phone"],
+            "emailMasked": mask_email(row["email"]),
+            "phoneMasked": mask_phone(row["phone"]),
             "tier": row["tier"],
             "role": row["role"],
             "avatarLabel": row["avatar_label"],
@@ -3874,6 +5930,10 @@ class PanelStore:
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }
+        if include_private:
+            payload["email"] = row["email"]
+            payload["phone"] = row["phone"]
+        return payload
 
     def _category_by_id(self, category_id: str) -> Dict[str, Any]:
         with self._connect() as conn:
@@ -4066,8 +6126,8 @@ class PanelStore:
             if product is None:
                 raise PanelError("미리보기를 확인할 상품을 찾을 수 없습니다.", status=404)
 
-        resolved = self._resolve_preview_target(product, fields)
-        if not resolved["rawInput"]:
+        validation = self._validate_product_target(product, fields, require_preview=False)
+        if not validation["rawInput"]:
             return {
                 "preview": {
                     "found": False,
@@ -4076,12 +6136,21 @@ class PanelStore:
                     "resolvedUrl": "",
                     "message": "링크나 계정 ID를 입력하면 미리보기가 표시됩니다.",
                     "displayInput": "",
-                    "sourceLabel": resolved["sourceLabel"],
+                    "sourceLabel": validation["sourceLabel"],
                     "state": "idle",
                 }
             }
 
-        if not resolved["url"]:
+        if validation["requiresPreview"]:
+            preview = extract_preview_metadata(validation["url"], product["accent_color"] or "#4c76ff")
+            preview["displayInput"] = validation["rawInput"]
+            preview["sourceLabel"] = validation["sourceLabel"]
+            preview["state"] = "found" if preview["found"] else "missing"
+            if not preview["found"]:
+                preview["message"] = "링크가 확인되지 않습니다."
+            return {"preview": preview}
+
+        if not validation["url"]:
             return {
                 "preview": {
                     "found": False,
@@ -4089,17 +6158,24 @@ class PanelStore:
                     "imageUrl": "",
                     "resolvedUrl": "",
                     "message": "링크가 확인되지 않습니다.",
-                    "displayInput": resolved["rawInput"],
-                    "sourceLabel": resolved["sourceLabel"],
+                    "displayInput": validation["rawInput"],
+                    "sourceLabel": validation["sourceLabel"],
                     "state": "missing",
                 }
             }
 
-        preview = extract_preview_metadata(resolved["url"], product["accent_color"])
-        preview["displayInput"] = resolved["rawInput"]
-        preview["sourceLabel"] = resolved["sourceLabel"]
-        preview["state"] = "found" if preview["found"] else "missing"
-        return {"preview": preview}
+        return {
+            "preview": {
+                "found": True,
+                "title": "",
+                "imageUrl": placeholder_thumbnail(validation["rawInput"], product["accent_color"] or "#4c76ff"),
+                "resolvedUrl": validation["url"],
+                "message": "링크 형식을 확인했습니다.",
+                "displayInput": validation["rawInput"],
+                "sourceLabel": validation["sourceLabel"],
+                "state": "found",
+            }
+        }
 
     def charge_balance(self, amount: int) -> Dict[str, Any]:
         if amount <= 0:
@@ -4144,7 +6220,8 @@ class PanelStore:
                     pc.id AS category_id,
                     pc.name AS category_name,
                     pg.platform_section_id,
-                    ps.slug AS platform_slug
+                    ps.slug AS platform_slug,
+                    ps.accent_color AS accent_color
                 FROM products p
                 JOIN product_categories pc ON pc.id = p.product_category_id
                 JOIN platform_groups pg ON pg.id = pc.platform_group_id
@@ -4158,6 +6235,7 @@ class PanelStore:
 
             rules = parse_json(product["form_structure_json"], {}).get("schema", {})
             self._validate_fields(fields, rules)
+            self._validate_product_target(product, fields, require_preview=True)
 
             quantity = self._resolve_quantity(product, fields)
             total_price = int(product["price"]) if product["price_strategy"] == "fixed" else int(product["price"]) * quantity
@@ -4173,7 +6251,9 @@ class PanelStore:
                 SELECT
                     psm.*,
                     s.api_url,
+                    s.integration_type,
                     s.api_key,
+                    s.bearer_token,
                     s.name AS supplier_name,
                     s.is_active AS supplier_is_active,
                     ss.name AS supplier_service_name,
@@ -4296,7 +6376,12 @@ class PanelStore:
         response_payload: Any = {}
 
         try:
-            client = SupplierApiClient(str(mapping["api_url"]), str(mapping["api_key"]))
+            client = SupplierApiClient(
+                str(mapping["api_url"]),
+                str(mapping["api_key"]),
+                integration_type=str(mapping.get("integration_type") or SUPPLIER_INTEGRATION_CLASSIC),
+                bearer_token=str(mapping.get("bearer_token") or ""),
+            )
             response_payload = client.order(request_payload)
             if isinstance(response_payload, dict):
                 supplier_external_order_id = str(response_payload.get("order") or response_payload.get("id") or "").strip()
@@ -4414,9 +6499,59 @@ class PanelStore:
             if "STRING_REQUIRED" in field_rules and not str(fields.get(key) or "").strip():
                 raise PanelError("필수 입력값이 비어 있습니다.")
 
+    def _validate_product_target(
+        self,
+        product: sqlite3.Row,
+        fields: Dict[str, Any],
+        require_preview: bool = False,
+    ) -> Dict[str, Any]:
+        resolved = self._resolve_preview_target(product, fields)
+        raw_input = resolved["rawInput"]
+        if not raw_input:
+            return {
+                "rawInput": "",
+                "url": "",
+                "sourceLabel": resolved["sourceLabel"],
+                "platformHint": resolved["platformHint"],
+                "fieldKey": resolved["fieldKey"],
+                "requiresPreview": False,
+            }
+
+        platform_hint = resolved["platformHint"]
+        field_key = resolved["fieldKey"]
+        url = resolved["url"]
+        format_valid = True
+
+        if field_key == "targetUrl":
+            format_valid = bool(url) and platform_target_url_matches(platform_hint, url)
+        elif field_key == "targetValue":
+            if looks_like_url(raw_input):
+                format_valid = bool(url) and platform_target_url_matches(platform_hint, url)
+            elif platform_hint in ACCOUNT_STYLE_PLATFORMS:
+                format_valid = bool(url)
+
+        if not format_valid:
+            raise PanelError(platform_target_error_message(platform_hint))
+
+        requires_preview = platform_hint == "instagram" and bool(url)
+        if require_preview and requires_preview:
+            preview = extract_preview_metadata(url, product["accent_color"] or "#4c76ff")
+            if not preview.get("found"):
+                raise PanelError("인스타그램 링크가 확인되지 않아 주문할 수 없습니다.")
+
+        return {
+            "rawInput": raw_input,
+            "url": url,
+            "sourceLabel": resolved["sourceLabel"],
+            "platformHint": platform_hint,
+            "fieldKey": field_key,
+            "requiresPreview": requires_preview,
+        }
+
     def _resolve_preview_target(self, product: sqlite3.Row, fields: Dict[str, Any]) -> Dict[str, str]:
         form_structure = parse_json(product["form_structure_json"], {})
         template = form_structure.get("template", {})
+        platform_hint = preview_platform_hint(product["product_code"], product["platform_slug"])
 
         for field_key in ("targetUrl", "targetValue"):
             raw_value = str(fields.get(field_key) or "").strip()
@@ -4432,27 +6567,34 @@ class PanelStore:
                     "rawInput": raw_value,
                     "url": normalize_url(raw_value) or "",
                     "sourceLabel": source_label,
+                    "fieldKey": field_key,
+                    "platformHint": platform_hint,
                 }
 
             if field_key == "targetValue":
-                platform_hint = preview_platform_hint(product["product_code"], product["platform_slug"])
                 inferred = account_preview_url(raw_value, platform_hint)
                 return {
                     "rawInput": raw_value,
                     "url": inferred or "",
                     "sourceLabel": source_label or template_options.get("label", "계정 ID"),
+                    "fieldKey": field_key,
+                    "platformHint": platform_hint,
                 }
 
             return {
                 "rawInput": raw_value,
                 "url": "",
                 "sourceLabel": source_label,
+                "fieldKey": field_key,
+                "platformHint": platform_hint,
             }
 
         return {
             "rawInput": "",
             "url": "",
             "sourceLabel": "",
+            "fieldKey": "",
+            "platformHint": platform_hint,
         }
 
     def _resolve_quantity(self, product: sqlite3.Row, fields: Dict[str, Any]) -> int:
