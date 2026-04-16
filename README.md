@@ -6,16 +6,58 @@
 ## 실행
 
 ```bash
+export SMM_PANEL_ADMIN_PASSWORD="강한관리자비밀번호"
 python3 smm_panel/server.py --host 127.0.0.1 --port 8024
 ```
 
 브라우저에서 `http://127.0.0.1:8024` 로 접속하면 됩니다.
+
+분리 배포를 준비할 때는 `smm_panel/.env.example` 의 항목을 기준으로 환경변수를 맞추는 것을 권장합니다.
+
+## 보안 기본값
+
+- `/admin` 및 `/api/admin/*` 는 관리자 로그인 세션이 있어야만 접근할 수 있습니다.
+- 공급사 API 키는 관리자 화면으로 평문이 다시 내려오지 않고, 마스킹된 상태만 표시됩니다.
+- 고객 목록, 주문 목록, 사용자 패널에서는 이메일/전화번호가 마스킹된 값만 노출됩니다.
+- 관리자 상세 화면에서만 고객 원본 정보가 조회되며, 응답은 `Cache-Control: no-store` 로 전송됩니다.
+- 관리자 세션 쿠키는 `HttpOnly`, `SameSite=Strict` 로 발급되고, HTTPS 프록시 뒤에서는 `Secure` 가 자동 적용됩니다.
+- 관리자 로그인은 연속 실패 횟수를 제한해 무차별 대입 시도를 완화합니다.
+- 허용된 Origin 에 대해서만 CORS 를 열고, 관리자 POST 요청에는 CSRF 토큰 검증을 수행합니다.
+- `link-preview` 는 내부망, localhost, 사설 IP 대역으로 연결되지 않도록 차단합니다.
+- 주문, 충전, 링크 미리보기, 방문 수집 API 는 IP 단위 속도 제한이 적용됩니다.
 
 ## 구성
 
 - 백엔드: Python 표준 라이브러리 HTTP 서버 + SQLite
 - 프론트엔드: 정적 HTML/CSS/Vanilla JS SPA
 - 저장소: `smm_panel/data/smm_panel.db`
+
+## 분리 배포 설계
+
+추후 `Vercel 프론트 + 별도 API + Supabase` 구조로 옮길 수 있도록 현재 코드도 그 방향을 기준으로 정리되어 있습니다.
+
+- 프론트엔드:
+  - `smm-api-base-url` 메타값을 읽어 API 서버를 분리해서 호출할 수 있습니다.
+  - 관리자 API 호출은 `credentials: include` 와 CSRF 헤더를 함께 사용합니다.
+  - 공급사 API 키나 서비스 롤 키는 프론트로 절대 내려주지 않습니다.
+- 백엔드:
+  - `SMM_PANEL_ALLOWED_ORIGINS` 로 허용 Origin 을 제한하고, 관리자 세션 쿠키 정책을 환경변수로 제어할 수 있습니다.
+  - 공급사 호출, 링크 검증, 주문 생성, 관리자 작업은 모두 백엔드에서만 처리해야 합니다.
+  - 추후 Supabase 로 이관할 때도 `service_role` 키는 백엔드에만 두고, 프론트에는 공개 키만 사용해야 합니다.
+- 데이터베이스:
+  - 현재는 SQLite 이지만, 다음 단계에서는 `PanelStore` 를 저장소 인터페이스 기준으로 분리해 `SQLiteAdapter -> Supabase/PostgresAdapter` 로 교체하는 구조를 권장합니다.
+  - 사용자 인증을 Supabase Auth 로 옮길 경우에도, 공급사 비밀값과 관리자 권한 작업은 별도 백엔드에서 계속 수행하는 편이 안전합니다.
+
+## 권장 환경변수
+
+- `SMM_PANEL_PUBLIC_API_BASE_URL`: 프론트가 호출할 API 기본 주소
+- `SMM_PANEL_ALLOWED_ORIGINS`: CORS 허용 Origin 목록
+- `SMM_PANEL_PUBLIC_APP_ORIGIN`: 대표 프론트 Origin
+- `SMM_PANEL_COOKIE_DOMAIN`: 관리자 세션 쿠키 공유 도메인
+- `SMM_PANEL_ADMIN_COOKIE_SAMESITE`: `Strict`, `Lax`, `None`
+- `SMM_PANEL_FORCE_SECURE_COOKIES`: HTTPS 강제 시 `true`
+
+운영에서는 `app.example.com` 과 `api.example.com` 처럼 같은 상위 도메인 아래에서 프론트와 API 를 나누는 구성을 추천합니다. 이렇게 하면 관리자 세션 쿠키를 상대적으로 안정적으로 유지할 수 있습니다.
 
 ## 주요 화면
 
