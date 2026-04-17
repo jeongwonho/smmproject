@@ -397,6 +397,96 @@ function popupPreviewPayload(popup) {
   };
 }
 
+function svgToDataUrl(svgMarkup) {
+  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svgMarkup)}`;
+}
+
+function resolveHomeBannerImageUrl(banner) {
+  const explicitUrl = String(banner?.imageUrl || "").trim();
+  if (explicitUrl) return explicitUrl;
+
+  const paletteMap = {
+    blue: { start: "#335CFF", end: "#7EA7FF", glow: "#D6E5FF", accent: "#1A2E78" },
+    mint: { start: "#05B89F", end: "#74E3CE", glow: "#D9FFF7", accent: "#0A3D47" },
+    dark: { start: "#1C2438", end: "#4F5B73", glow: "#CAD7F8", accent: "#0B1020" },
+  };
+  const theme = String(banner?.theme || "blue").trim().toLowerCase();
+  const palette = paletteMap[theme] || paletteMap.blue;
+  const seed = String(banner?.id || "banner");
+  const badge = seed.slice(-3).toUpperCase();
+
+  return svgToDataUrl(`
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" fill="none">
+      <defs>
+        <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="720" gradientUnits="userSpaceOnUse">
+          <stop stop-color="${palette.start}"/>
+          <stop offset="1" stop-color="${palette.end}"/>
+        </linearGradient>
+        <radialGradient id="glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(948 132) rotate(128.2) scale(440 340)">
+          <stop stop-color="${palette.glow}" stop-opacity="0.88"/>
+          <stop offset="1" stop-color="${palette.glow}" stop-opacity="0"/>
+        </radialGradient>
+      </defs>
+      <rect width="1200" height="720" rx="56" fill="url(#bg)"/>
+      <circle cx="980" cy="146" r="232" fill="url(#glow)"/>
+      <path d="M820 98C975 135 1072 244 1171 420" stroke="rgba(255,255,255,0.34)" stroke-width="20" stroke-linecap="round"/>
+      <path d="M702 536C836 440 968 426 1148 514" stroke="rgba(255,255,255,0.22)" stroke-width="28" stroke-linecap="round"/>
+      <rect x="814" y="336" width="264" height="242" rx="36" fill="rgba(255,255,255,0.16)" stroke="rgba(255,255,255,0.26)"/>
+      <rect x="846" y="366" width="202" height="126" rx="28" fill="rgba(255,255,255,0.14)"/>
+      <circle cx="934" cy="429" r="42" fill="rgba(255,255,255,0.18)"/>
+      <path d="M923 404L957 429L923 454V404Z" fill="white" fill-opacity="0.9"/>
+      <rect x="118" y="124" width="214" height="74" rx="37" fill="rgba(255,255,255,0.18)" stroke="rgba(255,255,255,0.22)"/>
+      <text x="154" y="171" fill="white" fill-opacity="0.9" font-size="34" font-family="SUIT, Pretendard, sans-serif" font-weight="700">${badge}</text>
+      <rect x="118" y="520" width="164" height="26" rx="13" fill="rgba(255,255,255,0.14)"/>
+      <rect x="118" y="560" width="252" height="26" rx="13" fill="rgba(255,255,255,0.14)"/>
+      <circle cx="1066" cy="150" r="18" fill="${palette.accent}" fill-opacity="0.34"/>
+      <circle cx="1096" cy="184" r="10" fill="white" fill-opacity="0.44"/>
+    </svg>
+  `);
+}
+
+function getActiveHomeBanners() {
+  return (state.bootstrap?.banners || []).filter((banner) => banner.isActive !== false);
+}
+
+function setHomeBannerIndex(nextIndex, { render = false } = {}) {
+  const banners = getActiveHomeBanners();
+  if (!banners.length) {
+    state.ui.bannerIndex = 0;
+    return;
+  }
+  const total = banners.length;
+  const normalized = ((Number(nextIndex) || 0) % total + total) % total;
+  state.ui.bannerIndex = normalized;
+
+  if (render || getRoute().name !== "home") {
+    renderRoute();
+    return;
+  }
+
+  const track = document.querySelector("[data-home-banner-track]");
+  if (track) {
+    track.style.transform = `translateX(-${normalized * 100}%)`;
+  }
+  document.querySelectorAll("[data-banner-index]").forEach((button, index) => {
+    button.classList.toggle("is-active", index === normalized);
+  });
+}
+
+function updateHomePlatformScrollerState(scroller = document.querySelector("[data-home-platform-scroller]")) {
+  if (!scroller) return;
+  const stack = scroller.closest("[data-home-platform-stack]");
+  const fade = stack?.querySelector("[data-home-platform-fade]");
+  const hint = stack?.querySelector("[data-home-platform-hint]");
+  const remaining = Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop);
+  const isScrollable = scroller.scrollHeight - scroller.clientHeight > 12;
+  const isEnd = remaining <= 6;
+  scroller.classList.toggle("is-scrollable", isScrollable);
+  scroller.classList.toggle("is-end", isEnd);
+  if (fade) fade.hidden = !isScrollable || isEnd;
+  if (hint) hint.hidden = !isScrollable || isEnd;
+}
+
 function readFileAsDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -2361,7 +2451,7 @@ function renderHomeBannerPreviewMarkup(banner) {
 function renderHomeBannerAdminSection() {
   const banners = getAdminHomeBanners();
   const draft = state.adminHomeBannerDraft || homeBannerToDraft(banners[0]);
-  const imageMeta = draft.imageName || (draft.imageUrl ? "저장된 배너 이미지 연결됨" : "이미지 없음");
+  const imageMeta = draft.imageName || (draft.imageUrl ? "저장된 배너 이미지 연결됨" : "기본 이미지 자동 적용 중");
 
   return `
     <section class="admin-card">
@@ -4777,7 +4867,8 @@ function renderAdmin() {
 }
 
 function renderHomeBannerCard(banner, { compact = false, index = 0, total = 1, interactive = true } = {}) {
-  const hasImage = Boolean(banner?.imageUrl);
+  const imageUrl = resolveHomeBannerImageUrl(banner);
+  const hasImage = Boolean(imageUrl);
   const title = banner?.title || "프로모션 배너";
   const subtitle = banner?.subtitle || "";
   const ctaLabel = banner?.ctaLabel || "바로 보기";
@@ -4792,7 +4883,7 @@ function renderHomeBannerCard(banner, { compact = false, index = 0, total = 1, i
         hasImage
           ? `
             <span class="home-banner-card__media">
-              <img src="${escapeHtml(banner.imageUrl)}" alt="${escapeHtml(title)}" loading="lazy" />
+              <img src="${escapeHtml(imageUrl)}" alt="${escapeHtml(title)}" loading="lazy" />
             </span>
             <span class="home-banner-card__overlay"></span>
           `
@@ -4803,10 +4894,16 @@ function renderHomeBannerCard(banner, { compact = false, index = 0, total = 1, i
         <strong>${escapeHtml(title)}</strong>
         ${subtitle ? `<em>${escapeHtml(subtitle)}</em>` : ""}
       </span>
-      <span class="home-banner-card__meta">
-        ${counter ? `<span class="home-banner-card__counter">${escapeHtml(counter)}</span>` : ""}
-        <span class="home-banner-card__cta">${escapeHtml(ctaLabel)}</span>
-      </span>
+      ${
+        compact
+          ? `<span class="home-banner-card__arrow" aria-hidden="true">›</span>`
+          : `
+            <span class="home-banner-card__meta">
+              ${counter ? `<span class="home-banner-card__counter">${escapeHtml(counter)}</span>` : ""}
+              <span class="home-banner-card__cta">${escapeHtml(ctaLabel)}</span>
+            </span>
+          `
+      }
     </${tag}>
   `;
 }
@@ -4819,7 +4916,7 @@ function renderHome() {
   const siteDescription =
     data.siteSettings?.siteDescription ||
     "원하는 플랫폼과 상품을 빠르게 찾고 주문까지 이어지는 SMM 주문 패널입니다.";
-  const activeBanners = (data.banners || []).filter((banner) => banner.isActive !== false);
+  const activeBanners = getActiveHomeBanners();
   const safeBannerIndex = activeBanners.length ? state.ui.bannerIndex % activeBanners.length : 0;
   if (safeBannerIndex !== state.ui.bannerIndex) {
     state.ui.bannerIndex = safeBannerIndex;
@@ -4898,22 +4995,28 @@ function renderHome() {
         </section>
 
         <section class="content-section content-section--tight">
-          <div class="home-platform-grid">
-            ${data.platforms
-              .map(
-                (platform) => `
-                  <button
-                    class="home-platform-card"
-                    type="button"
-                    data-route="/products"
-                    data-platform-id="${platform.id}"
-                  >
-                    <span class="home-platform-card__icon" style="--platform-accent:${escapeHtml(platform.accentColor)}">${escapeHtml(platform.icon)}</span>
-                    <strong>${escapeHtml(platform.displayName)}</strong>
-                  </button>
-                `
-              )
-              .join("")}
+          <div class="home-platform-stack" data-home-platform-stack>
+            <div class="home-platform-scroller" data-home-platform-scroller tabindex="0" aria-label="서비스 플랫폼 목록">
+              <div class="home-platform-grid">
+                ${data.platforms
+                  .map(
+                    (platform) => `
+                      <button
+                        class="home-platform-card"
+                        type="button"
+                        data-route="/products"
+                        data-platform-id="${platform.id}"
+                      >
+                        <span class="home-platform-card__icon" style="--platform-accent:${escapeHtml(platform.accentColor)}">${escapeHtml(platform.icon)}</span>
+                        <strong>${escapeHtml(platform.displayName)}</strong>
+                      </button>
+                    `
+                  )
+                  .join("")}
+              </div>
+            </div>
+            <div class="home-platform-scroller__fade" data-home-platform-fade></div>
+            <div class="home-platform-scroller__hint" data-home-platform-hint>아래로 스크롤해 더 많은 서비스를 확인하세요</div>
           </div>
         </section>
 
@@ -4922,7 +5025,7 @@ function renderHome() {
             ? `
               <section class="content-section">
                 <div class="banner-carousel banner-carousel--media">
-                  <div class="banner-track" style="transform: translateX(-${safeBannerIndex * 100}%);">
+                  <div class="banner-track" data-home-banner-track style="transform: translateX(-${safeBannerIndex * 100}%);">
                     ${activeBanners
                       .map((banner, index) => renderHomeBannerCard(banner, { compact: false, index, total: activeBanners.length }))
                       .join("")}
@@ -5757,6 +5860,9 @@ async function renderRoute() {
     if (route.name === "detail" && route.id && state.categoryCache[route.id]) {
       scheduleLinkPreview(state.categoryCache[route.id], { immediate: true });
     }
+    if (route.name === "home") {
+      requestAnimationFrame(() => updateHomePlatformScrollerState());
+    }
     ensureBannerTimer();
     trackPublicRoute(route);
   } catch (error) {
@@ -6021,11 +6127,12 @@ function navigate(path, { push = true } = {}) {
 }
 
 function ensureBannerTimer() {
-  if (bannerIntervalId || !state.bootstrap?.banners?.length) return;
+  if (bannerIntervalId || !getActiveHomeBanners().length) return;
   bannerIntervalId = window.setInterval(() => {
-    if (getRoute().name !== "home") return;
-    state.ui.bannerIndex = (state.ui.bannerIndex + 1) % state.bootstrap.banners.length;
-    renderRoute();
+    if (getRoute().name !== "home" || state.ui.loginModalOpen) return;
+    const activeElement = document.activeElement;
+    if (activeElement && activeElement.closest(".auth-modal, .home-search")) return;
+    setHomeBannerIndex(state.ui.bannerIndex + 1);
   }, 4500);
 }
 
@@ -6505,8 +6612,7 @@ document.addEventListener("click", async (event) => {
 
   const bannerDot = event.target.closest("[data-banner-index]");
   if (bannerDot) {
-    state.ui.bannerIndex = Number(bannerDot.getAttribute("data-banner-index")) || 0;
-    renderRoute();
+    setHomeBannerIndex(Number(bannerDot.getAttribute("data-banner-index")) || 0);
     return;
   }
 
@@ -7187,6 +7293,17 @@ document.addEventListener("submit", async (event) => {
     showToast(error.message || "주문 접수에 실패했습니다.", "error");
   }
 });
+
+document.addEventListener(
+  "scroll",
+  (event) => {
+    const target = event.target;
+    if (target instanceof HTMLElement && target.matches("[data-home-platform-scroller]")) {
+      updateHomePlatformScrollerState(target);
+    }
+  },
+  true
+);
 
 document.addEventListener("keydown", (event) => {
   const target = event.target;
