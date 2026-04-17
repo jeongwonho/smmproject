@@ -451,6 +451,20 @@ class AppHandler(SimpleHTTPRequestHandler):
     def _request_origin(self) -> str:
         return normalize_origin(f"{self._request_scheme()}://{self._request_host()}")
 
+    def _static_asset_path(self, request_path: str) -> Path:
+        raw_path = str(request_path or "/").split("?", 1)[0].split("#", 1)[0]
+        normalized = raw_path.lstrip("/")
+        if normalized.startswith("static/"):
+            normalized = normalized[len("static/") :]
+        return (STATIC_ROOT / normalized).resolve()
+
+    def _static_request_alias(self, request_path: str) -> str:
+        raw_path = str(request_path or "/").split("?", 1)[0].split("#", 1)[0]
+        normalized = raw_path.lstrip("/")
+        if normalized.startswith("static/"):
+            normalized = normalized[len("static/") :]
+        return f"/{normalized}"
+
     def _allowed_cors_origin(self) -> str:
         origin = normalize_origin(self.headers.get("Origin", ""))
         if not origin:
@@ -665,9 +679,9 @@ class AppHandler(SimpleHTTPRequestHandler):
             send_error_json(self, exc)
             return
 
-        asset_path = (STATIC_ROOT / parsed.path.lstrip("/")).resolve()
+        asset_path = self._static_asset_path(parsed.path)
         if parsed.path not in {"", "/"} and asset_path.is_file() and STATIC_ROOT in asset_path.parents:
-            self.path = parsed.path
+            self.path = self._static_request_alias(parsed.path)
             super().do_GET()
             return
 
@@ -680,9 +694,9 @@ class AppHandler(SimpleHTTPRequestHandler):
             write_text(self, 200, ROBOTS_TXT, write_body=False)
             return
 
-        asset_path = (STATIC_ROOT / parsed.path.lstrip("/")).resolve()
+        asset_path = self._static_asset_path(parsed.path)
         if parsed.path not in {"", "/"} and asset_path.is_file() and STATIC_ROOT in asset_path.parents:
-            self.path = parsed.path
+            self.path = self._static_request_alias(parsed.path)
             super().do_HEAD()
             return
 
