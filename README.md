@@ -48,6 +48,20 @@ python3 smm_panel/server.py --host 127.0.0.1 --port 8024
   - 현재는 SQLite 이지만, 다음 단계에서는 `PanelStore` 를 저장소 인터페이스 기준으로 분리해 `SQLiteAdapter -> Supabase/PostgresAdapter` 로 교체하는 구조를 권장합니다.
   - 사용자 인증을 Supabase Auth 로 옮길 경우에도, 공급사 비밀값과 관리자 권한 작업은 별도 백엔드에서 계속 수행하는 편이 안전합니다.
 
+## Vercel 프런트 배포
+
+이 저장소는 Vercel에서 정적 SPA 프런트로 배포할 수 있도록 `vercel.json` 과 `build-static.mjs` 를 포함합니다.
+
+- 빌드 시 `static/index.html` 을 `dist/index.html` 로 복사합니다.
+- `SMM_PANEL_PUBLIC_API_BASE_URL` 값이 있으면 빌드 단계에서 프런트 HTML 메타 태그에 주입합니다.
+- 모든 일반 경로는 `index.html` 로 재작성되고, `/api/*` 는 프런트 프로젝트에서 직접 처리하지 않도록 `404` 로 막습니다.
+
+Vercel 프로젝트에는 최소한 아래 환경변수를 설정하는 것을 권장합니다.
+
+- `SMM_PANEL_PUBLIC_API_BASE_URL`: 실제 백엔드 API 주소 예) `https://api.example.com`
+
+이 값이 비어 있으면 프런트는 같은 Origin의 `/api/*` 를 호출하게 되므로, 프런트와 백엔드를 분리 배포할 때는 반드시 설정해 두는 편이 안전합니다.
+
 ## 권장 환경변수
 
 - `SMM_PANEL_PUBLIC_API_BASE_URL`: 프론트가 호출할 API 기본 주소
