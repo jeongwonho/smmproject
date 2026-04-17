@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import os
 import re
 import secrets
 import socket
@@ -19,6 +20,13 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 from uuid import uuid4
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row as psycopg_dict_row
+except ImportError:  # pragma: no cover - optional runtime dependency
+    psycopg = None
+    psycopg_dict_row = None
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -367,6 +375,149 @@ class PanelError(Exception):
     def __init__(self, message: str, *, status: int = 400) -> None:
         super().__init__(message)
         self.status = status
+
+
+def split_sql_script(script: str) -> List[str]:
+    statements: List[str] = []
+    buffer: List[str] = []
+    for line in script.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        buffer.append(line)
+        if stripped.endswith(";"):
+            statement = "\n".join(buffer).strip().rstrip(";").strip()
+            if statement:
+                statements.append(statement)
+            buffer = []
+    if buffer:
+        statement = "\n".join(buffer).strip().rstrip(";").strip()
+        if statement:
+            statements.append(statement)
+    return statements
+
+
+def rewrite_postgres_placeholders(query: str) -> str:
+    if "?" not in query:
+        return query
+    result: List[str] = []
+    in_single = False
+    in_double = False
+    index = 0
+    while index < len(query):
+        char = query[index]
+        if char == "'" and not in_double:
+            result.append(char)
+            if in_single and index + 1 < len(query) and query[index + 1] == "'":
+                result.append("'")
+                index += 2
+                continue
+            in_single = not in_single
+            index += 1
+            continue
+        if char == '"' and not in_single:
+            result.append(char)
+            in_double = not in_double
+            index += 1
+            continue
+        if char == "?" and not in_single and not in_double:
+            result.append("%s")
+        else:
+            result.append(char)
+        index += 1
+    return "".join(result)
+
+
+def normalize_database_row(row: Any, description: Any = None) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return row
+    if isinstance(row, sqlite3.Row):
+        return dict(row)
+    if isinstance(row, (tuple, list)) and description:
+        columns: List[str] = []
+        for column in description:
+            if isinstance(column, (tuple, list)) and column:
+                columns.append(str(column[0]))
+            else:
+                columns.append(str(getattr(column, "name", "")))
+        return {column: value for column, value in zip(columns, row)}
+    return dict(row)
+
+
+class DatabaseCursor:
+    def __init__(self, raw_cursor: Any) -> None:
+        self.raw_cursor = raw_cursor
+
+    @property
+    def description(self) -> Any:
+        return getattr(self.raw_cursor, "description", None)
+
+    def fetchone(self) -> Optional[Dict[str, Any]]:
+        return normalize_database_row(self.raw_cursor.fetchone(), self.description)
+
+    def fetchall(self) -> List[Dict[str, Any]]:
+        return [
+            normalized
+            for row in self.raw_cursor.fetchall()
+            if (normalized := normalize_database_row(row, self.description)) is not None
+        ]
+
+    def __iter__(self):
+        for row in self.raw_cursor:
+            normalized = normalize_database_row(row, self.description)
+            if normalized is not None:
+                yield normalized
+
+
+class DatabaseConnection:
+    def __init__(self, backend: str, raw_connection: Any) -> None:
+        self.backend = backend
+        self.raw_connection = raw_connection
+
+    def _prepare_query(self, query: str) -> str:
+        if self.backend == "postgres":
+            return rewrite_postgres_placeholders(query)
+        return query
+
+    def execute(self, query: str, params: Iterable[Any] = ()) -> DatabaseCursor:
+        prepared_query = self._prepare_query(query)
+        if params:
+            raw_cursor = self.raw_connection.execute(prepared_query, tuple(params))
+        else:
+            raw_cursor = self.raw_connection.execute(prepared_query)
+        return DatabaseCursor(raw_cursor)
+
+    def executescript(self, script: str) -> None:
+        if self.backend == "sqlite":
+            self.raw_connection.executescript(script)
+            return
+        for statement in split_sql_script(script):
+            if statement.upper().startswith("PRAGMA "):
+                continue
+            self.raw_connection.execute(statement)
+
+    def commit(self) -> None:
+        self.raw_connection.commit()
+
+    def rollback(self) -> None:
+        self.raw_connection.rollback()
+
+    def close(self) -> None:
+        self.raw_connection.close()
+
+    def __enter__(self) -> "DatabaseConnection":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        try:
+            if exc_type is None:
+                self.commit()
+            else:
+                self.rollback()
+        finally:
+            self.close()
 
 
 class PreviewHTMLParser(HTMLParser):
@@ -2878,15 +3029,42 @@ def catalog_blueprints() -> List[Dict[str, Any]]:
 
 
 class PanelStore:
-    def __init__(self, db_path: Path = DB_PATH) -> None:
-        DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    def __init__(self, db_path: Path = DB_PATH, database_url: str = "") -> None:
         self.db_path = db_path
+        self.database_url = str(database_url or "").strip()
+        if self.database_url:
+            if not self.database_url.startswith(("postgres://", "postgresql://")):
+                raise RuntimeError("SMM_PANEL_DATABASE_URL must be a postgres connection string.")
+            self.backend = "postgres"
+        else:
+            DATA_ROOT.mkdir(parents=True, exist_ok=True)
+            self.backend = "sqlite"
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
+    @classmethod
+    def from_env(cls, db_path: Path = DB_PATH) -> "PanelStore":
+        database_url = (
+            os.environ.get("SMM_PANEL_DATABASE_URL", "").strip()
+            or os.environ.get("SMM_PANEL_SUPABASE_DB_URL", "").strip()
+        )
+        return cls(db_path=db_path, database_url=database_url)
+
+    def _connect(self) -> DatabaseConnection:
+        if self.backend == "postgres":
+            if psycopg is None or psycopg_dict_row is None:
+                raise RuntimeError(
+                    "Supabase/Postgres support requires psycopg. Install dependencies from requirements.txt first."
+                )
+            conn = psycopg.connect(
+                self.database_url,
+                autocommit=False,
+                prepare_threshold=None,
+                row_factory=psycopg_dict_row,
+            )
+            return DatabaseConnection(self.backend, conn)
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
-        return conn
+        return DatabaseConnection(self.backend, conn)
 
     def _initialize(self) -> None:
         with self._connect() as conn:
@@ -2902,7 +3080,7 @@ class PanelStore:
             self._ensure_analytics_samples(conn)
             conn.commit()
 
-    def _apply_migrations(self, conn: sqlite3.Connection) -> None:
+    def _apply_migrations(self, conn: DatabaseConnection) -> None:
         self._ensure_column(conn, "users", "password_hash", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "users", "role", "TEXT NOT NULL DEFAULT 'customer'")
         self._ensure_column(conn, "users", "is_active", "INTEGER NOT NULL DEFAULT 1")
@@ -2919,13 +3097,26 @@ class PanelStore:
         conn.execute("UPDATE users SET role = 'admin', is_active = 1 WHERE id = ?", (DEMO_USER_ID,))
         conn.execute("UPDATE users SET role = COALESCE(NULLIF(role, ''), 'customer') WHERE id != ?", (DEMO_USER_ID,))
 
-    def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-        columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    def _ensure_column(self, conn: DatabaseConnection, table: str, column: str, definition: str) -> None:
+        if self.backend == "postgres":
+            columns = {
+                row["column_name"]
+                for row in conn.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = ? AND column_name = ?
+                    """,
+                    (table, column),
+                ).fetchall()
+            }
+        else:
+            columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if column in columns:
             return
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
-    def _seed_management_samples(self, conn: sqlite3.Connection) -> None:
+    def _seed_management_samples(self, conn: DatabaseConnection) -> None:
         now = now_iso()
         customers = [
             ("user_brandlab", "브랜드랩", "hello@brandlab.kr", hash_password("brandlab123!"), "01011112222", "STANDARD", "BL", 120000, "customer", 1, "인스타 브랜딩 고객", now, now),
@@ -2949,7 +3140,7 @@ class PanelStore:
                 user,
             )
 
-    def _ensure_management_order_samples(self, conn: sqlite3.Connection) -> None:
+    def _ensure_management_order_samples(self, conn: DatabaseConnection) -> None:
         existing = conn.execute("SELECT 1 FROM orders WHERE user_id != ? LIMIT 1", (DEMO_USER_ID,)).fetchone()
         if existing is not None:
             return

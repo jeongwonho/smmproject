@@ -928,7 +928,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    store = PanelStore()
+    store = PanelStore.from_env()
     config = AppConfig.from_env()
     admin_sessions = AdminSessionStore(
         os.environ.get("SMM_PANEL_ADMIN_USERNAME", "admin"),
@@ -939,6 +939,7 @@ def main() -> None:
     handler = partial(AppHandler, directory=str(STATIC_ROOT))
     httpd = PanelHTTPServer((args.host, args.port), handler, store, admin_sessions, user_sessions, config, rate_limiter)
     print(f"Pulse24 demo panel running at http://{args.host}:{args.port}")
+    print(f"Storage backend: {store.backend}")
     if not admin_sessions.is_configured:
         print("Admin routes are locked. Set SMM_PANEL_ADMIN_PASSWORD to enable /admin.")
     try:
