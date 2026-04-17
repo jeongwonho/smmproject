@@ -3047,7 +3047,7 @@ class PanelStore:
                 raise RuntimeError("SMM_PANEL_DATABASE_URL must be a postgres connection string.")
             self.backend = "postgres"
         else:
-            DATA_ROOT.mkdir(parents=True, exist_ok=True)
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
             self.backend = "sqlite"
         self._initialize()
 
@@ -3057,7 +3057,10 @@ class PanelStore:
             os.environ.get("SMM_PANEL_DATABASE_URL", "").strip()
             or os.environ.get("SMM_PANEL_SUPABASE_DB_URL", "").strip()
         )
-        return cls(db_path=db_path, database_url=database_url)
+        effective_db_path = db_path
+        if not database_url and os.environ.get("VERCEL"):
+            effective_db_path = Path(os.environ.get("SMM_PANEL_SQLITE_TMP_PATH", "/tmp/smm_panel.db"))
+        return cls(db_path=effective_db_path, database_url=database_url)
 
     def _connect(self) -> DatabaseConnection:
         if self.backend == "postgres":
