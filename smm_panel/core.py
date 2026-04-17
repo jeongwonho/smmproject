@@ -489,6 +489,16 @@ class DatabaseConnection:
             raw_cursor = self.raw_connection.execute(prepared_query)
         return DatabaseCursor(raw_cursor)
 
+    def executemany(self, query: str, rows: Iterable[Iterable[Any]]) -> DatabaseCursor:
+        prepared_query = self._prepare_query(query)
+        payload = [tuple(row) for row in rows]
+        if self.backend == "postgres":
+            raw_cursor = self.raw_connection.cursor()
+            raw_cursor.executemany(prepared_query, payload)
+            return DatabaseCursor(raw_cursor)
+        raw_cursor = self.raw_connection.executemany(prepared_query, payload)
+        return DatabaseCursor(raw_cursor)
+
     def executescript(self, script: str) -> None:
         if self.backend == "sqlite":
             self.raw_connection.executescript(script)
