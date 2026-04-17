@@ -25,7 +25,9 @@ STATIC_ROOT = APP_ROOT / "static"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8024
 ADMIN_SESSION_COOKIE = "smm_panel_admin_session"
+PUBLIC_SESSION_COOKIE = "smm_panel_user_session"
 ADMIN_SESSION_TTL_SECONDS = 60 * 60 * 12
+PUBLIC_SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 MAX_JSON_BODY_BYTES = 10 * 1024 * 1024
 ADMIN_LOGIN_WINDOW_SECONDS = 15 * 60
 ADMIN_LOGIN_MAX_ATTEMPTS = 5
@@ -73,6 +75,7 @@ class AppConfig:
     allowed_origins: tuple[str, ...] = ()
     cookie_domain: str = ""
     admin_cookie_samesite: str = "Strict"
+    public_cookie_samesite: str = "Lax"
     force_secure_cookies: bool = False
 
     @property
@@ -90,11 +93,15 @@ class AppConfig:
         admin_cookie_samesite = (os.environ.get("SMM_PANEL_ADMIN_COOKIE_SAMESITE", "Strict").strip().capitalize() or "Strict")
         if admin_cookie_samesite not in {"Strict", "Lax", "None"}:
             admin_cookie_samesite = "Strict"
+        public_cookie_samesite = (os.environ.get("SMM_PANEL_PUBLIC_COOKIE_SAMESITE", "Lax").strip().capitalize() or "Lax")
+        if public_cookie_samesite not in {"Strict", "Lax", "None"}:
+            public_cookie_samesite = "Lax"
         return cls(
             public_api_base_url=public_api_base_url,
             allowed_origins=tuple(configured_origins),
             cookie_domain=cookie_domain,
             admin_cookie_samesite=admin_cookie_samesite,
+            public_cookie_samesite=public_cookie_samesite,
             force_secure_cookies=env_flag(os.environ.get("SMM_PANEL_FORCE_SECURE_COOKIES", "")),
         )
 
@@ -245,6 +252,37 @@ class AdminSessionStore:
             self.failed_attempts.pop(client_key, None)
 
 
+class UserSessionStore:
+    def __init__(self, ttl_seconds: int = PUBLIC_SESSION_TTL_SECONDS) -> None:
+        self.ttl_seconds = ttl_seconds
+        self.sessions: Dict[str, Dict[str, Any]] = {}
+
+    def create_session(self, user_id: str) -> str:
+        token = secrets.token_urlsafe(32)
+        self.sessions[token] = {
+            "user_id": user_id,
+            "csrf_token": secrets.token_urlsafe(24),
+            "expires_at": time.time() + self.ttl_seconds,
+        }
+        return token
+
+    def get_session(self, token: str) -> Optional[Dict[str, Any]]:
+        if not token:
+            return None
+        session = self.sessions.get(token)
+        if session is None:
+            return None
+        if float(session.get("expires_at", 0)) <= time.time():
+            self.sessions.pop(token, None)
+            return None
+        session["expires_at"] = time.time() + self.ttl_seconds
+        return session
+
+    def destroy_session(self, token: str) -> None:
+        if token:
+            self.sessions.pop(token, None)
+
+
 def read_json(handler: SimpleHTTPRequestHandler) -> Dict[str, Any]:
     length = int(handler.headers.get("Content-Length", "0"))
     if not length:
@@ -367,12 +405,14 @@ class PanelHTTPServer(ThreadingHTTPServer):
         handler_cls: type[SimpleHTTPRequestHandler],
         store: PanelStore,
         admin_sessions: AdminSessionStore,
+        user_sessions: UserSessionStore,
         config: AppConfig,
         rate_limiter: RequestRateLimiter,
     ) -> None:
         super().__init__(server_address, handler_cls)
         self.store = store
         self.admin_sessions = admin_sessions
+        self.user_sessions = user_sessions
         self.config = config
         self.rate_limiter = rate_limiter
 
@@ -468,17 +508,34 @@ class AppHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Security-Policy", self._content_security_policy())
         super().end_headers()
 
-    def _admin_session_token(self) -> str:
+    def _session_cookie_value(self, cookie_name: str) -> str:
         cookie_header = self.headers.get("Cookie", "")
         if not cookie_header:
             return ""
         cookie = SimpleCookie()
         cookie.load(cookie_header)
-        morsel = cookie.get(ADMIN_SESSION_COOKIE)
+        morsel = cookie.get(cookie_name)
         return morsel.value if morsel else ""
+
+    def _admin_session_token(self) -> str:
+        return self._session_cookie_value(ADMIN_SESSION_COOKIE)
+
+    def _public_session_token(self) -> str:
+        return self._session_cookie_value(PUBLIC_SESSION_COOKIE)
 
     def _admin_session(self) -> Optional[Dict[str, Any]]:
         return self._server().admin_sessions.get_session(self._admin_session_token())
+
+    def _public_session(self) -> Optional[Dict[str, Any]]:
+        token = self._public_session_token()
+        session = self._server().user_sessions.get_session(token)
+        if session is None:
+            return None
+        user = self._server().store.public_user_for_session(str(session.get("user_id") or ""))
+        if user is None:
+            self._server().user_sessions.destroy_session(token)
+            return None
+        return {**session, "user": user}
 
     def _client_identity(self) -> str:
         forwarded_for = self.headers.get("X-Forwarded-For", "")
@@ -504,20 +561,41 @@ class AppHandler(SimpleHTTPRequestHandler):
         if not expected or not provided or not hmac.compare_digest(provided, expected):
             raise PanelError("관리자 요청 검증에 실패했습니다. 다시 로그인해 주세요.", status=403)
 
-    def _cookie_header(self, value: str, max_age: int) -> str:
+    def _require_public_auth(self) -> Dict[str, Any]:
+        session = self._public_session()
+        if session is None:
+            raise PanelError("로그인이 필요합니다.", status=401)
+        return session
+
+    def _require_public_csrf(self, session: Dict[str, Any]) -> None:
+        expected = str(session.get("csrf_token") or "")
+        provided = self.headers.get("X-SMM-CSRF-Token", "").strip()
+        if not expected or not provided or not hmac.compare_digest(provided, expected):
+            raise PanelError("로그인 세션 검증에 실패했습니다. 다시 로그인해 주세요.", status=403)
+
+    def _public_session_payload(self) -> Dict[str, Any]:
+        session = self._public_session()
+        user = session.get("user") if session else None
+        return {
+            "authenticated": session is not None,
+            "csrfToken": session.get("csrf_token", "") if session else "",
+            "user": user,
+        }
+
+    def _cookie_header(self, cookie_name: str, value: str, max_age: int, samesite: str) -> str:
         cookie = SimpleCookie()
-        cookie[ADMIN_SESSION_COOKIE] = value
-        morsel = cookie[ADMIN_SESSION_COOKIE]
+        cookie[cookie_name] = value
+        morsel = cookie[cookie_name]
         morsel["path"] = "/"
         morsel["httponly"] = True
-        morsel["samesite"] = self._config().admin_cookie_samesite
+        morsel["samesite"] = samesite
         morsel["max-age"] = str(max_age)
         if self._config().cookie_domain:
             morsel["domain"] = self._config().cookie_domain
         if (
             self._request_scheme() == "https"
             or self._config().force_secure_cookies
-            or self._config().admin_cookie_samesite == "None"
+            or samesite == "None"
         ):
             morsel["secure"] = True
         return cookie.output(header="").strip()
@@ -543,8 +621,14 @@ class AppHandler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/admin/session":
                 write_json(self, 200, {"ok": True, **self._server().admin_sessions.session_payload(self._admin_session_token())})
                 return
+            if parsed.path == "/api/session":
+                write_json(self, 200, {"ok": True, **self._public_session_payload()})
+                return
             if parsed.path == "/api/bootstrap":
-                write_json(self, 200, {"ok": True, **self._server().store.bootstrap()})
+                session = self._public_session()
+                payload = self._server().store.bootstrap(str((session or {}).get("user", {}).get("id") or ""))
+                payload["viewer"] = self._public_session_payload()
+                write_json(self, 200, {"ok": True, **payload})
                 return
             if parsed.path.startswith("/api/admin/"):
                 self._require_admin_auth()
@@ -569,11 +653,13 @@ class AppHandler(SimpleHTTPRequestHandler):
                 write_json(self, 200, {"ok": True, "category": self._server().store.get_product_category(category_id)})
                 return
             if parsed.path == "/api/orders":
+                session = self._require_public_auth()
                 status = parse_qs(parsed.query).get("status", [""])[0]
-                write_json(self, 200, {"ok": True, **self._server().store.list_orders(status)})
+                write_json(self, 200, {"ok": True, **self._server().store.list_orders(status, str(session["user"]["id"]))})
                 return
             if parsed.path == "/api/transactions":
-                write_json(self, 200, {"ok": True, **self._server().store.list_transactions()})
+                session = self._require_public_auth()
+                write_json(self, 200, {"ok": True, **self._server().store.list_transactions(str(session["user"]["id"]))})
                 return
         except Exception as exc:
             send_error_json(self, exc)
@@ -617,9 +703,39 @@ class AppHandler(SimpleHTTPRequestHandler):
         try:
             self._require_trusted_origin()
             payload = read_json(self)
+            if parsed.path == "/api/login":
+                email = str(payload.get("email") or "").strip()
+                password = str(payload.get("password") or "")
+                user = self._server().store.authenticate_public_user(email, password)
+                token = self._server().user_sessions.create_session(user["id"])
+                session = self._server().user_sessions.get_session(token) or {}
+                write_json(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        "authenticated": True,
+                        "csrfToken": session.get("csrf_token", ""),
+                        "user": user,
+                    },
+                    extra_headers=[
+                        (
+                            "Set-Cookie",
+                            self._cookie_header(
+                                PUBLIC_SESSION_COOKIE,
+                                token,
+                                PUBLIC_SESSION_TTL_SECONDS,
+                                self._config().public_cookie_samesite,
+                            ),
+                        )
+                    ],
+                )
+                return
             if parsed.path == "/api/orders":
+                session = self._require_public_auth()
+                self._require_public_csrf(session)
                 self._enforce_rate_limit("orders", "주문 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
-                write_json(self, 200, self._server().store.create_order(payload))
+                write_json(self, 200, self._server().store.create_order(payload, str(session["user"]["id"])))
                 return
             if parsed.path == "/api/analytics/track":
                 self._enforce_rate_limit("analytics", "방문 수집 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
@@ -666,20 +782,62 @@ class AppHandler(SimpleHTTPRequestHandler):
                         "username": admin_sessions.username,
                         "csrfToken": admin_sessions.session_payload(token).get("csrfToken", ""),
                     },
-                    extra_headers=[("Set-Cookie", self._cookie_header(token, ADMIN_SESSION_TTL_SECONDS))],
+                    extra_headers=[
+                        (
+                            "Set-Cookie",
+                            self._cookie_header(
+                                ADMIN_SESSION_COOKIE,
+                                token,
+                                ADMIN_SESSION_TTL_SECONDS,
+                                self._config().admin_cookie_samesite,
+                            ),
+                        )
+                    ],
                 )
                 return
             session: Optional[Dict[str, Any]] = None
             if parsed.path.startswith("/api/admin/"):
                 session = self._require_admin_auth()
                 self._require_admin_csrf(session)
+            if parsed.path == "/api/logout":
+                session = self._public_session()
+                if session is not None:
+                    self._require_public_csrf(session)
+                self._server().user_sessions.destroy_session(self._public_session_token())
+                write_json(
+                    self,
+                    200,
+                    {"ok": True, "authenticated": False},
+                    extra_headers=[
+                        (
+                            "Set-Cookie",
+                            self._cookie_header(
+                                PUBLIC_SESSION_COOKIE,
+                                "",
+                                0,
+                                self._config().public_cookie_samesite,
+                            ),
+                        )
+                    ],
+                )
+                return
             if parsed.path == "/api/admin/logout":
                 self._server().admin_sessions.destroy_session(self._admin_session_token())
                 write_json(
                     self,
                     200,
                     {"ok": True, "authenticated": False},
-                    extra_headers=[("Set-Cookie", self._cookie_header("", 0))],
+                    extra_headers=[
+                        (
+                            "Set-Cookie",
+                            self._cookie_header(
+                                ADMIN_SESSION_COOKIE,
+                                "",
+                                0,
+                                self._config().admin_cookie_samesite,
+                            ),
+                        )
+                    ],
                 )
                 return
             if parsed.path == "/api/admin/site-settings":
@@ -687,6 +845,9 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             if parsed.path == "/api/admin/popup":
                 write_json(self, 200, {"ok": True, **self._server().store.save_home_popup(payload)})
+                return
+            if parsed.path == "/api/admin/home-banners":
+                write_json(self, 200, {"ok": True, **self._server().store.save_home_banner(payload)})
                 return
             if parsed.path == "/api/admin/suppliers":
                 write_json(self, 200, {"ok": True, **self._server().store.save_supplier(payload)})
@@ -733,9 +894,11 @@ class AppHandler(SimpleHTTPRequestHandler):
                 write_json(self, 200, self._server().store.preview_link(payload))
                 return
             if parsed.path == "/api/charge":
+                session = self._require_public_auth()
+                self._require_public_csrf(session)
                 self._enforce_rate_limit("charge", "충전 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
                 amount = int(payload.get("amount") or 0)
-                write_json(self, 200, self._server().store.charge_balance(amount))
+                write_json(self, 200, self._server().store.charge_balance(amount, str(session["user"]["id"])))
                 return
             raise PanelError("지원하지 않는 API 경로입니다.", status=404)
         except Exception as exc:
@@ -757,9 +920,10 @@ def main() -> None:
         os.environ.get("SMM_PANEL_ADMIN_USERNAME", "admin"),
         os.environ.get("SMM_PANEL_ADMIN_PASSWORD", ""),
     )
+    user_sessions = UserSessionStore()
     rate_limiter = RequestRateLimiter()
     handler = partial(AppHandler, directory=str(STATIC_ROOT))
-    httpd = PanelHTTPServer((args.host, args.port), handler, store, admin_sessions, config, rate_limiter)
+    httpd = PanelHTTPServer((args.host, args.port), handler, store, admin_sessions, user_sessions, config, rate_limiter)
     print(f"Pulse24 demo panel running at http://{args.host}:{args.port}")
     if not admin_sessions.is_configured:
         print("Admin routes are locked. Set SMM_PANEL_ADMIN_PASSWORD to enable /admin.")
