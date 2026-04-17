@@ -3,8 +3,9 @@
   "buildCommand": "node build-static.mjs",
   "outputDirectory": "dist",
   "routes": [
+    { "src": "/api$", "dest": "/api/index.py?__path=/api" },
+    { "src": "/api/(?<path>.*)", "dest": "/api/index.py?__path=/api/$path" },
     { "handle": "filesystem" },
-    { "src": "/api/(.*)", "status": 404 },
     { "src": "/(.*)", "dest": "/index.html" }
   ]
 }

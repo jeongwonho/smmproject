@@ -7,6 +7,7 @@
 
 ```bash
 export SMM_PANEL_ADMIN_PASSWORD="강한관리자비밀번호"
+export SMM_PANEL_SESSION_SECRET="충분히긴랜덤문자열"
 python3 smm_panel/server.py --host 127.0.0.1 --port 8024
 ```
 
@@ -27,6 +28,7 @@ python3 -m pip install -r requirements.txt
 - 고객 목록, 주문 목록, 사용자 패널에서는 이메일/전화번호가 마스킹된 값만 노출됩니다.
 - 관리자 상세 화면에서만 고객 원본 정보가 조회되며, 응답은 `Cache-Control: no-store` 로 전송됩니다.
 - 관리자 세션 쿠키는 `HttpOnly`, `SameSite=Strict` 로 발급되고, HTTPS 프록시 뒤에서는 `Secure` 가 자동 적용됩니다.
+- 로그인 세션은 서버 메모리가 아니라 서명된 토큰 쿠키로 유지되므로, Vercel Functions 같은 서버리스 환경에서도 인스턴스 교체 때문에 로그인이 바로 풀리지 않습니다.
 - 관리자 로그인은 연속 실패 횟수를 제한해 무차별 대입 시도를 완화합니다.
 - 허용된 Origin 에 대해서만 CORS 를 열고, 관리자 POST 요청에는 CSRF 토큰 검증을 수행합니다.
 - `link-preview` 는 내부망, localhost, 사설 IP 대역으로 연결되지 않도록 차단합니다.
@@ -49,6 +51,7 @@ python3 -m pip install -r requirements.txt
 - 백엔드:
   - `SMM_PANEL_ALLOWED_ORIGINS` 로 허용 Origin 을 제한하고, 관리자 세션 쿠키 정책을 환경변수로 제어할 수 있습니다.
   - 공급사 호출, 링크 검증, 주문 생성, 관리자 작업은 모두 백엔드에서만 처리해야 합니다.
+  - 현재 구조는 같은 Vercel 프로젝트 안에서 `/api/*` Python 함수로도 동작할 수 있도록 정리되어 있습니다.
   - 추후 Supabase 로 이관할 때도 `service_role` 키는 백엔드에만 두고, 프론트에는 공개 키만 사용해야 합니다.
 - 데이터베이스:
   - `PanelStore` 는 기본 SQLite 로 동작하고, `SMM_PANEL_DATABASE_URL` 이 설정되면 Supabase/Postgres 로 연결됩니다.
@@ -65,6 +68,7 @@ python3 -m pip install -r requirements.txt
 ```bash
 export SMM_PANEL_DATABASE_URL="postgresql://postgres.your-project:[PASSWORD]@aws-0-ap-northeast-2.pooler.supabase.com:6543/postgres?sslmode=require"
 export SMM_PANEL_ADMIN_PASSWORD="강한관리자비밀번호"
+export SMM_PANEL_SESSION_SECRET="충분히긴랜덤문자열"
 python3 smm_panel/server.py --host 0.0.0.0 --port 8024
 ```
 
@@ -77,21 +81,24 @@ python3 smm_panel/server.py --host 0.0.0.0 --port 8024
 
 ## Vercel 프런트 배포
 
-이 저장소는 Vercel에서 정적 SPA 프런트로 배포할 수 있도록 `vercel.json` 과 `build-static.mjs` 를 포함합니다.
+이 저장소는 Vercel에서 정적 SPA 프런트와 `/api/*` Python 함수를 함께 배포할 수 있도록 `vercel.json`, `build-static.mjs`, `api/index.py` 를 포함합니다.
 
 - 빌드 시 `static/index.html` 을 `dist/index.html` 로 복사합니다.
 - `SMM_PANEL_PUBLIC_API_BASE_URL` 값이 있으면 빌드 단계에서 프런트 HTML 메타 태그에 주입합니다.
-- 모든 일반 경로는 `index.html` 로 재작성되고, `/api/*` 는 프런트 프로젝트에서 직접 처리하지 않도록 `404` 로 막습니다.
+- `/api/*` 경로는 Python 함수로 전달되고, 나머지 일반 경로는 `index.html` 로 재작성됩니다.
 
 Vercel 프로젝트에는 최소한 아래 환경변수를 설정하는 것을 권장합니다.
 
-- `SMM_PANEL_PUBLIC_API_BASE_URL`: 실제 백엔드 API 주소 예) `https://api.example.com`
+- `SMM_PANEL_SESSION_SECRET`: 세션 서명용 긴 랜덤 문자열
+- `SMM_PANEL_ADMIN_PASSWORD`: 관리자 로그인 비밀번호
+- `SMM_PANEL_DATABASE_URL`: Supabase/Postgres 연결 문자열
 
-이 값이 비어 있으면 프런트는 같은 Origin의 `/api/*` 를 호출하게 되므로, 프런트와 백엔드를 분리 배포할 때는 반드시 설정해 두는 편이 안전합니다.
+같은 Vercel 프로젝트에서 프런트와 `/api/*` 함수를 같이 배포하면 `SMM_PANEL_PUBLIC_API_BASE_URL` 은 비워 두면 됩니다. 별도 백엔드 프로젝트로 나눌 때만 `https://api.example.com` 같은 공개 주소를 넣으면 됩니다.
 
 ## 권장 환경변수
 
 - `SMM_PANEL_DATABASE_URL`: SQLite 대신 Supabase/Postgres 를 사용할 때의 연결 문자열
+- `SMM_PANEL_SESSION_SECRET`: 세션 서명 비밀값
 - `SMM_PANEL_PUBLIC_API_BASE_URL`: 프론트가 호출할 API 기본 주소
 - `SMM_PANEL_ALLOWED_ORIGINS`: CORS 허용 Origin 목록
 - `SMM_PANEL_PUBLIC_APP_ORIGIN`: 대표 프론트 Origin
