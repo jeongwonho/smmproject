@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import hashlib
 import hmac
@@ -33,6 +34,7 @@ ADMIN_LOGIN_WINDOW_SECONDS = 15 * 60
 ADMIN_LOGIN_MAX_ATTEMPTS = 5
 ROBOTS_TXT = "User-agent: *\nDisallow: /admin\nDisallow: /api/admin\n"
 INDEX_TEMPLATE_PATH = STATIC_ROOT / "index.html"
+VERCEL_REWRITE_PATH_QUERY_KEY = "__path"
 
 
 def env_flag(value: str) -> bool:
@@ -67,6 +69,30 @@ def parse_origins(raw_value: str) -> tuple[str, ...]:
         if normalized and normalized not in origins:
             origins.append(normalized)
     return tuple(origins)
+
+
+def _base64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _base64url_decode(value: str) -> bytes:
+    padded = value + ("=" * (-len(value) % 4))
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def resolve_session_secret() -> str:
+    direct_secret = str(os.environ.get("SMM_PANEL_SESSION_SECRET", "")).strip()
+    if direct_secret:
+        return direct_secret
+    derived_parts = [
+        str(os.environ.get("SMM_PANEL_ADMIN_PASSWORD", "")).strip(),
+        str(os.environ.get("SMM_PANEL_DATABASE_URL", "")).strip(),
+        str(os.environ.get("SMM_PANEL_SUPABASE_DB_URL", "")).strip(),
+    ]
+    derived_material = "|".join(part for part in derived_parts if part)
+    if derived_material:
+        return hashlib.sha256(f"pulse24-session::{derived_material}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"pulse24-dev::{APP_ROOT}".encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -156,11 +182,57 @@ class RequestRateLimiter:
         self.record(bucket, client_key)
 
 
+class SignedSessionStore:
+    def __init__(self, secret: str, ttl_seconds: int, audience: str) -> None:
+        self.secret = secret.encode("utf-8")
+        self.ttl_seconds = ttl_seconds
+        self.audience = audience
+
+    def _sign(self, payload_segment: str) -> str:
+        digest = hmac.new(self.secret, payload_segment.encode("utf-8"), hashlib.sha256).digest()
+        return _base64url_encode(digest)
+
+    def create_session(self, payload: Dict[str, Any]) -> str:
+        session_payload = {
+            **payload,
+            "aud": self.audience,
+            "csrf_token": secrets.token_urlsafe(24),
+            "exp": int(time.time()) + self.ttl_seconds,
+        }
+        encoded_payload = _base64url_encode(
+            json.dumps(session_payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        )
+        return f"{encoded_payload}.{self._sign(encoded_payload)}"
+
+    def get_session(self, token: str) -> Optional[Dict[str, Any]]:
+        if not token or "." not in token:
+            return None
+        payload_segment, signature = token.rsplit(".", 1)
+        expected_signature = self._sign(payload_segment)
+        if not hmac.compare_digest(signature, expected_signature):
+            return None
+        try:
+            payload = json.loads(_base64url_decode(payload_segment).decode("utf-8"))
+        except (ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if str(payload.get("aud") or "") != self.audience:
+            return None
+        if int(payload.get("exp") or 0) <= int(time.time()):
+            return None
+        return payload
+
+    def destroy_session(self, token: str) -> None:
+        return None
+
+
 class AdminSessionStore:
     def __init__(
         self,
         username: str,
         password: str,
+        secret: str,
         ttl_seconds: int = ADMIN_SESSION_TTL_SECONDS,
         login_window_seconds: int = ADMIN_LOGIN_WINDOW_SECONDS,
         login_max_attempts: int = ADMIN_LOGIN_MAX_ATTEMPTS,
@@ -170,8 +242,8 @@ class AdminSessionStore:
         self.login_window_seconds = login_window_seconds
         self.login_max_attempts = login_max_attempts
         self.password_hash = self._hash_value(password) if password else ""
-        self.sessions: Dict[str, Dict[str, Any]] = {}
         self.failed_attempts: Dict[str, list[float]] = {}
+        self.signer = SignedSessionStore(secret, ttl_seconds, "admin")
 
     @property
     def is_configured(self) -> bool:
@@ -197,29 +269,16 @@ class AdminSessionStore:
         return hmac.compare_digest(self._hash_value(password), self.password_hash)
 
     def create_session(self) -> str:
-        token = secrets.token_urlsafe(32)
-        self.sessions[token] = {
-            "username": self.username,
-            "csrf_token": secrets.token_urlsafe(24),
-            "expires_at": time.time() + self.ttl_seconds,
-        }
-        return token
+        return self.signer.create_session({"username": self.username})
 
     def get_session(self, token: str) -> Optional[Dict[str, Any]]:
-        if not token:
-            return None
-        session = self.sessions.get(token)
+        session = self.signer.get_session(token)
         if session is None:
             return None
-        if float(session.get("expires_at", 0)) <= time.time():
-            self.sessions.pop(token, None)
-            return None
-        session["expires_at"] = time.time() + self.ttl_seconds
         return session
 
     def destroy_session(self, token: str) -> None:
-        if token:
-            self.sessions.pop(token, None)
+        self.signer.destroy_session(token)
 
     def _recent_failures(self, client_key: str) -> list[float]:
         now = time.time()
@@ -253,34 +312,18 @@ class AdminSessionStore:
 
 
 class UserSessionStore:
-    def __init__(self, ttl_seconds: int = PUBLIC_SESSION_TTL_SECONDS) -> None:
+    def __init__(self, secret: str, ttl_seconds: int = PUBLIC_SESSION_TTL_SECONDS) -> None:
         self.ttl_seconds = ttl_seconds
-        self.sessions: Dict[str, Dict[str, Any]] = {}
+        self.signer = SignedSessionStore(secret, ttl_seconds, "public")
 
     def create_session(self, user_id: str) -> str:
-        token = secrets.token_urlsafe(32)
-        self.sessions[token] = {
-            "user_id": user_id,
-            "csrf_token": secrets.token_urlsafe(24),
-            "expires_at": time.time() + self.ttl_seconds,
-        }
-        return token
+        return self.signer.create_session({"user_id": user_id})
 
     def get_session(self, token: str) -> Optional[Dict[str, Any]]:
-        if not token:
-            return None
-        session = self.sessions.get(token)
-        if session is None:
-            return None
-        if float(session.get("expires_at", 0)) <= time.time():
-            self.sessions.pop(token, None)
-            return None
-        session["expires_at"] = time.time() + self.ttl_seconds
-        return session
+        return self.signer.get_session(token)
 
     def destroy_session(self, token: str) -> None:
-        if token:
-            self.sessions.pop(token, None)
+        self.signer.destroy_session(token)
 
 
 def read_json(handler: SimpleHTTPRequestHandler) -> Dict[str, Any]:
@@ -417,13 +460,53 @@ class PanelHTTPServer(ThreadingHTTPServer):
         self.rate_limiter = rate_limiter
 
 
+@dataclass(frozen=True)
+class RuntimeContext:
+    store: PanelStore
+    admin_sessions: AdminSessionStore
+    user_sessions: UserSessionStore
+    config: AppConfig
+    rate_limiter: RequestRateLimiter
+
+
+_RUNTIME_CONTEXT: RuntimeContext | None = None
+
+
+def build_runtime_context() -> RuntimeContext:
+    session_secret = resolve_session_secret()
+    return RuntimeContext(
+        store=PanelStore.from_env(),
+        admin_sessions=AdminSessionStore(
+            os.environ.get("SMM_PANEL_ADMIN_USERNAME", "admin"),
+            os.environ.get("SMM_PANEL_ADMIN_PASSWORD", ""),
+            session_secret,
+        ),
+        user_sessions=UserSessionStore(session_secret),
+        config=AppConfig.from_env(),
+        rate_limiter=RequestRateLimiter(),
+    )
+
+
+def configure_runtime_context(context: RuntimeContext | None = None) -> RuntimeContext:
+    global _RUNTIME_CONTEXT
+    _RUNTIME_CONTEXT = context or build_runtime_context()
+    return _RUNTIME_CONTEXT
+
+
+def get_runtime_context() -> RuntimeContext:
+    return _RUNTIME_CONTEXT or configure_runtime_context()
+
+
 class AppHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args: Any, directory: str | None = None, **kwargs: Any) -> None:
         self._request_path = ""
         super().__init__(*args, directory=str(STATIC_ROOT if directory is None else directory), **kwargs)
 
-    def _server(self) -> PanelHTTPServer:
-        return self.server  # type: ignore[return-value]
+    def _server(self) -> PanelHTTPServer | RuntimeContext:
+        server = self.server
+        if all(hasattr(server, attribute) for attribute in ("store", "admin_sessions", "user_sessions", "config", "rate_limiter")):
+            return server  # type: ignore[return-value]
+        return get_runtime_context()
 
     def _robots_blocked_path(self) -> bool:
         request_path = self._request_path or "/"
@@ -440,13 +523,21 @@ class AppHandler(SimpleHTTPRequestHandler):
         forwarded_proto = self.headers.get("X-Forwarded-Proto", "").split(",")[0].strip().lower()
         if forwarded_proto in {"http", "https"}:
             return forwarded_proto
-        return "https" if self.server.server_port == 443 else "http"
+        server_port = int(getattr(self.server, "server_port", 443))
+        return "https" if server_port == 443 else "http"
 
     def _request_host(self) -> str:
         forwarded_host = self.headers.get("X-Forwarded-Host", "").split(",")[0].strip()
         if forwarded_host:
             return forwarded_host
-        return self.headers.get("Host", "").strip() or f"{self.server.server_name}:{self.server.server_port}"
+        host = self.headers.get("Host", "").strip()
+        if host:
+            return host
+        server_name = str(getattr(self.server, "server_name", "localhost"))
+        server_port = int(getattr(self.server, "server_port", 443))
+        if server_port in {80, 443}:
+            return server_name
+        return f"{server_name}:{server_port}"
 
     def _request_origin(self) -> str:
         return normalize_origin(f"{self._request_scheme()}://{self._request_host()}")
@@ -464,6 +555,13 @@ class AppHandler(SimpleHTTPRequestHandler):
         if normalized.startswith("static/"):
             normalized = normalized[len("static/") :]
         return f"/{normalized}"
+
+    def _incoming_request_path(self, raw_path: str) -> str:
+        parsed = urlparse(raw_path)
+        rewritten = parse_qs(parsed.query).get(VERCEL_REWRITE_PATH_QUERY_KEY, [""])[0]
+        if rewritten:
+            return str(rewritten)
+        return parsed.path
 
     def _allowed_cors_origin(self) -> str:
         origin = normalize_origin(self.headers.get("Origin", ""))
@@ -623,7 +721,8 @@ class AppHandler(SimpleHTTPRequestHandler):
         self._server().rate_limiter.enforce(bucket, client_key, message)
 
     def do_GET(self) -> None:
-        parsed = urlparse(self.path)
+        request_path = self._incoming_request_path(self.path)
+        parsed = urlparse(request_path)
         self._request_path = parsed.path
         try:
             if parsed.path == "/api/health":
@@ -688,7 +787,8 @@ class AppHandler(SimpleHTTPRequestHandler):
         self._serve_index_document()
 
     def do_HEAD(self) -> None:
-        parsed = urlparse(self.path)
+        request_path = self._incoming_request_path(self.path)
+        parsed = urlparse(request_path)
         self._request_path = parsed.path
         if parsed.path == "/robots.txt":
             write_text(self, 200, ROBOTS_TXT, write_body=False)
@@ -703,7 +803,8 @@ class AppHandler(SimpleHTTPRequestHandler):
         self._serve_index_document(write_body=False)
 
     def do_OPTIONS(self) -> None:
-        parsed = urlparse(self.path)
+        request_path = self._incoming_request_path(self.path)
+        parsed = urlparse(request_path)
         self._request_path = parsed.path
         try:
             self._require_trusted_origin()
@@ -712,7 +813,8 @@ class AppHandler(SimpleHTTPRequestHandler):
             send_error_json(self, exc)
 
     def do_POST(self) -> None:
-        parsed = urlparse(self.path)
+        request_path = self._incoming_request_path(self.path)
+        parsed = urlparse(request_path)
         self._request_path = parsed.path
         try:
             self._require_trusted_origin()
@@ -928,14 +1030,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    store = PanelStore.from_env()
-    config = AppConfig.from_env()
-    admin_sessions = AdminSessionStore(
-        os.environ.get("SMM_PANEL_ADMIN_USERNAME", "admin"),
-        os.environ.get("SMM_PANEL_ADMIN_PASSWORD", ""),
-    )
-    user_sessions = UserSessionStore()
-    rate_limiter = RequestRateLimiter()
+    runtime = configure_runtime_context()
+    store = runtime.store
+    config = runtime.config
+    admin_sessions = runtime.admin_sessions
+    user_sessions = runtime.user_sessions
+    rate_limiter = runtime.rate_limiter
     handler = partial(AppHandler, directory=str(STATIC_ROOT))
     httpd = PanelHTTPServer((args.host, args.port), handler, store, admin_sessions, user_sessions, config, rate_limiter)
     print(f"Pulse24 demo panel running at http://{args.host}:{args.port}")
