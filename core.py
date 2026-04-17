@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 import datetime as dt
+import hashlib
+import hmac
 import ipaddress
 import json
 import re
+import secrets
 import socket
 import ssl
 import sqlite3
@@ -67,6 +70,7 @@ CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     email TEXT NOT NULL,
+    password_hash TEXT NOT NULL DEFAULT '',
     phone TEXT NOT NULL,
     tier TEXT NOT NULL DEFAULT 'STANDARD',
     role TEXT NOT NULL DEFAULT 'customer',
@@ -144,7 +148,9 @@ CREATE TABLE IF NOT EXISTS home_banners (
     subtitle TEXT NOT NULL,
     cta_label TEXT NOT NULL,
     route TEXT NOT NULL,
+    image_url TEXT NOT NULL DEFAULT '',
     theme TEXT NOT NULL DEFAULT 'blue',
+    is_active INTEGER NOT NULL DEFAULT 1,
     sort_order INTEGER NOT NULL DEFAULT 0
 );
 
@@ -405,6 +411,35 @@ class PreviewHTMLParser(HTMLParser):
 
 def now_iso() -> str:
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+PASSWORD_HASH_ITERATIONS = 260_000
+
+
+def hash_password(password: str) -> str:
+    raw = str(password or "")
+    if not raw:
+        return ""
+    salt = secrets.token_hex(16)
+    derived = hashlib.pbkdf2_hmac("sha256", raw.encode("utf-8"), salt.encode("utf-8"), PASSWORD_HASH_ITERATIONS)
+    return f"pbkdf2_sha256${PASSWORD_HASH_ITERATIONS}${salt}${derived.hex()}"
+
+
+def verify_password(password: str, encoded_hash: str) -> bool:
+    raw_password = str(password or "")
+    stored = str(encoded_hash or "").strip()
+    if not raw_password or not stored:
+        return False
+    parts = stored.split("$", 3)
+    if len(parts) != 4 or parts[0] != "pbkdf2_sha256":
+        return False
+    _, iteration_text, salt, digest = parts
+    try:
+        iterations = int(iteration_text)
+    except ValueError:
+        return False
+    candidate = hashlib.pbkdf2_hmac("sha256", raw_password.encode("utf-8"), salt.encode("utf-8"), iterations)
+    return hmac.compare_digest(candidate.hex(), digest)
 
 
 def as_json(value: Any) -> str:
@@ -2868,10 +2903,13 @@ class PanelStore:
             conn.commit()
 
     def _apply_migrations(self, conn: sqlite3.Connection) -> None:
+        self._ensure_column(conn, "users", "password_hash", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "users", "role", "TEXT NOT NULL DEFAULT 'customer'")
         self._ensure_column(conn, "users", "is_active", "INTEGER NOT NULL DEFAULT 1")
         self._ensure_column(conn, "users", "notes", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "users", "last_login_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "home_banners", "image_url", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "home_banners", "is_active", "INTEGER NOT NULL DEFAULT 1")
         self._ensure_column(conn, "product_categories", "is_active", "INTEGER NOT NULL DEFAULT 1")
         self._ensure_column(conn, "products", "is_active", "INTEGER NOT NULL DEFAULT 1")
         self._ensure_column(conn, "suppliers", "integration_type", "TEXT NOT NULL DEFAULT 'classic'")
@@ -2890,19 +2928,23 @@ class PanelStore:
     def _seed_management_samples(self, conn: sqlite3.Connection) -> None:
         now = now_iso()
         customers = [
-            ("user_brandlab", "브랜드랩", "hello@brandlab.kr", "01011112222", "STANDARD", "BL", 120000, "customer", 1, "인스타 브랜딩 고객", now, now),
-            ("user_cafeflow", "카페플로우", "team@cafeflow.kr", "01033334444", "BUSINESS", "CF", 284000, "customer", 1, "플레이스 리뷰 중심 운영", now, now),
-            ("user_localmart", "로컬마트", "owner@localmart.kr", "01055556666", "STANDARD", "LM", 76000, "customer", 1, "쇼츠/지도 병행 고객", now, now),
+            ("user_brandlab", "브랜드랩", "hello@brandlab.kr", hash_password("brandlab123!"), "01011112222", "STANDARD", "BL", 120000, "customer", 1, "인스타 브랜딩 고객", now, now),
+            ("user_cafeflow", "카페플로우", "team@cafeflow.kr", hash_password("cafeflow123!"), "01033334444", "BUSINESS", "CF", 284000, "customer", 1, "플레이스 리뷰 중심 운영", now, now),
+            ("user_localmart", "로컬마트", "owner@localmart.kr", hash_password("localmart123!"), "01055556666", "STANDARD", "LM", 76000, "customer", 1, "쇼츠/지도 병행 고객", now, now),
         ]
         for user in customers:
             exists = conn.execute("SELECT 1 FROM users WHERE id = ?", (user[0],)).fetchone()
             if exists:
+                conn.execute(
+                    "UPDATE users SET password_hash = COALESCE(NULLIF(password_hash, ''), ?) WHERE id = ?",
+                    (user[3], user[0]),
+                )
                 continue
             conn.execute(
                 """
                 INSERT INTO users (
-                    id, name, email, phone, tier, avatar_label, balance, role, is_active, notes, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    id, name, email, password_hash, phone, tier, avatar_label, balance, role, is_active, notes, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 user,
             )
@@ -3194,19 +3236,19 @@ class PanelStore:
         created_at = now_iso()
         conn.execute(
             """
-            INSERT INTO users (id, name, email, phone, tier, role, avatar_label, balance, is_active, notes, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO users (id, name, email, password_hash, phone, tier, role, avatar_label, balance, is_active, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (DEMO_USER_ID, "데모 관리자", "demo@pulse24.local", "01024512400", "PRO", "admin", "P24", 185000, 1, "현재 데모 패널 운영 계정", created_at, created_at),
+            (DEMO_USER_ID, "데모 관리자", "demo@pulse24.local", "", "01024512400", "PRO", "admin", "P24", 185000, 1, "현재 데모 패널 운영 계정", created_at, created_at),
         )
 
         banners = [
-            ("banner_launch", "첫 캠페인을 더 빨리 띄우세요", "신규 계정과 런칭 숏폼에 맞춘 추천 패키지를 한 번에 비교할 수 있어요.", "추천 패키지 보기", "/products/cat_branding_standard", "blue", 0),
-            ("banner_safe", "안전한 속도로 지표를 설계합니다", "급격한 변화보다 지속 가능한 흐름을 우선하는 패널 UI/UX로 구성했습니다.", "인스타 성장 보기", "/products/cat_instagram_korean_followers", "mint", 1),
-            ("banner_consult", "찾는 상품이 없다면 맞춤 상담으로 연결", "웹툰, 커뮤니티, 앱, 오픈마켓까지 맞춤 구조로 이어서 설계할 수 있습니다.", "맞춤 서비스 보기", "/products/cat_custom_request", "dark", 2),
+            ("banner_launch", "첫 캠페인을 더 빨리 띄우세요", "신규 계정과 런칭 숏폼에 맞춘 추천 패키지를 한 번에 비교할 수 있어요.", "추천 패키지 보기", "/products/cat_branding_standard", "", "blue", 1, 0),
+            ("banner_safe", "안전한 속도로 지표를 설계합니다", "급격한 변화보다 지속 가능한 흐름을 우선하는 패널 UI/UX로 구성했습니다.", "인스타 성장 보기", "/products/cat_instagram_korean_followers", "", "mint", 1, 1),
+            ("banner_consult", "찾는 상품이 없다면 맞춤 상담으로 연결", "웹툰, 커뮤니티, 앱, 오픈마켓까지 맞춤 구조로 이어서 설계할 수 있습니다.", "맞춤 서비스 보기", "/products/cat_custom_request", "", "dark", 1, 2),
         ]
         conn.executemany(
-            "INSERT INTO home_banners (id, title, subtitle, cta_label, route, theme, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO home_banners (id, title, subtitle, cta_label, route, image_url, theme, is_active, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             banners,
         )
 
@@ -3486,10 +3528,23 @@ class PanelStore:
             raise PanelError("요청한 데이터를 찾을 수 없습니다.", status=404)
         return row
 
-    def _user_summary(self, conn: sqlite3.Connection) -> Dict[str, Any]:
-        user = conn.execute("SELECT * FROM users WHERE id = ?", (DEMO_USER_ID,)).fetchone()
+    def _public_user_row(self, conn: sqlite3.Connection, user_id: str) -> Optional[sqlite3.Row]:
+        if not user_id:
+            return None
+        row = conn.execute(
+            """
+            SELECT *
+            FROM users
+            WHERE id = ? AND is_active = 1 AND role != 'admin'
+            """,
+            (user_id,),
+        ).fetchone()
+        return row
+
+    def _user_summary(self, conn: sqlite3.Connection, user_id: str) -> Dict[str, Any]:
+        user = self._public_user_row(conn, user_id)
         if user is None:
-            raise PanelError("데모 사용자를 찾을 수 없습니다.", status=500)
+            raise PanelError("로그인한 사용자를 찾을 수 없습니다.", status=401)
         return {
             "id": user["id"],
             "name": user["name"],
@@ -3499,11 +3554,43 @@ class PanelStore:
             "avatarLabel": user["avatar_label"],
             "balance": user["balance"],
             "balanceLabel": money(user["balance"]),
+            "hasPassword": bool(user["password_hash"]),
         }
 
-    def bootstrap(self) -> Dict[str, Any]:
+    def authenticate_public_user(self, email: str, password: str) -> Dict[str, Any]:
+        normalized_email = str(email or "").strip().lower()
+        if not normalized_email:
+            raise PanelError("이메일을 입력해 주세요.")
+        if not str(password or ""):
+            raise PanelError("비밀번호를 입력해 주세요.")
+
         with self._connect() as conn:
-            user = self._user_summary(conn)
+            user = conn.execute(
+                """
+                SELECT *
+                FROM users
+                WHERE lower(email) = ? AND is_active = 1 AND role != 'admin'
+                LIMIT 1
+                """,
+                (normalized_email,),
+            ).fetchone()
+            if user is None or not verify_password(password, user["password_hash"]):
+                raise PanelError("이메일 또는 비밀번호가 올바르지 않습니다.", status=401)
+            timestamp = now_iso()
+            conn.execute("UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?", (timestamp, timestamp, user["id"]))
+            conn.commit()
+            return self._user_summary(conn, user["id"])
+
+    def public_user_for_session(self, user_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = self._public_user_row(conn, user_id)
+            if row is None:
+                return None
+            return self._user_summary(conn, user_id)
+
+    def bootstrap(self, user_id: str = "") -> Dict[str, Any]:
+        with self._connect() as conn:
+            user = self._user_summary(conn, user_id) if user_id else None
             popup_row = conn.execute("SELECT * FROM home_popups ORDER BY updated_at DESC LIMIT 1").fetchone()
             site_settings_row = self._site_settings_row(conn)
             site_settings = self._site_settings_public_payload(site_settings_row)
@@ -3554,11 +3641,16 @@ class PanelStore:
             ]
 
             product_count = conn.execute("SELECT COUNT(*) AS count FROM products WHERE is_active = 1").fetchone()["count"]
-            order_count = conn.execute("SELECT COUNT(*) AS count FROM orders WHERE user_id = ?", (DEMO_USER_ID,)).fetchone()["count"]
-            active_count = conn.execute(
-                "SELECT COUNT(*) AS count FROM orders WHERE user_id = ? AND status IN ('queued', 'in_progress')",
-                (DEMO_USER_ID,),
-            ).fetchone()["count"]
+            order_count = 0
+            active_count = 0
+            balance_label = "0원"
+            if user:
+                order_count = conn.execute("SELECT COUNT(*) AS count FROM orders WHERE user_id = ?", (user["id"],)).fetchone()["count"]
+                active_count = conn.execute(
+                    "SELECT COUNT(*) AS count FROM orders WHERE user_id = ? AND status IN ('queued', 'in_progress')",
+                    (user["id"],),
+                ).fetchone()["count"]
+                balance_label = user["balanceLabel"]
 
             company = {
                 "name": site_settings["siteName"],
@@ -3575,14 +3667,17 @@ class PanelStore:
                 },
                 "siteSettings": site_settings,
                 "user": user,
+                "viewer": {
+                    "authenticated": bool(user),
+                },
                 "heroStats": [
-                    {"label": "보유 캐시", "value": user["balanceLabel"]},
+                    {"label": "보유 캐시", "value": balance_label},
                     {"label": "등록 상품", "value": f"{product_count:,}개"},
                     {"label": "진행 중 주문", "value": f"{active_count:,}건"},
                     {"label": "누적 주문", "value": f"{order_count:,}건"},
                 ],
                 "topLinks": [
-                    {"label": "서비스 소개서", "route": "/my"},
+                    {"label": "서비스 소개서", "route": "/products"},
                     {"label": "이용 가이드", "route": "/my"},
                 ],
                 "popup": self._popup_public_payload(popup_row) if popup_row else None,
@@ -3604,9 +3699,12 @@ class PanelStore:
                         "subtitle": banner["subtitle"],
                         "ctaLabel": banner["cta_label"],
                         "route": banner["route"],
+                        "imageUrl": banner["image_url"],
                         "theme": banner["theme"],
+                        "isActive": bool(banner["is_active"]),
                     }
                     for banner in banners
+                    if bool(banner["is_active"])
                 ],
                 "interestTags": [
                     {
@@ -3843,7 +3941,9 @@ class PanelStore:
                 ],
             }
 
-    def list_orders(self, status: str = "") -> Dict[str, Any]:
+    def list_orders(self, status: str = "", user_id: str = "") -> Dict[str, Any]:
+        if not user_id:
+            raise PanelError("로그인이 필요합니다.", status=401)
         with self._connect() as conn:
             query = """
                 SELECT
@@ -3854,7 +3954,7 @@ class PanelStore:
                 JOIN platform_sections ps ON ps.id = o.platform_section_id
                 WHERE o.user_id = ?
             """
-            params: List[Any] = [DEMO_USER_ID]
+            params: List[Any] = [user_id]
             if status:
                 query += " AND o.status = ?"
                 params.append(status)
@@ -3905,14 +4005,16 @@ class PanelStore:
             }
             return {"orders": orders, "counts": counts}
 
-    def list_transactions(self) -> Dict[str, Any]:
+    def list_transactions(self, user_id: str = "") -> Dict[str, Any]:
+        if not user_id:
+            raise PanelError("로그인이 필요합니다.", status=401)
         rows = self._fetchall(
             """
             SELECT * FROM balance_transactions
             WHERE user_id = ?
             ORDER BY created_at DESC
             """,
-            (DEMO_USER_ID,),
+            (user_id,),
         )
         transactions = [
             {
@@ -4542,6 +4644,7 @@ class PanelStore:
     def admin_bootstrap(self) -> Dict[str, Any]:
         with self._connect() as conn:
             popup_row = conn.execute("SELECT * FROM home_popups ORDER BY updated_at DESC LIMIT 1").fetchone()
+            banner_rows = conn.execute("SELECT * FROM home_banners ORDER BY sort_order, id").fetchall()
             site_settings_row = self._site_settings_row(conn)
             analytics = self._admin_analytics_payload(conn)
             supplier_rows = conn.execute(
@@ -4612,6 +4715,7 @@ class PanelStore:
                     "balance": row["balance"],
                     "balanceLabel": money(row["balance"]),
                     "isActive": bool(row["is_active"]),
+                    "hasPassword": bool(row["password_hash"]),
                     "notes": row["notes"],
                     "lastLoginAt": row["last_login_at"],
                     "orderCount": row["order_count"],
@@ -4839,6 +4943,7 @@ class PanelStore:
             return {
                 "siteSettings": self._site_settings_admin_payload(site_settings_row),
                 "popup": self._popup_admin_payload(popup_row) if popup_row else None,
+                "homeBanners": [self._home_banner_payload(row) for row in banner_rows],
                 "analytics": analytics,
                 "suppliers": suppliers,
                 "customers": customers,
@@ -5075,6 +5180,50 @@ class PanelStore:
                 )
             conn.commit()
         return {"popup": self._home_popup_by_id(popup_id)}
+
+    def save_home_banner(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        banner_id = str(payload.get("id") or "").strip()
+        title = str(payload.get("title") or "").strip()
+        subtitle = str(payload.get("subtitle") or "").strip()
+        cta_label = str(payload.get("ctaLabel") or "").strip() or "바로 보기"
+        route = normalize_navigation_target(payload.get("route") or "/")
+        image_url = normalize_image_asset_source(payload.get("imageUrl") or "", "홈 배너 이미지")
+        theme = str(payload.get("theme") or "blue").strip().lower() or "blue"
+        is_active = bool(payload.get("isActive", True))
+        sort_order = int(payload.get("sortOrder") or 0)
+
+        if not banner_id:
+            raise PanelError("수정할 홈 배너를 선택해 주세요.")
+        if not title:
+            raise PanelError("배너 제목을 입력해 주세요.")
+        if theme not in {"blue", "mint", "dark"}:
+            theme = "blue"
+
+        timestamp = now_iso()
+        with self._connect() as conn:
+            existing = conn.execute("SELECT id FROM home_banners WHERE id = ?", (banner_id,)).fetchone()
+            if existing is None:
+                raise PanelError("수정할 홈 배너를 찾을 수 없습니다.", status=404)
+            conn.execute(
+                """
+                UPDATE home_banners
+                SET title = ?, subtitle = ?, cta_label = ?, route = ?, image_url = ?, theme = ?, is_active = ?, sort_order = ?
+                WHERE id = ?
+                """,
+                (
+                    title,
+                    subtitle,
+                    cta_label,
+                    route,
+                    image_url,
+                    theme,
+                    bool_to_int(is_active),
+                    sort_order,
+                    banner_id,
+                ),
+            )
+            conn.commit()
+        return {"banner": self._home_banner_by_id(banner_id)}
 
     def save_site_settings(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         site_name = str(payload.get("siteName") or "").strip()
@@ -5380,6 +5529,7 @@ class PanelStore:
         customer_id = str(payload.get("id") or "").strip()
         name = str(payload.get("name") or "").strip()
         email = str(payload.get("email") or "").strip()
+        password = str(payload.get("password") or "")
         phone = str(payload.get("phone") or "").strip()
         tier = str(payload.get("tier") or "STANDARD").strip() or "STANDARD"
         role = str(payload.get("role") or "customer").strip() or "customer"
@@ -5392,6 +5542,8 @@ class PanelStore:
             raise PanelError("이메일을 입력해 주세요.")
         if not phone:
             raise PanelError("연락처를 입력해 주세요.")
+        if not customer_id and role != "admin" and len(password) < 8:
+            raise PanelError("새 고객 계정에는 8자 이상 비밀번호를 입력해 주세요.")
 
         timestamp = now_iso()
         with self._connect() as conn:
@@ -5399,23 +5551,29 @@ class PanelStore:
                 row = conn.execute("SELECT * FROM users WHERE id = ?", (customer_id,)).fetchone()
                 if row is None:
                     raise PanelError("수정할 고객을 찾을 수 없습니다.", status=404)
+                password_hash = row["password_hash"]
+                if role != "admin" and password:
+                    if len(password) < 8:
+                        raise PanelError("비밀번호는 8자 이상으로 입력해 주세요.")
+                    password_hash = hash_password(password)
                 conn.execute(
                     """
                     UPDATE users
-                    SET name = ?, email = ?, phone = ?, tier = ?, role = ?, avatar_label = ?, is_active = ?, notes = ?, updated_at = ?
+                    SET name = ?, email = ?, password_hash = ?, phone = ?, tier = ?, role = ?, avatar_label = ?, is_active = ?, notes = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (name, email, phone, tier, role, avatar_label(name), bool_to_int(is_active), notes, timestamp, customer_id),
+                    (name, email, password_hash, phone, tier, role, avatar_label(name), bool_to_int(is_active), notes, timestamp, customer_id),
                 )
             else:
                 customer_id = f"user_{uuid4().hex[:12]}"
+                password_hash = "" if role == "admin" else hash_password(password)
                 conn.execute(
                     """
                     INSERT INTO users (
-                        id, name, email, phone, tier, role, avatar_label, balance, is_active, notes, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                        id, name, email, password_hash, phone, tier, role, avatar_label, balance, is_active, notes, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
                     """,
-                    (customer_id, name, email, phone, tier, role, avatar_label(name), bool_to_int(is_active), notes, timestamp, timestamp),
+                    (customer_id, name, email, password_hash, phone, tier, role, avatar_label(name), bool_to_int(is_active), notes, timestamp, timestamp),
                 )
             conn.commit()
         return {"customer": self._customer_by_id(customer_id)}
@@ -5887,9 +6045,26 @@ class PanelStore:
             "updatedAt": row["updated_at"],
         }
 
+    def _home_banner_payload(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "title": row["title"],
+            "subtitle": row["subtitle"],
+            "ctaLabel": row["cta_label"],
+            "route": row["route"],
+            "imageUrl": row["image_url"],
+            "theme": row["theme"],
+            "isActive": bool(row["is_active"]),
+            "sortOrder": row["sort_order"],
+        }
+
     def _home_popup_by_id(self, popup_id: str) -> Dict[str, Any]:
         row = self._fetchone("SELECT * FROM home_popups WHERE id = ?", (popup_id,))
         return self._popup_admin_payload(row)
+
+    def _home_banner_by_id(self, banner_id: str) -> Dict[str, Any]:
+        row = self._fetchone("SELECT * FROM home_banners WHERE id = ?", (banner_id,))
+        return self._home_banner_payload(row)
 
     def _customer_by_id(self, customer_id: str, *, include_private: bool = True) -> Dict[str, Any]:
         with self._connect() as conn:
@@ -5920,6 +6095,7 @@ class PanelStore:
             "balance": row["balance"],
             "balanceLabel": money(row["balance"]),
             "isActive": bool(row["is_active"]),
+            "hasPassword": bool(row["password_hash"]),
             "notes": row["notes"],
             "lastLoginAt": row["last_login_at"],
             "orderCount": row["order_count"],
@@ -6177,23 +6353,25 @@ class PanelStore:
             }
         }
 
-    def charge_balance(self, amount: int) -> Dict[str, Any]:
+    def charge_balance(self, amount: int, user_id: str = "") -> Dict[str, Any]:
+        if not user_id:
+            raise PanelError("로그인이 필요합니다.", status=401)
         if amount <= 0:
             raise PanelError("충전 금액은 0보다 커야 합니다.")
         if amount > 5_000_000:
             raise PanelError("한 번에 충전 가능한 금액을 초과했습니다.")
 
         with self._connect() as conn:
-            user = conn.execute("SELECT balance FROM users WHERE id = ?", (DEMO_USER_ID,)).fetchone()
+            user = conn.execute("SELECT balance FROM users WHERE id = ?", (user_id,)).fetchone()
             if user is None:
-                raise PanelError("데모 사용자를 찾을 수 없습니다.", status=500)
+                raise PanelError("사용자를 찾을 수 없습니다.", status=404)
             balance_after = int(user["balance"]) + amount
             timestamp = now_iso()
             tx_id = f"tx_{int(dt.datetime.now().timestamp() * 1000)}"
-            conn.execute("UPDATE users SET balance = ?, updated_at = ? WHERE id = ?", (balance_after, timestamp, DEMO_USER_ID))
+            conn.execute("UPDATE users SET balance = ?, updated_at = ? WHERE id = ?", (balance_after, timestamp, user_id))
             conn.execute(
                 "INSERT INTO balance_transactions (id, user_id, amount, balance_after, kind, memo, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (tx_id, DEMO_USER_ID, amount, balance_after, "charge", f"캐시 충전 {money(amount)}", timestamp),
+                (tx_id, user_id, amount, balance_after, "charge", f"캐시 충전 {money(amount)}", timestamp),
             )
             conn.commit()
             return {
@@ -6202,7 +6380,9 @@ class PanelStore:
                 "balanceLabel": money(balance_after),
             }
 
-    def create_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def create_order(self, payload: Dict[str, Any], user_id: str = "") -> Dict[str, Any]:
+        if not user_id:
+            raise PanelError("로그인이 필요합니다.", status=401)
         product_id = str(payload.get("productId") or "").strip()
         fields = payload.get("fields") or {}
         if not product_id:
@@ -6240,9 +6420,9 @@ class PanelStore:
             quantity = self._resolve_quantity(product, fields)
             total_price = int(product["price"]) if product["price_strategy"] == "fixed" else int(product["price"]) * quantity
 
-            user = conn.execute("SELECT balance, phone FROM users WHERE id = ?", (DEMO_USER_ID,)).fetchone()
+            user = conn.execute("SELECT balance, phone FROM users WHERE id = ?", (user_id,)).fetchone()
             if user is None:
-                raise PanelError("데모 사용자를 찾을 수 없습니다.", status=500)
+                raise PanelError("사용자를 찾을 수 없습니다.", status=404)
             if int(user["balance"]) < total_price:
                 raise PanelError("보유 캐시가 부족합니다. 충전 후 다시 시도해 주세요.")
 
@@ -6298,7 +6478,7 @@ class PanelStore:
                 (
                     order_id,
                     order_number,
-                    DEMO_USER_ID,
+                    user_id,
                     product["platform_section_id"],
                     product["category_id"],
                     product["id"],
@@ -6328,13 +6508,13 @@ class PanelStore:
 
             conn.execute(
                 "UPDATE users SET balance = ?, updated_at = ? WHERE id = ?",
-                (balance_after, timestamp, DEMO_USER_ID),
+                (balance_after, timestamp, user_id),
             )
             conn.execute(
                 "INSERT INTO balance_transactions (id, user_id, amount, balance_after, kind, memo, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     f"tx_{order_id}",
-                    DEMO_USER_ID,
+                    user_id,
                     -total_price,
                     balance_after,
                     "order",
