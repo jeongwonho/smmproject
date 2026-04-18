@@ -69,6 +69,40 @@ SUPPLIER_PLATFORM_LABELS = {
 }
 PREVIEW_BLOCKED_HOSTNAMES = {"localhost"}
 PREVIEW_BLOCKED_SUFFIXES = (".local", ".internal", ".localhost")
+LEGAL_DOCUMENT_VERSIONS = {
+    "terms": "2026-04-18",
+    "privacy": "2026-04-18",
+    "marketing": "2026-04-18",
+    "age": "2026-04-18",
+}
+
+
+def env_flag(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def runtime_mode() -> str:
+    return str(
+        os.environ.get("SMM_PANEL_ENV")
+        or os.environ.get("APP_ENV")
+        or os.environ.get("NODE_ENV")
+        or ""
+    ).strip().lower()
+
+
+def is_production_runtime() -> bool:
+    mode = runtime_mode()
+    if mode in {"dev", "development", "demo", "local", "test"}:
+        return False
+    if mode in {"prod", "production", "live"}:
+        return True
+    return bool(os.environ.get("VERCEL"))
+
+
+def demo_seed_enabled() -> bool:
+    return env_flag(os.environ.get("SMM_PANEL_ENABLE_DEMO_SEED")) or env_flag(
+        os.environ.get("SMM_PANEL_ENABLE_SAMPLE_SEED")
+    )
 
 
 SCHEMA_SQL = """
@@ -85,10 +119,53 @@ CREATE TABLE IF NOT EXISTS users (
     avatar_label TEXT NOT NULL DEFAULT 'P24',
     balance INTEGER NOT NULL DEFAULT 0,
     is_active INTEGER NOT NULL DEFAULT 1,
+    account_status TEXT NOT NULL DEFAULT 'active',
+    marketing_opt_in INTEGER NOT NULL DEFAULT 0,
+    marketing_opt_in_at TEXT NOT NULL DEFAULT '',
+    withdrawn_at TEXT NOT NULL DEFAULT '',
+    suspended_reason TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT '',
     last_login_at TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique
+    ON users(email);
+
+CREATE TABLE IF NOT EXISTS user_social_identities (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    provider_user_id TEXT NOT NULL,
+    provider_email TEXT NOT NULL DEFAULT '',
+    linked_at TEXT NOT NULL,
+    last_login_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(provider, provider_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS user_consents (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    consent_type TEXT NOT NULL,
+    consent_version TEXT NOT NULL,
+    is_agreed INTEGER NOT NULL DEFAULT 0,
+    agreed_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(user_id, consent_type, consent_version)
+);
+
+CREATE TABLE IF NOT EXISTS user_auth_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_type TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    consumed_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(token_type, token_hash)
 );
 
 CREATE TABLE IF NOT EXISTS platform_sections (
@@ -249,6 +326,19 @@ CREATE TABLE IF NOT EXISTS balance_transactions (
     kind TEXT NOT NULL,
     memo TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS payment_records (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    amount INTEGER NOT NULL,
+    payment_method TEXT NOT NULL,
+    payment_status TEXT NOT NULL,
+    reference TEXT NOT NULL DEFAULT '',
+    failure_reason TEXT NOT NULL DEFAULT '',
+    admin_adjustment_reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS suppliers (
@@ -620,6 +710,30 @@ def money(value: int) -> str:
     return f"{value:,}원"
 
 
+def payment_method_label(method: str) -> str:
+    labels = {
+        "manual_balance": "운영 수동 충전",
+        "bank_transfer": "무통장 입금",
+        "card": "카드 결제",
+        "virtual_account": "가상계좌",
+        "admin_adjustment": "관리자 조정",
+    }
+    key = str(method or "").strip().lower()
+    return labels.get(key, key or "미정")
+
+
+def payment_status_label(status: str) -> str:
+    labels = {
+        "pending": "확인 대기",
+        "processing": "처리 중",
+        "completed": "완료",
+        "failed": "실패",
+        "cancelled": "취소",
+    }
+    key = str(status or "").strip().lower()
+    return labels.get(key, key or "미정")
+
+
 def default_home_popup_record() -> Dict[str, Any]:
     return {
         "id": "popup_home_youtube_rank",
@@ -722,6 +836,90 @@ def mask_secret(secret: str, visible_suffix: int = 4) -> str:
     if len(raw) <= visible_suffix:
         return "*" * len(raw)
     return f"{'*' * max(6, len(raw) - visible_suffix)}{raw[-visible_suffix:]}"
+
+
+def legal_document_catalog() -> List[Dict[str, Any]]:
+    return [
+        {
+            "key": "terms",
+            "title": "이용약관",
+            "version": LEGAL_DOCUMENT_VERSIONS["terms"],
+            "required": True,
+            "summary": "회원가입, 주문, 서비스 이용 조건에 대한 기본 약관입니다.",
+            "body": [
+                "본 문서는 실제 운영 전 법률 검토가 필요한 초안입니다.",
+                "서비스 특성상 주문이 시작된 이후에는 환불·취소 기준이 제한될 수 있습니다.",
+                "허위 정보 입력, 타인 권리 침해, 정책 위반 주문은 제한될 수 있습니다.",
+            ],
+        },
+        {
+            "key": "privacy",
+            "title": "개인정보처리방침",
+            "version": LEGAL_DOCUMENT_VERSIONS["privacy"],
+            "required": True,
+            "summary": "회원 식별, 주문 처리, 고객 지원에 필요한 최소 정보 처리 방침입니다.",
+            "body": [
+                "이메일, 이름(또는 닉네임), 로그인 기록, 주문 이력, 잔액 내역 등을 처리할 수 있습니다.",
+                "공급사 연동에 필요한 최소 주문 정보만 외부 공급사로 전달합니다.",
+                "실서비스 오픈 전에는 수집 항목, 보관 기간, 위탁 현황을 실제 운영 기준으로 확정해야 합니다.",
+            ],
+        },
+        {
+            "key": "age",
+            "title": "연령 확인",
+            "version": LEGAL_DOCUMENT_VERSIONS["age"],
+            "required": True,
+            "summary": "만 14세 이상 또는 법정대리인 동의 필요 여부 확인 문구입니다.",
+            "body": [
+                "만 14세 미만 이용자는 법정대리인 동의가 필요할 수 있습니다.",
+                "실제 운영 전 업종·판매 방식에 맞는 연령 문구 검토가 필요합니다.",
+            ],
+        },
+        {
+            "key": "marketing",
+            "title": "마케팅 정보 수신 동의",
+            "version": LEGAL_DOCUMENT_VERSIONS["marketing"],
+            "required": False,
+            "summary": "이벤트, 상품 안내, 혜택 알림 수신 동의입니다.",
+            "body": [
+                "선택 동의이며, 동의하지 않아도 서비스 이용에 제한은 없습니다.",
+                "이메일, 문자 등 채널별 수신 정책은 실제 운영 전 별도 정리해야 합니다.",
+            ],
+        },
+    ]
+
+
+def oauth_provider_catalog() -> List[Dict[str, Any]]:
+    providers = [
+        ("google", "구글 로그인", "GOOGLE"),
+        ("kakao", "카카오 로그인", "KAKAO"),
+        ("naver", "네이버 로그인", "NAVER"),
+    ]
+    payload = []
+    for provider, label, prefix in providers:
+        enabled = all(
+            str(os.environ.get(f"SMM_PANEL_{prefix}_{name}", "")).strip()
+            for name in ("CLIENT_ID", "CLIENT_SECRET", "REDIRECT_URI")
+        )
+        payload.append(
+            {
+                "provider": provider,
+                "label": label,
+                "enabled": enabled,
+                "status": "configured" if enabled else "pending_config",
+                "startPath": f"/api/auth/oauth/{provider}/start",
+                "requiredEnv": [
+                    f"SMM_PANEL_{prefix}_CLIENT_ID",
+                    f"SMM_PANEL_{prefix}_CLIENT_SECRET",
+                    f"SMM_PANEL_{prefix}_REDIRECT_URI",
+                ],
+            }
+        )
+    return payload
+
+
+def generate_public_order_number() -> str:
+    return f"SMM-{dt.datetime.now().strftime('%Y%m%d')}-{secrets.token_hex(4).upper()}"
 
 
 def normalize_supplier_integration_type(raw: Any) -> str:
@@ -1423,7 +1621,6 @@ class SupplierApiClient:
         self.api_key = api_key.strip()
         self.integration_type = normalize_supplier_integration_type(integration_type)
         self.bearer_token = bearer_token.strip()
-        self.ssl_context = ssl._create_unverified_context()
 
     def _request_form(self, payload: Dict[str, Any]) -> Any:
         encoded = urlencode(payload).encode("utf-8")
@@ -1438,7 +1635,7 @@ class SupplierApiClient:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=12, context=self.ssl_context) as response:
+            with urlopen(request, timeout=12) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except (HTTPError, URLError, TimeoutError, ValueError) as exc:
             raise SupplierApiError(str(exc)) from exc
@@ -1472,7 +1669,7 @@ class SupplierApiClient:
             request_headers.setdefault("Content-Type", "application/json")
         request = Request(url or self.api_url, data=data, headers=request_headers, method=method)
         try:
-            with urlopen(request, timeout=12, context=self.ssl_context) as response:
+            with urlopen(request, timeout=12) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except (HTTPError, URLError, TimeoutError, ValueError) as exc:
             raise SupplierApiError(str(exc)) from exc
@@ -1860,7 +2057,7 @@ def infer_form_preset(form_structure: Dict[str, Any]) -> str:
     if not isinstance(template, dict):
         return "package"
 
-    keys = list(template.keys())
+    keys = [key for key in template.keys() if key != "requestMemo"]
     if keys == ["targetKeyword", "targetUrl", "orderedCount"]:
         return "keyword_url"
     if keys == ["targetUrl", "orderedCount", "contactPhone"]:
@@ -1909,6 +2106,33 @@ def admin_form_config(form_structure: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
+def ensure_request_memo_form_structure(
+    form_structure: Dict[str, Any],
+    memo_label: str = "요청 메모",
+) -> Dict[str, Any]:
+    if not isinstance(form_structure, dict):
+        return {}
+    schema = form_structure.get("schema")
+    template = form_structure.get("template")
+    if not isinstance(schema, dict) or not isinstance(template, dict):
+        return form_structure
+    if "requestMemo" in template:
+        return form_structure
+    _append_form_field(
+        schema,
+        template,
+        {
+            "name": "requestMemo",
+            "kind": "textarea",
+            "label": memo_label,
+            "placeholder": "추가 요청사항이 있으면 남겨 주세요.",
+            "rows": 4,
+            "required": False,
+        },
+    )
+    return form_structure
+
+
 def build_admin_form_structure(payload: Dict[str, Any], existing_form_structure_json: str = "") -> str:
     preset = str(payload.get("formPreset") or "").strip() or "account_quantity"
     target_label = str(payload.get("targetLabel") or "계정(ID)").strip() or "계정(ID)"
@@ -1953,16 +2177,17 @@ def build_admin_form_structure(payload: Dict[str, Any], existing_form_structure_
     else:
         form_structure_json = existing_form_structure_json or package_form(target_label, target_placeholder or "예: pulse24_official")
 
-    if not advanced_field_keys:
-        return form_structure_json
-
     form_structure = parse_json(form_structure_json, {})
     if not isinstance(form_structure, dict):
         return form_structure_json
+    form_structure = ensure_request_memo_form_structure(form_structure, memo_label)
     schema = form_structure.get("schema")
     template = form_structure.get("template")
     if not isinstance(schema, dict) or not isinstance(template, dict):
         return form_structure_json
+
+    if not advanced_field_keys:
+        return as_json(form_structure)
 
     for field_key in advanced_field_keys:
         field_spec = ADVANCED_ORDER_FIELD_SPECS.get(field_key)
@@ -3083,20 +3308,26 @@ class PanelStore:
         with self._connect() as conn:
             conn.executescript(SCHEMA_SQL)
             self._apply_migrations(conn)
-            has_user = conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"]
-            if not has_user:
+            has_categories = conn.execute("SELECT COUNT(*) AS count FROM product_categories").fetchone()["count"]
+            if not has_categories:
                 self._seed(conn)
-            self._seed_management_samples(conn)
-            self._ensure_management_order_samples(conn)
             self._ensure_home_popup(conn)
             self._ensure_site_settings(conn)
-            self._ensure_analytics_samples(conn)
+            if demo_seed_enabled():
+                self._seed_management_samples(conn)
+                self._ensure_management_order_samples(conn)
+                self._ensure_analytics_samples(conn)
             conn.commit()
 
     def _apply_migrations(self, conn: DatabaseConnection) -> None:
         self._ensure_column(conn, "users", "password_hash", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "users", "role", "TEXT NOT NULL DEFAULT 'customer'")
         self._ensure_column(conn, "users", "is_active", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column(conn, "users", "account_status", "TEXT NOT NULL DEFAULT 'active'")
+        self._ensure_column(conn, "users", "marketing_opt_in", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "users", "marketing_opt_in_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "users", "withdrawn_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "users", "suspended_reason", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "users", "notes", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "users", "last_login_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "home_banners", "image_url", "TEXT NOT NULL DEFAULT ''")
@@ -3107,7 +3338,14 @@ class PanelStore:
         self._ensure_column(conn, "suppliers", "bearer_token", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "home_popups", "image_url", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "site_visit_events", "exclude_from_stats", "INTEGER NOT NULL DEFAULT 0")
-        conn.execute("UPDATE users SET role = 'admin', is_active = 1 WHERE id = ?", (DEMO_USER_ID,))
+        conn.execute("UPDATE users SET email = lower(trim(email)) WHERE email != lower(trim(email))")
+        conn.execute("UPDATE support_links SET route = '/help#faq' WHERE id = 'support_faq'")
+        conn.execute("UPDATE support_links SET route = '/help#notice' WHERE id = 'support_notice'")
+        conn.execute("UPDATE support_links SET route = '/help#guide' WHERE id = 'support_guide'")
+        conn.execute(
+            "UPDATE users SET account_status = CASE WHEN is_active = 1 THEN 'active' ELSE 'suspended' END WHERE COALESCE(account_status, '') = ''"
+        )
+        conn.execute("UPDATE users SET role = 'admin', is_active = 1, account_status = 'active' WHERE id = ?", (DEMO_USER_ID,))
         conn.execute("UPDATE users SET role = COALESCE(NULLIF(role, ''), 'customer') WHERE id != ?", (DEMO_USER_ID,))
 
     def _ensure_column(self, conn: DatabaseConnection, table: str, column: str, definition: str) -> None:
@@ -3438,13 +3676,32 @@ class PanelStore:
 
     def _seed(self, conn: sqlite3.Connection) -> None:
         created_at = now_iso()
-        conn.execute(
-            """
-            INSERT INTO users (id, name, email, password_hash, phone, tier, role, avatar_label, balance, is_active, notes, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (DEMO_USER_ID, "데모 관리자", "demo@pulse24.local", "", "01024512400", "PRO", "admin", "P24", 185000, 1, "현재 데모 패널 운영 계정", created_at, created_at),
-        )
+        if demo_seed_enabled():
+            conn.execute(
+                """
+                INSERT INTO users (
+                    id, name, email, password_hash, phone, tier, role, avatar_label, balance,
+                    is_active, account_status, notes, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    DEMO_USER_ID,
+                    "데모 관리자",
+                    "demo@pulse24.local",
+                    "",
+                    "01024512400",
+                    "PRO",
+                    "admin",
+                    "P24",
+                    185000,
+                    1,
+                    "active",
+                    "현재 데모 패널 운영 계정",
+                    created_at,
+                    created_at,
+                ),
+            )
 
         banners = [
             ("banner_launch", "첫 캠페인을 더 빨리 띄우세요", "신규 계정과 런칭 숏폼에 맞춘 추천 패키지를 한 번에 비교할 수 있어요.", "추천 패키지 보기", "/products/cat_branding_standard", "", "blue", 1, 0),
@@ -3481,10 +3738,10 @@ class PanelStore:
         )
 
         supports = [
-            ("support_faq", "FAQ", "주문 전 자주 묻는 질문을 빠르게 확인하세요.", "/my", "?", "", 0),
-            ("support_notice", "공지사항", "운영 공지와 정책 업데이트를 바로 확인하세요.", "/my", "!", "", 1),
+            ("support_faq", "FAQ", "주문 전 자주 묻는 질문을 빠르게 확인하세요.", "/help#faq", "?", "", 0),
+            ("support_notice", "공지사항", "운영 공지와 정책 업데이트를 바로 확인하세요.", "/help#notice", "!", "", 1),
             ("support_consult", "1:1 상담", "맞춤형 상품이 필요하면 상담 흐름으로 연결합니다.", "/products/cat_custom_request", "☏", "", 2),
-            ("support_guide", "이용가이드", "처음 쓰는 분도 쉽게 이해할 수 있도록 흐름을 정리했습니다.", "/my", "→", "", 3),
+            ("support_guide", "이용가이드", "처음 쓰는 분도 쉽게 이해할 수 있도록 흐름을 정리했습니다.", "/help#guide", "→", "", 3),
         ]
         conn.executemany(
             "INSERT INTO support_links (id, title, subtitle, route, icon, external_url, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -3739,7 +3996,7 @@ class PanelStore:
             """
             SELECT *
             FROM users
-            WHERE id = ? AND is_active = 1 AND role != 'admin'
+            WHERE id = ? AND is_active = 1 AND account_status = 'active' AND role != 'admin'
             """,
             (user_id,),
         ).fetchone()
@@ -3759,12 +4016,71 @@ class PanelStore:
             "balance": user["balance"],
             "balanceLabel": money(user["balance"]),
             "hasPassword": bool(user["password_hash"]),
+            "accountStatus": user["account_status"],
+            "marketingOptIn": bool(user["marketing_opt_in"]),
         }
 
+    def _normalize_customer_email(self, email: str) -> str:
+        normalized = str(email or "").strip().lower()
+        if not normalized or "@" not in normalized or "." not in normalized.split("@", 1)[-1]:
+            raise PanelError("유효한 이메일을 입력해 주세요.")
+        return normalized
+
+    def _assert_available_customer_email(
+        self,
+        conn: DatabaseConnection,
+        email: str,
+        *,
+        exclude_user_id: str = "",
+    ) -> None:
+        params: List[Any] = [email]
+        query = "SELECT id FROM users WHERE email = ?"
+        if exclude_user_id:
+            query += " AND id != ?"
+            params.append(exclude_user_id)
+        exists = conn.execute(query, params).fetchone()
+        if exists is not None:
+            raise PanelError("이미 사용 중인 이메일입니다.")
+
+    def _record_user_consents(
+        self,
+        conn: DatabaseConnection,
+        user_id: str,
+        *,
+        terms_agreed: bool,
+        privacy_agreed: bool,
+        age_confirmed: bool,
+        marketing_agreed: bool,
+        agreed_at: str,
+    ) -> None:
+        rows = [
+            ("terms", LEGAL_DOCUMENT_VERSIONS["terms"], terms_agreed),
+            ("privacy", LEGAL_DOCUMENT_VERSIONS["privacy"], privacy_agreed),
+            ("age", LEGAL_DOCUMENT_VERSIONS["age"], age_confirmed),
+            ("marketing", LEGAL_DOCUMENT_VERSIONS["marketing"], marketing_agreed),
+        ]
+        for consent_type, version, agreed in rows:
+            existing = conn.execute(
+                "SELECT id FROM user_consents WHERE user_id = ? AND consent_type = ? AND consent_version = ?",
+                (user_id, consent_type, version),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO user_consents (
+                        id, user_id, consent_type, consent_version, is_agreed, agreed_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (f"consent_{uuid4().hex[:12]}", user_id, consent_type, version, bool_to_int(agreed), agreed_at, agreed_at),
+                )
+            else:
+                conn.execute(
+                    "UPDATE user_consents SET is_agreed = ?, agreed_at = ? WHERE id = ?",
+                    (bool_to_int(agreed), agreed_at, existing["id"]),
+                )
+
     def authenticate_public_user(self, email: str, password: str) -> Dict[str, Any]:
-        normalized_email = str(email or "").strip().lower()
-        if not normalized_email:
-            raise PanelError("이메일을 입력해 주세요.")
+        normalized_email = self._normalize_customer_email(email)
         if not str(password or ""):
             raise PanelError("비밀번호를 입력해 주세요.")
 
@@ -3773,7 +4089,7 @@ class PanelStore:
                 """
                 SELECT *
                 FROM users
-                WHERE lower(email) = ? AND is_active = 1 AND role != 'admin'
+                WHERE email = ? AND is_active = 1 AND account_status = 'active' AND role != 'admin'
                 LIMIT 1
                 """,
                 (normalized_email,),
@@ -3782,8 +4098,93 @@ class PanelStore:
                 raise PanelError("이메일 또는 비밀번호가 올바르지 않습니다.", status=401)
             timestamp = now_iso()
             conn.execute("UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?", (timestamp, timestamp, user["id"]))
+            identity = conn.execute(
+                "SELECT id FROM user_social_identities WHERE user_id = ? AND provider = 'email' AND provider_user_id = ?",
+                (user["id"], normalized_email),
+            ).fetchone()
+            if identity is None:
+                conn.execute(
+                    """
+                    INSERT INTO user_social_identities (
+                        id, user_id, provider, provider_user_id, provider_email, linked_at, last_login_at, created_at, updated_at
+                    ) VALUES (?, ?, 'email', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (f"identity_{uuid4().hex[:12]}", user["id"], normalized_email, normalized_email, timestamp, timestamp, timestamp, timestamp),
+                )
+            else:
+                conn.execute(
+                    "UPDATE user_social_identities SET provider_email = ?, last_login_at = ?, updated_at = ? WHERE id = ?",
+                    (normalized_email, timestamp, timestamp, identity["id"]),
+                )
             conn.commit()
             return self._user_summary(conn, user["id"])
+
+    def register_public_user(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        email = self._normalize_customer_email(payload.get("email") or "")
+        password = str(payload.get("password") or "")
+        password_confirmation = str(payload.get("passwordConfirmation") or "")
+        name = str(payload.get("name") or payload.get("nickname") or "").strip()
+        terms_agreed = bool(payload.get("termsAgreed"))
+        privacy_agreed = bool(payload.get("privacyAgreed"))
+        marketing_agreed = bool(payload.get("marketingAgreed"))
+        age_confirmed = bool(payload.get("ageConfirmed"))
+
+        if not name:
+            raise PanelError("이름 또는 닉네임을 입력해 주세요.")
+        if len(password) < 8:
+            raise PanelError("비밀번호는 8자 이상으로 입력해 주세요.")
+        if password != password_confirmation:
+            raise PanelError("비밀번호 확인이 일치하지 않습니다.")
+        if not terms_agreed:
+            raise PanelError("이용약관 동의가 필요합니다.")
+        if not privacy_agreed:
+            raise PanelError("개인정보처리방침 동의가 필요합니다.")
+        if not age_confirmed:
+            raise PanelError("연령 확인 문구에 동의해 주세요.")
+
+        timestamp = now_iso()
+        user_id = f"user_{uuid4().hex[:12]}"
+        with self._connect() as conn:
+            self._assert_available_customer_email(conn, email)
+            conn.execute(
+                """
+                INSERT INTO users (
+                    id, name, email, password_hash, phone, tier, role, avatar_label, balance, is_active,
+                    account_status, marketing_opt_in, marketing_opt_in_at, notes, last_login_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, '', 'STANDARD', 'customer', ?, 0, 1, 'active', ?, ?, '', ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    name,
+                    email,
+                    hash_password(password),
+                    avatar_label(name),
+                    bool_to_int(marketing_agreed),
+                    timestamp if marketing_agreed else "",
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO user_social_identities (
+                    id, user_id, provider, provider_user_id, provider_email, linked_at, last_login_at, created_at, updated_at
+                ) VALUES (?, ?, 'email', ?, ?, ?, ?, ?, ?)
+                """,
+                (f"identity_{uuid4().hex[:12]}", user_id, email, email, timestamp, timestamp, timestamp, timestamp),
+            )
+            self._record_user_consents(
+                conn,
+                user_id,
+                terms_agreed=terms_agreed,
+                privacy_agreed=privacy_agreed,
+                age_confirmed=age_confirmed,
+                marketing_agreed=marketing_agreed,
+                agreed_at=timestamp,
+            )
+            conn.commit()
+            return self._user_summary(conn, user_id)
 
     def public_user_for_session(self, user_id: str) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
@@ -3858,15 +4259,33 @@ class PanelStore:
 
             company = {
                 "name": site_settings["siteName"],
-                "representative": "Demo Operator",
-                "contact": "support@pulse24.local",
+                "representative": "운영 관리자",
+                "contact": "support@example.com",
                 "hours": "평일 10:00 - 19:00",
             }
+            legal_documents = legal_document_catalog()
+            guides = [
+                {
+                    "id": "guide_order",
+                    "title": "주문 전 확인 가이드",
+                    "description": "플랫폼별 입력 형식, 계정 공개 여부, 환불 가능 구간을 먼저 확인하세요.",
+                },
+                {
+                    "id": "guide_payment",
+                    "title": "충전 및 결제 안내",
+                    "description": "결제수단 확인, 입금/승인 상태, 충전 후 사용 흐름을 안내합니다.",
+                },
+                {
+                    "id": "guide_policy",
+                    "title": "환불·리필·정책 요약",
+                    "description": "주문 시작 전 취소 가능 구간, 진행 후 처리 기준, 재작업 정책을 정리했습니다.",
+                },
+            ]
 
             return {
                 "app": {
                     "name": site_settings["siteName"],
-                    "subtitle": "Reference-style SMM Growth Panel",
+                    "subtitle": "고객 친화형 SMM 서비스 쇼핑몰",
                     "accentColor": "#4c76ff",
                 },
                 "siteSettings": site_settings,
@@ -3882,7 +4301,7 @@ class PanelStore:
                 ],
                 "topLinks": [
                     {"label": "서비스 소개서", "route": "/products"},
-                    {"label": "이용 가이드", "route": "/my"},
+                    {"label": "이용 가이드", "route": "/help"},
                 ],
                 "popup": self._popup_public_payload(popup_row) if popup_row else None,
                 "platforms": [
@@ -3939,6 +4358,26 @@ class PanelStore:
                     }
                     for item in supports
                 ],
+                "guides": guides,
+                "legalDocuments": legal_documents,
+                "authConfig": {
+                    "signupEnabled": True,
+                    "loginRoute": "/auth",
+                    "passwordResetEnabled": False,
+                    "emailVerificationRequired": False,
+                    "oauthProviders": oauth_provider_catalog(),
+                },
+                "chargeConfig": {
+                    "methods": [
+                        {"id": "bank_transfer", "label": "무통장 입금", "description": "입금 확인 후 잔액이 반영되는 방식입니다."},
+                        {"id": "admin_manual", "label": "관리자 수동 충전", "description": "운영팀 확인 후 수동으로 반영되는 방식입니다."},
+                    ],
+                    "policyHighlights": [
+                        "결제수단 연동 전에는 운영팀 확인 후 충전이 반영될 수 있습니다.",
+                        "입금 확인 전 주문은 진행되지 않을 수 있습니다.",
+                        "환불 및 취소 기준은 이용약관과 개별 상품 정책을 따릅니다.",
+                    ],
+                },
                 "benefits": [
                     {
                         "id": item["id"],
@@ -4078,6 +4517,10 @@ class PanelStore:
                 "SELECT * FROM products WHERE product_category_id = ? AND is_active = 1 ORDER BY sort_order, option_name, name",
                 (category_id,),
             ).fetchall():
+                form_structure = ensure_request_memo_form_structure(
+                    parse_json(row["form_structure_json"], {}),
+                    "추가 요청사항",
+                )
                 products.append(
                     {
                         "id": row["id"],
@@ -4099,7 +4542,7 @@ class PanelStore:
                         "isCustom": bool(row["is_custom"]),
                         "estimatedTurnaround": row["estimated_turnaround"],
                         "badge": row["badge"],
-                        "formStructure": parse_json(row["form_structure_json"], {}),
+                        "formStructure": form_structure,
                     }
                 )
 
@@ -4214,9 +4657,20 @@ class PanelStore:
             raise PanelError("로그인이 필요합니다.", status=401)
         rows = self._fetchall(
             """
-            SELECT * FROM balance_transactions
-            WHERE user_id = ?
-            ORDER BY created_at DESC
+            SELECT
+                bt.*,
+                pr.payment_method,
+                pr.payment_status,
+                pr.reference,
+                pr.failure_reason,
+                pr.admin_adjustment_reason
+            FROM balance_transactions bt
+            LEFT JOIN payment_records pr
+              ON pr.user_id = bt.user_id
+             AND pr.amount = bt.amount
+             AND ABS(strftime('%s', pr.created_at) - strftime('%s', bt.created_at)) <= 5
+            WHERE bt.user_id = ?
+            ORDER BY bt.created_at DESC
             """,
             (user_id,),
         )
@@ -4229,6 +4683,13 @@ class PanelStore:
                 "balanceAfterLabel": money(row["balance_after"]),
                 "kind": row["kind"],
                 "memo": row["memo"],
+                "paymentMethod": row["payment_method"] or "",
+                "paymentMethodLabel": payment_method_label(row["payment_method"] or ""),
+                "paymentStatus": row["payment_status"] or "",
+                "paymentStatusLabel": payment_status_label(row["payment_status"] or ""),
+                "reference": row["reference"] or "",
+                "failureReason": row["failure_reason"] or "",
+                "adminAdjustmentReason": row["admin_adjustment_reason"] or "",
                 "createdAt": row["created_at"],
                 "createdLabel": self._relative_date_label(row["created_at"]),
             }
@@ -4309,12 +4770,22 @@ class PanelStore:
             return "홈"
         if normalized == "/products":
             return "상품 목록"
+        if normalized == "/help":
+            return "도움말 허브"
+        if normalized == "/auth":
+            return "로그인 / 회원가입"
         if normalized == "/charge":
             return "충전"
         if normalized == "/orders":
             return "주문 내역"
         if normalized == "/my":
             return "마이 페이지"
+        if normalized == "/legal/terms":
+            return "이용약관"
+        if normalized == "/legal/privacy":
+            return "개인정보처리방침"
+        if normalized == "/legal/marketing":
+            return "마케팅 수신 동의"
         if normalized.startswith("/products/"):
             category_id = normalized.split("/", 2)[2]
             row = conn.execute("SELECT name FROM product_categories WHERE id = ?", (category_id,)).fetchone()
@@ -4919,6 +5390,8 @@ class PanelStore:
                     "balance": row["balance"],
                     "balanceLabel": money(row["balance"]),
                     "isActive": bool(row["is_active"]),
+                    "accountStatus": row["account_status"],
+                    "marketingOptIn": bool(row["marketing_opt_in"]),
                     "hasPassword": bool(row["password_hash"]),
                     "notes": row["notes"],
                     "lastLoginAt": row["last_login_at"],
@@ -4927,6 +5400,19 @@ class PanelStore:
                     "totalSpentLabel": money(row["total_spent"]),
                     "lastOrderAt": row["last_order_at"] or "",
                     "lastOrderLabel": self._relative_date_label(row["last_order_at"]) if row["last_order_at"] else "",
+                    "searchText": " ".join(
+                        filter(
+                            None,
+                            [
+                                str(row["name"] or ""),
+                                str(row["email"] or ""),
+                                str(row["phone"] or ""),
+                                str(row["tier"] or ""),
+                                str(row["role"] or ""),
+                                str(row["notes"] or ""),
+                            ],
+                        )
+                    ).lower(),
                     "createdAt": row["created_at"],
                     "updatedAt": row["updated_at"],
                 }
@@ -5131,6 +5617,33 @@ class PanelStore:
                     "supplierStatus": row["supplier_status"] or "",
                     "supplierName": row["supplier_name"] or "",
                     "supplierExternalOrderId": row["supplier_external_order_id"] or "",
+                    "supplierDispatchLabel": (
+                        "발주 성공"
+                        if row["supplier_external_order_id"]
+                        else "발주 실패"
+                        if row["supplier_status"] == "failed"
+                        else "전송 대기"
+                        if row["supplier_name"]
+                        else "공급사 미연결"
+                    ),
+                    "searchText": " ".join(
+                        filter(
+                            None,
+                            [
+                                str(row["order_number"] or ""),
+                                str(row["customer_name"] or ""),
+                                str(row["customer_email"] or ""),
+                                str(row["product_name_snapshot"] or ""),
+                                str(row["option_name_snapshot"] or ""),
+                                str(row["target_value"] or ""),
+                                str((parse_json(row["notes_json"], {}) or {}).get("memo") or ""),
+                                str((parse_json(row["notes_json"], {}) or {}).get("adminMemo") or ""),
+                                str(row["supplier_name"] or ""),
+                                str(row["supplier_status"] or ""),
+                                str(row["supplier_external_order_id"] or ""),
+                            ],
+                        )
+                    ).lower(),
                     "createdAt": row["created_at"],
                     "createdLabel": self._relative_date_label(row["created_at"]),
                 }
@@ -5732,13 +6245,14 @@ class PanelStore:
     def save_customer(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         customer_id = str(payload.get("id") or "").strip()
         name = str(payload.get("name") or "").strip()
-        email = str(payload.get("email") or "").strip()
+        email = self._normalize_customer_email(payload.get("email") or "")
         password = str(payload.get("password") or "")
         phone = str(payload.get("phone") or "").strip()
         tier = str(payload.get("tier") or "STANDARD").strip() or "STANDARD"
         role = str(payload.get("role") or "customer").strip() or "customer"
         notes = str(payload.get("notes") or "").strip()
         is_active = bool(payload.get("isActive", True))
+        account_status = "active" if is_active else "suspended"
 
         if not name:
             raise PanelError("고객 이름을 입력해 주세요.")
@@ -5751,6 +6265,7 @@ class PanelStore:
 
         timestamp = now_iso()
         with self._connect() as conn:
+            self._assert_available_customer_email(conn, email, exclude_user_id=customer_id)
             if customer_id:
                 row = conn.execute("SELECT * FROM users WHERE id = ?", (customer_id,)).fetchone()
                 if row is None:
@@ -5763,10 +6278,10 @@ class PanelStore:
                 conn.execute(
                     """
                     UPDATE users
-                    SET name = ?, email = ?, password_hash = ?, phone = ?, tier = ?, role = ?, avatar_label = ?, is_active = ?, notes = ?, updated_at = ?
+                    SET name = ?, email = ?, password_hash = ?, phone = ?, tier = ?, role = ?, avatar_label = ?, is_active = ?, account_status = ?, notes = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (name, email, password_hash, phone, tier, role, avatar_label(name), bool_to_int(is_active), notes, timestamp, customer_id),
+                    (name, email, password_hash, phone, tier, role, avatar_label(name), bool_to_int(is_active), account_status, notes, timestamp, customer_id),
                 )
             else:
                 customer_id = f"user_{uuid4().hex[:12]}"
@@ -5774,10 +6289,11 @@ class PanelStore:
                 conn.execute(
                     """
                     INSERT INTO users (
-                        id, name, email, password_hash, phone, tier, role, avatar_label, balance, is_active, notes, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                        id, name, email, password_hash, phone, tier, role, avatar_label, balance, is_active,
+                        account_status, notes, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
                     """,
-                    (customer_id, name, email, password_hash, phone, tier, role, avatar_label(name), bool_to_int(is_active), notes, timestamp, timestamp),
+                    (customer_id, name, email, password_hash, phone, tier, role, avatar_label(name), bool_to_int(is_active), account_status, notes, timestamp, timestamp),
                 )
             conn.commit()
         return {"customer": self._customer_by_id(customer_id)}
@@ -6286,6 +6802,24 @@ class PanelStore:
                 """,
                 (customer_id,),
             ).fetchone()
+            consent_rows = conn.execute(
+                """
+                SELECT consent_type, consent_version, is_agreed, agreed_at
+                FROM user_consents
+                WHERE user_id = ?
+                ORDER BY agreed_at DESC
+                """,
+                (customer_id,),
+            ).fetchall()
+            social_rows = conn.execute(
+                """
+                SELECT provider, provider_email, linked_at, last_login_at
+                FROM user_social_identities
+                WHERE user_id = ?
+                ORDER BY created_at ASC
+                """,
+                (customer_id,),
+            ).fetchall()
         if row is None:
             raise PanelError("고객을 찾을 수 없습니다.", status=404)
         payload = {
@@ -6299,6 +6833,11 @@ class PanelStore:
             "balance": row["balance"],
             "balanceLabel": money(row["balance"]),
             "isActive": bool(row["is_active"]),
+            "accountStatus": row["account_status"],
+            "marketingOptIn": bool(row["marketing_opt_in"]),
+            "marketingOptInAt": row["marketing_opt_in_at"],
+            "withdrawnAt": row["withdrawn_at"],
+            "suspendedReason": row["suspended_reason"],
             "hasPassword": bool(row["password_hash"]),
             "notes": row["notes"],
             "lastLoginAt": row["last_login_at"],
@@ -6307,6 +6846,24 @@ class PanelStore:
             "totalSpentLabel": money(row["total_spent"]),
             "lastOrderAt": row["last_order_at"] or "",
             "lastOrderLabel": self._relative_date_label(row["last_order_at"]) if row["last_order_at"] else "",
+            "consents": [
+                {
+                    "type": consent["consent_type"],
+                    "version": consent["consent_version"],
+                    "isAgreed": bool(consent["is_agreed"]),
+                    "agreedAt": consent["agreed_at"],
+                }
+                for consent in consent_rows
+            ],
+            "socialIdentities": [
+                {
+                    "provider": social["provider"],
+                    "providerEmail": social["provider_email"],
+                    "linkedAt": social["linked_at"],
+                    "lastLoginAt": social["last_login_at"],
+                }
+                for social in social_rows
+            ],
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }
@@ -6571,17 +7128,29 @@ class PanelStore:
                 raise PanelError("사용자를 찾을 수 없습니다.", status=404)
             balance_after = int(user["balance"]) + amount
             timestamp = now_iso()
-            tx_id = f"tx_{int(dt.datetime.now().timestamp() * 1000)}"
+            tx_id = f"tx_{uuid4().hex[:16]}"
+            payment_id = f"pay_{uuid4().hex[:12]}"
+            reference = f"PMT-{dt.datetime.now().strftime('%Y%m%d')}-{secrets.token_hex(3).upper()}"
             conn.execute("UPDATE users SET balance = ?, updated_at = ? WHERE id = ?", (balance_after, timestamp, user_id))
             conn.execute(
                 "INSERT INTO balance_transactions (id, user_id, amount, balance_after, kind, memo, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (tx_id, user_id, amount, balance_after, "charge", f"캐시 충전 {money(amount)}", timestamp),
+            )
+            conn.execute(
+                """
+                INSERT INTO payment_records (
+                    id, user_id, amount, payment_method, payment_status, reference, failure_reason, admin_adjustment_reason, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, '', '', ?, ?)
+                """,
+                (payment_id, user_id, amount, "manual_balance", "completed", reference, timestamp, timestamp),
             )
             conn.commit()
             return {
                 "ok": True,
                 "balance": balance_after,
                 "balanceLabel": money(balance_after),
+                "paymentId": payment_id,
+                "paymentReference": reference,
             }
 
     def create_order(self, payload: Dict[str, Any], user_id: str = "") -> Dict[str, Any]:
@@ -6617,7 +7186,11 @@ class PanelStore:
             if product is None:
                 raise PanelError("주문할 상품을 찾을 수 없습니다.", status=404)
 
-            rules = parse_json(product["form_structure_json"], {}).get("schema", {})
+            form_structure = ensure_request_memo_form_structure(
+                parse_json(product["form_structure_json"], {}),
+                "추가 요청사항",
+            )
+            rules = form_structure.get("schema", {})
             self._validate_fields(fields, rules)
             self._validate_product_target(product, fields, require_preview=True)
 
@@ -6655,9 +7228,10 @@ class PanelStore:
             product_data = dict(product)
 
             timestamp = now_iso()
-            order_index = conn.execute("SELECT COUNT(*) AS count FROM orders").fetchone()["count"] + 1
-            order_number = f"P24{order_index:04d}"
-            order_id = f"order_{int(dt.datetime.now().timestamp() * 1000)}"
+            order_number = generate_public_order_number()
+            while conn.execute("SELECT 1 FROM orders WHERE order_number = ? LIMIT 1", (order_number,)).fetchone() is not None:
+                order_number = generate_public_order_number()
+            order_id = f"order_{uuid4().hex[:16]}"
             target_value = (
                 str(fields.get("targetValue") or "")
                 or str(fields.get("targetUrl") or "")
@@ -6669,6 +7243,9 @@ class PanelStore:
                 for key, value in fields.items()
                 if key not in {"targetValue", "targetUrl", "targetKeyword", "orderedCount", "contactPhone"}
             }
+            request_memo = str(fields.get("requestMemo") or "").strip()
+            if request_memo:
+                notes["memo"] = request_memo
 
             balance_after = int(user["balance"]) - total_price
             conn.execute(
@@ -6700,7 +7277,7 @@ class PanelStore:
                 ),
             )
 
-            template = parse_json(product["form_structure_json"], {}).get("template", {})
+            template = form_structure.get("template", {})
             for field_index, (field_key, field_value) in enumerate(fields.items()):
                 if field_value in ("", None):
                     continue
