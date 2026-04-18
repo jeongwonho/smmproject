@@ -1,3 +1,8 @@
+import { renderAuthModalMarkup, renderAuthPageMarkup } from "./public/auth.js";
+import { renderHelpMarkup, renderLegalPageMarkup } from "./public/help.js";
+import { parseRoute } from "./shared/routes.js";
+import { createRuntimeConfig } from "./shared/runtime.js";
+
 const app = document.querySelector("#app");
 const toast = document.querySelector("#toast");
 
@@ -30,6 +35,7 @@ const state = {
     orderFilter: "all",
     bannerIndex: 0,
     loginModalOpen: false,
+    authTab: "login",
     loginRedirect: "",
     adminActiveSection: "overview",
     adminAnalyticsTab: "dashboard",
@@ -63,25 +69,7 @@ let fallbackVisitorId = "";
 let fallbackSessionId = "";
 const previewTimers = {};
 
-function readRuntimeMeta(name) {
-  return document.querySelector(`meta[name="${name}"]`)?.getAttribute("content") || "";
-}
-
-function sanitizeApiBaseUrl(value) {
-  const raw = String(value || "").trim();
-  if (!raw) return "";
-  try {
-    const parsed = new URL(raw);
-    if (!/^https?:$/.test(parsed.protocol)) return "";
-    return parsed.href.replace(/\/+$/, "");
-  } catch (_) {
-    return "";
-  }
-}
-
-const runtimeConfig = Object.freeze({
-  apiBaseUrl: sanitizeApiBaseUrl(readRuntimeMeta("smm-api-base-url") || window.__SMM_CONFIG__?.apiBaseUrl || ""),
-});
+const runtimeConfig = createRuntimeConfig(document, window);
 
 const statusMap = {
   queued: { label: "접수 대기", className: "is-queued" },
@@ -1372,19 +1360,7 @@ async function apiPost(path, payload) {
 }
 
 function getRoute() {
-  const pathname = window.location.pathname.replace(/\/+$/, "") || "/";
-  if (pathname === "/") return { name: "home" };
-  if (pathname === "/admin") return { name: "admin", section: "overview" };
-  if (pathname.startsWith("/admin/")) {
-    const sectionId = decodeURIComponent(pathname.split("/")[2] || "");
-    return { name: "admin", section: normalizeAdminSectionId(sectionId) };
-  }
-  if (pathname === "/products") return { name: "products" };
-  if (pathname.startsWith("/products/")) return { name: "detail", id: decodeURIComponent(pathname.split("/")[2]) };
-  if (pathname === "/charge") return { name: "charge" };
-  if (pathname === "/orders") return { name: "orders" };
-  if (pathname === "/my") return { name: "my" };
-  return { name: "home" };
+  return parseRoute(window.location.pathname, normalizeAdminSectionId);
 }
 
 function showLoading(message = "패널을 불러오는 중...") {
@@ -1866,6 +1842,7 @@ function scheduleLinkPreview(detail, { immediate = false } = {}) {
 function updateOrderValidation(detail) {
   const product = getSelectedProduct(detail);
   const validation = getOrderValidationState(detail, product);
+  const loggedIn = isLoggedIn();
   const note = document.querySelector("[data-order-validation-note]");
   if (note) {
     note.textContent = validation.reason || "";
@@ -1875,7 +1852,7 @@ function updateOrderValidation(detail) {
   }
   document.querySelectorAll("[data-order-submit-button]").forEach((button) => {
     button.disabled = Boolean(validation.blocked);
-    button.textContent = validation.blocked ? "주문 불가" : "주문하기";
+    button.textContent = validation.blocked ? "주문 불가" : loggedIn ? "주문하기" : "로그인 후 주문";
   });
 }
 
@@ -1908,35 +1885,36 @@ function renderFrame(content, activeKey, extraSticky = "") {
 }
 
 function renderPublicLoginModal() {
-  if (!state.ui.loginModalOpen || isLoggedIn()) return "";
-  return `
-    <div class="auth-modal-layer">
-      <button class="auth-modal-layer__backdrop" type="button" aria-label="로그인 닫기" data-public-login-close></button>
-      <div class="auth-modal">
-        <div class="auth-modal__head">
-          <span class="auth-modal__eyebrow">Member Login</span>
-          <strong>로그인 후 주문을 이어갈 수 있어요</strong>
-          <p>주문 내역, 캐시 충전, 상품 구매는 로그인된 고객 계정에서만 이용할 수 있습니다.</p>
-        </div>
-        <form class="auth-modal__form" data-public-login-form>
-          <label class="form-field">
-            <span class="field-label">이메일</span>
-            <div class="field-shell">
-              <input class="field-input" type="email" name="email" placeholder="you@example.com" autocomplete="email" />
-            </div>
-          </label>
-          <label class="form-field">
-            <span class="field-label">비밀번호</span>
-            <div class="field-shell">
-              <input class="field-input" type="password" name="password" placeholder="비밀번호 입력" autocomplete="current-password" />
-            </div>
-          </label>
-          <button class="full-width-cta auth-modal__submit" type="submit">로그인</button>
-        </form>
-        <button class="auth-modal__close" type="button" data-public-login-close>닫기</button>
+  return renderAuthModalMarkup({
+    isOpen: state.ui.loginModalOpen,
+    isLoggedIn: isLoggedIn(),
+    authTab: state.ui.authTab,
+    authConfig: state.bootstrap?.authConfig || { oauthProviders: [] },
+    legalDocuments: state.bootstrap?.legalDocuments || [],
+    escapeHtml,
+  });
+}
+
+function renderAuthPage() {
+  return renderFrame(
+    `
+      <div class="page page-auth">
+        <header class="topbar">
+          <button class="icon-button" type="button" data-route="/">‹</button>
+          <strong class="topbar-title">로그인 / 회원가입</strong>
+          <button class="icon-button" type="button" data-route="/help">?</button>
+        </header>
+        <div class="topbar-spacer"></div>
+        ${renderAuthPageMarkup({
+          authTab: state.ui.authTab,
+          authConfig: state.bootstrap?.authConfig || { oauthProviders: [] },
+          legalDocuments: state.bootstrap?.legalDocuments || [],
+          escapeHtml,
+        })}
       </div>
-    </div>
-  `;
+    `,
+    "my"
+  );
 }
 
 function renderAdminFrame(content) {
@@ -2688,17 +2666,7 @@ function renderCustomerAdminSection() {
     if (activeFilter === "inactive" && customer.isActive) return false;
     if (activeFilter !== "all" && activeFilter !== "inactive" && customer.role !== activeFilter) return false;
     if (!search) return true;
-    const haystack = [
-      customer.name,
-      customer.emailMasked,
-      customer.phoneMasked,
-      customer.tier,
-      customer.role,
-      customer.notes,
-    ]
-      .join(" ")
-      .toLowerCase();
-    return haystack.includes(search);
+    return String(customer.searchText || "").includes(search);
   });
 
   return `
@@ -2716,13 +2684,13 @@ function renderCustomerAdminSection() {
           </div>
           <div class="admin-toolbar admin-toolbar--stack">
             <div class="search-shell">
-              <input
-                class="search-input"
-                type="text"
-                value="${escapeHtml(state.ui.adminCustomerSearch)}"
-                placeholder="이름, 등급, 역할, 메모 검색"
-                data-admin-customer-search
-              />
+                <input
+                  class="search-input"
+                  type="text"
+                  value="${escapeHtml(state.ui.adminCustomerSearch)}"
+                  placeholder="이름, 이메일, 연락처, 메모 검색"
+                  data-admin-customer-search
+                />
             </div>
             <div class="filter-row">
               ${[
@@ -2781,6 +2749,53 @@ function renderCustomerAdminSection() {
           <div class="admin-subcard__head">
             <strong>${draft.id ? "계정 수정" : "새 계정 생성"}</strong>
           </div>
+          ${
+            selectedCustomer
+              ? `
+                <div class="admin-customer-detail-card">
+                  <div class="admin-customer-detail-card__row">
+                    <strong>${escapeHtml(selectedCustomer.name)}</strong>
+                    <span class="admin-badge ${selectedCustomer.isActive ? "is-success" : "is-neutral"}">${escapeHtml(selectedCustomer.accountStatus || (selectedCustomer.isActive ? "active" : "suspended"))}</span>
+                  </div>
+                  <div class="admin-customer-detail-card__grid">
+                    <article><span>이메일</span><strong>${escapeHtml(selectedCustomer.email || selectedCustomer.emailMasked || "-")}</strong></article>
+                    <article><span>연락처</span><strong>${escapeHtml(selectedCustomer.phone || selectedCustomer.phoneMasked || "-")}</strong></article>
+                    <article><span>최근 로그인</span><strong>${escapeHtml(selectedCustomer.lastLoginAt || "기록 없음")}</strong></article>
+                    <article><span>마케팅 동의</span><strong>${selectedCustomer.marketingOptIn ? "동의" : "미동의"}</strong></article>
+                  </div>
+                  ${
+                    Array.isArray(selectedCustomer.socialIdentities) && selectedCustomer.socialIdentities.length
+                      ? `
+                        <div class="admin-detail-pill-row">
+                          ${selectedCustomer.socialIdentities
+                            .map((identity) => `<span class="admin-detail-pill">${escapeHtml(identity.providerLabel || identity.provider)}</span>`)
+                            .join("")}
+                        </div>
+                      `
+                      : ""
+                  }
+                  ${
+                    Array.isArray(selectedCustomer.consents) && selectedCustomer.consents.length
+                      ? `
+                        <div class="admin-detail-list">
+                          ${selectedCustomer.consents
+                            .map(
+                              (consent) => `
+                                <article>
+                                  <strong>${escapeHtml(consent.consentLabel || consent.consentType)}</strong>
+                                  <span>${consent.isAgreed ? "동의" : "미동의"} · ${escapeHtml(consent.agreedAt || "-")} · v${escapeHtml(consent.consentVersion || "")}</span>
+                                </article>
+                              `
+                            )
+                            .join("")}
+                        </div>
+                      `
+                      : ""
+                  }
+                </div>
+              `
+              : ""
+          }
           <form class="admin-form" data-admin-customer-form>
             <label class="form-field">
               <span class="field-label">이름</span>
@@ -3262,20 +3277,7 @@ function renderAdminOrdersSection() {
   const filteredOrders = activeFilter === "all" ? adminOrders : adminOrders.filter((order) => order.status === activeFilter);
   const visibleOrders = filteredOrders.filter((order) => {
     if (!search) return true;
-    const haystack = [
-      order.orderNumber,
-      order.customerName,
-      order.customerEmailMasked,
-      order.productName,
-      order.optionName,
-      order.targetValue,
-      order.supplierName,
-      order.supplierStatus,
-      order.notes?.adminMemo || "",
-    ]
-      .join(" ")
-      .toLowerCase();
-    return haystack.includes(search);
+    return String(order.searchText || "").includes(search);
   });
 
   return `
@@ -3334,9 +3336,21 @@ function renderAdminOrdersSection() {
                   <span>${escapeHtml(order.orderNumber)}</span>
                   <span>${escapeHtml(order.totalPriceLabel)}</span>
                   <span>${escapeHtml(order.createdLabel)}</span>
-                  ${order.supplierName ? `<span>${escapeHtml(order.supplierName)} / ${escapeHtml(order.supplierStatus || "미전송")}</span>` : ""}
+                  ${order.supplierName ? `<span>${escapeHtml(order.supplierName)} / ${escapeHtml(order.supplierDispatchLabel || order.supplierStatus || "미전송")}</span>` : ""}
                 </div>
                 <p class="order-card__target">${escapeHtml(order.targetValue || "입력값 없음")}</p>
+                <div class="admin-order-callout-grid">
+                  <article class="admin-mini-card">
+                    <span>공급사 전송</span>
+                    <strong>${escapeHtml(order.supplierDispatchLabel || "공급사 미연결")}</strong>
+                    <p>${escapeHtml(order.supplierExternalOrderId || order.supplierStatus || "외부 주문번호 없음")}</p>
+                  </article>
+                  <article class="admin-mini-card">
+                    <span>고객 요청 메모</span>
+                    <strong>${escapeHtml(order.notes?.memo || "없음")}</strong>
+                    <p>${escapeHtml(order.optionName || "기본 옵션")}</p>
+                  </article>
+                </div>
                 <form class="admin-order-form" data-admin-order-status-form>
                   <input type="hidden" name="orderId" value="${escapeHtml(order.id)}" />
                   <div class="admin-three-column">
@@ -3444,9 +3458,9 @@ function renderAdminAuth() {
 }
 
 function renderAdminErpHeader(stats = {}, popup = null) {
-  const sections = adminSectionItems(stats, popup);
   const username = state.adminSession?.username || "admin";
   const siteName = getAdminSiteSettings()?.siteName || state.bootstrap?.siteSettings?.siteName || "Pulse24";
+  const activeSection = getAdminSectionConfig();
 
   return `
     <header class="admin-erp-header">
@@ -3458,22 +3472,10 @@ function renderAdminErpHeader(stats = {}, popup = null) {
         </div>
       </div>
 
-      <nav class="admin-erp-tabs">
-        ${sections
-          .map(
-            (section) => `
-              <button
-                class="admin-erp-tab ${state.ui.adminActiveSection === section.id ? "is-active" : ""}"
-                type="button"
-                data-admin-scroll-section="${section.id}"
-              >
-                <span>${escapeHtml(section.label)}</span>
-                <small>${escapeHtml(section.stat || "")}</small>
-              </button>
-            `
-          )
-          .join("")}
-      </nav>
+      <div class="admin-erp-header__summary">
+        <strong>${escapeHtml(activeSection.label)}</strong>
+        <p>${escapeHtml(activeSection.summary)}</p>
+      </div>
 
       <div class="admin-erp-header__right">
         <div class="admin-erp-user">
@@ -4590,6 +4592,27 @@ function renderSupplierAdminSection({
 
       <main class="admin-main">
         <section class="admin-card">
+          <div class="admin-step-strip">
+            ${[
+              ["1. 연결 확인", Boolean(activeConnection?.resolvedApiUrl || selectedSupplier?.lastCheckedAt), "공급사 인증 정보와 응답 상태를 먼저 검증합니다."],
+              ["2. 서비스 동기화", Boolean(allServices.length), "실제 공급사 서비스 목록을 불러와 내부에서 검색 가능하게 만듭니다."],
+              ["3. 서비스 선택", Boolean(selectedService), "연동할 공급사 서비스를 선택하고 호출 예시를 검토합니다."],
+              ["4. 내부 상품 매핑", Boolean(selectedProduct?.mapping), "실제 판매 상품과 공급사 서비스를 연결해 주문 발주를 준비합니다."],
+            ]
+              .map(
+                ([label, done, description]) => `
+                  <article class="admin-step-card ${done ? "is-complete" : ""}">
+                    <strong>${escapeHtml(String(label))}</strong>
+                    <p>${escapeHtml(String(description))}</p>
+                    <span>${done ? "완료" : "대기"}</span>
+                  </article>
+                `
+              )
+              .join("")}
+          </div>
+        </section>
+
+        <section class="admin-card">
           <div class="section-head section-head--compact">
             <h2>API 연결 상태</h2>
             <p>${escapeHtml(integrationGuide.status)}</p>
@@ -4653,22 +4676,27 @@ function renderSupplierAdminSection({
           ${
             filteredServices.length
               ? `
-                <label class="form-field">
-                  <span class="field-label">동기화된 서비스 선택</span>
-                  <div class="field-shell field-shell--selectbox">
-                    <select class="field-select admin-service-selectbox" size="14" data-admin-service-select-box>
-                      ${filteredServices
-                        .map(
-                          (service) => `
-                            <option value="${escapeHtml(service.id)}" ${state.ui.adminSelectedSupplierServiceId === service.id ? "selected" : ""}>
-                              ${escapeHtml(`${service.category || "분류 없음"} | ${service.name} (#${service.externalServiceId}) | ${service.minAmount}~${service.maxAmount}`)}
-                            </option>
-                          `
-                        )
-                        .join("")}
-                    </select>
-                  </div>
-                </label>
+                <div class="admin-service-browser">
+                  ${filteredServices
+                    .slice(0, 120)
+                    .map(
+                      (service) => `
+                        <button
+                          class="admin-service-row ${state.ui.adminSelectedSupplierServiceId === service.id ? "is-active" : ""}"
+                          type="button"
+                          data-admin-service-select="${service.id}"
+                        >
+                          <div>
+                            <strong>${escapeHtml(service.name)}</strong>
+                            <p>${escapeHtml(service.category || "분류 없음")} · #${escapeHtml(service.externalServiceId)} · ${escapeHtml(String(service.minAmount || 0))}~${escapeHtml(String(service.maxAmount || 0))}</p>
+                          </div>
+                          <span>${escapeHtml(service.rateLabel)}</span>
+                        </button>
+                      `
+                    )
+                    .join("")}
+                </div>
+                ${filteredServices.length > 120 ? `<p class="admin-inline-note">표시 성능을 위해 상위 120개만 먼저 노출합니다. 검색어를 더 구체화하면 원하는 서비스를 빠르게 좁힐 수 있습니다.</p>` : ""}
                 ${
                   selectedService
                     ? `
@@ -4853,7 +4881,6 @@ function renderAdmin() {
     <div class="admin-erp-shell">
       ${renderAdminErpHeader(stats, popup)}
       <div class="admin-erp-body">
-        ${renderAdminErpIconRail(stats, popup)}
         ${renderAdminErpSidebar(stats, popup)}
         <main class="admin-erp-main">
           ${renderAdminModuleHeader(activeSection.id)}
@@ -4922,9 +4949,13 @@ function renderHome() {
     state.ui.bannerIndex = safeBannerIndex;
   }
   const topBanner = activeBanners[0] || null;
-  const quickLinks = data.topLinks?.length ? data.topLinks : [{ label: "서비스 소개서", route: "/products" }, { label: "이용 가이드", route: "/my" }];
-  const counterValueA = authenticated ? formatCompactNumber(user?.balance || 0) : "0";
-  const counterValueB = authenticated ? formatNumber(state.orderCounts.all || 0) : "0";
+  const quickLinks = data.topLinks?.length ? data.topLinks : [{ label: "서비스 소개서", route: "/products" }, { label: "이용 가이드", route: "/help" }];
+  const counterA = authenticated
+    ? { label: "보유 캐시", value: user?.balanceLabel || "0원" }
+    : { label: "등록 상품", value: `${formatNumber(data.heroStats?.[1]?.value?.replace(/[^\d]/g, "") || 0)}개` };
+  const counterB = authenticated
+    ? { label: "누적 주문", value: `${formatNumber(state.orderCounts.all || 0)}건` }
+    : { label: "고객 지원", value: `${formatNumber((data.supportLinks || []).length)}개 안내` };
 
   return renderFrame(
     `
@@ -4950,7 +4981,7 @@ function renderHome() {
             <button
               class="home-login-card ${authenticated ? "is-authenticated" : ""}"
               type="button"
-              ${authenticated ? 'data-route="/my"' : "data-public-login-open"}
+              ${authenticated ? 'data-route="/my"' : 'data-route="/auth"'}
             >
               <div class="home-login-card__copy">
                 <strong>${escapeHtml(authenticated ? `${user.name}님, 바로 주문할까요?` : "로그인이 필요해요")}</strong>
@@ -4960,12 +4991,12 @@ function renderHome() {
             </button>
             <div class="home-hero__counters">
               <div class="home-hero__counter">
-                <strong>${escapeHtml(counterValueA)}</strong>
-                <span>M</span>
+                <strong>${escapeHtml(counterA.value)}</strong>
+                <span>${escapeHtml(counterA.label)}</span>
               </div>
               <div class="home-hero__counter">
-                <strong>${escapeHtml(counterValueB)}</strong>
-                <span>P</span>
+                <strong>${escapeHtml(counterB.value)}</strong>
+                <span>${escapeHtml(counterB.label)}</span>
               </div>
             </div>
           </div>
@@ -5083,7 +5114,7 @@ function renderHome() {
           <div class="home-section-grid__side">
             <div class="section-head">
               <h2>빠른 안내</h2>
-              <p>상담, 공지, FAQ를 홈에서 바로 확인할 수 있습니다.</p>
+              <p>로그인 없이도 FAQ, 공지, 이용 가이드를 바로 확인할 수 있습니다.</p>
             </div>
             <div class="support-grid support-grid--compact">
               ${data.supportLinks
@@ -5223,7 +5254,7 @@ function renderLoginRequiredPage(title, description, activeKey = "home") {
           <span class="empty-card__eyebrow">로그인 필요</span>
           <strong>${escapeHtml(title)}</strong>
           <p>${escapeHtml(description)}</p>
-          <button class="full-width-cta" type="button" data-public-login-open>로그인하기</button>
+          <button class="full-width-cta" type="button" data-route="/auth">로그인 / 회원가입</button>
           <button class="ghost-secondary-button" type="button" data-route="/products">서비스 둘러보기</button>
         </section>
       </div>
@@ -5383,6 +5414,23 @@ function renderDetail(detail) {
         }
 
         <section class="content-section">
+          <div class="detail-trust-row">
+            <article class="info-card">
+              <strong>판매가</strong>
+              <p>${escapeHtml(selectedProduct?.priceLabel || "0원")} ${selectedProduct?.priceStrategy === "fixed" ? "패키지" : `· 최소 ${formatNumber(selectedProduct?.minAmount || 0)}${escapeHtml(selectedProduct?.unitLabel || "개")}`}</p>
+            </article>
+            <article class="info-card">
+              <strong>예상 소요시간</strong>
+              <p>${escapeHtml(selectedProduct?.estimatedTurnaround || "상품별 상이 · 주문 후 순차 진행")}</p>
+            </article>
+            <article class="info-card">
+              <strong>핵심 정책</strong>
+              <p>${escapeHtml(detail.refundNotice?.[0] || "작업 시작 후 환불·취소 기준은 상품 정책을 따릅니다.")}</p>
+            </article>
+          </div>
+        </section>
+
+        <section class="content-section">
           <div class="section-head section-head--compact">
             <h2>주문 폼</h2>
             <p>${escapeHtml(detail.description)}</p>
@@ -5391,7 +5439,6 @@ function renderDetail(detail) {
             <div class="detail-form-layout ${previewSource ? "has-preview" : ""}">
               <div class="detail-form-layout__fields">
                 ${Object.entries(template)
-                  .filter(([key]) => key !== "requestMemo")
                   .map(([key, entry]) => renderField(key, entry, rules[key], values))
                   .join("")}
 
@@ -5410,7 +5457,7 @@ function renderDetail(detail) {
                   </div>
                 </div>
                 <p class="order-validation-note ${orderValidation.blocked ? "is-blocked" : ""}" data-order-validation-note ${orderValidation.reason ? "" : "hidden"}>
-                  ${escapeHtml(orderValidation.reason || "")}
+                  ${escapeHtml(orderValidation.blocked ? `현재 주문이 막힌 이유: ${orderValidation.reason || ""}` : orderValidation.reason || "")}
                 </p>
               </div>
 
@@ -5493,6 +5540,8 @@ function renderDetail(detail) {
 function renderCharge() {
   const user = state.bootstrap?.user;
   const quickAmounts = [30000, 50000, 100000, 300000];
+  const chargeConfig = state.bootstrap?.chargeConfig || { methods: [], policyHighlights: [] };
+  const transactions = state.transactions || [];
 
   return renderFrame(
     `
@@ -5505,15 +5554,15 @@ function renderCharge() {
         <div class="topbar-spacer"></div>
 
         <section class="wallet-board">
-          <p class="wallet-board__eyebrow">${escapeHtml(user?.name || "데모 사용자")}</p>
+          <p class="wallet-board__eyebrow">${escapeHtml(user?.name || "고객")}</p>
           <strong>${escapeHtml(user?.balanceLabel || "0원")}</strong>
-          <span>상품 주문 시 자동 차감되는 데모 캐시입니다.</span>
+          <span>충전 완료 후 주문 결제 시 자동 차감됩니다.</span>
         </section>
 
         <section class="content-section">
           <div class="section-head">
-            <h2>빠른 충전</h2>
-            <p>충전 버튼을 누르면 즉시 데모 잔액에 반영됩니다.</p>
+            <h2>충전 금액 선택</h2>
+            <p>현재는 운영 확인형 충전 구조입니다. 이후 PG 연동 시에도 동일한 결제 상태 모델을 그대로 사용할 수 있게 설계했습니다.</p>
           </div>
           <div class="charge-grid">
             ${quickAmounts
@@ -5530,17 +5579,41 @@ function renderCharge() {
 
         <section class="content-section">
           <div class="section-head">
+            <h2>결제수단 안내</h2>
+            <p>결제 방식별 확인 절차와 반영 흐름을 미리 안내합니다.</p>
+          </div>
+          <div class="guide-list">
+            ${(chargeConfig.methods || [])
+              .map(
+                (method) => `
+                  <article class="guide-card">
+                    <strong>${escapeHtml(method.label)}</strong>
+                    <p>${escapeHtml(method.description)}</p>
+                  </article>
+                `
+              )
+              .join("")}
+          </div>
+        </section>
+
+        <section class="content-section">
+          <div class="section-head">
             <h2>거래 내역</h2>
-            <p>주문 차감과 캐시 충전 내역을 한 화면에서 확인할 수 있어요.</p>
+            <p>충전, 주문 차감, 관리자 조정 내역을 시간순으로 확인할 수 있습니다.</p>
           </div>
           <div class="transaction-list">
-            ${state.transactions
-              .map(
+            ${transactions.length
+              ? transactions
+                  .map(
                 (tx) => `
                   <article class="transaction-card">
                     <div>
                       <strong>${escapeHtml(tx.memo)}</strong>
                       <p>${escapeHtml(tx.createdLabel)}</p>
+                      <p class="transaction-card__submeta">
+                        ${escapeHtml(tx.paymentMethodLabel || "거래")} · ${escapeHtml(tx.paymentStatusLabel || "완료")}
+                        ${tx.reference ? ` · ${escapeHtml(tx.reference)}` : ""}
+                      </p>
                     </div>
                     <div class="transaction-card__amount ${tx.amount > 0 ? "is-positive" : "is-negative"}">
                       <strong>${escapeHtml(tx.amountLabel)}</strong>
@@ -5549,6 +5622,20 @@ function renderCharge() {
                   </article>
                 `
               )
+                  .join("")
+              : `
+                <article class="empty-card">
+                  <strong>아직 거래 내역이 없습니다.</strong>
+                  <p>첫 충전이 완료되면 결제 상태와 참조번호가 이 영역에 누적됩니다.</p>
+                </article>
+              `}
+          </div>
+        </section>
+
+        <section class="content-section footer-section">
+          <div class="guide-list">
+            ${(chargeConfig.policyHighlights || [])
+              .map((item) => `<article class="guide-card"><p>${escapeHtml(item)}</p></article>`)
               .join("")}
           </div>
         </section>
@@ -5598,33 +5685,41 @@ function renderOrders() {
 
         <section class="content-section">
           <div class="order-list">
-            ${visibleOrders
-              .map((order) => {
-                const status = statusMap[order.status] || statusMap.queued;
-                return `
-                  <article class="order-card">
-                    <div class="order-card__top">
-                      <div>
-                        <span class="order-card__platform">${escapeHtml(order.platformIcon)} ${escapeHtml(order.platformName)}</span>
-                        <strong>${escapeHtml(order.productName)}</strong>
-                      </div>
-                      <span class="status-pill ${status.className}">${escapeHtml(status.label)}</span>
-                    </div>
-                    <p class="order-card__target">${escapeHtml(order.targetValue || "입력 정보 없음")}</p>
-                    <div class="order-card__meta">
-                      <span>${escapeHtml(order.optionName || "기본 옵션")}</span>
-                      <span>${escapeHtml(order.totalPriceLabel)}</span>
-                      <span>${escapeHtml(order.createdLabel)}</span>
-                    </div>
-                    ${
-                      order.notes.memo
-                        ? `<div class="order-card__note">메모: ${escapeHtml(order.notes.memo)}</div>`
-                        : ""
-                    }
-                  </article>
-                `;
-              })
-              .join("")}
+            ${visibleOrders.length
+              ? visibleOrders
+                  .map((order) => {
+                    const status = statusMap[order.status] || statusMap.queued;
+                    return `
+                      <article class="order-card">
+                        <div class="order-card__top">
+                          <div>
+                            <span class="order-card__platform">${escapeHtml(order.platformIcon)} ${escapeHtml(order.platformName)}</span>
+                            <strong>${escapeHtml(order.productName)}</strong>
+                          </div>
+                          <span class="status-pill ${status.className}">${escapeHtml(status.label)}</span>
+                        </div>
+                        <p class="order-card__target">${escapeHtml(order.targetValue || "입력 정보 없음")}</p>
+                        <div class="order-card__meta">
+                          <span>${escapeHtml(order.optionName || "기본 옵션")}</span>
+                          <span>${escapeHtml(order.totalPriceLabel)}</span>
+                          <span>${escapeHtml(order.createdLabel)}</span>
+                        </div>
+                        ${
+                          order.notes.memo
+                            ? `<div class="order-card__note">요청 메모: ${escapeHtml(order.notes.memo)}</div>`
+                            : ""
+                        }
+                      </article>
+                    `;
+                  })
+                  .join("")
+              : `
+                <article class="empty-card">
+                  <strong>${activeFilter === "all" ? "주문 내역이 아직 없습니다." : "이 상태의 주문이 없습니다."}</strong>
+                  <p>서비스를 탐색한 뒤 첫 주문을 생성하거나, 필터를 바꿔 다른 상태의 주문을 확인해 주세요.</p>
+                  <button class="full-width-cta" type="button" data-route="/products">서비스 둘러보기</button>
+                </article>
+              `}
           </div>
         </section>
       </div>
@@ -5656,109 +5751,64 @@ function renderMy() {
 
         <section class="content-section">
           <div class="section-head">
-            <h2>도움말 바로가기</h2>
-            <p>레퍼런스 홈에서 이어지는 FAQ/공지/상담/가이드 흐름을 한곳에 모았습니다.</p>
+            <h2>계정 요약</h2>
+            <p>주문, 충전, 계정 상태를 한 곳에서 확인합니다.</p>
           </div>
-          <div class="support-grid">
-            ${data.supportLinks
-              .map(
-                (item) => `
-                  <button class="support-card" type="button" data-route="${item.route}">
-                    <span class="support-card__icon">${escapeHtml(item.icon)}</span>
-                    <strong>${escapeHtml(item.title)}</strong>
-                    <p>${escapeHtml(item.subtitle)}</p>
-                  </button>
-                `
-              )
-              .join("")}
-          </div>
-        </section>
-
-        <section class="content-section">
-          <div class="section-head">
-            <h2>공지사항</h2>
-          </div>
-          <div class="notice-list">
-            ${data.notices
-              .map(
-                (notice) => `
-                  <article class="notice-card">
-                    <div class="notice-card__top">
-                      <span class="mini-badge">${escapeHtml(notice.tag)}</span>
-                      <span>${escapeHtml(notice.publishedLabel)}</span>
-                    </div>
-                    <strong>${escapeHtml(notice.title)}</strong>
-                    <p>${escapeHtml(notice.body)}</p>
-                  </article>
-                `
-              )
-              .join("")}
+          <div class="support-grid support-grid--account">
+            <article class="support-card">
+              <span class="support-card__icon">₩</span>
+              <strong>보유 잔액</strong>
+              <p>${escapeHtml(data.user.balanceLabel)}</p>
+            </article>
+            <article class="support-card">
+              <span class="support-card__icon">◎</span>
+              <strong>누적 주문</strong>
+              <p>${escapeHtml(formatNumber(state.orderCounts.all || 0))}건</p>
+            </article>
+            <button class="support-card" type="button" data-route="/orders">
+              <span class="support-card__icon">→</span>
+              <strong>주문 내역 보기</strong>
+              <p>진행 상태, 주문 메모, 결제 금액을 확인합니다.</p>
+            </button>
+            <button class="support-card" type="button" data-route="/help">
+              <span class="support-card__icon">?</span>
+              <strong>도움말 허브</strong>
+              <p>FAQ, 공지, 이용 가이드, 상담 안내로 이동합니다.</p>
+            </button>
           </div>
         </section>
 
         <section class="content-section">
           <div class="section-head">
-            <h2>FAQ</h2>
-          </div>
-          <div class="faq-list">
-            ${data.faqs
-              .map(
-                (faq) => `
-                  <details class="faq-item">
-                    <summary>${escapeHtml(faq.question)}</summary>
-                    <p>${escapeHtml(faq.answer)}</p>
-                  </details>
-                `
-              )
-              .join("")}
-          </div>
-        </section>
-
-        <section class="content-section">
-          <div class="section-head">
-            <h2>이용 가이드</h2>
-            <p>홈 → 주문 탭 → 상품 상세 → 충전/주문 → 내역 확인 흐름으로 설계되어 있습니다.</p>
+            <h2>계정/주문 안내</h2>
+            <p>로그인 계정 기준으로만 잔액과 주문 내역이 관리됩니다.</p>
           </div>
           <div class="guide-list">
-            <article class="guide-card"><strong>1. 홈에서 진입</strong><p>배너, 관심 태그, 추천 카드에서 원하는 상품으로 빠르게 이동합니다.</p></article>
-            <article class="guide-card"><strong>2. 상품 구조 탐색</strong><p>좌측 플랫폼 레일과 우측 카드 리스트로 카탈로그를 빠르게 훑습니다.</p></article>
-            <article class="guide-card"><strong>3. 주문 폼 입력</strong><p>상품 유형에 따라 계정형, URL형, 키워드형 폼을 다르게 렌더링합니다.</p></article>
-            <article class="guide-card"><strong>4. 충전과 주문 내역</strong><p>캐시 충전과 주문 상태 조회가 각각 독립된 화면으로 이어집니다.</p></article>
-          </div>
-        </section>
-
-        <section class="content-section">
-          <div class="section-head">
-            <h2>운영 바로가기</h2>
-            <p>고객, 상품, 주문, 공급사 관리를 한 번에 처리하는 관리자 화면으로 바로 이동합니다.</p>
-          </div>
-          <div class="support-grid">
-            ${[
-              ["고객 관리", "계정 생성, 역할 변경, 잔액 조정까지 한 화면에서 운영합니다."],
-              ["상품 관리", "카테고리 생성과 상품 등록, 편집, 숨김 처리를 바로 진행합니다."],
-              ["주문 운영", "최근 주문 상태와 내부 메모를 수동으로 관리합니다."],
-              ["공급사 연동", "외부 API 연결 확인과 서비스 동기화, 상품 매핑을 설정합니다."],
-            ]
-              .map(
-                ([title, subtitle]) => `
-                  <button class="support-card" type="button" data-route="/admin">
-                    <span class="support-card__icon">→</span>
-                    <strong>${escapeHtml(title)}</strong>
-                    <p>${escapeHtml(subtitle)}</p>
-                  </button>
-                `
-              )
-              .join("")}
+            <article class="guide-card"><strong>주문 전</strong><p>플랫폼 링크 형식과 계정 공개 여부를 먼저 확인해 주세요.</p></article>
+            <article class="guide-card"><strong>충전 후 주문</strong><p>충전 반영 후 상품 상세에서 바로 주문을 진행할 수 있습니다.</p></article>
+            <article class="guide-card"><strong>정책 확인</strong><p>환불·리필·작업 지연 기준은 도움말 허브와 상품 상세에서 확인합니다.</p></article>
           </div>
         </section>
 
         <section class="content-section footer-section">
-          <button class="full-width-cta" type="button" data-route="/admin">운영 관리자 열기</button>
+          <button class="full-width-cta" type="button" data-route="/help">도움말 허브로 이동</button>
         </section>
       </div>
     `,
     "my"
   );
+}
+
+function renderHelp() {
+  return renderFrame(renderHelpMarkup({ data: state.bootstrap, escapeHtml }), "home");
+}
+
+function renderLegalPage(documentKey) {
+  const documentItem = (state.bootstrap?.legalDocuments || []).find((item) => item.key === documentKey);
+  if (!documentItem) {
+    return renderNotFound("약관 또는 정책 문서를 찾지 못했습니다.");
+  }
+  return renderFrame(renderLegalPageMarkup({ documentItem, escapeHtml }), "home");
 }
 
 function renderNotFound(message) {
@@ -5818,6 +5868,10 @@ async function renderRoute() {
         await ensureCategory(route.id);
       }
     }
+    if (isLoggedIn() && route.name === "auth") {
+      navigate(state.ui.loginRedirect || "/my");
+      return;
+    }
     if (!isLoggedIn() && ["charge", "orders", "my"].includes(route.name)) {
       const descriptions = {
         charge: "충전과 거래 내역은 로그인된 고객 계정에서만 확인할 수 있습니다.",
@@ -5830,8 +5884,14 @@ async function renderRoute() {
 
     if (route.name === "home") {
       app.innerHTML = renderHome();
+    } else if (route.name === "auth") {
+      app.innerHTML = renderAuthPage();
     } else if (route.name === "admin") {
       app.innerHTML = renderAdmin();
+    } else if (route.name === "help") {
+      app.innerHTML = renderHelp();
+    } else if (route.name === "legal") {
+      app.innerHTML = renderLegalPage(route.documentKey);
     } else if (route.name === "products") {
       app.innerHTML = renderProducts();
     } else if (route.name === "detail") {
@@ -5857,6 +5917,7 @@ async function renderRoute() {
     }
 
     updateLiveSummary();
+    scrollToActiveHash();
     if (route.name === "detail" && route.id && state.categoryCache[route.id]) {
       scheduleLinkPreview(state.categoryCache[route.id], { immediate: true });
     }
@@ -6056,6 +6117,9 @@ function analyticsSessionId() {
 
 function analyticsPageLabel(route) {
   if (route.name === "home") return "홈";
+  if (route.name === "auth") return "로그인 / 회원가입";
+  if (route.name === "help") return "도움말 허브";
+  if (route.name === "legal") return "약관/정책";
   if (route.name === "products") return "상품 목록";
   if (route.name === "charge") return "충전";
   if (route.name === "orders") return "주문 내역";
@@ -6098,13 +6162,21 @@ function trackPublicRoute(route) {
 
 function openLoginModal(redirectPath = "") {
   state.ui.loginRedirect = redirectPath || window.location.pathname || "/";
+  state.ui.authTab = "login";
   state.ui.loginModalOpen = true;
   renderRoute();
 }
 
 function closeLoginModal() {
   state.ui.loginModalOpen = false;
+  state.ui.authTab = "login";
   state.ui.loginRedirect = "";
+}
+
+function postAuthRedirectPath() {
+  const candidate = state.ui.loginRedirect || "";
+  if (candidate && candidate !== "/auth") return candidate;
+  return "/";
 }
 
 function requiresUserAuthPath(path) {
@@ -6117,13 +6189,27 @@ function navigate(path, { push = true } = {}) {
     return;
   }
   if (requiresUserAuthPath(path) && !isLoggedIn()) {
-    openLoginModal(path);
+    state.ui.loginRedirect = path;
+    if (push) {
+      window.history.pushState({}, "", "/auth");
+    }
+    renderRoute();
     return;
   }
   if (push) {
     window.history.pushState({}, "", path);
   }
   renderRoute();
+}
+
+function scrollToActiveHash() {
+  const hash = String(window.location.hash || "").trim();
+  if (!hash) return;
+  const target = document.querySelector(hash);
+  if (!(target instanceof HTMLElement)) return;
+  window.requestAnimationFrame(() => {
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
 }
 
 function ensureBannerTimer() {
@@ -6164,6 +6250,25 @@ async function applyAdminSiteSettingsImage(kind, file) {
 }
 
 document.addEventListener("click", async (event) => {
+  const authTabButton = event.target.closest("[data-auth-tab]");
+  if (authTabButton) {
+    state.ui.authTab = authTabButton.getAttribute("data-auth-tab") || "login";
+    renderRoute();
+    return;
+  }
+
+  const oauthProviderButton = event.target.closest("[data-oauth-provider]");
+  if (oauthProviderButton) {
+    const provider = oauthProviderButton.getAttribute("data-oauth-provider") || "";
+    const providerConfig = (state.bootstrap?.authConfig?.oauthProviders || []).find((item) => item.provider === provider);
+    if (!providerConfig?.enabled) {
+      showToast(`${providerConfig?.label || provider} 연동은 환경변수 설정 후 활성화됩니다.`, "error");
+      return;
+    }
+    navigate(providerConfig.startPath);
+    return;
+  }
+
   const publicLoginOpenButton = event.target.closest("[data-public-login-open]");
   if (publicLoginOpenButton) {
     openLoginModal(window.location.pathname || "/");
@@ -6934,7 +7039,7 @@ document.addEventListener("submit", async (event) => {
     event.preventDefault();
     const formData = new FormData(form);
     try {
-      const redirectPath = state.ui.loginRedirect || window.location.pathname || "/";
+      const redirectPath = postAuthRedirectPath();
       const result = await apiPost("/api/login", {
         email: formData.get("email"),
         password: formData.get("password"),
@@ -6950,6 +7055,35 @@ document.addEventListener("submit", async (event) => {
       showToast("로그인되었습니다.");
     } catch (error) {
       showToast(error.message || "로그인에 실패했습니다.", "error");
+    }
+    return;
+  }
+  if (form.matches("[data-public-signup-form]")) {
+    event.preventDefault();
+    const formData = new FormData(form);
+    try {
+      const redirectPath = postAuthRedirectPath();
+      const result = await apiPost("/api/signup", {
+        email: formData.get("email"),
+        name: formData.get("name"),
+        password: formData.get("password"),
+        passwordConfirmation: formData.get("passwordConfirmation"),
+        termsAgreed: formData.get("termsAgreed") === "on",
+        privacyAgreed: formData.get("privacyAgreed") === "on",
+        ageConfirmed: formData.get("ageConfirmed") === "on",
+        marketingAgreed: formData.get("marketingAgreed") === "on",
+      });
+      state.publicCsrfToken = result.csrfToken || "";
+      closeLoginModal();
+      await refreshCoreData();
+      if (redirectPath && redirectPath !== window.location.pathname) {
+        navigate(redirectPath);
+        return;
+      }
+      renderRoute();
+      showToast("회원가입이 완료되었습니다.");
+    } catch (error) {
+      showToast(error.message || "회원가입에 실패했습니다.", "error");
     }
     return;
   }
@@ -7263,7 +7397,8 @@ document.addEventListener("submit", async (event) => {
   const route = getRoute();
   if (route.name !== "detail") return;
   if (!isLoggedIn()) {
-    openLoginModal(window.location.pathname || "/");
+    state.ui.loginRedirect = window.location.pathname || "/products";
+    navigate("/auth");
     showToast("주문하려면 먼저 로그인해 주세요.", "error");
     return;
   }

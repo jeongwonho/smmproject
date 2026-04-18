@@ -62,6 +62,24 @@ def normalize_public_url(value: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}{path}"
 
 
+def runtime_mode() -> str:
+    return str(
+        os.environ.get("SMM_PANEL_ENV")
+        or os.environ.get("APP_ENV")
+        or os.environ.get("NODE_ENV")
+        or ""
+    ).strip().lower()
+
+
+def is_dev_runtime() -> bool:
+    mode = runtime_mode()
+    if mode in {"dev", "development", "demo", "local", "test"}:
+        return True
+    if mode in {"prod", "production", "live"}:
+        return False
+    return not bool(os.environ.get("VERCEL"))
+
+
 def parse_origins(raw_value: str) -> tuple[str, ...]:
     origins: list[str] = []
     for candidate in str(raw_value or "").split(","):
@@ -84,6 +102,11 @@ def resolve_session_secret() -> str:
     direct_secret = str(os.environ.get("SMM_PANEL_SESSION_SECRET", "")).strip()
     if direct_secret:
         return direct_secret
+    if not is_dev_runtime():
+        raise RuntimeError(
+            "SMM_PANEL_SESSION_SECRET is required in production-like environments. "
+            "Set a strong random secret before starting the server."
+        )
     derived_parts = [
         str(os.environ.get("SMM_PANEL_ADMIN_PASSWORD", "")).strip(),
         str(os.environ.get("SMM_PANEL_DATABASE_URL", "")).strip(),
@@ -433,7 +456,7 @@ def render_index_html(store: PanelStore, request_path: str, config: AppConfig) -
 
     head_markup = "\n    ".join(head_parts)
     title_markup = f"<title>{html.escape(title)}</title>"
-    document = template.replace("<title>Pulse24 Demo Panel</title>", title_markup)
+    document = template.replace("<title>Pulse24 Panel</title>", title_markup)
     document = document.replace(
         '<meta name="smm-api-base-url" content="" data-managed-runtime="api-base" />',
         f'<meta name="smm-api-base-url" content="{html.escape(config.public_api_base_url, quote=True)}" data-managed-runtime="api-base" />',
@@ -726,7 +749,7 @@ class AppHandler(SimpleHTTPRequestHandler):
         self._request_path = parsed.path
         try:
             if parsed.path == "/api/health":
-                write_json(self, 200, {"ok": True, "service": "Pulse24 Demo Panel"})
+                write_json(self, 200, {"ok": True, "service": "Pulse24 Panel"})
                 return
             if parsed.path == "/robots.txt":
                 write_text(self, 200, ROBOTS_TXT)
@@ -743,6 +766,12 @@ class AppHandler(SimpleHTTPRequestHandler):
                 payload["viewer"] = self._public_session_payload()
                 write_json(self, 200, {"ok": True, **payload})
                 return
+            if parsed.path.startswith("/api/auth/oauth/") and parsed.path.endswith("/start"):
+                provider = parsed.path.split("/")[4]
+                raise PanelError(
+                    f"{provider} OAuth는 환경변수 설정 후 활성화됩니다. 현재는 구조만 준비된 상태입니다.",
+                    status=503,
+                )
             if parsed.path.startswith("/api/admin/"):
                 self._require_admin_auth()
             if parsed.path == "/api/admin/bootstrap":
@@ -823,6 +852,32 @@ class AppHandler(SimpleHTTPRequestHandler):
                 email = str(payload.get("email") or "").strip()
                 password = str(payload.get("password") or "")
                 user = self._server().store.authenticate_public_user(email, password)
+                token = self._server().user_sessions.create_session(user["id"])
+                session = self._server().user_sessions.get_session(token) or {}
+                write_json(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        "authenticated": True,
+                        "csrfToken": session.get("csrf_token", ""),
+                        "user": user,
+                    },
+                    extra_headers=[
+                        (
+                            "Set-Cookie",
+                            self._cookie_header(
+                                PUBLIC_SESSION_COOKIE,
+                                token,
+                                PUBLIC_SESSION_TTL_SECONDS,
+                                self._config().public_cookie_samesite,
+                            ),
+                        )
+                    ],
+                )
+                return
+            if parsed.path == "/api/signup":
+                user = self._server().store.register_public_user(payload)
                 token = self._server().user_sessions.create_session(user["id"])
                 session = self._server().user_sessions.get_session(token) or {}
                 write_json(
@@ -1022,7 +1077,7 @@ class AppHandler(SimpleHTTPRequestHandler):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Pulse24 demo SMM panel")
+    parser = argparse.ArgumentParser(description="Pulse24 SMM panel")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     return parser.parse_args()
@@ -1038,7 +1093,7 @@ def main() -> None:
     rate_limiter = runtime.rate_limiter
     handler = partial(AppHandler, directory=str(STATIC_ROOT))
     httpd = PanelHTTPServer((args.host, args.port), handler, store, admin_sessions, user_sessions, config, rate_limiter)
-    print(f"Pulse24 demo panel running at http://{args.host}:{args.port}")
+    print(f"Pulse24 panel running at http://{args.host}:{args.port}")
     print(f"Storage backend: {store.backend}")
     if not admin_sessions.is_configured:
         print("Admin routes are locked. Set SMM_PANEL_ADMIN_PASSWORD to enable /admin.")
