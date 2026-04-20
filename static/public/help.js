@@ -1,4 +1,11 @@
 export function renderHelpMarkup({ data, escapeHtml }) {
+  const company = data.company || {};
+  const quickAnchors = [
+    ["support", "빠른 지원"],
+    ["guide", "이용 가이드"],
+    ["notice", "공지"],
+    ["faq", "FAQ"],
+  ];
   return `
     <div class="page page-help">
       <header class="topbar">
@@ -7,6 +14,23 @@ export function renderHelpMarkup({ data, escapeHtml }) {
         <button class="icon-button" type="button" data-route="/products">▦</button>
       </header>
       <div class="topbar-spacer"></div>
+
+      <section class="content-section">
+        <div class="help-hero-card">
+          <span class="help-hero-card__eyebrow">Support Hub</span>
+          <strong>주문 전 확인해야 할 정보와 운영 안내를 한곳에 모았습니다</strong>
+          <p>로그인 없이도 이용 가이드, 공지, FAQ, 정책 문서를 바로 확인할 수 있습니다.</p>
+          <div class="help-anchor-row">
+            ${quickAnchors
+              .map(
+                ([id, label]) => `
+                  <a class="help-anchor-chip" href="#${escapeHtml(id)}">${escapeHtml(label)}</a>
+                `
+              )
+              .join("")}
+          </div>
+        </div>
+      </section>
 
       <section class="content-section" id="support">
         <div class="section-head">
@@ -26,6 +50,11 @@ export function renderHelpMarkup({ data, escapeHtml }) {
             )
             .join("")}
         </div>
+        <article class="guide-card help-contact-card">
+          <strong>운영 문의</strong>
+          <p>문의 채널: ${escapeHtml(company.contact || "support@example.com")}</p>
+          <p>운영 시간: ${escapeHtml(company.hours || "평일 10:00 - 19:00")}</p>
+        </article>
       </section>
 
       <section class="content-section" id="guide">
@@ -119,6 +148,7 @@ export function renderLegalPageMarkup({ documentItem, escapeHtml }) {
           <span class="mini-badge">v${escapeHtml(documentItem.version)}</span>
           <h2>${escapeHtml(documentItem.title)}</h2>
           <p>${escapeHtml(documentItem.summary)}</p>
+          <div class="legal-card__note">아래 내용은 서비스 운영에 맞춰 관리자에서 갱신할 수 있는 정책 전문 영역입니다.</div>
           <div class="guide-list">
             ${documentItem.body.map((line) => `<article class="guide-card"><p>${escapeHtml(line)}</p></article>`).join("")}
           </div>

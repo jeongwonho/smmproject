@@ -1,7 +1,26 @@
-import { renderAuthModalMarkup, renderAuthPageMarkup } from "./public/auth.js";
-import { renderHelpMarkup, renderLegalPageMarkup } from "./public/help.js";
+import {
+  configurePublicPages,
+  renderAuthPage,
+  renderHome,
+  renderProducts,
+  renderDetail,
+  renderCharge,
+  renderOrders,
+  renderMy,
+  renderHelp,
+  renderLegalPage,
+  renderFrame,
+} from "./public/pages.js";
+import {
+  configureAdminPages,
+  renderAdminAuth,
+  renderAdmin,
+} from "./admin/pages.js";
 import { parseRoute } from "./shared/routes.js";
 import { createRuntimeConfig } from "./shared/runtime.js";
+import { blankPublicAuthState, blankSignupState, evaluatePublicPasswordStrength } from "./public/auth-state.js";
+
+const DEFAULT_LIGHT_BRAND_LOGO_URL = "/static/assets/instamart-logo-light-bg.png";
 
 const app = document.querySelector("#app");
 const toast = document.querySelector("#toast");
@@ -9,11 +28,16 @@ const toast = document.querySelector("#toast");
 const state = {
   bootstrap: null,
   publicCsrfToken: "",
+  publicAuth: blankPublicAuthState(),
   catalog: [],
   categoryCache: {},
   orders: [],
   orderCounts: { all: 0, queued: 0, in_progress: 0, completed: 0 },
   transactions: [],
+  wallet: null,
+  walletLedger: [],
+  chargeOrders: [],
+  chargeDraft: null,
   adminBootstrap: null,
   adminSession: null,
   adminCsrfToken: "",
@@ -22,6 +46,7 @@ const state = {
   adminSiteSettingsDraft: null,
   adminPopupDraft: null,
   adminHomeBannerDraft: null,
+  adminPlatformSectionDraft: null,
   adminSupplierDraft: null,
   adminConnectionResult: null,
   adminCustomerDraft: null,
@@ -33,7 +58,16 @@ const state = {
     search: "",
     activePlatform: "",
     orderFilter: "all",
+    chargeTab: "create",
+    chargeHistoryMode: "chargeOrders",
+    chargeStatusFilter: "all",
+    chargeMethodFilter: "all",
+    chargePeriodFilter: "all",
+    chargeDetailKind: "",
+    chargeDetailId: "",
+    chargeDetailOpen: false,
     bannerIndex: 0,
+    homeFooterExpanded: false,
     loginModalOpen: false,
     authTab: "login",
     loginRedirect: "",
@@ -43,6 +77,7 @@ const state = {
     adminCustomerFilter: "all",
     adminCustomerSearch: "",
     adminSupplierMode: "edit",
+    adminSelectedPlatformSectionId: "",
     adminSelectedSupplierId: "",
     adminSelectedProductId: "",
     adminSelectedSupplierServiceId: "",
@@ -84,6 +119,13 @@ const navItems = [
   { route: "/orders", key: "orders", label: "내역", icon: "◎" },
   { route: "/my", key: "my", label: "마이", icon: "☻" },
 ];
+
+const DEFAULT_HOME_BANNER_ASSETS = {
+  banner_launch: "/static/assets/home-banner-launch.jpg",
+  banner_safe: "/static/assets/home-banner-safe.jpg",
+  banner_consult: "/static/assets/home-banner-consult.jpg",
+};
+const DEFAULT_SITE_NAME = "인스타마트";
 
 const adminSectionBlueprints = [
   { id: "overview", label: "대시보드", icon: "⌂", description: "운영 요약과 핵심 지표", title: "운영 대시보드", summary: "전체 운영 현황과 빠른 실행 메뉴를 한 곳에서 확인합니다." },
@@ -135,6 +177,31 @@ const analyticsRangeBlueprints = [
   { id: "30d", label: "최근 30일", days: 30 },
   { id: "90d", label: "최근 90일", days: 90 },
 ];
+
+function blankChargeDraft(chargeConfig = state.bootstrap?.chargeConfig || {}) {
+  const defaultMethod =
+    (chargeConfig.methods || []).find((method) => method.id === "bank_transfer" && method.enabled)?.id ||
+    (chargeConfig.methods || []).find((method) => method.enabled)?.id ||
+    "card";
+  return {
+    amountInput: "",
+    amount: 0,
+    paymentChannel: defaultMethod,
+    paymentMethodDetail: "general_card",
+    depositorName: "",
+    receiptType: "none",
+    receiptPayload: {
+      phoneNumber: "",
+      businessNumber: "",
+      purpose: "personal",
+      businessName: "",
+      recipientEmail: "",
+      contactName: "",
+    },
+    agreementChecked: false,
+    submitting: false,
+  };
+}
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -198,6 +265,94 @@ function formatCompactNumber(value) {
 
 function formatPercent(value, digits = 1) {
   return `${Number(value || 0).toFixed(digits)}%`;
+}
+
+function parseCurrencyInput(rawValue) {
+  const normalized = String(rawValue || "").replace(/[^\d]/g, "");
+  return normalized ? Number(normalized) : 0;
+}
+
+function formatCurrencyInput(rawValue) {
+  const amount = parseCurrencyInput(rawValue);
+  return amount ? Number(amount).toLocaleString("ko-KR") : "";
+}
+
+function ensureChargeDraft() {
+  if (!state.chargeDraft) {
+    state.chargeDraft = blankChargeDraft();
+  }
+  return state.chargeDraft;
+}
+
+function chargeMethodConfig(methodId) {
+  return (state.bootstrap?.chargeConfig?.methods || []).find((method) => method.id === methodId) || null;
+}
+
+function chargeAmountSummary(amount) {
+  const normalized = Math.max(0, parseCurrencyInput(amount));
+  const vat = Math.floor(normalized / 10);
+  const total = normalized + vat;
+  const current = Number(state.wallet?.availableBalance || state.bootstrap?.user?.balance || 0);
+  return {
+    amount: normalized,
+    vat,
+    total,
+    expectedBalance: current + normalized,
+  };
+}
+
+function filteredChargeOrders() {
+  const range = state.ui.chargePeriodFilter;
+  const status = state.ui.chargeStatusFilter;
+  const method = state.ui.chargeMethodFilter;
+  const now = new Date();
+  const minimumTime = (() => {
+    if (range === "7d") return now.getTime() - 7 * 24 * 60 * 60 * 1000;
+    if (range === "30d") return now.getTime() - 30 * 24 * 60 * 60 * 1000;
+    if (range === "90d") return now.getTime() - 90 * 24 * 60 * 60 * 1000;
+    return 0;
+  })();
+  return (state.chargeOrders || []).filter((item) => {
+    if (status !== "all" && item.status !== status) return false;
+    if (method !== "all" && item.paymentChannel !== method) return false;
+    if (minimumTime) {
+      const createdAt = Date.parse(item.createdAt || "");
+      if (Number.isFinite(createdAt) && createdAt < minimumTime) return false;
+    }
+    return true;
+  });
+}
+
+function filteredWalletEntries() {
+  const range = state.ui.chargePeriodFilter;
+  const method = state.ui.chargeMethodFilter;
+  const now = new Date();
+  const minimumTime = (() => {
+    if (range === "7d") return now.getTime() - 7 * 24 * 60 * 60 * 1000;
+    if (range === "30d") return now.getTime() - 30 * 24 * 60 * 60 * 1000;
+    if (range === "90d") return now.getTime() - 90 * 24 * 60 * 60 * 1000;
+    return 0;
+  })();
+  return (state.walletLedger || []).filter((item) => {
+    if (method !== "all" && item.paymentChannel !== method) return false;
+    if (minimumTime) {
+      const createdAt = Date.parse(item.createdAt || "");
+      if (Number.isFinite(createdAt) && createdAt < minimumTime) return false;
+    }
+    return true;
+  });
+}
+
+function openChargeDetail(kind, id) {
+  state.ui.chargeDetailKind = kind;
+  state.ui.chargeDetailId = id;
+  state.ui.chargeDetailOpen = Boolean(kind && id);
+}
+
+function closeChargeDetail() {
+  state.ui.chargeDetailKind = "";
+  state.ui.chargeDetailId = "";
+  state.ui.chargeDetailOpen = false;
 }
 
 function analyticsRangeDays(rangeId = state.ui.adminAnalyticsRange) {
@@ -275,6 +430,9 @@ function blankSiteSettingsDraft() {
     siteDescription: "",
     useMailSmsSiteName: false,
     mailSmsSiteName: "",
+    headerLogoUrl: "",
+    headerLogoName: "",
+    headerLogoUrlInput: "",
     faviconUrl: "",
     faviconName: "",
     faviconUrlInput: "",
@@ -300,8 +458,24 @@ function blankHomeBannerDraft() {
   };
 }
 
+function blankPlatformSectionDraft() {
+  return {
+    id: "",
+    slug: "",
+    displayName: "",
+    description: "",
+    icon: "●",
+    logoImageUrl: "",
+    logoImageName: "",
+    logoImageUrlInput: "",
+    accentColor: "#4c76ff",
+    sortOrder: 0,
+  };
+}
+
 function siteSettingsToDraft(siteSettings) {
   if (!siteSettings) return blankSiteSettingsDraft();
+  const headerLogoUrl = siteSettings.headerLogoUrl || "";
   const faviconUrl = siteSettings.faviconUrl || "";
   const shareImageUrl = siteSettings.shareImageUrl || "";
   return {
@@ -309,6 +483,9 @@ function siteSettingsToDraft(siteSettings) {
     siteDescription: siteSettings.siteDescription || "",
     useMailSmsSiteName: Boolean(siteSettings.useMailSmsSiteName),
     mailSmsSiteName: siteSettings.mailSmsSiteName || "",
+    headerLogoUrl,
+    headerLogoName: "",
+    headerLogoUrlInput: headerLogoUrl && !String(headerLogoUrl).startsWith("data:image/") ? headerLogoUrl : "",
     faviconUrl,
     faviconName: "",
     faviconUrlInput: faviconUrl && !String(faviconUrl).startsWith("data:image/") ? faviconUrl : "",
@@ -333,6 +510,7 @@ function siteSettingsPreviewPayload(siteSettings) {
     useMailSmsSiteName: Boolean(draft.useMailSmsSiteName),
     mailSmsSiteName: draft.mailSmsSiteName || "",
     effectiveMailSmsSiteName: getEffectiveMailSmsSiteName(draft) || "사이트 이름",
+    headerLogoUrl: draft.headerLogoUrl || "",
     faviconUrl: draft.faviconUrl || "",
     shareImageUrl: draft.shareImageUrl || "",
   };
@@ -372,6 +550,23 @@ function homeBannerToDraft(banner) {
   };
 }
 
+function platformSectionToDraft(platformSection) {
+  if (!platformSection) return blankPlatformSectionDraft();
+  const logoImageUrl = platformSection.logoImageUrl || "";
+  return {
+    id: platformSection.id || "",
+    slug: platformSection.slug || "",
+    displayName: platformSection.displayName || "",
+    description: platformSection.description || "",
+    icon: platformSection.icon || "●",
+    logoImageUrl,
+    logoImageName: "",
+    logoImageUrlInput: logoImageUrl && !String(logoImageUrl).startsWith("data:image/") ? logoImageUrl : "",
+    accentColor: platformSection.accentColor || "#4c76ff",
+    sortOrder: Number(platformSection.sortOrder || 0),
+  };
+}
+
 function popupPreviewPayload(popup) {
   return {
     id: popup?.id || "preview",
@@ -389,48 +584,34 @@ function svgToDataUrl(svgMarkup) {
   return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svgMarkup)}`;
 }
 
+function defaultHomeBannerImageUrl(bannerId = "", theme = "blue") {
+  const explicit = DEFAULT_HOME_BANNER_ASSETS[String(bannerId || "").trim()];
+  if (explicit) return explicit;
+  const fallbackByTheme = {
+    blue: DEFAULT_HOME_BANNER_ASSETS.banner_launch,
+    mint: DEFAULT_HOME_BANNER_ASSETS.banner_safe,
+    dark: DEFAULT_HOME_BANNER_ASSETS.banner_consult,
+  };
+  return fallbackByTheme[String(theme || "blue").trim().toLowerCase()] || DEFAULT_HOME_BANNER_ASSETS.banner_launch;
+}
+
 function resolveHomeBannerImageUrl(banner) {
   const explicitUrl = String(banner?.imageUrl || "").trim();
   if (explicitUrl) return explicitUrl;
+  return defaultHomeBannerImageUrl(banner?.id, banner?.theme);
+}
 
-  const paletteMap = {
-    blue: { start: "#335CFF", end: "#7EA7FF", glow: "#D6E5FF", accent: "#1A2E78" },
-    mint: { start: "#05B89F", end: "#74E3CE", glow: "#D9FFF7", accent: "#0A3D47" },
-    dark: { start: "#1C2438", end: "#4F5B73", glow: "#CAD7F8", accent: "#0B1020" },
-  };
-  const theme = String(banner?.theme || "blue").trim().toLowerCase();
-  const palette = paletteMap[theme] || paletteMap.blue;
-  const seed = String(banner?.id || "banner");
-  const badge = seed.slice(-3).toUpperCase();
-
-  return svgToDataUrl(`
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" fill="none">
-      <defs>
-        <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="720" gradientUnits="userSpaceOnUse">
-          <stop stop-color="${palette.start}"/>
-          <stop offset="1" stop-color="${palette.end}"/>
-        </linearGradient>
-        <radialGradient id="glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(948 132) rotate(128.2) scale(440 340)">
-          <stop stop-color="${palette.glow}" stop-opacity="0.88"/>
-          <stop offset="1" stop-color="${palette.glow}" stop-opacity="0"/>
-        </radialGradient>
-      </defs>
-      <rect width="1200" height="720" rx="56" fill="url(#bg)"/>
-      <circle cx="980" cy="146" r="232" fill="url(#glow)"/>
-      <path d="M820 98C975 135 1072 244 1171 420" stroke="rgba(255,255,255,0.34)" stroke-width="20" stroke-linecap="round"/>
-      <path d="M702 536C836 440 968 426 1148 514" stroke="rgba(255,255,255,0.22)" stroke-width="28" stroke-linecap="round"/>
-      <rect x="814" y="336" width="264" height="242" rx="36" fill="rgba(255,255,255,0.16)" stroke="rgba(255,255,255,0.26)"/>
-      <rect x="846" y="366" width="202" height="126" rx="28" fill="rgba(255,255,255,0.14)"/>
-      <circle cx="934" cy="429" r="42" fill="rgba(255,255,255,0.18)"/>
-      <path d="M923 404L957 429L923 454V404Z" fill="white" fill-opacity="0.9"/>
-      <rect x="118" y="124" width="214" height="74" rx="37" fill="rgba(255,255,255,0.18)" stroke="rgba(255,255,255,0.22)"/>
-      <text x="154" y="171" fill="white" fill-opacity="0.9" font-size="34" font-family="SUIT, Pretendard, sans-serif" font-weight="700">${badge}</text>
-      <rect x="118" y="520" width="164" height="26" rx="13" fill="rgba(255,255,255,0.14)"/>
-      <rect x="118" y="560" width="252" height="26" rx="13" fill="rgba(255,255,255,0.14)"/>
-      <circle cx="1066" cy="150" r="18" fill="${palette.accent}" fill-opacity="0.34"/>
-      <circle cx="1096" cy="184" r="10" fill="white" fill-opacity="0.44"/>
-    </svg>
-  `);
+function renderPlatformLogoMarkup(platform, className) {
+  const accentColor = escapeHtml(platform?.accentColor || "#4c76ff");
+  const logoImageUrl = String(platform?.logoImageUrl || "").trim();
+  if (logoImageUrl) {
+    return `
+      <span class="${className} is-image" style="--platform-accent:${accentColor}">
+        <img src="${escapeHtml(logoImageUrl)}" alt="${escapeHtml(platform?.displayName || "")}" loading="lazy" />
+      </span>
+    `;
+  }
+  return `<span class="${className}" style="--platform-accent:${accentColor}">${escapeHtml(platform?.icon || "●")}</span>`;
 }
 
 function getActiveHomeBanners() {
@@ -474,6 +655,32 @@ function updateHomePlatformScrollerState(scroller = document.querySelector("[dat
   if (fade) fade.hidden = !isScrollable || isEnd;
   if (hint) hint.hidden = !isScrollable || isEnd;
 }
+
+function getHomePlatformScroller(target) {
+  if (!(target instanceof Element)) return null;
+  return target.closest("[data-home-platform-scroller]");
+}
+
+function homePlatformScrollerAtBoundary(scroller, deltaY) {
+  if (!scroller || !deltaY) return false;
+  const maxScrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+  if (deltaY > 0) {
+    return scroller.scrollTop >= maxScrollTop - 2;
+  }
+  return scroller.scrollTop <= 2;
+}
+
+function relayHomePlatformScroll(scroller, deltaY) {
+  const pageScroller = document.scrollingElement || document.documentElement;
+  if (!pageScroller || !deltaY) return;
+  pageScroller.scrollTop += deltaY;
+  updateHomePlatformScrollerState(scroller);
+}
+
+const homePlatformTouchState = {
+  scroller: null,
+  lastY: 0,
+};
 
 function readFileAsDataUrl(file) {
   return new Promise((resolve, reject) => {
@@ -876,6 +1083,10 @@ function getAdminHomeBanners() {
   return state.adminBootstrap?.homeBanners || [];
 }
 
+function getAdminPlatformSections() {
+  return state.adminBootstrap?.platformSections || [];
+}
+
 function getAdminAnalytics() {
   return state.adminBootstrap?.analytics || null;
 }
@@ -905,6 +1116,10 @@ function getSelectedAdminHomeBanner() {
   return getAdminHomeBanners().find((banner) => banner.id === state.ui.adminSelectedHomeBannerId) || null;
 }
 
+function getSelectedAdminPlatformSection() {
+  return getAdminPlatformSections().find((platform) => platform.id === state.ui.adminSelectedPlatformSectionId) || null;
+}
+
 function getSelectedAdminCategory() {
   return getAdminCategories().find((category) => category.id === state.ui.adminSelectedCategoryId) || null;
 }
@@ -925,6 +1140,7 @@ function syncAdminSelections({ preserveDraft = true } = {}) {
   const groups = getAdminPlatformGroups();
   const popup = getAdminPopup();
   const homeBanners = getAdminHomeBanners();
+  const platformSections = getAdminPlatformSections();
   const siteSettings = getAdminSiteSettings();
 
   if (!preserveDraft || !state.adminSiteSettingsDraft) {
@@ -951,6 +1167,25 @@ function syncAdminSelections({ preserveDraft = true } = {}) {
     const matchingBanner = homeBanners.find((banner) => banner.id === state.adminHomeBannerDraft.id);
     if (matchingBanner) {
       state.adminHomeBannerDraft = homeBannerToDraft(matchingBanner);
+    }
+  }
+
+  if (
+    state.ui.adminSelectedPlatformSectionId &&
+    !platformSections.some((platform) => platform.id === state.ui.adminSelectedPlatformSectionId)
+  ) {
+    state.ui.adminSelectedPlatformSectionId = "";
+  }
+  if (!state.ui.adminSelectedPlatformSectionId && platformSections.length) {
+    state.ui.adminSelectedPlatformSectionId = platformSections[0].id;
+  }
+  const selectedPlatformSection = getSelectedAdminPlatformSection();
+  if (!preserveDraft || !state.adminPlatformSectionDraft) {
+    state.adminPlatformSectionDraft = platformSectionToDraft(selectedPlatformSection);
+  } else if (state.adminPlatformSectionDraft.id) {
+    const matchingPlatformSection = platformSections.find((platform) => platform.id === state.adminPlatformSectionDraft.id);
+    if (matchingPlatformSection) {
+      state.adminPlatformSectionDraft = platformSectionToDraft(matchingPlatformSection);
     }
   }
 
@@ -1187,18 +1422,22 @@ async function ensureAdminCustomerDetail(customerId, { force = false } = {}) {
 
 function syncShellMode(route) {
   const deviceShell = document.querySelector(".device-shell");
+  const appRoot = document.getElementById("app");
   const isAdmin = route.name === "admin";
   if (deviceShell) {
-    deviceShell.classList.toggle("is-admin", isAdmin);
+    deviceShell.dataset.routeSurface = isAdmin ? "admin" : "public";
   }
-  document.body.classList.toggle("is-admin-route", isAdmin);
+  if (appRoot) {
+    appRoot.dataset.routeSurface = isAdmin ? "admin" : "public";
+  }
+  document.body.dataset.routeSurface = isAdmin ? "admin" : "public";
   applySitePresentation(route);
 }
 
 function applySitePresentation(route) {
   const isAdmin = route.name === "admin";
   const siteSettings = state.adminBootstrap?.siteSettings || state.bootstrap?.siteSettings || {};
-  const siteName = String(siteSettings.siteName || "Pulse24").trim() || "Pulse24";
+  const siteName = String(siteSettings.siteName || DEFAULT_SITE_NAME).trim() || DEFAULT_SITE_NAME;
   const siteDescription = String(siteSettings.siteDescription || "").trim();
   const faviconUrl = String(siteSettings.faviconUrl || "").trim();
   const shareImageUrl = String(siteSettings.shareImageUrl || "").trim();
@@ -1290,6 +1529,10 @@ function clearPublicSessionState() {
   }
   state.orders = [];
   state.transactions = [];
+  state.wallet = null;
+  state.walletLedger = [];
+  state.chargeOrders = [];
+  state.chargeDraft = null;
   state.orderCounts = { all: 0, queued: 0, in_progress: 0, completed: 0 };
 }
 
@@ -1329,7 +1572,11 @@ async function apiPost(path, payload) {
     Accept: "application/json",
     "Content-Type": "application/json",
   };
-  if (["/api/orders", "/api/charge", "/api/logout"].includes(path) && state.publicCsrfToken) {
+  if (
+    (["/api/orders", "/api/charge", "/api/charge-orders", "/api/logout"].includes(path) ||
+      path.startsWith("/api/charge-orders/")) &&
+    state.publicCsrfToken
+  ) {
     headers["X-SMM-CSRF-Token"] = state.publicCsrfToken;
   }
   if (isAdminApiPath(path) && path !== "/api/admin/login" && state.adminCsrfToken) {
@@ -1388,15 +1635,78 @@ async function refreshCoreData() {
   state.bootstrap = bootstrapData;
   state.publicCsrfToken = bootstrapData.viewer?.csrfToken || "";
   if (bootstrapData.viewer?.authenticated) {
-    const [ordersData, transactionData] = await Promise.all([apiGet("/api/orders"), apiGet("/api/transactions")]);
+    const [ordersData, walletData, walletLedgerData, chargeOrdersData] = await Promise.all([
+      apiGet("/api/orders"),
+      apiGet("/api/wallet"),
+      apiGet("/api/wallet/ledger?limit=100"),
+      apiGet("/api/charge-orders?limit=100"),
+    ]);
     state.orders = ordersData.orders;
     state.orderCounts = ordersData.counts;
-    state.transactions = transactionData.transactions;
+    state.wallet = walletData.wallet;
+    state.walletLedger = walletLedgerData.entries || [];
+    state.chargeOrders = chargeOrdersData.chargeOrders || [];
+    state.transactions = state.walletLedger;
+    if (!state.chargeDraft) {
+      state.chargeDraft = blankChargeDraft(bootstrapData.chargeConfig);
+    }
   } else {
     state.orders = [];
     state.orderCounts = { all: 0, queued: 0, in_progress: 0, completed: 0 };
     state.transactions = [];
+    state.wallet = null;
+  state.walletLedger = [];
+  state.chargeOrders = [];
+  state.chargeDraft = null;
+}
+
+function resetSignupFlow() {
+  state.publicAuth.signup = blankSignupState();
+}
+
+function currentSignupState() {
+  if (!state.publicAuth) {
+    state.publicAuth = blankPublicAuthState();
   }
+  if (!state.publicAuth.signup) {
+    state.publicAuth.signup = blankSignupState();
+  }
+  return state.publicAuth.signup;
+}
+
+function updateSignupPasswordFeedback(scope) {
+  const container = scope || document;
+  const form = container.querySelector("[data-public-signup-complete-form]");
+  if (!(form instanceof HTMLElement)) return;
+  const passwordInput = form.querySelector("[data-signup-password-input]");
+  const nameInput = form.querySelector("[data-signup-name-input]");
+  if (!(passwordInput instanceof HTMLInputElement)) return;
+  const rawPassword = passwordInput.value || "";
+  const feedback = evaluatePublicPasswordStrength(rawPassword, {
+    email: currentSignupState().email || "",
+    name: nameInput instanceof HTMLInputElement ? nameInput.value : "",
+  });
+  const root = form.querySelector("[data-password-strength]");
+  const label = form.querySelector("[data-password-strength-label]");
+  const guidance = form.querySelector("[data-password-strength-guidance]");
+  const warnings = form.querySelector("[data-password-strength-warnings]");
+  const bar = form.querySelector(".password-strength__bar span");
+  if (root instanceof HTMLElement) {
+    root.setAttribute("data-tone", feedback.tone);
+  }
+  if (label instanceof HTMLElement) {
+    label.textContent = rawPassword ? feedback.label : "안내";
+  }
+  if (guidance instanceof HTMLElement) {
+    guidance.textContent = rawPassword ? feedback.guidance : "문장처럼 길게 만들면 더 안전해요.";
+  }
+  if (warnings instanceof HTMLElement) {
+    warnings.innerHTML = rawPassword ? feedback.warnings.map((item) => `<li>${escapeHtml(item)}</li>`).join("") : "";
+  }
+  if (bar instanceof HTMLElement) {
+    bar.style.width = rawPassword ? `${Math.max(0, Math.min(feedback.score, 4)) * 25}%` : "0%";
+  }
+}
   if (!state.ui.activePlatform && bootstrapData.platforms.length) {
     state.ui.activePlatform = bootstrapData.platforms[0].id;
   }
@@ -1856,186 +2166,6 @@ function updateOrderValidation(detail) {
   });
 }
 
-function renderBottomNav(activeKey) {
-  return `
-    <nav class="bottom-nav">
-      ${navItems
-        .map(
-          (item) => `
-          <button class="bottom-nav__item ${activeKey === item.key ? "is-active" : ""}" type="button" data-route="${item.route}">
-            <span class="bottom-nav__icon">${item.icon}</span>
-            <span class="bottom-nav__label">${item.label}</span>
-          </button>
-        `
-        )
-        .join("")}
-    </nav>
-  `;
-}
-
-function renderFrame(content, activeKey, extraSticky = "") {
-  return `
-    <div class="phone-frame">
-      ${content}
-      ${extraSticky}
-      ${renderBottomNav(activeKey)}
-      ${renderPublicLoginModal()}
-    </div>
-  `;
-}
-
-function renderPublicLoginModal() {
-  return renderAuthModalMarkup({
-    isOpen: state.ui.loginModalOpen,
-    isLoggedIn: isLoggedIn(),
-    authTab: state.ui.authTab,
-    authConfig: state.bootstrap?.authConfig || { oauthProviders: [] },
-    legalDocuments: state.bootstrap?.legalDocuments || [],
-    escapeHtml,
-  });
-}
-
-function renderAuthPage() {
-  return renderFrame(
-    `
-      <div class="page page-auth">
-        <header class="topbar">
-          <button class="icon-button" type="button" data-route="/">‹</button>
-          <strong class="topbar-title">로그인 / 회원가입</strong>
-          <button class="icon-button" type="button" data-route="/help">?</button>
-        </header>
-        <div class="topbar-spacer"></div>
-        ${renderAuthPageMarkup({
-          authTab: state.ui.authTab,
-          authConfig: state.bootstrap?.authConfig || { oauthProviders: [] },
-          legalDocuments: state.bootstrap?.legalDocuments || [],
-          escapeHtml,
-        })}
-      </div>
-    `,
-    "my"
-  );
-}
-
-function renderAdminFrame(content) {
-  return `
-    <div class="admin-frame">
-      ${content}
-    </div>
-  `;
-}
-
-function renderAdminTopbar(title, description, metrics = []) {
-  return `
-    <section class="admin-topbar">
-      <div class="admin-topbar__content">
-        <span class="admin-topbar__eyebrow">Admin Workspace</span>
-        <h2>${escapeHtml(title)}</h2>
-        <p>${escapeHtml(description)}</p>
-      </div>
-      ${
-        metrics.length
-          ? `
-            <div class="admin-topbar__metrics">
-              ${metrics
-                .map(
-                  (metric) => `
-                    <article class="admin-topbar__metric">
-                      <span>${escapeHtml(metric.label)}</span>
-                      <strong>${escapeHtml(metric.value)}</strong>
-                    </article>
-                  `
-                )
-                .join("")}
-            </div>
-          `
-          : ""
-      }
-    </section>
-  `;
-}
-
-function renderAdminWorkspaceNav(stats = {}, popup = null) {
-  const sections = adminSectionItems(stats, popup);
-  return `
-    <div class="admin-rail-card">
-      <div class="admin-rail-card__top">
-        <span class="admin-rail-card__eyebrow">Desktop Console</span>
-        <strong>운영 섹션</strong>
-        <p>관리 항목이 더 많아져도 좌측 탐색에서 빠르게 이동할 수 있도록 PC 중심 구조로 정리했습니다.</p>
-      </div>
-      <div class="admin-section-nav">
-        ${sections
-          .map(
-            (section) => `
-              <button
-                class="admin-section-nav__button ${state.ui.adminActiveSection === section.id ? "is-active" : ""}"
-                type="button"
-                data-admin-scroll-section="${section.id}"
-              >
-                <span>${escapeHtml(section.label)}</span>
-                <strong>${escapeHtml(section.stat || "")}</strong>
-                <small>${escapeHtml(section.description)}</small>
-              </button>
-            `
-          )
-          .join("")}
-      </div>
-      <div class="admin-rail-card__foot">
-        <span class="admin-badge is-neutral">PC 최적화</span>
-        <span class="admin-badge is-neutral">Bot 차단</span>
-      </div>
-    </div>
-  `;
-}
-
-function renderAdminAuthRail(session = {}) {
-  const securityCards = [
-    {
-      label: "검색엔진 차단",
-      value: "활성",
-      description: "robots.txt와 X-Robots-Tag로 /admin 경로를 차단합니다.",
-    },
-    {
-      label: "세션 보안",
-      value: "Strict",
-      description: "HttpOnly + SameSite 쿠키 기반으로 관리자 세션을 유지합니다.",
-    },
-    {
-      label: "민감정보 보호",
-      value: "마스킹",
-      description: "공급사 키와 고객 정보는 기본 화면에서 노출되지 않습니다.",
-    },
-  ];
-
-  return `
-    <div class="admin-rail-card admin-rail-card--auth">
-      <div class="admin-rail-card__top">
-        <span class="admin-rail-card__eyebrow">Security Gate</span>
-        <strong>관리자 전용 데스크톱 진입</strong>
-        <p>운영 메뉴가 계속 늘어나더라도 PC에서 빠르게 탐색할 수 있도록 관리자 화면을 별도 워크스페이스로 운용합니다.</p>
-      </div>
-      <div class="admin-auth-rail-grid">
-        ${securityCards
-          .map(
-            (item) => `
-              <article class="admin-auth-rail-card">
-                <span>${escapeHtml(item.label)}</span>
-                <strong>${escapeHtml(item.value)}</strong>
-                <p>${escapeHtml(item.description)}</p>
-              </article>
-            `
-          )
-          .join("")}
-      </div>
-      <div class="admin-rail-card__foot">
-        <span class="admin-badge ${session.configured ? "is-success" : "is-warning"}">${session.configured ? "보안 설정 완료" : "보안 설정 필요"}</span>
-        <span class="admin-badge is-neutral">PC 최적화 콘솔</span>
-      </div>
-    </div>
-  `;
-}
-
 function syncAdminSectionNavState() {
   document.querySelectorAll("[data-admin-scroll-section]").forEach((button) => {
     button.classList.toggle("is-active", button.getAttribute("data-admin-scroll-section") === state.ui.adminActiveSection);
@@ -2172,7 +2302,36 @@ function updateAdminHomeBannerPreview() {
     previewHost.innerHTML = renderHomeBannerPreviewMarkup(draft);
   }
   if (clearButton) {
-    clearButton.disabled = !draft.imageUrl;
+    clearButton.disabled = !draft.imageUrl || draft.imageUrl === defaultHomeBannerImageUrl(draft.id, draft.theme);
+  }
+}
+
+function renderPlatformLogoPreviewMarkup(platform) {
+  const preview = platformSectionToDraft(platform);
+  return `
+    <div class="admin-platform-logo-preview-card">
+      ${renderPlatformLogoMarkup(preview, "admin-platform-logo-preview-card__visual")}
+      <div class="admin-platform-logo-preview-card__copy">
+        <strong>${escapeHtml(preview.displayName || "플랫폼 이름")}</strong>
+        <p>${escapeHtml(preview.description || "홈 서비스 그리드와 상품 플랫폼 탭에 같은 로고가 노출됩니다.")}</p>
+      </div>
+    </div>
+  `;
+}
+
+function updateAdminPlatformSectionPreview() {
+  const draft = state.adminPlatformSectionDraft || platformSectionToDraft(getSelectedAdminPlatformSection());
+  const previewHost = document.querySelector("[data-admin-platform-section-preview]");
+  const clearButton = document.querySelector("[data-admin-platform-section-image-clear]");
+  const imageMeta = document.querySelector("[data-admin-platform-section-image-meta]");
+  if (previewHost) {
+    previewHost.innerHTML = renderPlatformLogoPreviewMarkup(draft);
+  }
+  if (clearButton) {
+    clearButton.disabled = !draft.logoImageUrl;
+  }
+  if (imageMeta) {
+    imageMeta.textContent = draft.logoImageName || (draft.logoImageUrl ? "저장된 로고 이미지 연결됨" : "텍스트 아이콘 사용 중");
   }
 }
 
@@ -2181,6 +2340,14 @@ function renderSiteSettingsPreviewMarkup(siteSettings) {
   const origin = window.location.origin || "https://your-site.example";
   return `
     <div class="admin-site-preview-stack">
+      <article class="admin-site-preview-note">
+        <span>상단 로고</span>
+        <strong>${escapeHtml(preview.siteName)}</strong>
+        <div class="admin-site-preview-logo">
+          ${renderSiteBrandLogoMarkup(preview, "admin-site-preview-logo__mark", { surface: "light" })}
+        </div>
+      </article>
+
       <div class="admin-site-preview-browser">
         <div class="admin-site-preview-browser__tab">
           <span class="admin-site-preview-browser__favicon">
@@ -2233,8 +2400,10 @@ function updateAdminSiteSettingsPreview() {
   const nameCount = document.querySelector("[data-admin-site-settings-name-count]");
   const descriptionCount = document.querySelector("[data-admin-site-settings-description-count]");
   const mailCount = document.querySelector("[data-admin-site-settings-mail-count]");
+  const headerLogoMeta = document.querySelector("[data-admin-site-settings-header-logo-meta]");
   const faviconMeta = document.querySelector("[data-admin-site-settings-favicon-meta]");
   const shareMeta = document.querySelector("[data-admin-site-settings-share-meta]");
+  const headerLogoClear = document.querySelector("[data-admin-site-settings-header-logo-clear]");
   const faviconClear = document.querySelector("[data-admin-site-settings-favicon-clear]");
   const shareClear = document.querySelector("[data-admin-site-settings-share-clear]");
   if (previewHost) {
@@ -2249,11 +2418,17 @@ function updateAdminSiteSettingsPreview() {
   if (mailCount) {
     mailCount.textContent = `${String(draft.mailSmsSiteName || "").length}/60`;
   }
+  if (headerLogoMeta) {
+    headerLogoMeta.textContent = draft.headerLogoName || (draft.headerLogoUrl ? "저장된 상단 로고 연결됨" : "상단 로고 없음");
+  }
   if (faviconMeta) {
     faviconMeta.textContent = draft.faviconName || (draft.faviconUrl ? "저장된 파비콘 연결됨" : "파비콘 없음");
   }
   if (shareMeta) {
     shareMeta.textContent = draft.shareImageName || (draft.shareImageUrl ? "저장된 대표 이미지 연결됨" : "대표 이미지 없음");
+  }
+  if (headerLogoClear) {
+    headerLogoClear.disabled = !draft.headerLogoUrl;
   }
   if (faviconClear) {
     faviconClear.disabled = !draft.faviconUrl;
@@ -2327,7 +2502,28 @@ function renderSiteSettingsAdminSection() {
             <section class="admin-settings-section">
               <div class="admin-settings-section__head">
                 <h3>사이트 표시 이미지</h3>
-                <p>파비콘과 공유 대표 이미지는 저장 즉시 헤드 메타와 미리보기에 반영됩니다.</p>
+                <p>상단 로고, 파비콘, 공유 대표 이미지는 저장 즉시 공개 화면과 미리보기에 반영됩니다.</p>
+              </div>
+
+              <div class="admin-popup-upload">
+                <div class="admin-popup-upload__head">
+                  <div>
+                    <strong>상단 로고</strong>
+                    <p>권장 사이즈: 가로형 PNG/WebP/SVG, 400 x 120px 이상, 2MB 이하. 홈 상단과 고정 서비스 바에 사용됩니다.</p>
+                  </div>
+                  <span class="admin-badge is-neutral" data-admin-site-settings-header-logo-meta>${escapeHtml(draft.headerLogoName || (draft.headerLogoUrl ? "저장된 상단 로고 연결됨" : "상단 로고 없음"))}</span>
+                </div>
+                <div class="admin-popup-upload__controls">
+                  <label class="admin-secondary-button admin-secondary-button--file" for="admin-site-settings-header-logo-upload">상단 로고 업로드</label>
+                  <input class="admin-popup-upload__input" id="admin-site-settings-header-logo-upload" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" data-admin-site-settings-image-upload="headerLogo" />
+                  <button class="admin-secondary-button" type="button" data-admin-site-settings-header-logo-clear ${draft.headerLogoUrl ? "" : "disabled"}>상단 로고 제거</button>
+                </div>
+                <label class="form-field">
+                  <span class="field-label">상단 로고 URL</span>
+                  <div class="field-shell">
+                    <input class="field-input" type="text" name="headerLogoUrlInput" value="${escapeHtml(draft.headerLogoUrlInput || "")}" placeholder="https://example.com/header-logo.png" data-admin-site-settings-field="headerLogoUrlInput" />
+                  </div>
+                </label>
               </div>
 
               <div class="admin-popup-upload">
@@ -2390,6 +2586,7 @@ function renderSiteSettingsAdminSection() {
         </div>
       </div>
     </section>
+    ${renderPlatformLogoAdminSection()}
   `;
 }
 
@@ -2426,6 +2623,97 @@ function renderHomeBannerPreviewMarkup(banner) {
   return renderHomeBannerCard(banner, { compact: false, index: 0, total: 1, interactive: false });
 }
 
+function renderPlatformLogoAdminSection() {
+  const platforms = getAdminPlatformSections();
+  const draft = state.adminPlatformSectionDraft || platformSectionToDraft(platforms[0]);
+  return `
+    <section class="admin-card">
+      <div class="section-head section-head--compact">
+        <h2>플랫폼 로고 관리</h2>
+        <p>홈 서비스 그리드와 주문 페이지 플랫폼 탭에 노출되는 로고 이미지를 수정합니다. 이미지가 없으면 대체 텍스트 아이콘이 사용됩니다.</p>
+      </div>
+
+      <div class="admin-banner-list">
+        ${platforms
+          .map(
+            (platform) => `
+              <button
+                class="admin-banner-list__item ${platform.id === state.ui.adminSelectedPlatformSectionId ? "is-active" : ""}"
+                type="button"
+                data-admin-platform-section-select="${platform.id}"
+              >
+                <span>${escapeHtml(platform.displayName)}</span>
+                <strong>${escapeHtml(String(platform.productCount || 0))}개</strong>
+              </button>
+            `
+          )
+          .join("")}
+      </div>
+
+      <div class="admin-management-layout admin-management-layout--popup">
+        <div class="admin-card admin-subcard">
+          <div class="admin-subcard__head">
+            <strong>플랫폼 로고 편집</strong>
+          </div>
+          <form class="admin-form" data-admin-platform-section-form>
+            <label class="form-field">
+              <span class="field-label">플랫폼 이름</span>
+              <div class="field-shell">
+                <input class="field-input" type="text" value="${escapeHtml(draft.displayName)}" disabled />
+              </div>
+            </label>
+            <div class="admin-popup-upload">
+              <div class="admin-popup-upload__head">
+                <div>
+                  <strong>플랫폼 로고 이미지</strong>
+                  <p>권장 사이즈: 정사각 256 x 256px 이상, JPG/PNG/WebP, 2MB 이하. 비율은 고정 슬롯에서 자동으로 맞춰집니다.</p>
+                </div>
+                <span class="admin-badge is-neutral" data-admin-platform-section-image-meta>${escapeHtml(draft.logoImageName || (draft.logoImageUrl ? "저장된 로고 이미지 연결됨" : "텍스트 아이콘 사용 중"))}</span>
+              </div>
+              <div class="admin-popup-upload__controls">
+                <label class="admin-secondary-button admin-secondary-button--file" for="admin-platform-section-image-upload">로고 업로드</label>
+                <input class="admin-popup-upload__input" id="admin-platform-section-image-upload" type="file" accept="image/png,image/jpeg,image/webp" data-admin-platform-section-image-upload />
+                <button class="admin-secondary-button" type="button" data-admin-platform-section-image-clear ${draft.logoImageUrl ? "" : "disabled"}>로고 제거</button>
+              </div>
+              <label class="form-field">
+                <span class="field-label">로고 이미지 URL</span>
+                <div class="field-shell">
+                  <input class="field-input" type="text" name="logoImageUrlInput" value="${escapeHtml(draft.logoImageUrlInput || "")}" placeholder="https://example.com/platform-logo.jpg" data-admin-platform-section-field="logoImageUrlInput" />
+                </div>
+              </label>
+            </div>
+            <div class="admin-two-column">
+              <label class="form-field">
+                <span class="field-label">대체 텍스트 아이콘</span>
+                <div class="field-shell">
+                  <input class="field-input" type="text" name="icon" value="${escapeHtml(draft.icon)}" maxlength="6" data-admin-platform-section-field="icon" />
+                </div>
+              </label>
+              <label class="form-field">
+                <span class="field-label">강조 색상</span>
+                <div class="field-shell">
+                  <input class="field-input" type="text" name="accentColor" value="${escapeHtml(draft.accentColor)}" placeholder="#4c76ff" data-admin-platform-section-field="accentColor" />
+                </div>
+              </label>
+            </div>
+            <button class="admin-primary-button" type="submit">플랫폼 로고 저장</button>
+          </form>
+        </div>
+
+        <div class="admin-card admin-subcard">
+          <div class="admin-subcard__head">
+            <strong>플랫폼 미리보기</strong>
+            <span class="admin-badge is-neutral">${escapeHtml(draft.slug || "")}</span>
+          </div>
+          <div class="admin-home-banner-preview" data-admin-platform-section-preview>
+            ${renderPlatformLogoPreviewMarkup(draft)}
+          </div>
+        </div>
+      </div>
+    </section>
+  `;
+}
+
 function renderHomeBannerAdminSection() {
   const banners = getAdminHomeBanners();
   const draft = state.adminHomeBannerDraft || homeBannerToDraft(banners[0]);
@@ -2458,31 +2746,27 @@ function renderHomeBannerAdminSection() {
       <div class="admin-management-layout admin-management-layout--popup">
         <div class="admin-card admin-subcard">
           <div class="admin-subcard__head">
-            <strong>배너 편집</strong>
+            <strong>배너 슬롯 편집</strong>
           </div>
           <form class="admin-form" data-admin-home-banner-form>
             <label class="form-field">
-              <span class="field-label">배너 제목</span>
+              <span class="field-label">배너 이름(관리용)</span>
               <div class="field-shell">
                 <input class="field-input" type="text" name="title" value="${escapeHtml(draft.title)}" data-admin-home-banner-field="title" />
               </div>
-            </label>
-            <label class="form-field">
-              <span class="field-label">배너 설명</span>
-              <textarea class="field-textarea" name="subtitle" rows="3" data-admin-home-banner-field="subtitle">${escapeHtml(draft.subtitle)}</textarea>
             </label>
             <div class="admin-popup-upload">
               <div class="admin-popup-upload__head">
                 <div>
                   <strong>배너 이미지</strong>
-                  <p>권장 사이즈: 1600 x 720px 이상, JPG/PNG/WebP, 5MB 이하. 중요한 텍스트는 좌측 또는 중앙에 두는 것을 권장합니다.</p>
+                  <p>권장 사이즈: 1600 x 720px 이상, JPG/PNG/WebP, 5MB 이하. 홈 상단 배너 영역은 고정 크기로 노출되며 이미지는 자동 크롭됩니다.</p>
                 </div>
                 <span class="admin-badge is-neutral">${escapeHtml(imageMeta)}</span>
               </div>
               <div class="admin-popup-upload__controls">
                 <label class="admin-secondary-button admin-secondary-button--file" for="admin-home-banner-image-upload">이미지 업로드</label>
                 <input class="admin-popup-upload__input" id="admin-home-banner-image-upload" type="file" accept="image/png,image/jpeg,image/webp" data-admin-home-banner-image-upload />
-                <button class="admin-secondary-button" type="button" data-admin-home-banner-image-clear ${draft.imageUrl ? "" : "disabled"}>이미지 제거</button>
+                <button class="admin-secondary-button" type="button" data-admin-home-banner-image-clear ${draft.imageUrl && draft.imageUrl !== defaultHomeBannerImageUrl(draft.id, draft.theme) ? "" : "disabled"}>기본 이미지 복원</button>
               </div>
               <label class="form-field">
                 <span class="field-label">이미지 URL</span>
@@ -2498,12 +2782,6 @@ function renderHomeBannerAdminSection() {
                   <input class="field-input" type="text" name="route" value="${escapeHtml(draft.route)}" data-admin-home-banner-field="route" />
                 </div>
               </label>
-              <label class="form-field">
-                <span class="field-label">버튼 문구</span>
-                <div class="field-shell">
-                  <input class="field-input" type="text" name="ctaLabel" value="${escapeHtml(draft.ctaLabel)}" data-admin-home-banner-field="ctaLabel" />
-                </div>
-              </label>
             </div>
             <div class="admin-two-column">
               <label class="form-field">
@@ -2512,20 +2790,10 @@ function renderHomeBannerAdminSection() {
                   <input class="field-input" type="number" name="sortOrder" value="${escapeHtml(String(draft.sortOrder || 0))}" data-admin-home-banner-field="sortOrder" />
                 </div>
               </label>
-              <label class="form-field">
-                <span class="field-label">테마</span>
-                <div class="field-shell">
-                  <select class="field-select" name="theme" data-admin-home-banner-field="theme">
-                    ${[
-                      ["blue", "Blue"],
-                      ["mint", "Mint"],
-                      ["dark", "Dark"],
-                    ]
-                      .map(([value, label]) => `<option value="${value}" ${draft.theme === value ? "selected" : ""}>${label}</option>`)
-                      .join("")}
-                  </select>
-                </div>
-              </label>
+              <div class="form-field">
+                <span class="field-label">노출 방식</span>
+                <p class="admin-inline-note">배너 슬롯은 이미지 전용으로 고정되며 텍스트 UI를 별도로 그리지 않습니다.</p>
+              </div>
             </div>
             <label class="admin-toggle">
               <input type="checkbox" name="isActive" ${draft.isActive ? "checked" : ""} data-admin-home-banner-field="isActive" />
@@ -2656,6 +2924,46 @@ function renderPopupAdminSection() {
   `;
 }
 
+function renderAdminInsightStrip(items, className = "") {
+  return `
+    <div class="admin-insight-grid ${className}">
+      ${items
+        .map(
+          (item) => `
+            <article class="admin-insight-card ${item.tone ? `is-${item.tone}` : ""}">
+              <span>${escapeHtml(item.label)}</span>
+              <strong>${escapeHtml(item.value)}</strong>
+              <p>${escapeHtml(item.description || "")}</p>
+            </article>
+          `
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function renderAdminFormSection(title, description, content, { open = true } = {}) {
+  return `
+    <details class="admin-form-section" ${open ? "open" : ""}>
+      <summary>
+        <div>
+          <strong>${escapeHtml(title)}</strong>
+          <p>${escapeHtml(description)}</p>
+        </div>
+        <span>${open ? "열림" : "선택"}</span>
+      </summary>
+      <div class="admin-form-section__body">
+        ${content}
+      </div>
+    </details>
+  `;
+}
+
+function isSupplierDispatchIssue(order) {
+  const text = `${order?.supplierDispatchLabel || ""} ${order?.supplierStatus || ""}`.toLowerCase();
+  return /(실패|오류|failed|cancel|취소|blocked|error)/.test(text);
+}
+
 function renderCustomerAdminSection() {
   const customers = getAdminCustomers();
   const selectedCustomer = getSelectedAdminCustomer();
@@ -2668,6 +2976,33 @@ function renderCustomerAdminSection() {
     if (!search) return true;
     return String(customer.searchText || "").includes(search);
   });
+  const activeCustomers = customers.filter((customer) => customer.isActive).length;
+  const marketingOptInCount = customers.filter((customer) => customer.marketingOptIn).length;
+  const selectedIdentitySummary = Array.isArray(selectedCustomer?.socialIdentities) && selectedCustomer.socialIdentities.length
+    ? `
+      <div class="admin-detail-pill-row">
+        ${selectedCustomer.socialIdentities
+          .map((identity) => `<span class="admin-detail-pill">${escapeHtml(identity.providerLabel || identity.provider)}</span>`)
+          .join("")}
+      </div>
+    `
+    : `<p class="admin-inline-note">연결된 소셜 계정이 없습니다.</p>`;
+  const selectedConsentSummary = Array.isArray(selectedCustomer?.consents) && selectedCustomer.consents.length
+    ? `
+      <div class="admin-detail-list">
+        ${selectedCustomer.consents
+          .map(
+            (consent) => `
+              <article>
+                <strong>${escapeHtml(consent.consentLabel || consent.consentType)}</strong>
+                <span>${consent.isAgreed ? "동의" : "미동의"} · ${escapeHtml(consent.agreedAt || "-")} · v${escapeHtml(consent.consentVersion || "")}</span>
+              </article>
+            `
+          )
+          .join("")}
+      </div>
+    `
+    : `<p class="admin-inline-note">저장된 동의 이력이 없습니다.</p>`;
 
   return `
     <section class="admin-card">
@@ -2676,8 +3011,18 @@ function renderCustomerAdminSection() {
         <p>고객 계정을 생성하고 등급, 역할, 활성 상태, 잔액을 관리할 수 있습니다.</p>
       </div>
 
-      <div class="admin-management-layout">
-        <div class="admin-card admin-subcard">
+      ${renderAdminInsightStrip(
+        [
+          { label: "전체 고객", value: `${customers.length}명`, description: "검색과 역할 필터 기준의 전체 회원 수" },
+          { label: "활성 계정", value: `${activeCustomers}명`, description: "현재 로그인 가능 상태로 운영 중인 계정" },
+          { label: "마케팅 동의", value: `${marketingOptInCount}명`, description: "마케팅 수신 동의가 저장된 고객" },
+          { label: "현재 결과", value: `${filteredCustomers.length}명`, description: "현재 필터와 검색 조건에 맞는 고객" },
+        ],
+        "admin-insight-grid--compact"
+      )}
+
+      <div class="admin-customer-shell">
+        <div class="admin-card admin-subcard admin-pane">
           <div class="admin-subcard__head">
             <strong>고객 목록</strong>
             <button class="admin-secondary-button" type="button" data-admin-customer-new>새 고객</button>
@@ -2705,7 +3050,7 @@ function renderCustomerAdminSection() {
                     <button class="filter-chip ${activeFilter === key ? "is-active" : ""}" type="button" data-admin-customer-filter="${key}">
                       ${escapeHtml(label)}
                     </button>
-                  `
+                `
                 )
                 .join("")}
             </div>
@@ -2716,26 +3061,26 @@ function renderCustomerAdminSection() {
                   .map(
                 (customer) => `
                   <button
-                    class="admin-supplier-card ${state.ui.adminSelectedCustomerId === customer.id && state.ui.adminCustomerMode !== "new" ? "is-active" : ""}"
+                    class="admin-record-row admin-record-row--customer ${state.ui.adminSelectedCustomerId === customer.id && state.ui.adminCustomerMode !== "new" ? "is-active" : ""}"
                     type="button"
                     data-admin-select-customer="${customer.id}"
                   >
-                    <div class="admin-supplier-card__top">
+                    <div class="admin-record-row__main">
                       <strong>${escapeHtml(customer.name)}</strong>
-                      <span class="admin-badge ${customer.isActive ? "is-success" : "is-neutral"}">${customer.isActive ? "활성" : "비활성"}</span>
+                      <p>${escapeHtml(customer.emailMasked || "이메일 비공개")} · ${escapeHtml(customer.phoneMasked || "연락처 비공개")}</p>
                     </div>
-                    <p>${escapeHtml(customer.emailMasked || "이메일 비공개")}</p>
-                    <div class="admin-supplier-card__meta">
+                    <div class="admin-record-row__meta">
                       <span>${escapeHtml(customer.role)}</span>
                       <span>${escapeHtml(customer.tier)}</span>
-                      <span>주문 ${escapeHtml(String(customer.orderCount || 0))}</span>
-                      <span>잔액 ${escapeHtml(customer.balanceLabel)}</span>
-                    </div>
-                    <div class="admin-supplier-card__meta">
                       <span>${customer.hasPassword ? "로그인 가능" : "비밀번호 없음"}</span>
-                      <span>${escapeHtml(customer.phoneMasked || "연락처 비공개")}</span>
-                      <span>누적 ${escapeHtml(customer.totalSpentLabel || "0원")}</span>
-                      <span>${escapeHtml(customer.lastOrderLabel || "주문 이력 없음")}</span>
+                    </div>
+                    <div class="admin-record-row__stats">
+                      <strong>${escapeHtml(customer.balanceLabel)}</strong>
+                      <small>주문 ${escapeHtml(String(customer.orderCount || 0))} · 누적 ${escapeHtml(customer.totalSpentLabel || "0원")}</small>
+                    </div>
+                    <div class="admin-record-row__status">
+                      <span class="admin-badge ${customer.isActive ? "is-success" : "is-neutral"}">${customer.isActive ? "활성" : "비활성"}</span>
+                      <small>${escapeHtml(customer.lastLoginAt || customer.lastOrderLabel || "활동 기록 없음")}</small>
                     </div>
                   </button>
                 `
@@ -2745,156 +3090,138 @@ function renderCustomerAdminSection() {
           </div>
         </div>
 
-        <div class="admin-card admin-subcard">
-          <div class="admin-subcard__head">
-            <strong>${draft.id ? "계정 수정" : "새 계정 생성"}</strong>
-          </div>
-          ${
-            selectedCustomer
-              ? `
-                <div class="admin-customer-detail-card">
-                  <div class="admin-customer-detail-card__row">
-                    <strong>${escapeHtml(selectedCustomer.name)}</strong>
-                    <span class="admin-badge ${selectedCustomer.isActive ? "is-success" : "is-neutral"}">${escapeHtml(selectedCustomer.accountStatus || (selectedCustomer.isActive ? "active" : "suspended"))}</span>
-                  </div>
-                  <div class="admin-customer-detail-card__grid">
-                    <article><span>이메일</span><strong>${escapeHtml(selectedCustomer.email || selectedCustomer.emailMasked || "-")}</strong></article>
-                    <article><span>연락처</span><strong>${escapeHtml(selectedCustomer.phone || selectedCustomer.phoneMasked || "-")}</strong></article>
-                    <article><span>최근 로그인</span><strong>${escapeHtml(selectedCustomer.lastLoginAt || "기록 없음")}</strong></article>
-                    <article><span>마케팅 동의</span><strong>${selectedCustomer.marketingOptIn ? "동의" : "미동의"}</strong></article>
-                  </div>
-                  ${
-                    Array.isArray(selectedCustomer.socialIdentities) && selectedCustomer.socialIdentities.length
-                      ? `
-                        <div class="admin-detail-pill-row">
-                          ${selectedCustomer.socialIdentities
-                            .map((identity) => `<span class="admin-detail-pill">${escapeHtml(identity.providerLabel || identity.provider)}</span>`)
-                            .join("")}
-                        </div>
-                      `
-                      : ""
-                  }
-                  ${
-                    Array.isArray(selectedCustomer.consents) && selectedCustomer.consents.length
-                      ? `
-                        <div class="admin-detail-list">
-                          ${selectedCustomer.consents
-                            .map(
-                              (consent) => `
-                                <article>
-                                  <strong>${escapeHtml(consent.consentLabel || consent.consentType)}</strong>
-                                  <span>${consent.isAgreed ? "동의" : "미동의"} · ${escapeHtml(consent.agreedAt || "-")} · v${escapeHtml(consent.consentVersion || "")}</span>
-                                </article>
-                              `
-                            )
-                            .join("")}
-                        </div>
-                      `
-                      : ""
-                  }
-                </div>
-              `
-              : ""
-          }
-          <form class="admin-form" data-admin-customer-form>
-            <label class="form-field">
-              <span class="field-label">이름</span>
-              <div class="field-shell">
-                <input class="field-input" type="text" name="name" value="${escapeHtml(draft.name)}" data-admin-customer-field="name" />
-              </div>
-            </label>
-            <label class="form-field">
-              <span class="field-label">이메일</span>
-              <div class="field-shell">
-                <input class="field-input" type="email" name="email" value="${escapeHtml(draft.email)}" data-admin-customer-field="email" />
-              </div>
-            </label>
-            <label class="form-field">
-              <span class="field-label">연락처</span>
-              <div class="field-shell">
-                <input class="field-input" type="text" name="phone" value="${escapeHtml(draft.phone)}" data-admin-customer-field="phone" />
-              </div>
-            </label>
-            <label class="form-field">
-              <span class="field-label">고객 로그인 비밀번호</span>
-              <div class="field-shell">
-                <input class="field-input" type="password" name="password" value="" placeholder="${draft.id ? "변경 시에만 입력" : "8자 이상 입력"}" data-admin-customer-field="password" />
-              </div>
-            </label>
-            <p class="admin-inline-note">고객 로그인은 일반 고객 역할 계정에서만 사용됩니다. 수정 시 비밀번호를 비워두면 기존 비밀번호를 유지합니다.</p>
-            <div class="admin-two-column">
-              <label class="form-field">
-                <span class="field-label">등급</span>
-                <div class="field-shell">
-                  <select class="field-select" name="tier" data-admin-customer-field="tier">
-                    ${["STANDARD", "BUSINESS", "PRO"]
-                      .map((tier) => `<option value="${tier}" ${draft.tier === tier ? "selected" : ""}>${tier}</option>`)
-                      .join("")}
-                  </select>
-                </div>
-              </label>
-              <label class="form-field">
-                <span class="field-label">역할</span>
-                <div class="field-shell">
-                  <select class="field-select" name="role" data-admin-customer-field="role">
-                    ${[
-                      ["customer", "고객"],
-                      ["operator", "운영자"],
-                      ["admin", "관리자"],
-                    ]
-                      .map(([value, label]) => `<option value="${value}" ${draft.role === value ? "selected" : ""}>${label}</option>`)
-                      .join("")}
-                  </select>
-                </div>
-              </label>
+        <div class="admin-customer-main">
+          <div class="admin-card admin-subcard admin-pane">
+            <div class="admin-subcard__head">
+              <strong>선택 고객 상세</strong>
+              ${selectedCustomer ? `<span class="admin-badge ${selectedCustomer.isActive ? "is-success" : "is-neutral"}">${escapeHtml(selectedCustomer.accountStatus || (selectedCustomer.isActive ? "active" : "suspended"))}</span>` : ""}
             </div>
-            <label class="form-field">
-              <span class="field-label">메모</span>
-              <textarea class="field-textarea" name="notes" rows="4" data-admin-customer-field="notes">${escapeHtml(draft.notes)}</textarea>
-            </label>
-            <label class="admin-toggle">
-              <input type="checkbox" name="isActive" ${draft.isActive ? "checked" : ""} data-admin-customer-field="isActive" />
-              <span>활성 계정으로 운영</span>
-            </label>
-            <div class="admin-action-row">
-              <button class="admin-primary-button" type="submit">${draft.id ? "고객 저장" : "고객 생성"}</button>
-              ${selectedCustomer && selectedCustomer.id !== "user_demo" ? `<button class="admin-secondary-button" type="button" data-admin-delete-customer="${selectedCustomer.id}">삭제/비활성</button>` : ""}
-            </div>
-          </form>
-
-          ${
-            selectedCustomer
-              ? `
-                <form class="admin-form admin-balance-form" data-admin-balance-form>
-                  <div class="admin-subcard__head">
-                    <strong>잔액 조정</strong>
-                  </div>
-                  <input type="hidden" name="customerId" value="${escapeHtml(selectedCustomer.id)}" />
-                  <div class="admin-two-column">
-                    <label class="form-field">
-                      <span class="field-label">조정 금액</span>
-                      <div class="field-shell">
-                        <input class="field-input" type="number" name="amount" placeholder="예: 10000 또는 -5000" />
-                      </div>
-                    </label>
-                    <label class="form-field">
-                      <span class="field-label">현재 잔액</span>
-                      <div class="field-shell">
-                        <input class="field-input" type="text" value="${escapeHtml(selectedCustomer.balanceLabel)}" disabled />
-                      </div>
-                    </label>
-                  </div>
-                  <label class="form-field">
-                    <span class="field-label">사유</span>
-                    <div class="field-shell">
-                      <input class="field-input" type="text" name="memo" placeholder="예: 수동 충전, 정산 조정" />
+            ${
+              selectedCustomer
+                ? `
+                  <div class="admin-customer-detail-card">
+                    <div class="admin-customer-detail-card__row">
+                      <strong>${escapeHtml(selectedCustomer.name)}</strong>
+                      <span class="admin-inline-note">${escapeHtml(selectedCustomer.role)} · ${escapeHtml(selectedCustomer.tier)}</span>
                     </div>
-                  </label>
-                  <button class="admin-secondary-button" type="submit">잔액 반영</button>
-                </form>
-              `
-              : ""
-          }
+                    <div class="admin-customer-detail-card__grid">
+                      <article><span>이메일</span><strong>${escapeHtml(selectedCustomer.email || selectedCustomer.emailMasked || "-")}</strong></article>
+                      <article><span>연락처</span><strong>${escapeHtml(selectedCustomer.phone || selectedCustomer.phoneMasked || "-")}</strong></article>
+                      <article><span>최근 로그인</span><strong>${escapeHtml(selectedCustomer.lastLoginAt || "기록 없음")}</strong></article>
+                      <article><span>마케팅 동의</span><strong>${selectedCustomer.marketingOptIn ? "동의" : "미동의"}</strong></article>
+                      <article><span>누적 주문</span><strong>${escapeHtml(String(selectedCustomer.orderCount || 0))}건</strong></article>
+                      <article><span>총 결제</span><strong>${escapeHtml(selectedCustomer.totalSpentLabel || "0원")}</strong></article>
+                    </div>
+                    ${selectedIdentitySummary}
+                    ${selectedConsentSummary}
+                  </div>
+
+                  <form class="admin-form admin-balance-form" data-admin-balance-form>
+                    <div class="admin-subcard__head">
+                      <strong>잔액 조정</strong>
+                    </div>
+                    <input type="hidden" name="customerId" value="${escapeHtml(selectedCustomer.id)}" />
+                    <div class="admin-two-column">
+                      <label class="form-field">
+                        <span class="field-label">조정 금액</span>
+                        <div class="field-shell">
+                          <input class="field-input" type="number" name="amount" placeholder="예: 10000 또는 -5000" />
+                        </div>
+                      </label>
+                      <label class="form-field">
+                        <span class="field-label">현재 잔액</span>
+                        <div class="field-shell">
+                          <input class="field-input" type="text" value="${escapeHtml(selectedCustomer.balanceLabel)}" disabled />
+                        </div>
+                      </label>
+                    </div>
+                    <label class="form-field">
+                      <span class="field-label">사유</span>
+                      <div class="field-shell">
+                        <input class="field-input" type="text" name="memo" placeholder="예: 수동 충전, 정산 조정" />
+                      </div>
+                    </label>
+                    <button class="admin-secondary-button" type="submit">잔액 반영</button>
+                  </form>
+                `
+                : `<div class="admin-empty-card"><strong>선택된 고객이 없습니다.</strong><p>왼쪽 목록에서 계정을 선택하면 상세 정보와 운영 액션이 표시됩니다.</p></div>`
+            }
+          </div>
+
+          <div class="admin-card admin-subcard admin-pane">
+            <div class="admin-subcard__head">
+              <strong>${draft.id ? "계정 수정" : "새 계정 생성"}</strong>
+            </div>
+            <form class="admin-form" data-admin-customer-form>
+              <div class="admin-two-column">
+                <label class="form-field">
+                  <span class="field-label">이름</span>
+                  <div class="field-shell">
+                    <input class="field-input" type="text" name="name" value="${escapeHtml(draft.name)}" data-admin-customer-field="name" />
+                  </div>
+                </label>
+                <label class="form-field">
+                  <span class="field-label">이메일</span>
+                  <div class="field-shell">
+                    <input class="field-input" type="email" name="email" value="${escapeHtml(draft.email)}" data-admin-customer-field="email" />
+                  </div>
+                </label>
+              </div>
+              <div class="admin-two-column">
+                <label class="form-field">
+                  <span class="field-label">연락처</span>
+                  <div class="field-shell">
+                    <input class="field-input" type="text" name="phone" value="${escapeHtml(draft.phone)}" data-admin-customer-field="phone" />
+                  </div>
+                </label>
+                <label class="form-field">
+                  <span class="field-label">고객 로그인 비밀번호</span>
+                  <div class="field-shell">
+                    <input class="field-input" type="password" name="password" value="" placeholder="${draft.id ? "변경 시에만 입력" : "8자 이상 입력"}" data-admin-customer-field="password" />
+                  </div>
+                </label>
+              </div>
+              <p class="admin-inline-note">고객 로그인은 일반 고객 역할 계정에서만 사용됩니다. 수정 시 비밀번호를 비워두면 기존 비밀번호를 유지합니다.</p>
+              <div class="admin-two-column">
+                <label class="form-field">
+                  <span class="field-label">등급</span>
+                  <div class="field-shell">
+                    <select class="field-select" name="tier" data-admin-customer-field="tier">
+                      ${["STANDARD", "BUSINESS", "PRO"]
+                        .map((tier) => `<option value="${tier}" ${draft.tier === tier ? "selected" : ""}>${tier}</option>`)
+                        .join("")}
+                    </select>
+                  </div>
+                </label>
+                <label class="form-field">
+                  <span class="field-label">역할</span>
+                  <div class="field-shell">
+                    <select class="field-select" name="role" data-admin-customer-field="role">
+                      ${[
+                        ["customer", "고객"],
+                        ["operator", "운영자"],
+                        ["admin", "관리자"],
+                      ]
+                        .map(([value, label]) => `<option value="${value}" ${draft.role === value ? "selected" : ""}>${label}</option>`)
+                        .join("")}
+                    </select>
+                  </div>
+                </label>
+              </div>
+              <label class="form-field">
+                <span class="field-label">메모</span>
+                <textarea class="field-textarea" name="notes" rows="4" data-admin-customer-field="notes">${escapeHtml(draft.notes)}</textarea>
+              </label>
+              <label class="admin-toggle">
+                <input type="checkbox" name="isActive" ${draft.isActive ? "checked" : ""} data-admin-customer-field="isActive" />
+                <span>활성 계정으로 운영</span>
+              </label>
+              <div class="admin-action-row">
+                <button class="admin-primary-button" type="submit">${draft.id ? "고객 저장" : "고객 생성"}</button>
+                ${selectedCustomer && selectedCustomer.id !== "user_demo" ? `<button class="admin-secondary-button" type="button" data-admin-delete-customer="${selectedCustomer.id}">삭제/비활성</button>` : ""}
+              </div>
+            </form>
+          </div>
         </div>
       </div>
     </section>
@@ -2910,6 +3237,7 @@ function renderCatalogAdminSection() {
   const categoryProducts = getManageProducts(selectedCategory?.id || state.ui.adminSelectedCategoryId);
   const selectedManageProduct = getSelectedManageProduct();
   const productDraft = state.adminProductDraft || blankProductDraft(selectedCategory?.id || "");
+  const categoryName = selectedCategory?.name || "카테고리 미선택";
 
   return `
     <section class="admin-card">
@@ -2918,7 +3246,17 @@ function renderCatalogAdminSection() {
         <p>카테고리 생성/편집과 상품 생성/편집/삭제를 통해 사용자 패널 노출 상품을 직접 관리할 수 있습니다.</p>
       </div>
 
-      <div class="admin-management-layout">
+      ${renderAdminInsightStrip(
+        [
+          { label: "카테고리", value: `${categories.length}개`, description: "운영 중인 전체 카테고리 수" },
+          { label: "선택 카테고리", value: categoryName, description: `${categoryProducts.length}개 상품 연결` },
+          { label: "최근 공급사 추천", value: selectedSupplierService ? selectedSupplierService.externalServiceId : "-", description: selectedSupplierService ? selectedSupplierService.name : "선택된 공급사 서비스 없음" },
+          { label: "상품 편집 상태", value: productDraft.id ? "수정 중" : "신규 작성", description: productDraft.id ? productDraft.name : "새 상품 작성 폼" },
+        ],
+        "admin-insight-grid--compact"
+      )}
+
+      <div class="admin-management-layout admin-management-layout--catalog-top">
         <div class="admin-card admin-subcard">
           <div class="admin-subcard__head">
             <strong>카테고리</strong>
@@ -2949,85 +3287,104 @@ function renderCatalogAdminSection() {
           </div>
         </div>
 
-        <div class="admin-card admin-subcard">
+        <div class="admin-card admin-subcard admin-pane">
           <div class="admin-subcard__head">
             <strong>${categoryDraft.id ? "카테고리 수정" : "카테고리 생성"}</strong>
           </div>
           <form class="admin-form" data-admin-category-form>
-            <label class="form-field">
-              <span class="field-label">플랫폼 그룹</span>
-              <div class="field-shell">
-                <select class="field-select" name="groupId" data-admin-category-field="groupId">
-                  ${groups
-                    .map(
-                      (group) => `
-                        <option value="${escapeHtml(group.id)}" ${categoryDraft.groupId === group.id ? "selected" : ""}>
-                          ${escapeHtml(group.platformName)} · ${escapeHtml(group.name)}
-                        </option>
-                      `
-                    )
-                    .join("")}
-                </select>
-              </div>
-            </label>
-            <div class="admin-two-column">
-              <label class="form-field">
-                <span class="field-label">카테고리명</span>
-                <div class="field-shell">
-                  <input class="field-input" type="text" name="name" value="${escapeHtml(categoryDraft.name)}" data-admin-category-field="name" />
+            ${renderAdminFormSection(
+              "기본 정보",
+              "플랫폼 그룹과 공개 카테고리명을 먼저 정의합니다.",
+              `
+                <label class="form-field">
+                  <span class="field-label">플랫폼 그룹</span>
+                  <div class="field-shell">
+                    <select class="field-select" name="groupId" data-admin-category-field="groupId">
+                      ${groups
+                        .map(
+                          (group) => `
+                            <option value="${escapeHtml(group.id)}" ${categoryDraft.groupId === group.id ? "selected" : ""}>
+                              ${escapeHtml(group.platformName)} · ${escapeHtml(group.name)}
+                            </option>
+                          `
+                        )
+                        .join("")}
+                    </select>
+                  </div>
+                </label>
+                <div class="admin-two-column">
+                  <label class="form-field">
+                    <span class="field-label">카테고리명</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="text" name="name" value="${escapeHtml(categoryDraft.name)}" data-admin-category-field="name" />
+                    </div>
+                  </label>
+                  <label class="form-field">
+                    <span class="field-label">옵션 라벨</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="text" name="optionLabelName" value="${escapeHtml(categoryDraft.optionLabelName)}" data-admin-category-field="optionLabelName" />
+                    </div>
+                  </label>
                 </div>
-              </label>
-              <label class="form-field">
-                <span class="field-label">옵션 라벨</span>
-                <div class="field-shell">
-                  <input class="field-input" type="text" name="optionLabelName" value="${escapeHtml(categoryDraft.optionLabelName)}" data-admin-category-field="optionLabelName" />
+                <label class="form-field">
+                  <span class="field-label">설명</span>
+                  <textarea class="field-textarea" name="description" rows="3" data-admin-category-field="description">${escapeHtml(categoryDraft.description)}</textarea>
+                </label>
+              `
+            )}
+            ${renderAdminFormSection(
+              "노출 카피",
+              "목록/상세 상단에 노출할 제목과 설명 문구를 구성합니다.",
+              `
+                <div class="admin-two-column">
+                  <label class="form-field">
+                    <span class="field-label">히어로 제목</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="text" name="heroTitle" value="${escapeHtml(categoryDraft.heroTitle)}" data-admin-category-field="heroTitle" />
+                    </div>
+                  </label>
+                  <label class="form-field">
+                    <span class="field-label">히어로 부제</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="text" name="heroSubtitle" value="${escapeHtml(categoryDraft.heroSubtitle)}" data-admin-category-field="heroSubtitle" />
+                    </div>
+                  </label>
                 </div>
-              </label>
-            </div>
-            <label class="form-field">
-              <span class="field-label">설명</span>
-              <textarea class="field-textarea" name="description" rows="3" data-admin-category-field="description">${escapeHtml(categoryDraft.description)}</textarea>
-            </label>
-            <div class="admin-two-column">
-              <label class="form-field">
-                <span class="field-label">히어로 제목</span>
-                <div class="field-shell">
-                  <input class="field-input" type="text" name="heroTitle" value="${escapeHtml(categoryDraft.heroTitle)}" data-admin-category-field="heroTitle" />
+                <label class="form-field">
+                  <span class="field-label">상세 설명 HTML</span>
+                  <textarea class="field-textarea" name="serviceDescriptionHtml" rows="4" data-admin-category-field="serviceDescriptionHtml">${escapeHtml(categoryDraft.serviceDescriptionHtml)}</textarea>
+                </label>
+                <div class="admin-two-column">
+                  <label class="form-field">
+                    <span class="field-label">주의사항</span>
+                    <textarea class="field-textarea" name="cautionText" rows="4" data-admin-category-field="cautionText">${escapeHtml(categoryDraft.cautionText)}</textarea>
+                  </label>
+                  <label class="form-field">
+                    <span class="field-label">환불 안내</span>
+                    <textarea class="field-textarea" name="refundText" rows="4" data-admin-category-field="refundText">${escapeHtml(categoryDraft.refundText)}</textarea>
+                  </label>
                 </div>
-              </label>
-              <label class="form-field">
-                <span class="field-label">히어로 부제</span>
-                <div class="field-shell">
-                  <input class="field-input" type="text" name="heroSubtitle" value="${escapeHtml(categoryDraft.heroSubtitle)}" data-admin-category-field="heroSubtitle" />
+              `
+            )}
+            ${renderAdminFormSection(
+              "노출 상태",
+              "정렬과 공개 여부를 마지막에 확정합니다.",
+              `
+                <div class="admin-two-column">
+                  <label class="form-field">
+                    <span class="field-label">정렬 순서</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="number" name="sortOrder" value="${escapeHtml(String(categoryDraft.sortOrder || 0))}" data-admin-category-field="sortOrder" />
+                    </div>
+                  </label>
+                  <label class="admin-toggle">
+                    <input type="checkbox" name="isActive" ${categoryDraft.isActive ? "checked" : ""} data-admin-category-field="isActive" />
+                    <span>카테고리 노출</span>
+                  </label>
                 </div>
-              </label>
-            </div>
-            <label class="form-field">
-              <span class="field-label">상세 설명 HTML</span>
-              <textarea class="field-textarea" name="serviceDescriptionHtml" rows="4" data-admin-category-field="serviceDescriptionHtml">${escapeHtml(categoryDraft.serviceDescriptionHtml)}</textarea>
-            </label>
-            <div class="admin-two-column">
-              <label class="form-field">
-                <span class="field-label">주의사항</span>
-                <textarea class="field-textarea" name="cautionText" rows="4" data-admin-category-field="cautionText">${escapeHtml(categoryDraft.cautionText)}</textarea>
-              </label>
-              <label class="form-field">
-                <span class="field-label">환불 안내</span>
-                <textarea class="field-textarea" name="refundText" rows="4" data-admin-category-field="refundText">${escapeHtml(categoryDraft.refundText)}</textarea>
-              </label>
-            </div>
-            <div class="admin-two-column">
-              <label class="form-field">
-                <span class="field-label">정렬 순서</span>
-                <div class="field-shell">
-                  <input class="field-input" type="number" name="sortOrder" value="${escapeHtml(String(categoryDraft.sortOrder || 0))}" data-admin-category-field="sortOrder" />
-                </div>
-              </label>
-              <label class="admin-toggle">
-                <input type="checkbox" name="isActive" ${categoryDraft.isActive ? "checked" : ""} data-admin-category-field="isActive" />
-                <span>카테고리 노출</span>
-              </label>
-            </div>
+              `,
+              { open: false }
+            )}
             <div class="admin-action-row">
               <button class="admin-primary-button" type="submit">${categoryDraft.id ? "카테고리 저장" : "카테고리 생성"}</button>
               ${state.ui.adminCategoryMode !== "new" && selectedCategory ? `<button class="admin-secondary-button" type="button" data-admin-delete-category="${selectedCategory.id}">삭제/숨김</button>` : ""}
@@ -3085,180 +3442,211 @@ function renderCatalogAdminSection() {
               : ""
           }
           <form class="admin-form" data-admin-product-form>
-            <label class="form-field">
-              <span class="field-label">카테고리</span>
-              <div class="field-shell">
-                <select class="field-select" name="categoryId" data-admin-product-field="categoryId">
-                  ${categories
-                    .map((category) => `<option value="${escapeHtml(category.id)}" ${productDraft.categoryId === category.id ? "selected" : ""}>${escapeHtml(category.platformName)} · ${escapeHtml(category.name)}</option>`)
-                    .join("")}
-                </select>
-              </div>
-            </label>
-            <div class="admin-two-column">
-              <label class="form-field">
-                <span class="field-label">상품명</span>
-                <div class="field-shell">
-                  <input class="field-input" type="text" name="name" value="${escapeHtml(productDraft.name)}" data-admin-product-field="name" />
+            ${renderAdminFormSection(
+              "1) 기본 정보",
+              "카테고리, 상품명, 메뉴명, 옵션명, 내부 코드와 기본 배지를 설정합니다.",
+              `
+                <label class="form-field">
+                  <span class="field-label">카테고리</span>
+                  <div class="field-shell">
+                    <select class="field-select" name="categoryId" data-admin-product-field="categoryId">
+                      ${categories
+                        .map((category) => `<option value="${escapeHtml(category.id)}" ${productDraft.categoryId === category.id ? "selected" : ""}>${escapeHtml(category.platformName)} · ${escapeHtml(category.name)}</option>`)
+                        .join("")}
+                    </select>
+                  </div>
+                </label>
+                <div class="admin-two-column">
+                  <label class="form-field">
+                    <span class="field-label">상품명</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="text" name="name" value="${escapeHtml(productDraft.name)}" data-admin-product-field="name" />
+                    </div>
+                  </label>
+                  <label class="form-field">
+                    <span class="field-label">메뉴명</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="text" name="menuName" value="${escapeHtml(productDraft.menuName)}" data-admin-product-field="menuName" />
+                    </div>
+                  </label>
                 </div>
-              </label>
-              <label class="form-field">
-                <span class="field-label">메뉴명</span>
-                <div class="field-shell">
-                  <input class="field-input" type="text" name="menuName" value="${escapeHtml(productDraft.menuName)}" data-admin-product-field="menuName" />
+                <div class="admin-two-column">
+                  <label class="form-field">
+                    <span class="field-label">옵션명</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="text" name="optionName" value="${escapeHtml(productDraft.optionName)}" data-admin-product-field="optionName" />
+                    </div>
+                  </label>
+                  <label class="form-field">
+                    <span class="field-label">상품 코드</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="text" name="productCode" value="${escapeHtml(productDraft.productCode)}" data-admin-product-field="productCode" />
+                    </div>
+                  </label>
                 </div>
-              </label>
-            </div>
-            <div class="admin-two-column">
-              <label class="form-field">
-                <span class="field-label">옵션명</span>
-                <div class="field-shell">
-                  <input class="field-input" type="text" name="optionName" value="${escapeHtml(productDraft.optionName)}" data-admin-product-field="optionName" />
+              `
+            )}
+            ${renderAdminFormSection(
+              "2) 가격/수량 정책",
+              "판매 가격과 최소/최대/증가 단위를 같은 섹션에서 조정합니다.",
+              `
+                <div class="admin-three-column">
+                  <label class="form-field">
+                    <span class="field-label">가격</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="number" name="price" value="${escapeHtml(String(productDraft.price || 0))}" data-admin-product-field="price" />
+                    </div>
+                  </label>
+                  <label class="form-field">
+                    <span class="field-label">가격 방식</span>
+                    <div class="field-shell">
+                      <select class="field-select" name="priceStrategy" data-admin-product-field="priceStrategy">
+                        <option value="unit" ${productDraft.priceStrategy === "unit" ? "selected" : ""}>수량형</option>
+                        <option value="fixed" ${productDraft.priceStrategy === "fixed" ? "selected" : ""}>패키지형</option>
+                      </select>
+                    </div>
+                  </label>
+                  <label class="form-field">
+                    <span class="field-label">단위</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="text" name="unitLabel" value="${escapeHtml(productDraft.unitLabel)}" data-admin-product-field="unitLabel" />
+                    </div>
+                  </label>
                 </div>
-              </label>
-            </div>
-            <div class="admin-two-column">
-              <label class="form-field">
-                <span class="field-label">상품 코드</span>
-                <div class="field-shell">
-                  <input class="field-input" type="text" name="productCode" value="${escapeHtml(productDraft.productCode)}" data-admin-product-field="productCode" />
+                <div class="admin-three-column">
+                  <label class="form-field">
+                    <span class="field-label">최소</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="number" name="minAmount" value="${escapeHtml(String(productDraft.minAmount || 1))}" data-admin-product-field="minAmount" />
+                    </div>
+                  </label>
+                  <label class="form-field">
+                    <span class="field-label">최대</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="number" name="maxAmount" value="${escapeHtml(String(productDraft.maxAmount || 1))}" data-admin-product-field="maxAmount" />
+                    </div>
+                  </label>
+                  <label class="form-field">
+                    <span class="field-label">증가 단위</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="number" name="stepAmount" value="${escapeHtml(String(productDraft.stepAmount || 1))}" data-admin-product-field="stepAmount" />
+                    </div>
+                  </label>
                 </div>
-              </label>
-              <label class="form-field">
-                <span class="field-label">배지</span>
-                <div class="field-shell">
-                  <input class="field-input" type="text" name="badge" value="${escapeHtml(productDraft.badge)}" data-admin-product-field="badge" />
+              `
+            )}
+            ${renderAdminFormSection(
+              "3) 주문 폼 구성",
+              "사용자가 보게 될 입력 라벨과 예상 시작 시간을 설정합니다.",
+              `
+                <div class="admin-three-column">
+                  <label class="form-field">
+                    <span class="field-label">폼 프리셋</span>
+                    <div class="field-shell">
+                      <select class="field-select" name="formPreset" data-admin-product-field="formPreset">
+                        ${[
+                          ["account_quantity", "계정 ID + 수량"],
+                          ["url_quantity", "URL + 수량"],
+                          ["keyword_url", "키워드 + URL + 수량"],
+                          ["package", "계정 패키지형"],
+                          ["url_package", "URL 패키지형"],
+                          ["custom", "맞춤 문의형"],
+                        ]
+                          .map(([value, label]) => `<option value="${value}" ${productDraft.formPreset === value ? "selected" : ""}>${label}</option>`)
+                          .join("")}
+                      </select>
+                    </div>
+                  </label>
+                  <label class="form-field">
+                    <span class="field-label">입력 라벨</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="text" name="targetLabel" value="${escapeHtml(productDraft.targetLabel)}" data-admin-product-field="targetLabel" />
+                    </div>
+                  </label>
+                  <label class="form-field">
+                    <span class="field-label">입력 플레이스홀더</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="text" name="targetPlaceholder" value="${escapeHtml(productDraft.targetPlaceholder)}" data-admin-product-field="targetPlaceholder" />
+                    </div>
+                  </label>
                 </div>
-              </label>
-            </div>
-            <div class="admin-three-column">
-              <label class="form-field">
-                <span class="field-label">가격</span>
-                <div class="field-shell">
-                  <input class="field-input" type="number" name="price" value="${escapeHtml(String(productDraft.price || 0))}" data-admin-product-field="price" />
+                <div class="admin-three-column">
+                  <label class="form-field">
+                    <span class="field-label">수량 라벨</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="text" name="quantityLabel" value="${escapeHtml(productDraft.quantityLabel)}" data-admin-product-field="quantityLabel" />
+                    </div>
+                  </label>
+                  <label class="form-field">
+                    <span class="field-label">메모 라벨</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="text" name="memoLabel" value="${escapeHtml(productDraft.memoLabel)}" data-admin-product-field="memoLabel" />
+                    </div>
+                  </label>
+                  <label class="form-field">
+                    <span class="field-label">예상 시작 시간</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="text" name="estimatedTurnaround" value="${escapeHtml(productDraft.estimatedTurnaround)}" data-admin-product-field="estimatedTurnaround" />
+                    </div>
+                  </label>
                 </div>
-              </label>
-              <label class="form-field">
-                <span class="field-label">가격 방식</span>
-                <div class="field-shell">
-                  <select class="field-select" name="priceStrategy" data-admin-product-field="priceStrategy">
-                    <option value="unit" ${productDraft.priceStrategy === "unit" ? "selected" : ""}>수량형</option>
-                    <option value="fixed" ${productDraft.priceStrategy === "fixed" ? "selected" : ""}>패키지형</option>
-                  </select>
+              `
+            )}
+            ${renderAdminFormSection(
+              "4) 노출/배지",
+              "배지, 할인 노출, 판매 상태, 정렬 순서를 같이 관리합니다.",
+              `
+                <div class="admin-two-column">
+                  <label class="form-field">
+                    <span class="field-label">배지</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="text" name="badge" value="${escapeHtml(productDraft.badge)}" data-admin-product-field="badge" />
+                    </div>
+                  </label>
+                  <label class="form-field">
+                    <span class="field-label">정렬 순서</span>
+                    <div class="field-shell">
+                      <input class="field-input" type="number" name="sortOrder" value="${escapeHtml(String(productDraft.sortOrder || 0))}" data-admin-product-field="sortOrder" />
+                    </div>
+                  </label>
                 </div>
-              </label>
-              <label class="form-field">
-                <span class="field-label">단위</span>
-                <div class="field-shell">
-                  <input class="field-input" type="text" name="unitLabel" value="${escapeHtml(productDraft.unitLabel)}" data-admin-product-field="unitLabel" />
+                <div class="admin-two-column">
+                  <label class="admin-toggle">
+                    <input type="checkbox" name="isDiscounted" ${productDraft.isDiscounted ? "checked" : ""} data-admin-product-field="isDiscounted" />
+                    <span>할인 상품으로 표시</span>
+                  </label>
+                  <label class="admin-toggle">
+                    <input type="checkbox" name="isActive" ${productDraft.isActive ? "checked" : ""} data-admin-product-field="isActive" />
+                    <span>판매 상태로 노출</span>
+                  </label>
                 </div>
-              </label>
-            </div>
-            <div class="admin-three-column">
-              <label class="form-field">
-                <span class="field-label">최소</span>
-                <div class="field-shell">
-                  <input class="field-input" type="number" name="minAmount" value="${escapeHtml(String(productDraft.minAmount || 1))}" data-admin-product-field="minAmount" />
-                </div>
-              </label>
-              <label class="form-field">
-                <span class="field-label">최대</span>
-                <div class="field-shell">
-                  <input class="field-input" type="number" name="maxAmount" value="${escapeHtml(String(productDraft.maxAmount || 1))}" data-admin-product-field="maxAmount" />
-                </div>
-              </label>
-              <label class="form-field">
-                <span class="field-label">증가 단위</span>
-                <div class="field-shell">
-                  <input class="field-input" type="number" name="stepAmount" value="${escapeHtml(String(productDraft.stepAmount || 1))}" data-admin-product-field="stepAmount" />
-                </div>
-              </label>
-            </div>
-            <div class="admin-three-column">
-              <label class="form-field">
-                <span class="field-label">폼 프리셋</span>
-                <div class="field-shell">
-                  <select class="field-select" name="formPreset" data-admin-product-field="formPreset">
-                    ${[
-                      ["account_quantity", "계정 ID + 수량"],
-                      ["url_quantity", "URL + 수량"],
-                      ["keyword_url", "키워드 + URL + 수량"],
-                      ["package", "계정 패키지형"],
-                      ["url_package", "URL 패키지형"],
-                      ["custom", "맞춤 문의형"],
-                    ]
-                      .map(([value, label]) => `<option value="${value}" ${productDraft.formPreset === value ? "selected" : ""}>${label}</option>`)
+              `
+            )}
+            ${renderAdminFormSection(
+              "5) 고급 옵션",
+              "드립/트래픽/반복형 상품에 필요한 추가 주문 필드를 선택합니다.",
+              `
+                <div class="form-field">
+                  <span class="field-label">추가 주문 옵션</span>
+                  <div class="admin-advanced-field-grid">
+                    ${advancedOrderFieldKeys
+                      .map((fieldKey) => {
+                        const field = advancedOrderFieldBlueprints[fieldKey];
+                        const active = Array.isArray(productDraft.advancedFieldKeys) && productDraft.advancedFieldKeys.includes(fieldKey);
+                        return `
+                          <label class="admin-check-card ${active ? "is-active" : ""}">
+                            <input type="checkbox" ${active ? "checked" : ""} data-admin-product-advanced-field="${fieldKey}" />
+                            <strong>${escapeHtml(field.label)}</strong>
+                            <span>${escapeHtml(field.description)}</span>
+                          </label>
+                        `;
+                      })
                       .join("")}
-                  </select>
+                  </div>
                 </div>
-              </label>
-              <label class="form-field">
-                <span class="field-label">입력 라벨</span>
-                <div class="field-shell">
-                  <input class="field-input" type="text" name="targetLabel" value="${escapeHtml(productDraft.targetLabel)}" data-admin-product-field="targetLabel" />
-                </div>
-              </label>
-              <label class="form-field">
-                <span class="field-label">입력 플레이스홀더</span>
-                <div class="field-shell">
-                  <input class="field-input" type="text" name="targetPlaceholder" value="${escapeHtml(productDraft.targetPlaceholder)}" data-admin-product-field="targetPlaceholder" />
-                </div>
-              </label>
-            </div>
-            <div class="admin-three-column">
-              <label class="form-field">
-                <span class="field-label">수량 라벨</span>
-                <div class="field-shell">
-                  <input class="field-input" type="text" name="quantityLabel" value="${escapeHtml(productDraft.quantityLabel)}" data-admin-product-field="quantityLabel" />
-                </div>
-              </label>
-              <label class="form-field">
-                <span class="field-label">메모 라벨</span>
-                <div class="field-shell">
-                  <input class="field-input" type="text" name="memoLabel" value="${escapeHtml(productDraft.memoLabel)}" data-admin-product-field="memoLabel" />
-                </div>
-              </label>
-              <label class="form-field">
-                <span class="field-label">예상 시작 시간</span>
-                <div class="field-shell">
-                  <input class="field-input" type="text" name="estimatedTurnaround" value="${escapeHtml(productDraft.estimatedTurnaround)}" data-admin-product-field="estimatedTurnaround" />
-                </div>
-              </label>
-            </div>
-            <div class="form-field">
-              <span class="field-label">추가 주문 옵션</span>
-              <div class="admin-advanced-field-grid">
-                ${advancedOrderFieldKeys
-                  .map((fieldKey) => {
-                    const field = advancedOrderFieldBlueprints[fieldKey];
-                    const active = Array.isArray(productDraft.advancedFieldKeys) && productDraft.advancedFieldKeys.includes(fieldKey);
-                    return `
-                      <label class="admin-check-card ${active ? "is-active" : ""}">
-                        <input type="checkbox" ${active ? "checked" : ""} data-admin-product-advanced-field="${fieldKey}" />
-                        <strong>${escapeHtml(field.label)}</strong>
-                        <span>${escapeHtml(field.description)}</span>
-                      </label>
-                    `;
-                  })
-                  .join("")}
-              </div>
-            </div>
-            <div class="admin-two-column">
-              <label class="admin-toggle">
-                <input type="checkbox" name="isDiscounted" ${productDraft.isDiscounted ? "checked" : ""} data-admin-product-field="isDiscounted" />
-                <span>할인 상품으로 표시</span>
-              </label>
-              <label class="admin-toggle">
-                <input type="checkbox" name="isActive" ${productDraft.isActive ? "checked" : ""} data-admin-product-field="isActive" />
-                <span>판매 상태로 노출</span>
-              </label>
-            </div>
-            <label class="form-field">
-              <span class="field-label">정렬 순서</span>
-              <div class="field-shell">
-                <input class="field-input" type="number" name="sortOrder" value="${escapeHtml(String(productDraft.sortOrder || 0))}" data-admin-product-field="sortOrder" />
-              </div>
-            </label>
+              `,
+              { open: false }
+            )}
             <div class="admin-action-row">
               <button class="admin-primary-button" type="submit">${productDraft.id ? "상품 저장" : "상품 생성"}</button>
               ${state.ui.adminProductMode !== "new" && selectedManageProduct ? `<button class="admin-secondary-button" type="button" data-admin-delete-product="${selectedManageProduct.id}">삭제/숨김</button>` : ""}
@@ -3279,6 +3667,10 @@ function renderAdminOrdersSection() {
     if (!search) return true;
     return String(order.searchText || "").includes(search);
   });
+  const queuedCount = adminOrders.filter((order) => order.status === "queued").length;
+  const inProgressCount = adminOrders.filter((order) => order.status === "in_progress").length;
+  const completedCount = adminOrders.filter((order) => order.status === "completed").length;
+  const dispatchIssueCount = adminOrders.filter((order) => isSupplierDispatchIssue(order)).length;
 
   return `
     <section class="admin-card">
@@ -3286,6 +3678,16 @@ function renderAdminOrdersSection() {
         <h2>주문 운영</h2>
         <p>최근 주문을 확인하고 상태를 수동으로 업데이트할 수 있습니다.</p>
       </div>
+
+      ${renderAdminInsightStrip(
+        [
+          { label: "대기", value: `${queuedCount}건`, description: "아직 작업이 시작되지 않은 주문" },
+          { label: "진행", value: `${inProgressCount}건`, description: "공급사 처리 또는 내부 확인이 필요한 주문" },
+          { label: "완료", value: `${completedCount}건`, description: "완료 처리된 주문" },
+          { label: "전송 이슈", value: `${dispatchIssueCount}건`, description: "공급사 전송 실패/오류가 감지된 주문" },
+        ],
+        "admin-insight-grid--compact"
+      )}
 
       <div class="filter-row admin-filter-row">
         ${[
@@ -3322,27 +3724,32 @@ function renderAdminOrdersSection() {
           ? visibleOrders
               .map((order) => {
             const status = statusMap[order.status] || statusMap.queued;
+            const hasDispatchIssue = isSupplierDispatchIssue(order);
+            const supplierDispatchLabel = order.supplierDispatchLabel || order.supplierStatus || "공급사 미연결";
             return `
-              <article class="admin-order-card">
+              <article class="admin-order-card ${hasDispatchIssue ? "is-risk" : ""}">
                 <div class="admin-order-card__top">
                   <div>
                     <span class="order-card__platform">${escapeHtml(order.platformIcon)} ${escapeHtml(order.platformName)}</span>
                     <strong>${escapeHtml(order.productName)}</strong>
                     <p>${escapeHtml(order.customerName)} · ${escapeHtml(order.customerEmailMasked || "비공개")}</p>
                   </div>
-                  <span class="status-pill ${status.className}">${escapeHtml(status.label)}</span>
+                  <div class="admin-order-card__statusbox">
+                    <span class="admin-order-card__number">${escapeHtml(order.orderNumber)}</span>
+                    <span class="status-pill ${status.className}">${escapeHtml(status.label)}</span>
+                  </div>
                 </div>
-                <div class="admin-order-card__meta">
-                  <span>${escapeHtml(order.orderNumber)}</span>
-                  <span>${escapeHtml(order.totalPriceLabel)}</span>
-                  <span>${escapeHtml(order.createdLabel)}</span>
-                  ${order.supplierName ? `<span>${escapeHtml(order.supplierName)} / ${escapeHtml(order.supplierDispatchLabel || order.supplierStatus || "미전송")}</span>` : ""}
+                <div class="admin-order-card__fact-grid">
+                  <article><span>결제 금액</span><strong>${escapeHtml(order.totalPriceLabel)}</strong></article>
+                  <article><span>접수 시각</span><strong>${escapeHtml(order.createdLabel)}</strong></article>
+                  <article><span>공급사</span><strong>${escapeHtml(order.supplierName || "미연결")}</strong></article>
+                  <article><span>전송 상태</span><strong>${escapeHtml(supplierDispatchLabel)}</strong></article>
                 </div>
                 <p class="order-card__target">${escapeHtml(order.targetValue || "입력값 없음")}</p>
                 <div class="admin-order-callout-grid">
-                  <article class="admin-mini-card">
+                  <article class="admin-mini-card ${hasDispatchIssue ? "is-risk" : ""}">
                     <span>공급사 전송</span>
-                    <strong>${escapeHtml(order.supplierDispatchLabel || "공급사 미연결")}</strong>
+                    <strong>${escapeHtml(supplierDispatchLabel)}</strong>
                     <p>${escapeHtml(order.supplierExternalOrderId || order.supplierStatus || "외부 주문번호 없음")}</p>
                   </article>
                   <article class="admin-mini-card">
@@ -3384,263 +3791,6 @@ function renderAdminOrdersSection() {
           })
               .join("")
           : `<div class="admin-empty-card"><strong>조건에 맞는 주문이 없습니다.</strong><p>상태 필터나 검색어를 바꿔 다시 확인해 주세요.</p></div>`}
-      </div>
-    </section>
-  `;
-}
-
-function renderAdminAuth() {
-  const session = state.adminSession || { configured: false, authenticated: false };
-  const topbar = renderAdminTopbar("보안 인증 워크스페이스", "관리자 로그인 전에도 보안 상태와 접근 정책을 한눈에 볼 수 있도록 데스크톱형 진입 화면으로 재구성했습니다.", [
-    { label: "관리자 계정", value: session.configured ? "준비됨" : "미설정" },
-    { label: "봇 차단", value: "ON" },
-    { label: "민감정보", value: "보호중" },
-  ]);
-
-  return renderAdminFrame(`
-    <div class="admin-workspace admin-workspace--auth">
-      <aside class="admin-rail">
-        ${renderAdminAuthRail(session)}
-      </aside>
-
-      <div class="admin-content">
-        ${topbar}
-        <div class="admin-auth-layout">
-          <section class="admin-hero admin-hero--auth">
-            <div>
-              <p class="admin-hero__eyebrow">Security Gate</p>
-              <h1>관리자 보안 인증</h1>
-              <p>공급사 API 키, 고객 상세 정보, 운영 제어 메뉴는 로그인된 관리자 세션에서만 접근할 수 있도록 잠금 처리되었습니다.</p>
-            </div>
-          </section>
-
-          <section class="admin-card admin-auth-card">
-            ${
-              session.configured
-                ? `
-                  <div class="section-head section-head--compact">
-                    <h2>관리자 로그인</h2>
-                    <p>인증 후에만 고객 상세 정보와 공급사 키 수정 기능이 활성화됩니다.</p>
-                  </div>
-                  <form class="admin-form" data-admin-login-form>
-                    <label class="form-field">
-                      <span class="field-label">관리자 계정</span>
-                      <div class="field-shell">
-                        <input class="field-input" type="text" name="username" value="admin" autocomplete="username" />
-                      </div>
-                    </label>
-                    <label class="form-field">
-                      <span class="field-label">관리자 비밀번호</span>
-                      <div class="field-shell">
-                        <input class="field-input" type="password" name="password" autocomplete="current-password" />
-                      </div>
-                    </label>
-                    <button class="admin-primary-button" type="submit">로그인</button>
-                  </form>
-                `
-                : `
-                  <div class="section-head section-head--compact">
-                    <h2>보안 설정 필요</h2>
-                    <p>서버 시작 시 관리자 비밀번호를 설정해야 관리자 화면이 열립니다.</p>
-                  </div>
-                  <div class="admin-security-note">
-                    <strong>실행 예시</strong>
-                    <code>export SMM_PANEL_ADMIN_PASSWORD="강한비밀번호"</code>
-                    <code>python3 smm_panel/server.py --host 127.0.0.1 --port 8024</code>
-                  </div>
-                `
-            }
-          </section>
-        </div>
-      </div>
-    </div>
-  `);
-}
-
-function renderAdminErpHeader(stats = {}, popup = null) {
-  const username = state.adminSession?.username || "admin";
-  const siteName = getAdminSiteSettings()?.siteName || state.bootstrap?.siteSettings?.siteName || "Pulse24";
-  const activeSection = getAdminSectionConfig();
-
-  return `
-    <header class="admin-erp-header">
-      <div class="admin-erp-brand">
-        <div class="admin-erp-brand__mark">P</div>
-        <div class="admin-erp-brand__text">
-          <strong>${escapeHtml(siteName)} ERP</strong>
-          <span>Operations Console</span>
-        </div>
-      </div>
-
-      <div class="admin-erp-header__summary">
-        <strong>${escapeHtml(activeSection.label)}</strong>
-        <p>${escapeHtml(activeSection.summary)}</p>
-      </div>
-
-      <div class="admin-erp-header__right">
-        <div class="admin-erp-user">
-          <span class="admin-erp-user__avatar">${escapeHtml(username.slice(0, 1).toUpperCase())}</span>
-          <div>
-            <strong>${escapeHtml(username)}</strong>
-            <span>관리자 세션 진행 중</span>
-          </div>
-        </div>
-        <button class="admin-erp-utility" type="button" data-route="/">사용자 패널</button>
-        <button class="admin-erp-utility" type="button" data-admin-refresh>새로고침</button>
-        <button class="admin-erp-utility is-primary" type="button" data-admin-logout>로그아웃</button>
-      </div>
-    </header>
-  `;
-}
-
-function renderAdminErpIconRail(stats = {}, popup = null) {
-  const sections = adminSectionItems(stats, popup);
-  return `
-    <aside class="admin-erp-iconbar">
-      <div class="admin-erp-iconbar__menu">
-        ${sections
-          .map(
-            (section) => `
-              <button
-                class="admin-erp-iconbutton ${state.ui.adminActiveSection === section.id ? "is-active" : ""}"
-                type="button"
-                data-admin-scroll-section="${section.id}"
-                title="${escapeHtml(section.label)}"
-              >
-                <span>${escapeHtml(section.icon || "•")}</span>
-              </button>
-            `
-          )
-          .join("")}
-      </div>
-      <div class="admin-erp-iconbar__footer">
-        <button class="admin-erp-iconbutton" type="button" data-route="/" title="사용자 패널">
-          <span>⌂</span>
-        </button>
-      </div>
-    </aside>
-  `;
-}
-
-function renderAdminErpSidebar(stats = {}, popup = null) {
-  const sections = adminSectionItems(stats, popup);
-  const activeSection = getAdminSectionConfig();
-  const siteSettings = getAdminSiteSettings() || state.bootstrap?.siteSettings || null;
-  const controlItems = [
-    { label: "봇 차단", value: "활성", description: "/admin, /api/admin 색인 차단" },
-    { label: "사이트명", value: siteSettings?.siteName || "미설정", description: "기본 설정에서 브랜딩과 메타를 관리" },
-    { label: "공급사 수", value: `${Number(stats.supplierCount || 0)}개`, description: "API 연동 공급사 등록 현황" },
-    { label: "팝업 상태", value: popup?.isActive ? "노출중" : "비노출", description: popup?.route || "이동 경로 미설정" },
-  ];
-
-  return `
-    <aside class="admin-erp-sidebar">
-      <section class="admin-erp-sidebar__section">
-        <span class="admin-erp-sidebar__eyebrow">Current Module</span>
-        <strong class="admin-erp-sidebar__title">${escapeHtml(activeSection.title)}</strong>
-        <p class="admin-erp-sidebar__copy">${escapeHtml(activeSection.summary)}</p>
-      </section>
-
-      <section class="admin-erp-sidebar__section">
-        <span class="admin-erp-sidebar__eyebrow">Workspace Menu</span>
-        <div class="admin-erp-sidebar__menu">
-          ${sections
-            .map(
-              (section) => `
-                <button
-                  class="admin-erp-sidebar__item ${state.ui.adminActiveSection === section.id ? "is-active" : ""}"
-                  type="button"
-                  data-admin-scroll-section="${section.id}"
-                >
-                  <span class="admin-erp-sidebar__item-icon">${escapeHtml(section.icon || "•")}</span>
-                  <div>
-                    <strong>${escapeHtml(section.label)}</strong>
-                    <small>${escapeHtml(section.description)}</small>
-                  </div>
-                  <span class="admin-erp-sidebar__item-stat">${escapeHtml(section.stat || "")}</span>
-                </button>
-              `
-            )
-            .join("")}
-        </div>
-      </section>
-
-      <section class="admin-erp-sidebar__section">
-        <span class="admin-erp-sidebar__eyebrow">Control Board</span>
-        <div class="admin-erp-sidebar__stack">
-          ${controlItems
-            .map(
-              (item) => `
-                <article class="admin-erp-sidebar__card">
-                  <span>${escapeHtml(item.label)}</span>
-                  <strong>${escapeHtml(item.value)}</strong>
-                  <p>${escapeHtml(item.description)}</p>
-                </article>
-              `
-            )
-            .join("")}
-        </div>
-      </section>
-    </aside>
-  `;
-}
-
-function renderAdminModuleHeader(sectionId) {
-  const section = getAdminSectionConfig(sectionId);
-  const categorySelected = Boolean(state.ui.adminSelectedCategoryId);
-
-  let actions = `
-    <button class="admin-secondary-button" type="button" data-admin-refresh>새로고침</button>
-  `;
-
-  if (sectionId === "overview") {
-    actions = `
-      <button class="admin-secondary-button" type="button" data-route="/">사용자 패널 열기</button>
-      <button class="admin-primary-button" type="button" data-admin-refresh>운영 데이터 갱신</button>
-    `;
-  } else if (sectionId === "analytics") {
-    actions = `
-      <button class="admin-secondary-button" type="button" data-route="/">사이트 열기</button>
-      <button class="admin-primary-button" type="button" data-admin-refresh>통계 새로고침</button>
-    `;
-  } else if (sectionId === "settings") {
-    actions = `
-      <button class="admin-secondary-button" type="button" data-route="/">사이트 확인</button>
-      <button class="admin-primary-button" type="button" data-admin-refresh>설정 다시 불러오기</button>
-    `;
-  } else if (sectionId === "popup") {
-    actions = `
-      <button class="admin-secondary-button" type="button" data-route="/">홈 미리보기</button>
-      <button class="admin-primary-button" type="button" data-admin-refresh>노출 데이터 갱신</button>
-    `;
-  } else if (sectionId === "suppliers") {
-    actions = `
-      <button class="admin-secondary-button" type="button" data-admin-refresh>연동 현황 갱신</button>
-      <button class="admin-primary-button" type="button" data-admin-supplier-new>새 공급사</button>
-    `;
-  } else if (sectionId === "customers") {
-    actions = `
-      <button class="admin-secondary-button" type="button" data-admin-refresh>회원 목록 갱신</button>
-      <button class="admin-primary-button" type="button" data-admin-customer-new>새 고객</button>
-    `;
-  } else if (sectionId === "catalog") {
-    actions = `
-      <button class="admin-secondary-button" type="button" data-admin-category-new>새 카테고리</button>
-      <button class="admin-primary-button" type="button" data-admin-product-new ${categorySelected ? "" : "disabled"}>새 상품</button>
-    `;
-  }
-
-  return `
-    <section class="admin-module-header">
-      <div class="admin-module-header__breadcrumb">관리자 / ${escapeHtml(section.label)}</div>
-      <div class="admin-module-header__row">
-        <div>
-          <h1>${escapeHtml(section.title)}</h1>
-          <p>${escapeHtml(section.summary)}</p>
-        </div>
-        <div class="admin-module-header__actions">
-          ${actions}
-        </div>
       </div>
     </section>
   `;
@@ -4482,11 +4632,27 @@ function renderSupplierAdminSection({
   const integrationType = draft.integrationType || selectedSupplier?.integrationType || "classic";
   const integrationGuide = supplierConnectionGuide(integrationType);
   const apiKeyLabel = supplierApiKeyLabel(integrationType);
+  const visibleServices = filteredServices.slice(0, 160);
   const savedSecretSummary = integrationType === "mkt24"
     ? `x-api-key ${draft.hasApiKey ? draft.apiKeyMasked || "설정됨" : "미설정"} · Bearer ${draft.hasBearerToken ? draft.bearerTokenMasked || "설정됨" : "미설정"}`
     : draft.hasApiKey
       ? draft.apiKeyMasked || "설정됨"
       : "미설정";
+  const connectionState = activeConnection?.status || activeConnection?.lastTestStatus || "never";
+  const currentIssue = connectionState === "success"
+    ? "오류 없음"
+    : activeConnection?.message || activeConnection?.lastTestMessage || "연결 확인을 아직 실행하지 않았습니다.";
+  const nextAction = !selectedSupplier
+    ? "공급사를 선택해 연결 확인을 시작하세요."
+    : !activeConnection?.resolvedApiUrl && !selectedSupplier?.lastCheckedAt
+      ? "연결 확인을 먼저 실행하세요."
+      : !allServices.length
+        ? "서비스 동기화를 실행하세요."
+        : !selectedService
+          ? "서비스 목록에서 하나를 선택하세요."
+          : !selectedProduct
+            ? "내부 상품을 선택해 매핑을 준비하세요."
+            : "현재 선택값으로 매핑을 저장하세요.";
   return `
     <div class="admin-layout">
       <aside class="admin-sidebar">
@@ -4608,7 +4774,7 @@ function renderSupplierAdminSection({
                   </article>
                 `
               )
-              .join("")}
+            .join("")}
           </div>
         </section>
 
@@ -4618,28 +4784,32 @@ function renderSupplierAdminSection({
             <p>${escapeHtml(integrationGuide.status)}</p>
           </div>
 
-          <div class="admin-connection-grid">
-            <article class="admin-connection-card">
-              <span>연결 상태</span>
-              <strong>${activeConnection ? renderAdminHealthBadge(activeConnection.status || activeConnection.lastTestStatus) : renderAdminHealthBadge("never")}</strong>
-              <p>${escapeHtml(activeConnection?.message || activeConnection?.lastTestMessage || "아직 연결 확인을 진행하지 않았습니다.")}</p>
-            </article>
-            <article class="admin-connection-card">
-              <span>확인된 URL</span>
-              <strong>${escapeHtml(activeConnection?.resolvedApiUrl || selectedSupplier?.apiUrl || draft.apiUrl || "-")}</strong>
-              <p>${escapeHtml(activeConnection?.checkedAt || selectedSupplier?.lastCheckedAt || "최근 확인 기록이 없습니다.")}</p>
-            </article>
-            <article class="admin-connection-card">
-              <span>잔액</span>
-              <strong>${escapeHtml(activeConnection?.balance ? `${activeConnection.balance} ${activeConnection.currency || ""}`.trim() : selectedSupplier?.lastBalance ? `${selectedSupplier.lastBalance} ${selectedSupplier.lastCurrency || ""}`.trim() : "-")}</strong>
-              <p>${escapeHtml(integrationGuide.balance)}</p>
-            </article>
-            <article class="admin-connection-card">
-              <span>서비스 수</span>
-              <strong>${escapeHtml(String(activeConnection?.serviceCount || selectedSupplier?.lastServiceCount || selectedSupplier?.serviceCount || 0))}</strong>
-              <p>서비스 동기화 전에도 연결 테스트 단계에서 개수를 확인합니다.</p>
-            </article>
-          </div>
+          ${renderAdminInsightStrip(
+            [
+              {
+                label: "현재 문제",
+                value: currentIssue,
+                description: connectionState === "success" ? "최근 연결 확인에서 오류가 감지되지 않았습니다." : "API URL, 인증 정보, 공급사 응답 메시지를 먼저 점검하세요.",
+                tone: connectionState === "success" ? "success" : "warning",
+              },
+              {
+                label: "마지막 확인",
+                value: activeConnection?.checkedAt || selectedSupplier?.lastCheckedAt || "기록 없음",
+                description: activeConnection?.resolvedApiUrl || selectedSupplier?.apiUrl || draft.apiUrl || "확인된 URL 없음",
+              },
+              {
+                label: "다음 액션",
+                value: nextAction,
+                description: "연결 확인 → 서비스 동기화 → 서비스 선택 → 내부 상품 매핑 순서를 유지합니다.",
+              },
+              {
+                label: "사용 가능 서비스",
+                value: `${String(activeConnection?.serviceCount || selectedSupplier?.lastServiceCount || selectedSupplier?.serviceCount || 0)}개`,
+                description: activeConnection?.balance ? `잔액 ${`${activeConnection.balance} ${activeConnection.currency || ""}`.trim()}` : integrationGuide.balance,
+              },
+            ],
+            "admin-insight-grid--compact"
+          )}
 
           ${integrationGuide.dispatch ? `<p class="admin-inline-note">${escapeHtml(integrationGuide.dispatch)}</p>` : ""}
 
@@ -4657,61 +4827,69 @@ function renderSupplierAdminSection({
             <p>${escapeHtml(selectedSupplier ? `${selectedSupplier.name}에서 불러온 서비스입니다.` : "공급사를 선택하면 서비스 목록이 표시됩니다.")}</p>
           </div>
 
-          <div class="admin-toolbar admin-toolbar--stack">
-            <div class="search-shell">
-              <input
-                class="search-input"
-                type="text"
-                value="${escapeHtml(state.ui.adminServiceSearch)}"
-                placeholder="서비스명, 카테고리, ID 검색"
-                data-admin-service-search
-              />
+          <div class="admin-supplier-explorer">
+            <div class="admin-card admin-subcard admin-pane">
+              <div class="admin-toolbar admin-toolbar--stack">
+                <div class="search-shell">
+                  <input
+                    class="search-input"
+                    type="text"
+                    value="${escapeHtml(state.ui.adminServiceSearch)}"
+                    placeholder="서비스명, 카테고리, ID 검색"
+                    data-admin-service-search
+                  />
+                </div>
+                <div class="admin-inline-note">
+                  전체 ${escapeHtml(String(allServices.length))}개 / 검색 결과 ${escapeHtml(String(filteredServices.length))}개
+                </div>
+              </div>
+              ${
+                filteredServices.length
+                  ? `
+                    <div class="admin-service-browser">
+                      ${visibleServices
+                        .map(
+                          (service) => `
+                            <button
+                              class="admin-service-row ${state.ui.adminSelectedSupplierServiceId === service.id ? "is-active" : ""}"
+                              type="button"
+                              data-admin-service-select="${service.id}"
+                            >
+                              <div>
+                                <strong>${escapeHtml(service.name)}</strong>
+                                <p>${escapeHtml(service.category || "분류 없음")} · #${escapeHtml(service.externalServiceId)} · ${escapeHtml(String(service.minAmount || 0))}~${escapeHtml(String(service.maxAmount || 0))}</p>
+                              </div>
+                              <span>${escapeHtml(service.rateLabel)}</span>
+                            </button>
+                          `
+                        )
+                        .join("")}
+                    </div>
+                    ${filteredServices.length > visibleServices.length ? `<p class="admin-inline-note">성능을 위해 상위 ${escapeHtml(String(visibleServices.length))}개만 먼저 보여줍니다. 검색어를 더 구체화해 서비스 범위를 좁히세요.</p>` : ""}
+                  `
+                  : `<div class="admin-empty-card"><strong>표시할 서비스가 없습니다.</strong><p>공급사를 저장하고 서비스 동기화를 먼저 실행하거나 검색어를 조정해 주세요.</p></div>`
+              }
             </div>
-            <div class="admin-inline-note">
-              ${escapeHtml(selectedService ? `선택됨: ${selectedService.name} (#${selectedService.externalServiceId})` : "서비스를 선택하면 우측 매핑 폼에 반영됩니다.")} ·
-              전체 ${escapeHtml(String(allServices.length))}개 / 표시 ${escapeHtml(String(filteredServices.length))}개
+
+            <div class="admin-card admin-subcard admin-pane">
+              <div class="admin-subcard__head">
+                <strong>선택 서비스 상세</strong>
+                ${selectedService ? `<span class="admin-badge is-success">선택됨</span>` : `<span class="admin-badge is-neutral">미선택</span>`}
+              </div>
+              ${
+                selectedService
+                  ? `
+                    <div class="admin-mini-card">
+                      <span>선택 서비스</span>
+                      <strong>${escapeHtml(selectedService.name)} (#${escapeHtml(selectedService.externalServiceId)})</strong>
+                      <p>${escapeHtml(selectedService.category || "분류 없음")} · Rate ${escapeHtml(selectedService.rateLabel)} · ${escapeHtml(String(selectedService.minAmount || 0))} ~ ${escapeHtml(String(selectedService.maxAmount || 0))} · ${selectedService.refill ? "리필 가능" : "리필 없음"}</p>
+                    </div>
+                    ${renderSupplierRequestGuide(selectedService, { applyLabel: selectedProduct ? "선택한 상품 제작 폼에 추천 적용" : "새 상품 제작 폼에 추천 적용" })}
+                  `
+                  : `<div class="admin-empty-card"><strong>선택된 서비스가 없습니다.</strong><p>왼쪽 목록에서 공급사 서비스를 고르면 호출 예시와 추천 양식이 이곳에 표시됩니다.</p></div>`
+              }
             </div>
           </div>
-
-          ${
-            filteredServices.length
-              ? `
-                <div class="admin-service-browser">
-                  ${filteredServices
-                    .slice(0, 120)
-                    .map(
-                      (service) => `
-                        <button
-                          class="admin-service-row ${state.ui.adminSelectedSupplierServiceId === service.id ? "is-active" : ""}"
-                          type="button"
-                          data-admin-service-select="${service.id}"
-                        >
-                          <div>
-                            <strong>${escapeHtml(service.name)}</strong>
-                            <p>${escapeHtml(service.category || "분류 없음")} · #${escapeHtml(service.externalServiceId)} · ${escapeHtml(String(service.minAmount || 0))}~${escapeHtml(String(service.maxAmount || 0))}</p>
-                          </div>
-                          <span>${escapeHtml(service.rateLabel)}</span>
-                        </button>
-                      `
-                    )
-                    .join("")}
-                </div>
-                ${filteredServices.length > 120 ? `<p class="admin-inline-note">표시 성능을 위해 상위 120개만 먼저 노출합니다. 검색어를 더 구체화하면 원하는 서비스를 빠르게 좁힐 수 있습니다.</p>` : ""}
-                ${
-                  selectedService
-                    ? `
-                      <div class="admin-mini-card">
-                        <span>선택 서비스 상세</span>
-                        <strong>${escapeHtml(selectedService.name)} (#${escapeHtml(selectedService.externalServiceId)})</strong>
-                        <p>${escapeHtml(selectedService.category || "분류 없음")} · Rate ${escapeHtml(selectedService.rateLabel)} · ${escapeHtml(String(selectedService.minAmount || 0))} ~ ${escapeHtml(String(selectedService.maxAmount || 0))} · ${selectedService.refill ? "리필 가능" : "리필 없음"}</p>
-                      </div>
-                      ${renderSupplierRequestGuide(selectedService, { applyLabel: selectedProduct ? "선택한 상품 제작 폼에 추천 적용" : "새 상품 제작 폼에 추천 적용" })}
-                    `
-                    : ""
-                }
-              `
-              : `<div class="admin-empty-card"><strong>표시할 서비스가 없습니다.</strong><p>공급사를 저장하고 서비스 동기화를 먼저 실행하거나 검색어를 조정해 주세요.</p></div>`
-          }
         </section>
 
         <section class="admin-card">
@@ -4828,422 +5006,48 @@ function renderSupplierAdminSection({
   `;
 }
 
-function renderAdminActiveSection(sectionId, context) {
-  if (sectionId === "analytics") return renderAnalyticsAdminSection();
-  if (sectionId === "settings") return renderSiteSettingsAdminSection();
-  if (sectionId === "popup") return renderPopupAdminSection();
-  if (sectionId === "suppliers") return renderSupplierAdminSection(context);
-  if (sectionId === "customers") return renderCustomerAdminSection();
-  if (sectionId === "catalog") return renderCatalogAdminSection();
-  if (sectionId === "orders") return renderAdminOrdersSection();
-  return renderAdminOverviewSection(context.stats, context.popup);
-}
-
-function renderAdmin() {
-  const suppliers = getAdminSuppliers();
-  const products = getAdminProducts();
-  const stats = state.adminBootstrap?.stats || {};
-  const popup = getAdminPopup();
-  const selectedSupplier = getSelectedAdminSupplier();
-  const selectedProduct = getSelectedAdminProduct();
-  const draft = state.adminSupplierDraft || blankSupplierDraft();
-  const serviceData = selectedSupplier ? state.adminSupplierServices[selectedSupplier.id] : null;
-  const allServices = serviceData?.services || [];
-  const serviceSearch = state.ui.adminServiceSearch.trim().toLowerCase();
-  const filteredServices = allServices
-    .filter((service) => {
-      if (!serviceSearch) return true;
-      const haystack = `${service.name} ${service.category} ${service.externalServiceId}`.toLowerCase();
-      return haystack.includes(serviceSearch);
-    });
-  const selectedService =
-    allServices.find((service) => service.id === state.ui.adminSelectedSupplierServiceId) ||
-    filteredServices.find((service) => service.id === state.ui.adminSelectedSupplierServiceId) ||
-    null;
-  const connectionResult = state.adminConnectionResult;
-  const activeConnection = connectionResult || selectedSupplier;
-  const activeSection = getAdminSectionConfig();
-  const context = {
-    suppliers,
-    products,
-    stats,
-    popup,
-    selectedSupplier,
-    selectedProduct,
-    draft,
-    allServices,
-    filteredServices,
-    selectedService,
-    activeConnection,
-  };
-
-  return renderAdminFrame(`
-    <div class="admin-erp-shell">
-      ${renderAdminErpHeader(stats, popup)}
-      <div class="admin-erp-body">
-        ${renderAdminErpSidebar(stats, popup)}
-        <main class="admin-erp-main">
-          ${renderAdminModuleHeader(activeSection.id)}
-          <div class="admin-erp-stage">
-            ${renderAdminActiveSection(activeSection.id, context)}
-          </div>
-        </main>
-      </div>
-    </div>
-  `);
-}
-
 function renderHomeBannerCard(banner, { compact = false, index = 0, total = 1, interactive = true } = {}) {
   const imageUrl = resolveHomeBannerImageUrl(banner);
-  const hasImage = Boolean(imageUrl);
   const title = banner?.title || "프로모션 배너";
-  const subtitle = banner?.subtitle || "";
-  const ctaLabel = banner?.ctaLabel || "바로 보기";
   const route = banner?.route || "/";
-  const theme = banner?.theme || "blue";
-  const counter = total > 1 && !compact ? `${index + 1} / ${total}` : "";
   const tag = interactive ? "button" : "div";
   const routeAttr = interactive ? ` type="button" data-route="${escapeHtml(route)}"` : "";
   return `
-    <${tag} class="home-banner-card home-banner-card--${compact ? "compact" : "feature"} home-banner-card--${escapeHtml(theme)} ${hasImage ? "has-image" : ""}"${routeAttr}>
-      ${
-        hasImage
-          ? `
-            <span class="home-banner-card__media">
-              <img src="${escapeHtml(imageUrl)}" alt="${escapeHtml(title)}" loading="lazy" />
-            </span>
-            <span class="home-banner-card__overlay"></span>
-          `
-          : ""
-      }
-      <span class="home-banner-card__copy">
-        ${compact ? "" : `<span class="home-banner-card__eyebrow">PROMOTION</span>`}
-        <strong>${escapeHtml(title)}</strong>
-        ${subtitle ? `<em>${escapeHtml(subtitle)}</em>` : ""}
+    <${tag} class="home-banner-card home-banner-card--${compact ? "compact" : "feature"}" aria-label="${escapeHtml(title)}"${routeAttr}>
+      <span class="home-banner-card__media">
+        <img src="${escapeHtml(imageUrl)}" alt="${escapeHtml(title)}" loading="lazy" />
       </span>
-      ${
-        compact
-          ? `<span class="home-banner-card__arrow" aria-hidden="true">›</span>`
-          : `
-            <span class="home-banner-card__meta">
-              ${counter ? `<span class="home-banner-card__counter">${escapeHtml(counter)}</span>` : ""}
-              <span class="home-banner-card__cta">${escapeHtml(ctaLabel)}</span>
-            </span>
-          `
-      }
+      ${!compact && total > 1 ? `<span class="home-banner-card__slot">${escapeHtml(`${index + 1} / ${total}`)}</span>` : ""}
     </${tag}>
   `;
 }
 
-function renderHome() {
-  const data = state.bootstrap;
-  if (!data) return "";
-  const authenticated = isLoggedIn();
-  const user = data.user;
-  const siteDescription =
-    data.siteSettings?.siteDescription ||
-    "원하는 플랫폼과 상품을 빠르게 찾고 주문까지 이어지는 SMM 주문 패널입니다.";
-  const activeBanners = getActiveHomeBanners();
-  const safeBannerIndex = activeBanners.length ? state.ui.bannerIndex % activeBanners.length : 0;
-  if (safeBannerIndex !== state.ui.bannerIndex) {
-    state.ui.bannerIndex = safeBannerIndex;
-  }
-  const topBanner = activeBanners[0] || null;
-  const quickLinks = data.topLinks?.length ? data.topLinks : [{ label: "서비스 소개서", route: "/products" }, { label: "이용 가이드", route: "/help" }];
-  const counterA = authenticated
-    ? { label: "보유 캐시", value: user?.balanceLabel || "0원" }
-    : { label: "등록 상품", value: `${formatNumber(data.heroStats?.[1]?.value?.replace(/[^\d]/g, "") || 0)}개` };
-  const counterB = authenticated
-    ? { label: "누적 주문", value: `${formatNumber(state.orderCounts.all || 0)}건` }
-    : { label: "고객 지원", value: `${formatNumber((data.supportLinks || []).length)}개 안내` };
-
-  return renderFrame(
-    `
-      <div class="page page-home page-home--renewed">
-        <section class="home-hero">
-          <div class="home-hero__header">
-            <div class="home-hero__brandmark" aria-label="${escapeHtml(data.app.name)}">${escapeHtml(user?.avatarLabel || "P24")}</div>
-            <div class="home-hero__quicklinks">
-              ${quickLinks
-                .map(
-                  (link) => `
-                    <button class="home-hero__quicklink" type="button" data-route="${escapeHtml(link.route)}">
-                      ${escapeHtml(link.label)}
-                    </button>
-                  `
-                )
-                .join("")}
-              <button class="home-hero__chat" type="button" data-route="/products/cat_custom_request" aria-label="상담 연결">●</button>
-            </div>
-          </div>
-
-          <div class="home-hero__body">
-            <button
-              class="home-login-card ${authenticated ? "is-authenticated" : ""}"
-              type="button"
-              ${authenticated ? 'data-route="/my"' : 'data-route="/auth"'}
-            >
-              <div class="home-login-card__copy">
-                <strong>${escapeHtml(authenticated ? `${user.name}님, 바로 주문할까요?` : "로그인이 필요해요")}</strong>
-                <span>${escapeHtml(authenticated ? `보유 캐시 ${user.balanceLabel} · 주문 ${formatNumber(state.orderCounts.all || 0)}건` : siteDescription)}</span>
-              </div>
-              <span class="home-login-card__arrow">›</span>
-            </button>
-            <div class="home-hero__counters">
-              <div class="home-hero__counter">
-                <strong>${escapeHtml(counterA.value)}</strong>
-                <span>${escapeHtml(counterA.label)}</span>
-              </div>
-              <div class="home-hero__counter">
-                <strong>${escapeHtml(counterB.value)}</strong>
-                <span>${escapeHtml(counterB.label)}</span>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        ${
-          topBanner
-            ? `
-              <section class="content-section content-section--tight">
-                ${renderHomeBannerCard(topBanner, { compact: true })}
-              </section>
-            `
-            : ""
-        }
-
-        <section class="content-section content-section--tight">
-          <div class="home-search">
-            <input
-              class="home-search__input"
-              type="text"
-              placeholder="어떤 서비스를 찾으세요?"
-              value="${escapeHtml(state.ui.search)}"
-              data-home-search-input
-            />
-            <button class="home-search__submit" type="button" aria-label="서비스 검색" data-home-search-submit>⌕</button>
-          </div>
-        </section>
-
-        <section class="content-section content-section--tight">
-          <div class="home-platform-stack" data-home-platform-stack>
-            <div class="home-platform-scroller" data-home-platform-scroller tabindex="0" aria-label="서비스 플랫폼 목록">
-              <div class="home-platform-grid">
-                ${data.platforms
-                  .map(
-                    (platform) => `
-                      <button
-                        class="home-platform-card"
-                        type="button"
-                        data-route="/products"
-                        data-platform-id="${platform.id}"
-                      >
-                        <span class="home-platform-card__icon" style="--platform-accent:${escapeHtml(platform.accentColor)}">${escapeHtml(platform.icon)}</span>
-                        <strong>${escapeHtml(platform.displayName)}</strong>
-                      </button>
-                    `
-                  )
-                  .join("")}
-              </div>
-            </div>
-            <div class="home-platform-scroller__fade" data-home-platform-fade></div>
-            <div class="home-platform-scroller__hint" data-home-platform-hint>아래로 스크롤해 더 많은 서비스를 확인하세요</div>
-          </div>
-        </section>
-
-        ${
-          activeBanners.length
-            ? `
-              <section class="content-section">
-                <div class="banner-carousel banner-carousel--media">
-                  <div class="banner-track" data-home-banner-track style="transform: translateX(-${safeBannerIndex * 100}%);">
-                    ${activeBanners
-                      .map((banner, index) => renderHomeBannerCard(banner, { compact: false, index, total: activeBanners.length }))
-                      .join("")}
-                  </div>
-                </div>
-                ${
-                  activeBanners.length > 1
-                    ? `
-                      <div class="banner-dots banner-dots--home">
-                        ${activeBanners
-                          .map(
-                            (_, index) => `
-                              <button
-                                class="banner-dot ${index === safeBannerIndex ? "is-active" : ""}"
-                                type="button"
-                                data-banner-index="${index}"
-                                aria-label="배너 ${index + 1}"
-                              ></button>
-                            `
-                          )
-                          .join("")}
-                      </div>
-                    `
-                    : ""
-                }
-              </section>
-            `
-            : ""
-        }
-
-        <section class="content-section home-section-grid">
-          <div class="home-section-grid__main">
-            <div class="section-head">
-              <h2>추천 서비스</h2>
-              <p>자주 찾는 서비스만 짧고 또렷하게 정리했습니다.</p>
-            </div>
-            <div class="spotlight-list">
-              ${data.featuredServices
-                .map(
-                  (item) => `
-                    <button class="spotlight-card" type="button" data-route="${item.route}">
-                      <span class="spotlight-card__icon">${escapeHtml(item.icon)}</span>
-                      <div class="spotlight-card__copy">
-                        <strong>${escapeHtml(item.title)}</strong>
-                        <p>${escapeHtml(item.subtitle)}</p>
-                      </div>
-                      <span class="spotlight-card__arrow">›</span>
-                    </button>
-                  `
-                )
-                .join("")}
-            </div>
-          </div>
-
-          <div class="home-section-grid__side">
-            <div class="section-head">
-              <h2>빠른 안내</h2>
-              <p>로그인 없이도 FAQ, 공지, 이용 가이드를 바로 확인할 수 있습니다.</p>
-            </div>
-            <div class="support-grid support-grid--compact">
-              ${data.supportLinks
-                .map(
-                  (item) => `
-                    <button class="support-card" type="button" data-route="${item.route}">
-                      <span class="support-card__icon">${escapeHtml(item.icon)}</span>
-                      <strong>${escapeHtml(item.title)}</strong>
-                      <p>${escapeHtml(item.subtitle)}</p>
-                    </button>
-                  `
-                )
-                .join("")}
-            </div>
-          </div>
-        </section>
-
-        <section class="content-section footer-section">
-          <div class="footer-meta">
-            <p><strong>${escapeHtml(data.company.name)}</strong></p>
-            <p>대표: ${escapeHtml(data.company.representative)}</p>
-            <p>문의: ${escapeHtml(data.company.contact)}</p>
-            <p>운영시간: ${escapeHtml(data.company.hours)}</p>
-          </div>
-        </section>
-      </div>
-    `,
-    "home",
-    renderHomePopupOverlay()
-  );
+function siteNameOrDefault(siteName) {
+  return String(siteName || "").trim() || DEFAULT_SITE_NAME;
 }
 
-function renderProducts() {
-  const platforms = filteredCatalog();
-  const activePlatform = getCurrentPlatform(platforms);
+function brandMonogram(siteName) {
+  const normalized = siteNameOrDefault(siteName).replace(/\s+/g, "");
+  const latin = normalized.replace(/[^A-Za-z0-9]/g, "");
+  if (latin.length >= 2) {
+    return latin.slice(0, 2).toUpperCase();
+  }
+  return Array.from(normalized)[0] || "인";
+}
 
-  return renderFrame(
-    `
-      <div class="page page-products">
-        <header class="topbar topbar--search">
-          <button class="icon-button" type="button" data-route="/">‹</button>
-          <div class="search-shell">
-            <input
-              class="search-input"
-              type="text"
-              name="search"
-              placeholder="상품명, 플랫폼, 설명 검색"
-              value="${escapeHtml(state.ui.search)}"
-              data-search-input="catalog"
-            />
-          </div>
-          <button class="icon-button" type="button" data-route="/charge">₩</button>
-        </header>
-        <div class="topbar-spacer"></div>
-
-        <div class="catalog-layout">
-          <aside class="platform-rail">
-            ${platforms
-              .map(
-                (platform) => `
-                  <button
-                    class="platform-rail__item ${activePlatform && platform.id === activePlatform.id ? "is-active" : ""}"
-                    type="button"
-                    data-platform-select="${platform.id}"
-                  >
-                    <span>${escapeHtml(platform.icon)}</span>
-                    <strong>${escapeHtml(platform.displayName)}</strong>
-                  </button>
-                `
-              )
-              .join("")}
-          </aside>
-
-          <section class="catalog-main">
-            ${
-              activePlatform
-                ? `
-                  <div class="catalog-hero">
-                    <span class="catalog-hero__eyebrow">${escapeHtml(activePlatform.displayName)}</span>
-                    <h2>${escapeHtml(activePlatform.description)}</h2>
-                  </div>
-                  ${activePlatform.groups
-                    .map(
-                      (group) => `
-                        <section class="catalog-group">
-                          <div class="section-head section-head--compact">
-                            <h3>${escapeHtml(group.name)}</h3>
-                            <p>${escapeHtml(group.description)}</p>
-                          </div>
-                          <div class="catalog-card-list">
-                            ${group.productCategories
-                              .map(
-                                (category) => `
-                                  <button class="catalog-card" type="button" data-route="/products/${category.id}">
-                                    <div class="catalog-card__copy">
-                                      <div class="catalog-card__title">
-                                        <strong>${escapeHtml(category.name)}</strong>
-                                        ${category.badge ? `<span class="mini-badge">${escapeHtml(category.badge)}</span>` : ""}
-                                      </div>
-                                      <p>${escapeHtml(category.description)}</p>
-                                      <div class="catalog-card__meta">
-                                        <span>${escapeHtml(category.startingPriceLabel)}부터</span>
-                                        <span>${escapeHtml(String(category.optionCount))}개 옵션</span>
-                                      </div>
-                                    </div>
-                                    <span class="catalog-card__arrow">›</span>
-                                  </button>
-                                `
-                              )
-                              .join("")}
-                          </div>
-                        </section>
-                      `
-                    )
-                    .join("")}
-                `
-                : `
-                  <div class="empty-card">
-                    <strong>검색 결과가 없습니다.</strong>
-                    <p>다른 키워드로 다시 검색해 주세요.</p>
-                  </div>
-                `
-            }
-          </section>
-        </div>
-      </div>
-    `,
-    "products"
-  );
+function renderSiteBrandLogoMarkup(siteSettings, className, options = {}) {
+  const siteName = siteNameOrDefault(siteSettings?.siteName);
+  const surface = options.surface === "light" ? "light" : "dark";
+  const darkLogoImageUrl = String(siteSettings?.headerLogoUrl || "").trim();
+  const logoImageUrl = surface === "light" ? DEFAULT_LIGHT_BRAND_LOGO_URL || darkLogoImageUrl : darkLogoImageUrl;
+  if (logoImageUrl) {
+    return `
+      <span class="${escapeHtml(className)} is-image" aria-label="${escapeHtml(siteName)}">
+        <img src="${escapeHtml(logoImageUrl)}" alt="${escapeHtml(siteName)}" loading="lazy" />
+      </span>
+    `;
+  }
+  return `<span class="${escapeHtml(className)}" aria-label="${escapeHtml(siteName)}">${escapeHtml(brandMonogram(siteName))}</span>`;
 }
 
 function renderLoginRequiredPage(title, description, activeKey = "home") {
@@ -5254,6 +5058,16 @@ function renderLoginRequiredPage(title, description, activeKey = "home") {
           <span class="empty-card__eyebrow">로그인 필요</span>
           <strong>${escapeHtml(title)}</strong>
           <p>${escapeHtml(description)}</p>
+          <div class="guide-list">
+            <article class="guide-card">
+              <strong>로그인 후 가능</strong>
+              <p>주문 내역, 잔액, 충전, 계정별 진행 현황을 한 화면에서 확인할 수 있습니다.</p>
+            </article>
+            <article class="guide-card">
+              <strong>탐색은 로그인 없이 가능</strong>
+              <p>상품 탐색, 상세 확인, FAQ, 공지, 정책 문서는 로그인 없이 열람할 수 있습니다.</p>
+            </article>
+          </div>
           <button class="full-width-cta" type="button" data-route="/auth">로그인 / 회원가입</button>
           <button class="ghost-secondary-button" type="button" data-route="/products">서비스 둘러보기</button>
         </section>
@@ -5347,470 +5161,6 @@ function renderField(key, templateEntry, rules, values) {
   `;
 }
 
-function renderDetail(detail) {
-  const summary = calculateSummary(detail);
-  const selection = ensureSelection(detail);
-  const selectedProduct = summary?.product;
-  const values = selection?.fields || {};
-  const template = selectedProduct?.formStructure?.template || {};
-  const rules = selectedProduct?.formStructure?.schema || {};
-  const previewSource = getPreviewSource(detail, selectedProduct);
-  const orderValidation = getOrderValidationState(detail, selectedProduct);
-  const loggedIn = isLoggedIn();
-
-  return renderFrame(
-    `
-      <div class="page page-detail">
-        <header class="topbar">
-          <button class="icon-button" type="button" data-route="/products">‹</button>
-          <strong class="topbar-title">${escapeHtml(detail.platform.displayName)}</strong>
-          <button class="icon-button" type="button" data-route="/charge">₩</button>
-        </header>
-        <div class="topbar-spacer"></div>
-
-        <section class="detail-hero-card">
-          <div class="detail-hero-card__eyebrow">${escapeHtml(detail.group.name)}</div>
-          <h1>${escapeHtml(detail.heroTitle)}</h1>
-          <p>${escapeHtml(detail.heroSubtitle)}</p>
-          <div class="detail-meta-row">
-            <span class="meta-chip">${escapeHtml(detail.platform.displayName)}</span>
-            ${
-              selectedProduct?.badge
-                ? `<span class="meta-chip meta-chip--accent">${escapeHtml(selectedProduct.badge)}</span>`
-                : ""
-            }
-            <span class="meta-chip">${escapeHtml(selectedProduct?.estimatedTurnaround || "")}</span>
-          </div>
-        </section>
-
-        ${
-          detail.products.length > 1
-            ? `
-              <section class="content-section">
-                <div class="section-head section-head--compact">
-                  <h2>${escapeHtml(detail.optionLabelName || "옵션 선택")}</h2>
-                  <p>레퍼런스의 옵션 칩 UI를 참고해 한 화면에서 바로 비교할 수 있게 구성했습니다.</p>
-                </div>
-                <div class="option-chip-row">
-                  ${detail.products
-                    .map(
-                      (product) => `
-                        <button
-                          class="option-chip ${selectedProduct && product.id === selectedProduct.id ? "is-active" : ""}"
-                          type="button"
-                          data-option-select="${product.id}"
-                          data-category-id="${detail.id}"
-                        >
-                          <strong>${escapeHtml(product.optionName || product.name)}</strong>
-                          <span>${escapeHtml(product.priceLabel)}</span>
-                        </button>
-                      `
-                    )
-                    .join("")}
-                </div>
-              </section>
-            `
-            : ""
-        }
-
-        <section class="content-section">
-          <div class="detail-trust-row">
-            <article class="info-card">
-              <strong>판매가</strong>
-              <p>${escapeHtml(selectedProduct?.priceLabel || "0원")} ${selectedProduct?.priceStrategy === "fixed" ? "패키지" : `· 최소 ${formatNumber(selectedProduct?.minAmount || 0)}${escapeHtml(selectedProduct?.unitLabel || "개")}`}</p>
-            </article>
-            <article class="info-card">
-              <strong>예상 소요시간</strong>
-              <p>${escapeHtml(selectedProduct?.estimatedTurnaround || "상품별 상이 · 주문 후 순차 진행")}</p>
-            </article>
-            <article class="info-card">
-              <strong>핵심 정책</strong>
-              <p>${escapeHtml(detail.refundNotice?.[0] || "작업 시작 후 환불·취소 기준은 상품 정책을 따릅니다.")}</p>
-            </article>
-          </div>
-        </section>
-
-        <section class="content-section">
-          <div class="section-head section-head--compact">
-            <h2>주문 폼</h2>
-            <p>${escapeHtml(detail.description)}</p>
-          </div>
-          <form class="detail-form-card" id="order-form" data-order-form="${detail.id}">
-            <div class="detail-form-layout ${previewSource ? "has-preview" : ""}">
-              <div class="detail-form-layout__fields">
-                ${Object.entries(template)
-                  .map(([key, entry]) => renderField(key, entry, rules[key], values))
-                  .join("")}
-
-                <div class="order-summary">
-                  <div>
-                    <span>예상 수량</span>
-                    <strong id="summary-quantity">${escapeHtml(
-                      selectedProduct?.priceStrategy === "fixed"
-                        ? "패키지 1건"
-                        : `${summary?.quantity || 0}${selectedProduct?.unitLabel || ""}`
-                    )}</strong>
-                  </div>
-                  <div>
-                    <span>예상 결제금액</span>
-                    <strong id="summary-total">${escapeHtml(summary ? formatMoney(summary.total) : "0원")}</strong>
-                  </div>
-                </div>
-                <p class="order-validation-note ${orderValidation.blocked ? "is-blocked" : ""}" data-order-validation-note ${orderValidation.reason ? "" : "hidden"}>
-                  ${escapeHtml(orderValidation.blocked ? `현재 주문이 막힌 이유: ${orderValidation.reason || ""}` : orderValidation.reason || "")}
-                </p>
-              </div>
-
-              ${
-                previewSource
-                  ? `<aside class="detail-form-layout__preview" data-preview-panel>${renderPreviewPanel(detail, selectedProduct)}</aside>`
-                  : ""
-              }
-            </div>
-          </form>
-        </section>
-
-        <section class="content-section two-column-mobile">
-          <article class="info-card">
-            <div class="section-head section-head--compact">
-              <h2>주의사항</h2>
-            </div>
-            <ul class="bullet-list">
-              ${detail.caution.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
-            </ul>
-          </article>
-          <article class="info-card">
-            <div class="section-head section-head--compact">
-              <h2>환불 안내</h2>
-            </div>
-            <ul class="bullet-list">
-              ${detail.refundNotice.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
-            </ul>
-          </article>
-        </section>
-
-        <section class="content-section">
-          <div class="section-head section-head--compact">
-            <h2>서비스 설명</h2>
-            <p>HTML 상세 설명 영역도 로컬 DB에서 읽어와 동일한 흐름으로 붙였습니다.</p>
-          </div>
-          <article class="html-card">${detail.serviceDescriptionHtml}</article>
-        </section>
-
-        ${
-          detail.relatedCategories.length
-            ? `
-              <section class="content-section">
-                <div class="section-head section-head--compact">
-                  <h2>같은 그룹의 다른 상품</h2>
-                </div>
-                <div class="related-list">
-                  ${detail.relatedCategories
-                    .map(
-                      (category) => `
-                        <button class="related-card" type="button" data-route="/products/${category.id}">
-                          <strong>${escapeHtml(category.name)}</strong>
-                          <p>${escapeHtml(category.description)}</p>
-                        </button>
-                      `
-                    )
-                    .join("")}
-                </div>
-              </section>
-            `
-            : ""
-        }
-      </div>
-    `,
-    "products",
-    `
-      <div class="sticky-order-bar">
-        <div class="sticky-order-bar__price">
-          <span>총 결제금액</span>
-          <strong id="sticky-total">${escapeHtml(summary ? formatMoney(summary.total) : "0원")}</strong>
-        </div>
-        <button class="sticky-order-bar__button" type="submit" form="order-form" data-order-submit-button ${orderValidation.blocked ? "disabled" : ""}>
-          ${orderValidation.blocked ? "주문 불가" : loggedIn ? "주문하기" : "로그인 후 주문"}
-        </button>
-      </div>
-    `
-  );
-}
-
-function renderCharge() {
-  const user = state.bootstrap?.user;
-  const quickAmounts = [30000, 50000, 100000, 300000];
-  const chargeConfig = state.bootstrap?.chargeConfig || { methods: [], policyHighlights: [] };
-  const transactions = state.transactions || [];
-
-  return renderFrame(
-    `
-      <div class="page page-charge">
-        <header class="topbar">
-          <button class="icon-button" type="button" data-route="/">‹</button>
-          <strong class="topbar-title">캐시 충전</strong>
-          <button class="icon-button" type="button" data-route="/orders">◎</button>
-        </header>
-        <div class="topbar-spacer"></div>
-
-        <section class="wallet-board">
-          <p class="wallet-board__eyebrow">${escapeHtml(user?.name || "고객")}</p>
-          <strong>${escapeHtml(user?.balanceLabel || "0원")}</strong>
-          <span>충전 완료 후 주문 결제 시 자동 차감됩니다.</span>
-        </section>
-
-        <section class="content-section">
-          <div class="section-head">
-            <h2>충전 금액 선택</h2>
-            <p>현재는 운영 확인형 충전 구조입니다. 이후 PG 연동 시에도 동일한 결제 상태 모델을 그대로 사용할 수 있게 설계했습니다.</p>
-          </div>
-          <div class="charge-grid">
-            ${quickAmounts
-              .map(
-                (amount) => `
-                  <button class="charge-chip" type="button" data-charge-amount="${amount}">
-                    ${formatMoney(amount)}
-                  </button>
-                `
-              )
-              .join("")}
-          </div>
-        </section>
-
-        <section class="content-section">
-          <div class="section-head">
-            <h2>결제수단 안내</h2>
-            <p>결제 방식별 확인 절차와 반영 흐름을 미리 안내합니다.</p>
-          </div>
-          <div class="guide-list">
-            ${(chargeConfig.methods || [])
-              .map(
-                (method) => `
-                  <article class="guide-card">
-                    <strong>${escapeHtml(method.label)}</strong>
-                    <p>${escapeHtml(method.description)}</p>
-                  </article>
-                `
-              )
-              .join("")}
-          </div>
-        </section>
-
-        <section class="content-section">
-          <div class="section-head">
-            <h2>거래 내역</h2>
-            <p>충전, 주문 차감, 관리자 조정 내역을 시간순으로 확인할 수 있습니다.</p>
-          </div>
-          <div class="transaction-list">
-            ${transactions.length
-              ? transactions
-                  .map(
-                (tx) => `
-                  <article class="transaction-card">
-                    <div>
-                      <strong>${escapeHtml(tx.memo)}</strong>
-                      <p>${escapeHtml(tx.createdLabel)}</p>
-                      <p class="transaction-card__submeta">
-                        ${escapeHtml(tx.paymentMethodLabel || "거래")} · ${escapeHtml(tx.paymentStatusLabel || "완료")}
-                        ${tx.reference ? ` · ${escapeHtml(tx.reference)}` : ""}
-                      </p>
-                    </div>
-                    <div class="transaction-card__amount ${tx.amount > 0 ? "is-positive" : "is-negative"}">
-                      <strong>${escapeHtml(tx.amountLabel)}</strong>
-                      <span>잔액 ${escapeHtml(tx.balanceAfterLabel)}</span>
-                    </div>
-                  </article>
-                `
-              )
-                  .join("")
-              : `
-                <article class="empty-card">
-                  <strong>아직 거래 내역이 없습니다.</strong>
-                  <p>첫 충전이 완료되면 결제 상태와 참조번호가 이 영역에 누적됩니다.</p>
-                </article>
-              `}
-          </div>
-        </section>
-
-        <section class="content-section footer-section">
-          <div class="guide-list">
-            ${(chargeConfig.policyHighlights || [])
-              .map((item) => `<article class="guide-card"><p>${escapeHtml(item)}</p></article>`)
-              .join("")}
-          </div>
-        </section>
-      </div>
-    `,
-    "charge"
-  );
-}
-
-function renderOrders() {
-  const activeFilter = state.ui.orderFilter;
-  const visibleOrders =
-    activeFilter === "all" ? state.orders : state.orders.filter((order) => order.status === activeFilter);
-
-  return renderFrame(
-    `
-      <div class="page page-orders">
-        <header class="topbar">
-          <button class="icon-button" type="button" data-route="/">‹</button>
-          <strong class="topbar-title">주문 내역</strong>
-          <button class="icon-button" type="button" data-route="/products">＋</button>
-        </header>
-        <div class="topbar-spacer"></div>
-
-        <section class="content-section">
-          <div class="section-head">
-            <h2>상태별 주문</h2>
-            <p>접수, 진행, 완료 흐름이 한눈에 보이도록 카드형으로 정리했습니다.</p>
-          </div>
-          <div class="filter-row">
-            ${[
-              ["all", `전체 ${state.orderCounts.all}`],
-              ["queued", `대기 ${state.orderCounts.queued}`],
-              ["in_progress", `진행 ${state.orderCounts.in_progress}`],
-              ["completed", `완료 ${state.orderCounts.completed}`],
-            ]
-              .map(
-                ([key, label]) => `
-                  <button class="filter-chip ${activeFilter === key ? "is-active" : ""}" type="button" data-order-filter="${key}">
-                    ${escapeHtml(label)}
-                  </button>
-                `
-              )
-              .join("")}
-          </div>
-        </section>
-
-        <section class="content-section">
-          <div class="order-list">
-            ${visibleOrders.length
-              ? visibleOrders
-                  .map((order) => {
-                    const status = statusMap[order.status] || statusMap.queued;
-                    return `
-                      <article class="order-card">
-                        <div class="order-card__top">
-                          <div>
-                            <span class="order-card__platform">${escapeHtml(order.platformIcon)} ${escapeHtml(order.platformName)}</span>
-                            <strong>${escapeHtml(order.productName)}</strong>
-                          </div>
-                          <span class="status-pill ${status.className}">${escapeHtml(status.label)}</span>
-                        </div>
-                        <p class="order-card__target">${escapeHtml(order.targetValue || "입력 정보 없음")}</p>
-                        <div class="order-card__meta">
-                          <span>${escapeHtml(order.optionName || "기본 옵션")}</span>
-                          <span>${escapeHtml(order.totalPriceLabel)}</span>
-                          <span>${escapeHtml(order.createdLabel)}</span>
-                        </div>
-                        ${
-                          order.notes.memo
-                            ? `<div class="order-card__note">요청 메모: ${escapeHtml(order.notes.memo)}</div>`
-                            : ""
-                        }
-                      </article>
-                    `;
-                  })
-                  .join("")
-              : `
-                <article class="empty-card">
-                  <strong>${activeFilter === "all" ? "주문 내역이 아직 없습니다." : "이 상태의 주문이 없습니다."}</strong>
-                  <p>서비스를 탐색한 뒤 첫 주문을 생성하거나, 필터를 바꿔 다른 상태의 주문을 확인해 주세요.</p>
-                  <button class="full-width-cta" type="button" data-route="/products">서비스 둘러보기</button>
-                </article>
-              `}
-          </div>
-        </section>
-      </div>
-    `,
-    "orders"
-  );
-}
-
-function renderMy() {
-  const data = state.bootstrap;
-  return renderFrame(
-    `
-      <div class="page page-my">
-        <header class="topbar">
-          <button class="icon-button" type="button" data-route="/">‹</button>
-          <strong class="topbar-title">마이</strong>
-          <button class="icon-button" type="button" data-public-logout>⇥</button>
-        </header>
-        <div class="topbar-spacer"></div>
-
-        <section class="profile-card">
-          <div class="profile-card__avatar">${escapeHtml(data.user.avatarLabel)}</div>
-          <div class="profile-card__copy">
-            <strong>${escapeHtml(data.user.name)}</strong>
-            <p>${escapeHtml(data.user.emailMasked || "이메일 비공개")}</p>
-            <span>${escapeHtml(data.user.tier)} · 보유 캐시 ${escapeHtml(data.user.balanceLabel)}</span>
-          </div>
-        </section>
-
-        <section class="content-section">
-          <div class="section-head">
-            <h2>계정 요약</h2>
-            <p>주문, 충전, 계정 상태를 한 곳에서 확인합니다.</p>
-          </div>
-          <div class="support-grid support-grid--account">
-            <article class="support-card">
-              <span class="support-card__icon">₩</span>
-              <strong>보유 잔액</strong>
-              <p>${escapeHtml(data.user.balanceLabel)}</p>
-            </article>
-            <article class="support-card">
-              <span class="support-card__icon">◎</span>
-              <strong>누적 주문</strong>
-              <p>${escapeHtml(formatNumber(state.orderCounts.all || 0))}건</p>
-            </article>
-            <button class="support-card" type="button" data-route="/orders">
-              <span class="support-card__icon">→</span>
-              <strong>주문 내역 보기</strong>
-              <p>진행 상태, 주문 메모, 결제 금액을 확인합니다.</p>
-            </button>
-            <button class="support-card" type="button" data-route="/help">
-              <span class="support-card__icon">?</span>
-              <strong>도움말 허브</strong>
-              <p>FAQ, 공지, 이용 가이드, 상담 안내로 이동합니다.</p>
-            </button>
-          </div>
-        </section>
-
-        <section class="content-section">
-          <div class="section-head">
-            <h2>계정/주문 안내</h2>
-            <p>로그인 계정 기준으로만 잔액과 주문 내역이 관리됩니다.</p>
-          </div>
-          <div class="guide-list">
-            <article class="guide-card"><strong>주문 전</strong><p>플랫폼 링크 형식과 계정 공개 여부를 먼저 확인해 주세요.</p></article>
-            <article class="guide-card"><strong>충전 후 주문</strong><p>충전 반영 후 상품 상세에서 바로 주문을 진행할 수 있습니다.</p></article>
-            <article class="guide-card"><strong>정책 확인</strong><p>환불·리필·작업 지연 기준은 도움말 허브와 상품 상세에서 확인합니다.</p></article>
-          </div>
-        </section>
-
-        <section class="content-section footer-section">
-          <button class="full-width-cta" type="button" data-route="/help">도움말 허브로 이동</button>
-        </section>
-      </div>
-    `,
-    "my"
-  );
-}
-
-function renderHelp() {
-  return renderFrame(renderHelpMarkup({ data: state.bootstrap, escapeHtml }), "home");
-}
-
-function renderLegalPage(documentKey) {
-  const documentItem = (state.bootstrap?.legalDocuments || []).find((item) => item.key === documentKey);
-  if (!documentItem) {
-    return renderNotFound("약관 또는 정책 문서를 찾지 못했습니다.");
-  }
-  return renderFrame(renderLegalPageMarkup({ documentItem, escapeHtml }), "home");
-}
-
 function renderNotFound(message) {
   return renderFrame(
     `
@@ -5825,6 +5175,64 @@ function renderNotFound(message) {
     "home"
   );
 }
+
+configurePublicPages({
+  state,
+  navItems,
+  escapeHtml,
+  formatNumber,
+  formatMoney,
+  isLoggedIn,
+  getRoute,
+  filteredCatalog,
+  getCurrentPlatform,
+  getActiveHomeBanners,
+  renderHomeBannerCard,
+  renderSiteBrandLogoMarkup,
+  renderPlatformLogoMarkup,
+  renderHomePopupOverlay,
+  ensureSelection,
+  calculateSummary,
+  getPreviewSource,
+  getOrderValidationState,
+  renderField,
+  renderPreviewPanel,
+  ensureChargeDraft,
+  chargeAmountSummary,
+  chargeMethodConfig,
+  filteredChargeOrders,
+  filteredWalletEntries,
+  parseCurrencyInput,
+  formatCurrencyInput,
+  siteNameOrDefault,
+  brandMonogram,
+  statusMap,
+  renderNotFound,
+});
+
+configureAdminPages({
+  state,
+  escapeHtml,
+  DEFAULT_SITE_NAME,
+  brandMonogram,
+  adminSectionItems,
+  getAdminSectionConfig,
+  getAdminSiteSettings,
+  getAdminSuppliers,
+  getAdminProducts,
+  getAdminPopup,
+  getSelectedAdminSupplier,
+  getSelectedAdminProduct,
+  blankSupplierDraft,
+  renderAnalyticsAdminSection,
+  renderSiteSettingsAdminSection,
+  renderPopupAdminSection,
+  renderSupplierAdminSection,
+  renderCustomerAdminSection,
+  renderCatalogAdminSection,
+  renderAdminOrdersSection,
+  renderAdminOverviewSection,
+});
 
 async function renderRoute() {
   const route = getRoute();
@@ -5902,6 +5310,7 @@ async function renderRoute() {
       }
       app.innerHTML = renderDetail(detail);
     } else if (route.name === "charge") {
+      ensureChargeDraft();
       app.innerHTML = renderCharge();
     } else if (route.name === "orders") {
       app.innerHTML = renderOrders();
@@ -5917,6 +5326,9 @@ async function renderRoute() {
     }
 
     updateLiveSummary();
+    if (route.name === "auth") {
+      updateSignupPasswordFeedback(app);
+    }
     scrollToActiveHash();
     if (route.name === "detail" && route.id && state.categoryCache[route.id]) {
       scheduleLinkPreview(state.categoryCache[route.id], { immediate: true });
@@ -6117,7 +5529,7 @@ function analyticsSessionId() {
 
 function analyticsPageLabel(route) {
   if (route.name === "home") return "홈";
-  if (route.name === "auth") return "로그인 / 회원가입";
+  if (route.name === "auth") return route.mode === "signup" ? "회원가입" : "로그인";
   if (route.name === "help") return "도움말 허브";
   if (route.name === "legal") return "약관/정책";
   if (route.name === "products") return "상품 목록";
@@ -6167,15 +5579,17 @@ function openLoginModal(redirectPath = "") {
   renderRoute();
 }
 
-function closeLoginModal() {
+function closeLoginModal({ preserveRedirect = false } = {}) {
   state.ui.loginModalOpen = false;
   state.ui.authTab = "login";
-  state.ui.loginRedirect = "";
+  if (!preserveRedirect) {
+    state.ui.loginRedirect = "";
+  }
 }
 
 function postAuthRedirectPath() {
   const candidate = state.ui.loginRedirect || "";
-  if (candidate && candidate !== "/auth") return candidate;
+  if (candidate && candidate !== "/auth" && candidate !== "/auth/signup") return candidate;
   return "/";
 }
 
@@ -6190,10 +5604,17 @@ function navigate(path, { push = true } = {}) {
   }
   if (requiresUserAuthPath(path) && !isLoggedIn()) {
     state.ui.loginRedirect = path;
-    if (push) {
-      window.history.pushState({}, "", "/auth");
-    }
-    renderRoute();
+    const messages = {
+      "/charge": "로그인 후 충전 내역과 주문 내역을 확인할 수 있어요",
+      "/orders": "로그인 후 주문 내역을 확인할 수 있어요",
+      "/my": "로그인 후 계정과 보유금액을 확인할 수 있어요",
+    };
+    showToast(messages[path] || "로그인이 필요합니다.");
+    window.setTimeout(() => {
+      if (!isLoggedIn()) {
+        openLoginModal(path);
+      }
+    }, 420);
     return;
   }
   if (push) {
@@ -6227,17 +5648,25 @@ async function applyAdminSiteSettingsImage(kind, file) {
     state.adminSiteSettingsDraft = blankSiteSettingsDraft();
   }
   const isFavicon = kind === "favicon";
+  const isHeaderLogo = kind === "headerLogo";
   if (!file.type.startsWith("image/")) {
     throw new Error("이미지 파일만 업로드할 수 있습니다.");
   }
   if (isFavicon && file.size > 1024 * 1024) {
     throw new Error("파비콘 이미지는 1MB 이하로 업로드해 주세요.");
   }
-  if (!isFavicon && file.size > 5 * 1024 * 1024) {
+  if (isHeaderLogo && file.size > 2 * 1024 * 1024) {
+    throw new Error("상단 로고 이미지는 2MB 이하로 업로드해 주세요.");
+  }
+  if (!isFavicon && !isHeaderLogo && file.size > 5 * 1024 * 1024) {
     throw new Error("대표 이미지는 5MB 이하로 업로드해 주세요.");
   }
   const encoded = await readFileAsDataUrl(file);
-  if (isFavicon) {
+  if (isHeaderLogo) {
+    state.adminSiteSettingsDraft.headerLogoUrl = encoded;
+    state.adminSiteSettingsDraft.headerLogoName = file.name;
+    state.adminSiteSettingsDraft.headerLogoUrlInput = "";
+  } else if (isFavicon) {
     state.adminSiteSettingsDraft.faviconUrl = encoded;
     state.adminSiteSettingsDraft.faviconName = file.name;
     state.adminSiteSettingsDraft.faviconUrlInput = "";
@@ -6250,14 +5679,17 @@ async function applyAdminSiteSettingsImage(kind, file) {
 }
 
 document.addEventListener("click", async (event) => {
-  const authTabButton = event.target.closest("[data-auth-tab]");
+  const targetElement = event.target instanceof Element ? event.target : event.target?.parentElement;
+  const closest = (selector) => targetElement?.closest(selector);
+
+  const authTabButton = closest("[data-auth-tab]");
   if (authTabButton) {
     state.ui.authTab = authTabButton.getAttribute("data-auth-tab") || "login";
     renderRoute();
     return;
   }
 
-  const oauthProviderButton = event.target.closest("[data-oauth-provider]");
+  const oauthProviderButton = closest("[data-oauth-provider]");
   if (oauthProviderButton) {
     const provider = oauthProviderButton.getAttribute("data-oauth-provider") || "";
     const providerConfig = (state.bootstrap?.authConfig?.oauthProviders || []).find((item) => item.provider === provider);
@@ -6269,20 +5701,70 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const publicLoginOpenButton = event.target.closest("[data-public-login-open]");
+  const publicLoginOpenButton = closest("[data-public-login-open]");
   if (publicLoginOpenButton) {
     openLoginModal(window.location.pathname || "/");
     return;
   }
 
-  const publicLoginCloseButton = event.target.closest("[data-public-login-close]");
+  const publicLoginCloseButton = closest("[data-public-login-close]");
   if (publicLoginCloseButton) {
     closeLoginModal();
     renderRoute();
     return;
   }
 
-  const publicLogoutButton = event.target.closest("[data-public-logout]");
+  const passwordToggleButton = closest("[data-password-toggle]");
+  if (passwordToggleButton) {
+    const shell = passwordToggleButton.closest(".field-shell--password");
+    const input = shell?.querySelector("input");
+    if (input instanceof HTMLInputElement) {
+      input.type = input.type === "password" ? "text" : "password";
+      passwordToggleButton.textContent = input.type === "password" ? "보기" : "숨기기";
+    }
+    return;
+  }
+
+  const signupChangeEmailButton = closest("[data-public-signup-change-email]");
+  if (signupChangeEmailButton) {
+    const nextState = currentSignupState();
+    nextState.step = "email";
+    nextState.verificationToken = "";
+    nextState.previewCode = "";
+    nextState.verifiedAt = "";
+    nextState.completeBy = "";
+    renderRoute();
+    return;
+  }
+
+  const signupResendButton = closest("[data-public-signup-resend]");
+  if (signupResendButton) {
+    const signup = currentSignupState();
+    if (!signup.email) {
+      showToast("먼저 이메일을 입력해 주세요.", "error");
+      return;
+    }
+    try {
+      const result = await apiPost("/api/auth/email/send-code", { email: signup.email });
+      Object.assign(signup, {
+        step: "verify",
+        challengeId: result.challengeId || "",
+        resendAvailableAt: result.resendAvailableAt || "",
+        expiresAt: result.expiresAt || "",
+        previewCode: result.previewCode || "",
+        verificationToken: "",
+        verifiedAt: "",
+        completeBy: "",
+      });
+      renderRoute();
+      showToast("인증코드를 다시 보냈습니다.");
+    } catch (error) {
+      showToast(error.message || "인증코드 재전송에 실패했습니다.", "error");
+    }
+    return;
+  }
+
+  const publicLogoutButton = closest("[data-public-logout]");
   if (publicLogoutButton) {
     try {
       await apiPost("/api/logout", {});
@@ -6296,10 +5778,20 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const routeButton = event.target.closest("[data-route]");
+  const homeFooterToggleButton = closest("[data-home-footer-toggle]");
+  if (homeFooterToggleButton) {
+    state.ui.homeFooterExpanded = !state.ui.homeFooterExpanded;
+    renderRoute();
+    return;
+  }
+
+  const routeButton = closest("[data-route]");
   if (routeButton) {
     const path = routeButton.getAttribute("data-route");
     const platformId = routeButton.getAttribute("data-platform-id");
+    if (state.ui.loginModalOpen) {
+      closeLoginModal({ preserveRedirect: Boolean(path && path.startsWith("/auth")) });
+    }
     if (platformId) {
       state.ui.activePlatform = platformId;
       state.ui.search = "";
@@ -6308,13 +5800,13 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const homeSearchSubmitButton = event.target.closest("[data-home-search-submit]");
+  const homeSearchSubmitButton = closest("[data-home-search-submit]");
   if (homeSearchSubmitButton) {
     navigate("/products");
     return;
   }
 
-  const popupDismissTodayButton = event.target.closest("[data-popup-dismiss-today]");
+  const popupDismissTodayButton = closest("[data-popup-dismiss-today]");
   if (popupDismissTodayButton) {
     const popup = state.bootstrap?.popup;
     dismissPopupToday(popup);
@@ -6323,14 +5815,14 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const popupCloseButton = event.target.closest("[data-popup-close]");
+  const popupCloseButton = closest("[data-popup-close]");
   if (popupCloseButton) {
     closePopupForSession(state.bootstrap?.popup);
     renderRoute();
     return;
   }
 
-  const clearPopupImageButton = event.target.closest("[data-admin-popup-image-clear]");
+  const clearPopupImageButton = closest("[data-admin-popup-image-clear]");
   if (clearPopupImageButton) {
     if (!state.adminPopupDraft) {
       state.adminPopupDraft = blankPopupDraft();
@@ -6343,7 +5835,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const selectHomeBannerButton = event.target.closest("[data-admin-home-banner-select]");
+  const selectHomeBannerButton = closest("[data-admin-home-banner-select]");
   if (selectHomeBannerButton) {
     state.ui.adminSelectedHomeBannerId = selectHomeBannerButton.getAttribute("data-admin-home-banner-select") || "";
     state.adminHomeBannerDraft = homeBannerToDraft(getSelectedAdminHomeBanner());
@@ -6351,7 +5843,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const clearHomeBannerImageButton = event.target.closest("[data-admin-home-banner-image-clear]");
+  const clearHomeBannerImageButton = closest("[data-admin-home-banner-image-clear]");
   if (clearHomeBannerImageButton) {
     if (!state.adminHomeBannerDraft) {
       state.adminHomeBannerDraft = homeBannerToDraft(getSelectedAdminHomeBanner());
@@ -6363,7 +5855,41 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const clearFaviconButton = event.target.closest("[data-admin-site-settings-favicon-clear]");
+  const selectPlatformSectionButton = closest("[data-admin-platform-section-select]");
+  if (selectPlatformSectionButton) {
+    state.ui.adminSelectedPlatformSectionId = selectPlatformSectionButton.getAttribute("data-admin-platform-section-select") || "";
+    state.adminPlatformSectionDraft = platformSectionToDraft(getSelectedAdminPlatformSection());
+    renderRoute();
+    return;
+  }
+
+  const clearPlatformSectionImageButton = closest("[data-admin-platform-section-image-clear]");
+  if (clearPlatformSectionImageButton) {
+    if (!state.adminPlatformSectionDraft) {
+      state.adminPlatformSectionDraft = platformSectionToDraft(getSelectedAdminPlatformSection());
+    }
+    state.adminPlatformSectionDraft.logoImageUrl = "";
+    state.adminPlatformSectionDraft.logoImageName = "";
+    state.adminPlatformSectionDraft.logoImageUrlInput = "";
+    updateAdminPlatformSectionPreview();
+    return;
+  }
+
+  const clearHeaderLogoButton = closest("[data-admin-site-settings-header-logo-clear]");
+  if (clearHeaderLogoButton) {
+    if (!state.adminSiteSettingsDraft) {
+      state.adminSiteSettingsDraft = blankSiteSettingsDraft();
+    }
+    state.adminSiteSettingsDraft.headerLogoUrl = "";
+    state.adminSiteSettingsDraft.headerLogoName = "";
+    state.adminSiteSettingsDraft.headerLogoUrlInput = "";
+    const headerLogoInput = document.querySelector('[data-admin-site-settings-field="headerLogoUrlInput"]');
+    if (headerLogoInput) headerLogoInput.value = "";
+    updateAdminSiteSettingsPreview();
+    return;
+  }
+
+  const clearFaviconButton = closest("[data-admin-site-settings-favicon-clear]");
   if (clearFaviconButton) {
     if (!state.adminSiteSettingsDraft) {
       state.adminSiteSettingsDraft = blankSiteSettingsDraft();
@@ -6377,7 +5903,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const clearShareImageButton = event.target.closest("[data-admin-site-settings-share-clear]");
+  const clearShareImageButton = closest("[data-admin-site-settings-share-clear]");
   if (clearShareImageButton) {
     if (!state.adminSiteSettingsDraft) {
       state.adminSiteSettingsDraft = blankSiteSettingsDraft();
@@ -6391,35 +5917,35 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const adminSectionButton = event.target.closest("[data-admin-scroll-section]");
+  const adminSectionButton = closest("[data-admin-scroll-section]");
   if (adminSectionButton) {
     const sectionId = adminSectionButton.getAttribute("data-admin-scroll-section") || "overview";
     navigate(adminSectionPath(sectionId));
     return;
   }
 
-  const analyticsTabButton = event.target.closest("[data-admin-analytics-tab]");
+  const analyticsTabButton = closest("[data-admin-analytics-tab]");
   if (analyticsTabButton) {
     state.ui.adminAnalyticsTab = analyticsTabButton.getAttribute("data-admin-analytics-tab") || "dashboard";
     renderRoute();
     return;
   }
 
-  const analyticsRangeButton = event.target.closest("[data-admin-analytics-range]");
+  const analyticsRangeButton = closest("[data-admin-analytics-range]");
   if (analyticsRangeButton) {
     state.ui.adminAnalyticsRange = analyticsRangeButton.getAttribute("data-admin-analytics-range") || "30d";
     renderRoute();
     return;
   }
 
-  const customerFilterButton = event.target.closest("[data-admin-customer-filter]");
+  const customerFilterButton = closest("[data-admin-customer-filter]");
   if (customerFilterButton) {
     state.ui.adminCustomerFilter = customerFilterButton.getAttribute("data-admin-customer-filter") || "all";
     renderRoute();
     return;
   }
 
-  const adminRefreshButton = event.target.closest("[data-admin-refresh]");
+  const adminRefreshButton = closest("[data-admin-refresh]");
   if (adminRefreshButton) {
     try {
       await refreshAdminData({ preserveDraft: false });
@@ -6437,7 +5963,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const adminLogoutButton = event.target.closest("[data-admin-logout]");
+  const adminLogoutButton = closest("[data-admin-logout]");
   if (adminLogoutButton) {
     try {
       await apiPost("/api/admin/logout", {});
@@ -6452,7 +5978,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const newSupplierButton = event.target.closest("[data-admin-supplier-new]");
+  const newSupplierButton = closest("[data-admin-supplier-new]");
   if (newSupplierButton) {
     state.ui.adminSupplierMode = "new";
     state.ui.adminSelectedSupplierId = "";
@@ -6463,7 +5989,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const supplierButton = event.target.closest("[data-admin-select-supplier]");
+  const supplierButton = closest("[data-admin-select-supplier]");
   if (supplierButton) {
     const supplierId = supplierButton.getAttribute("data-admin-select-supplier");
     const supplier = getAdminSuppliers().find((item) => item.id === supplierId) || null;
@@ -6484,7 +6010,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const testConnectionButton = event.target.closest("[data-admin-test-connection]");
+  const testConnectionButton = closest("[data-admin-test-connection]");
   if (testConnectionButton) {
     const draft = state.adminSupplierDraft || blankSupplierDraft();
     try {
@@ -6517,7 +6043,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const syncServicesButton = event.target.closest("[data-admin-sync-services]");
+  const syncServicesButton = closest("[data-admin-sync-services]");
   if (syncServicesButton) {
     const supplierId = state.ui.adminSelectedSupplierId;
     if (!supplierId) {
@@ -6545,14 +6071,14 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const serviceButton = event.target.closest("[data-admin-service-select]");
+  const serviceButton = closest("[data-admin-service-select]");
   if (serviceButton) {
     state.ui.adminSelectedSupplierServiceId = serviceButton.getAttribute("data-admin-service-select") || "";
     renderRoute();
     return;
   }
 
-  const applyServiceRecommendationButton = event.target.closest("[data-apply-service-recommendation]");
+  const applyServiceRecommendationButton = closest("[data-apply-service-recommendation]");
   if (applyServiceRecommendationButton) {
     const service = getSelectedAdminSupplierService();
     const product = getSelectedAdminProduct() || getSelectedManageProduct() || null;
@@ -6566,7 +6092,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const productButton = event.target.closest("[data-admin-product-select]");
+  const productButton = closest("[data-admin-product-select]");
   if (productButton) {
     const productId = productButton.getAttribute("data-admin-product-select") || "";
     state.ui.adminSelectedProductId = productId;
@@ -6578,7 +6104,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const deleteMappingButton = event.target.closest("[data-admin-delete-mapping]");
+  const deleteMappingButton = closest("[data-admin-delete-mapping]");
   if (deleteMappingButton) {
     const mappingId = deleteMappingButton.getAttribute("data-admin-delete-mapping");
     if (!mappingId) return;
@@ -6593,7 +6119,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const newCustomerButton = event.target.closest("[data-admin-customer-new]");
+  const newCustomerButton = closest("[data-admin-customer-new]");
   if (newCustomerButton) {
     state.ui.adminCustomerMode = "new";
     state.ui.adminSelectedCustomerId = "";
@@ -6602,7 +6128,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const selectCustomerButton = event.target.closest("[data-admin-select-customer]");
+  const selectCustomerButton = closest("[data-admin-select-customer]");
   if (selectCustomerButton) {
     const customerId = selectCustomerButton.getAttribute("data-admin-select-customer") || "";
     try {
@@ -6617,7 +6143,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const deleteCustomerButton = event.target.closest("[data-admin-delete-customer]");
+  const deleteCustomerButton = closest("[data-admin-delete-customer]");
   if (deleteCustomerButton) {
     const customerId = deleteCustomerButton.getAttribute("data-admin-delete-customer");
     try {
@@ -6632,7 +6158,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const newCategoryButton = event.target.closest("[data-admin-category-new]");
+  const newCategoryButton = closest("[data-admin-category-new]");
   if (newCategoryButton) {
     state.ui.adminCategoryMode = "new";
     state.adminCategoryDraft = blankCategoryDraft(getAdminPlatformGroups()[0]?.id || "");
@@ -6640,7 +6166,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const selectCategoryButton = event.target.closest("[data-admin-category-select]");
+  const selectCategoryButton = closest("[data-admin-category-select]");
   if (selectCategoryButton) {
     const categoryId = selectCategoryButton.getAttribute("data-admin-category-select") || "";
     const category = getAdminCategories().find((item) => item.id === categoryId) || null;
@@ -6653,7 +6179,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const deleteCategoryButton = event.target.closest("[data-admin-delete-category]");
+  const deleteCategoryButton = closest("[data-admin-delete-category]");
   if (deleteCategoryButton) {
     const categoryId = deleteCategoryButton.getAttribute("data-admin-delete-category");
     try {
@@ -6667,7 +6193,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const newProductButton = event.target.closest("[data-admin-product-new]");
+  const newProductButton = closest("[data-admin-product-new]");
   if (newProductButton) {
     state.ui.adminProductMode = "new";
     state.ui.adminSelectedManageProductId = "";
@@ -6676,7 +6202,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const selectManageProductButton = event.target.closest("[data-admin-manage-product-select]");
+  const selectManageProductButton = closest("[data-admin-manage-product-select]");
   if (selectManageProductButton) {
     const productId = selectManageProductButton.getAttribute("data-admin-manage-product-select") || "";
     const product = getAdminProducts().find((item) => item.id === productId) || null;
@@ -6687,7 +6213,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const deleteProductButton = event.target.closest("[data-admin-delete-product]");
+  const deleteProductButton = closest("[data-admin-delete-product]");
   if (deleteProductButton) {
     const productId = deleteProductButton.getAttribute("data-admin-delete-product");
     try {
@@ -6701,27 +6227,27 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const adminOrderFilterButton = event.target.closest("[data-admin-order-filter]");
+  const adminOrderFilterButton = closest("[data-admin-order-filter]");
   if (adminOrderFilterButton) {
     state.ui.adminOrderFilter = adminOrderFilterButton.getAttribute("data-admin-order-filter") || "all";
     renderRoute();
     return;
   }
 
-  const platformButton = event.target.closest("[data-platform-select]");
+  const platformButton = closest("[data-platform-select]");
   if (platformButton) {
     state.ui.activePlatform = platformButton.getAttribute("data-platform-select");
     renderRoute();
     return;
   }
 
-  const bannerDot = event.target.closest("[data-banner-index]");
+  const bannerDot = closest("[data-banner-index]");
   if (bannerDot) {
     setHomeBannerIndex(Number(bannerDot.getAttribute("data-banner-index")) || 0);
     return;
   }
 
-  const optionButton = event.target.closest("[data-option-select]");
+  const optionButton = closest("[data-option-select]");
   if (optionButton) {
     const route = getRoute();
     const categoryId = optionButton.getAttribute("data-category-id");
@@ -6734,29 +6260,90 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const filterButton = event.target.closest("[data-order-filter]");
+  const filterButton = closest("[data-order-filter]");
   if (filterButton) {
     state.ui.orderFilter = filterButton.getAttribute("data-order-filter");
     renderRoute();
     return;
   }
 
-  const chargeButton = event.target.closest("[data-charge-amount]");
-  if (chargeButton) {
-    const amount = Number(chargeButton.getAttribute("data-charge-amount"));
-    try {
-      await apiPost("/api/charge", { amount });
-      await refreshCoreData();
-      showToast(`${formatMoney(amount)} 충전이 완료되었습니다.`);
-      renderRoute();
-    } catch (error) {
-      showToast(error.message || "충전에 실패했습니다.", "error");
+  const chargeTabButton = closest("[data-charge-tab]");
+  if (chargeTabButton) {
+    state.ui.chargeTab = chargeTabButton.getAttribute("data-charge-tab") || "create";
+    closeChargeDetail();
+    renderRoute();
+    return;
+  }
+
+  const chargeHistoryModeButton = closest("[data-charge-history-mode]");
+  if (chargeHistoryModeButton) {
+    state.ui.chargeHistoryMode = chargeHistoryModeButton.getAttribute("data-charge-history-mode") || "chargeOrders";
+    closeChargeDetail();
+    renderRoute();
+    return;
+  }
+
+  const chargeQuickAmountButton = closest("[data-charge-quick-amount]");
+  if (chargeQuickAmountButton) {
+    const draft = ensureChargeDraft();
+    const delta = Number(chargeQuickAmountButton.getAttribute("data-charge-quick-amount") || 0);
+    const nextAmount = parseCurrencyInput(draft.amountInput) + delta;
+    draft.amountInput = String(nextAmount);
+    renderRoute();
+    return;
+  }
+
+  const chargePaymentChannelButton = closest("[data-charge-payment-channel]");
+  if (chargePaymentChannelButton) {
+    const nextChannel = chargePaymentChannelButton.getAttribute("data-charge-payment-channel") || "card";
+    const method = chargeMethodConfig(nextChannel);
+    if (method && !method.enabled) {
+      showToast(method.label === "카드/간편결제" ? "카드/간편결제는 준비 중입니다." : "계좌입금 설정이 필요합니다.", "error");
+      return;
     }
+    const draft = ensureChargeDraft();
+    draft.paymentChannel = nextChannel;
+    renderRoute();
+    return;
+  }
+
+  const chargeSubmitButton = closest("[data-charge-submit]");
+  if (chargeSubmitButton) {
+    const form = document.querySelector("[data-charge-create-form]");
+    if (form instanceof HTMLFormElement) {
+      form.requestSubmit();
+    }
+    return;
+  }
+
+  const chargeDetailButton = closest("[data-charge-detail-open]");
+  if (chargeDetailButton) {
+    openChargeDetail(
+      chargeDetailButton.getAttribute("data-charge-detail-kind") || "chargeOrders",
+      chargeDetailButton.getAttribute("data-charge-detail-open") || "",
+    );
+    renderRoute();
+    return;
+  }
+
+  const chargeDetailCloseButton = closest("[data-charge-detail-close]");
+  if (chargeDetailCloseButton) {
+    closeChargeDetail();
+    renderRoute();
+    return;
   }
 });
 
 document.addEventListener("input", (event) => {
   const target = event.target;
+  if (target.matches("[data-signup-email-input]")) {
+    currentSignupState().email = target.value;
+    return;
+  }
+  if (target.matches("[data-signup-name-input], [data-signup-password-input]")) {
+    updateSignupPasswordFeedback(target.closest("[data-public-signup-complete-form]"));
+    return;
+  }
   if (target.matches("[data-home-search-input]")) {
     state.ui.search = target.value;
     return;
@@ -6771,6 +6358,63 @@ document.addEventListener("input", (event) => {
         input.setSelectionRange(cursor, cursor);
       }
     });
+    return;
+  }
+
+  if (target.matches("[data-charge-amount-input]")) {
+    const draft = ensureChargeDraft();
+    const cursor = target.selectionStart || target.value.length;
+    draft.amountInput = String(parseCurrencyInput(target.value) || "");
+    renderRoute().then(() => {
+      const input = document.querySelector("[data-charge-amount-input]");
+      if (input) {
+        input.focus();
+        const formattedLength = input.value.length;
+        input.setSelectionRange(formattedLength, formattedLength);
+      }
+    });
+    return;
+  }
+
+  if (target.matches("[data-charge-draft-field]")) {
+    const draft = ensureChargeDraft();
+    const field = target.getAttribute("data-charge-draft-field") || "";
+    const nextValue = target.type === "checkbox" ? target.checked : target.value;
+    draft[field] = nextValue;
+    if (field === "receiptType" && nextValue === "none") {
+      draft.receiptPayload = {
+        ...draft.receiptPayload,
+        phoneNumber: "",
+        businessNumber: "",
+        businessName: "",
+        recipientEmail: "",
+        contactName: "",
+      };
+    }
+    if (target.type === "checkbox" || target.type === "radio" || target.tagName === "SELECT") {
+      renderRoute();
+    }
+    return;
+  }
+
+  if (target.matches("[data-charge-receipt-field]")) {
+    const draft = ensureChargeDraft();
+    const field = target.getAttribute("data-charge-receipt-field") || "";
+    const nextValue = target.type === "checkbox" ? target.checked : target.value;
+    draft.receiptPayload = { ...(draft.receiptPayload || {}), [field]: nextValue };
+    if (target.type === "radio" || target.tagName === "SELECT") {
+      renderRoute();
+    }
+    return;
+  }
+
+  if (target.matches("[data-charge-filter]")) {
+    const field = target.getAttribute("data-charge-filter") || "";
+    if (field === "status") state.ui.chargeStatusFilter = target.value || "all";
+    if (field === "method") state.ui.chargeMethodFilter = target.value || "all";
+    if (field === "period") state.ui.chargePeriodFilter = target.value || "all";
+    closeChargeDetail();
+    renderRoute();
     return;
   }
 
@@ -6819,6 +6463,21 @@ document.addEventListener("input", (event) => {
     return;
   }
 
+  if (target.matches("[data-admin-platform-section-field]")) {
+    const field = target.getAttribute("data-admin-platform-section-field");
+    if (!state.adminPlatformSectionDraft) {
+      state.adminPlatformSectionDraft = platformSectionToDraft(getSelectedAdminPlatformSection());
+    }
+    const nextValue = target.type === "checkbox" ? target.checked : target.value;
+    state.adminPlatformSectionDraft[field] = nextValue;
+    if (field === "logoImageUrlInput") {
+      state.adminPlatformSectionDraft.logoImageUrl = String(nextValue || "").trim();
+      state.adminPlatformSectionDraft.logoImageName = "";
+    }
+    updateAdminPlatformSectionPreview();
+    return;
+  }
+
   if (target.matches("[data-admin-site-settings-field]")) {
     const field = target.getAttribute("data-admin-site-settings-field");
     if (!state.adminSiteSettingsDraft) {
@@ -6826,6 +6485,10 @@ document.addEventListener("input", (event) => {
     }
     const nextValue = target.type === "checkbox" ? target.checked : target.value;
     state.adminSiteSettingsDraft[field] = nextValue;
+    if (field === "headerLogoUrlInput") {
+      state.adminSiteSettingsDraft.headerLogoUrl = String(nextValue || "").trim();
+      state.adminSiteSettingsDraft.headerLogoName = "";
+    }
     if (field === "faviconUrlInput") {
       state.adminSiteSettingsDraft.faviconUrl = String(nextValue || "").trim();
       state.adminSiteSettingsDraft.faviconName = "";
@@ -6927,6 +6590,15 @@ document.addEventListener("input", (event) => {
 
 document.addEventListener("change", async (event) => {
   const target = event.target;
+  if (target.matches("[data-charge-filter]")) {
+    const field = target.getAttribute("data-charge-filter") || "";
+    if (field === "status") state.ui.chargeStatusFilter = target.value || "all";
+    if (field === "method") state.ui.chargeMethodFilter = target.value || "all";
+    if (field === "period") state.ui.chargePeriodFilter = target.value || "all";
+    closeChargeDetail();
+    renderRoute();
+    return;
+  }
   if (target.matches("[data-admin-product-advanced-field]")) {
     if (!state.adminProductDraft) {
       state.adminProductDraft = blankProductDraft(state.ui.adminSelectedCategoryId);
@@ -7004,13 +6676,49 @@ document.addEventListener("change", async (event) => {
     return;
   }
 
+  if (target.matches("[data-admin-platform-section-image-upload]")) {
+    const file = target.files && target.files[0];
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      showToast("이미지 파일만 업로드할 수 있습니다.", "error");
+      target.value = "";
+      return;
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      showToast("플랫폼 로고 이미지는 2MB 이하로 업로드해 주세요.", "error");
+      target.value = "";
+      return;
+    }
+    if (!state.adminPlatformSectionDraft) {
+      state.adminPlatformSectionDraft = platformSectionToDraft(getSelectedAdminPlatformSection());
+    }
+    try {
+      state.adminPlatformSectionDraft.logoImageUrl = await readFileAsDataUrl(file);
+      state.adminPlatformSectionDraft.logoImageName = file.name;
+      state.adminPlatformSectionDraft.logoImageUrlInput = "";
+      showToast("플랫폼 로고가 적용되었습니다. 저장하면 실제 서비스에 반영됩니다.");
+      updateAdminPlatformSectionPreview();
+    } catch (error) {
+      showToast(error.message || "이미지 업로드에 실패했습니다.", "error");
+    } finally {
+      target.value = "";
+    }
+    return;
+  }
+
   const siteImageType = target.getAttribute("data-admin-site-settings-image-upload");
   if (!siteImageType) return;
   const file = target.files && target.files[0];
   if (!file) return;
   try {
     await applyAdminSiteSettingsImage(siteImageType, file);
-    showToast(siteImageType === "favicon" ? "파비콘이 적용되었습니다. 저장하면 실제 사이트에 반영됩니다." : "대표 이미지가 적용되었습니다. 저장하면 공유 미리보기에 반영됩니다.");
+    if (siteImageType === "headerLogo") {
+      showToast("상단 로고가 적용되었습니다. 저장하면 홈 상단과 고정 서비스 바에 반영됩니다.");
+    } else if (siteImageType === "favicon") {
+      showToast("파비콘이 적용되었습니다. 저장하면 실제 사이트에 반영됩니다.");
+    } else {
+      showToast("대표 이미지가 적용되었습니다. 저장하면 공유 미리보기에 반영됩니다.");
+    }
   } catch (error) {
     showToast(error.message || "이미지 업로드에 실패했습니다.", "error");
   } finally {
@@ -7043,6 +6751,7 @@ document.addEventListener("submit", async (event) => {
       const result = await apiPost("/api/login", {
         email: formData.get("email"),
         password: formData.get("password"),
+        rememberMe: formData.get("rememberMe") === "on",
       });
       state.publicCsrfToken = result.csrfToken || "";
       closeLoginModal();
@@ -7058,13 +6767,62 @@ document.addEventListener("submit", async (event) => {
     }
     return;
   }
-  if (form.matches("[data-public-signup-form]")) {
+  if (form.matches("[data-public-signup-send-code-form]")) {
+    event.preventDefault();
+    const formData = new FormData(form);
+    try {
+      const result = await apiPost("/api/auth/email/send-code", {
+        email: formData.get("email"),
+      });
+      Object.assign(currentSignupState(), {
+        step: "verify",
+        email: result.email || String(formData.get("email") || "").trim(),
+        challengeId: result.challengeId || "",
+        resendAvailableAt: result.resendAvailableAt || "",
+        expiresAt: result.expiresAt || "",
+        previewCode: result.previewCode || "",
+        verificationToken: "",
+        verifiedAt: "",
+        completeBy: "",
+      });
+      renderRoute();
+      showToast("인증코드를 보냈습니다.");
+    } catch (error) {
+      showToast(error.message || "인증코드 발송에 실패했습니다.", "error");
+    }
+    return;
+  }
+  if (form.matches("[data-public-signup-verify-form]")) {
+    event.preventDefault();
+    const formData = new FormData(form);
+    try {
+      const signup = currentSignupState();
+      const result = await apiPost("/api/auth/email/verify-code", {
+        email: signup.email,
+        code: formData.get("code"),
+      });
+      Object.assign(signup, {
+        step: "account",
+        verificationToken: result.verificationToken || "",
+        verifiedAt: result.verifiedAt || "",
+        completeBy: result.completeBy || "",
+      });
+      renderRoute();
+      showToast("이메일 인증이 완료되었습니다.");
+    } catch (error) {
+      showToast(error.message || "인증 확인에 실패했습니다.", "error");
+    }
+    return;
+  }
+  if (form.matches("[data-public-signup-complete-form]")) {
     event.preventDefault();
     const formData = new FormData(form);
     try {
       const redirectPath = postAuthRedirectPath();
+      const signup = currentSignupState();
       const result = await apiPost("/api/signup", {
-        email: formData.get("email"),
+        email: signup.email,
+        verificationToken: signup.verificationToken,
         name: formData.get("name"),
         password: formData.get("password"),
         passwordConfirmation: formData.get("passwordConfirmation"),
@@ -7074,6 +6832,7 @@ document.addEventListener("submit", async (event) => {
         marketingAgreed: formData.get("marketingAgreed") === "on",
       });
       state.publicCsrfToken = result.csrfToken || "";
+      resetSignupFlow();
       closeLoginModal();
       await refreshCoreData();
       if (redirectPath && redirectPath !== window.location.pathname) {
@@ -7084,6 +6843,65 @@ document.addEventListener("submit", async (event) => {
       showToast("회원가입이 완료되었습니다.");
     } catch (error) {
       showToast(error.message || "회원가입에 실패했습니다.", "error");
+    }
+    return;
+  }
+  if (form.matches("[data-charge-create-form]")) {
+    event.preventDefault();
+    const draft = ensureChargeDraft();
+    const chargeConfig = state.bootstrap?.chargeConfig || {};
+    const amountSummary = chargeAmountSummary(draft.amountInput);
+    const method = chargeMethodConfig(draft.paymentChannel);
+    if (!draft.agreementChecked) {
+      showToast("충전 유의사항과 환불 안내에 동의해 주세요.", "error");
+      return;
+    }
+    if (amountSummary.amount < Number(chargeConfig.minimumAmount || 5000)) {
+      showToast(`최소 충전 금액은 ${formatMoney(chargeConfig.minimumAmount || 5000)}입니다.`, "error");
+      return;
+    }
+    if (!method?.enabled) {
+      showToast("선택한 결제수단은 아직 사용할 수 없습니다.", "error");
+      return;
+    }
+    const payload = {
+      amount: amountSummary.amount,
+      paymentChannel: draft.paymentChannel,
+      paymentMethodDetail: draft.paymentMethodDetail,
+      depositorName: draft.depositorName,
+      receiptType: draft.receiptType,
+      receiptPayload: draft.receiptPayload,
+    };
+    try {
+      const created = await apiPost("/api/charge-orders", payload);
+      let detailId = created.chargeOrder.id;
+      if (draft.paymentChannel === "bank_transfer") {
+        await apiPost(`/api/charge-orders/${encodeURIComponent(detailId)}/deposit-request`, payload);
+        await refreshCoreData();
+        state.ui.chargeTab = "history";
+        state.ui.chargeHistoryMode = "chargeOrders";
+        openChargeDetail("chargeOrders", detailId);
+        state.chargeDraft = blankChargeDraft(state.bootstrap?.chargeConfig);
+        showToast("입금 요청이 접수되었습니다. 입금 확인 후 보유금액이 반영됩니다.");
+        renderRoute();
+        return;
+      }
+      const started = await apiPost(`/api/charge-orders/${encodeURIComponent(detailId)}/start-payment`, {
+        paymentMethodDetail: draft.paymentMethodDetail,
+      });
+      await refreshCoreData();
+      state.ui.chargeTab = "history";
+      state.ui.chargeHistoryMode = "chargeOrders";
+      openChargeDetail("chargeOrders", detailId);
+      state.chargeDraft = blankChargeDraft(state.bootstrap?.chargeConfig);
+      renderRoute();
+      if (started.paymentSession?.providerConfigured) {
+        showToast("결제 세션이 준비되었습니다. PG SDK 연결 단계가 남아 있습니다.");
+      } else {
+        showToast("결제 준비에 실패했습니다.", "error");
+      }
+    } catch (error) {
+      showToast(error.message || "충전 요청에 실패했습니다.", "error");
     }
     return;
   }
@@ -7166,6 +6984,26 @@ document.addEventListener("submit", async (event) => {
     return;
   }
 
+  if (form.matches("[data-admin-platform-section-form]")) {
+    event.preventDefault();
+    const draft = state.adminPlatformSectionDraft || platformSectionToDraft(getSelectedAdminPlatformSection());
+    try {
+      const result = await apiPost("/api/admin/platform-sections", {
+        id: draft.id,
+        icon: draft.icon,
+        logoImageUrl: draft.logoImageUrl,
+        accentColor: draft.accentColor,
+      });
+      state.adminPlatformSectionDraft = platformSectionToDraft(result.platformSection);
+      await Promise.all([refreshCoreData(), refreshAdminData({ preserveDraft: false })]);
+      showToast("플랫폼 로고를 저장했습니다.");
+      renderRoute();
+    } catch (error) {
+      showToast(error.message || "플랫폼 로고 저장에 실패했습니다.", "error");
+    }
+    return;
+  }
+
   if (form.matches("[data-admin-site-settings-form]")) {
     event.preventDefault();
     const draft = state.adminSiteSettingsDraft || blankSiteSettingsDraft();
@@ -7175,6 +7013,7 @@ document.addEventListener("submit", async (event) => {
         siteDescription: draft.siteDescription,
         useMailSmsSiteName: draft.useMailSmsSiteName,
         mailSmsSiteName: draft.mailSmsSiteName,
+        headerLogoUrl: draft.headerLogoUrl,
         faviconUrl: draft.faviconUrl,
         shareImageUrl: draft.shareImageUrl,
       });
@@ -7438,6 +7277,55 @@ document.addEventListener(
     }
   },
   true
+);
+
+document.addEventListener(
+  "wheel",
+  (event) => {
+    const scroller = getHomePlatformScroller(event.target);
+    if (!scroller) return;
+    if (!homePlatformScrollerAtBoundary(scroller, event.deltaY)) return;
+    event.preventDefault();
+    relayHomePlatformScroll(scroller, event.deltaY);
+  },
+  { passive: false }
+);
+
+document.addEventListener(
+  "touchstart",
+  (event) => {
+    const scroller = getHomePlatformScroller(event.target);
+    if (!scroller || event.touches.length !== 1) {
+      homePlatformTouchState.scroller = null;
+      return;
+    }
+    homePlatformTouchState.scroller = scroller;
+    homePlatformTouchState.lastY = event.touches[0].clientY;
+  },
+  { passive: true }
+);
+
+document.addEventListener(
+  "touchmove",
+  (event) => {
+    const scroller = homePlatformTouchState.scroller;
+    if (!scroller || event.touches.length !== 1) return;
+    const currentY = event.touches[0].clientY;
+    const deltaY = homePlatformTouchState.lastY - currentY;
+    homePlatformTouchState.lastY = currentY;
+    if (!homePlatformScrollerAtBoundary(scroller, deltaY)) return;
+    event.preventDefault();
+    relayHomePlatformScroll(scroller, deltaY);
+  },
+  { passive: false }
+);
+
+document.addEventListener(
+  "touchend",
+  () => {
+    homePlatformTouchState.scroller = null;
+  },
+  { passive: true }
 );
 
 document.addEventListener("keydown", (event) => {

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 from urllib.parse import parse_qs, urlparse
 
-from core import APP_ROOT, PanelError, PanelStore
+from core import APP_ROOT, DEFAULT_SITE_NAME, PanelError, PanelStore
 
 
 STATIC_ROOT = APP_ROOT / "static"
@@ -162,6 +162,7 @@ class RequestRateLimiter:
             "link_preview": (30, 60),
             "charge": (12, 60),
             "analytics": (180, 60),
+            "auth": (18, 60),
         }
         self.events: Dict[str, list[float]] = {}
 
@@ -409,7 +410,7 @@ def send_error_json(handler: SimpleHTTPRequestHandler, exc: Exception) -> None:
 def render_index_html(store: PanelStore, request_path: str, config: AppConfig) -> str:
     template = INDEX_TEMPLATE_PATH.read_text(encoding="utf-8")
     settings = store.public_site_settings()["siteSettings"]
-    site_name = str(settings.get("siteName") or "Pulse24").strip() or "Pulse24"
+    site_name = str(settings.get("siteName") or DEFAULT_SITE_NAME).strip() or DEFAULT_SITE_NAME
     site_description = str(settings.get("siteDescription") or "").strip()
     favicon_url = str(settings.get("faviconUrl") or "").strip()
     share_image_url = str(settings.get("shareImageUrl") or "").strip()
@@ -456,7 +457,7 @@ def render_index_html(store: PanelStore, request_path: str, config: AppConfig) -
 
     head_markup = "\n    ".join(head_parts)
     title_markup = f"<title>{html.escape(title)}</title>"
-    document = template.replace("<title>Pulse24 Panel</title>", title_markup)
+    document = template.replace(f"<title>{DEFAULT_SITE_NAME}</title>", title_markup)
     document = document.replace(
         '<meta name="smm-api-base-url" content="" data-managed-runtime="api-base" />',
         f'<meta name="smm-api-base-url" content="{html.escape(config.public_api_base_url, quote=True)}" data-managed-runtime="api-base" />',
@@ -717,14 +718,15 @@ class AppHandler(SimpleHTTPRequestHandler):
             "user": user,
         }
 
-    def _cookie_header(self, cookie_name: str, value: str, max_age: int, samesite: str) -> str:
+    def _cookie_header(self, cookie_name: str, value: str, max_age: Optional[int], samesite: str) -> str:
         cookie = SimpleCookie()
         cookie[cookie_name] = value
         morsel = cookie[cookie_name]
         morsel["path"] = "/"
         morsel["httponly"] = True
         morsel["samesite"] = samesite
-        morsel["max-age"] = str(max_age)
+        if max_age is not None:
+            morsel["max-age"] = str(max_age)
         if self._config().cookie_domain:
             morsel["domain"] = self._config().cookie_domain
         if (
@@ -749,7 +751,7 @@ class AppHandler(SimpleHTTPRequestHandler):
         self._request_path = parsed.path
         try:
             if parsed.path == "/api/health":
-                write_json(self, 200, {"ok": True, "service": "Pulse24 Panel"})
+                write_json(self, 200, {"ok": True, "service": f"{DEFAULT_SITE_NAME} Panel"})
                 return
             if parsed.path == "/robots.txt":
                 write_text(self, 200, ROBOTS_TXT)
@@ -799,6 +801,48 @@ class AppHandler(SimpleHTTPRequestHandler):
                 status = parse_qs(parsed.query).get("status", [""])[0]
                 write_json(self, 200, {"ok": True, **self._server().store.list_orders(status, str(session["user"]["id"]))})
                 return
+            if parsed.path == "/api/wallet":
+                session = self._require_public_auth()
+                write_json(self, 200, {"ok": True, **self._server().store.get_wallet(str(session["user"]["id"]))})
+                return
+            if parsed.path == "/api/wallet/ledger":
+                session = self._require_public_auth()
+                query = parse_qs(parsed.query)
+                limit = query.get("limit", ["50"])[0]
+                filters = {
+                    "entryType": query.get("entryType", [""])[0],
+                    "status": query.get("status", [""])[0],
+                    "paymentChannel": query.get("paymentChannel", [""])[0],
+                    "createdFrom": query.get("createdFrom", [""])[0],
+                    "createdTo": query.get("createdTo", [""])[0],
+                }
+                write_json(
+                    self,
+                    200,
+                    {"ok": True, **self._server().store.list_wallet_ledger(str(session["user"]["id"]), int(limit or 50), filters)},
+                )
+                return
+            if parsed.path == "/api/charge-orders":
+                session = self._require_public_auth()
+                query = parse_qs(parsed.query)
+                limit = query.get("limit", ["50"])[0]
+                filters = {
+                    "status": query.get("status", [""])[0],
+                    "paymentChannel": query.get("paymentChannel", [""])[0],
+                    "createdFrom": query.get("createdFrom", [""])[0],
+                    "createdTo": query.get("createdTo", [""])[0],
+                }
+                write_json(
+                    self,
+                    200,
+                    {"ok": True, **self._server().store.list_charge_orders(str(session["user"]["id"]), int(limit or 50), filters)},
+                )
+                return
+            if parsed.path.startswith("/api/charge-orders/") and len([part for part in parsed.path.split("/") if part]) == 3:
+                session = self._require_public_auth()
+                charge_order_id = parsed.path.rsplit("/", 1)[-1]
+                write_json(self, 200, {"ok": True, **self._server().store.get_charge_order(charge_order_id, str(session["user"]["id"]))})
+                return
             if parsed.path == "/api/transactions":
                 session = self._require_public_auth()
                 write_json(self, 200, {"ok": True, **self._server().store.list_transactions(str(session["user"]["id"]))})
@@ -846,11 +890,35 @@ class AppHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(request_path)
         self._request_path = parsed.path
         try:
+            if parsed.path == "/api/payments/webhook":
+                payload = read_json(self)
+                write_json(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        **self._server().store.process_payment_webhook(
+                            payload,
+                            provided_secret=self.headers.get("X-SMM-Webhook-Secret", ""),
+                        ),
+                    },
+                )
+                return
             self._require_trusted_origin()
             payload = read_json(self)
+            if parsed.path == "/api/auth/email/send-code":
+                self._enforce_rate_limit("auth", "인증 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
+                write_json(self, 200, {"ok": True, **self._server().store.start_signup_email_verification(payload)})
+                return
+            if parsed.path == "/api/auth/email/verify-code":
+                self._enforce_rate_limit("auth", "인증 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
+                write_json(self, 200, {"ok": True, **self._server().store.verify_signup_email_code(payload)})
+                return
             if parsed.path == "/api/login":
+                self._enforce_rate_limit("auth", "로그인 시도가 많습니다. {retry_after}초 후 다시 시도해 주세요.")
                 email = str(payload.get("email") or "").strip()
                 password = str(payload.get("password") or "")
+                remember_me = bool(payload.get("rememberMe"))
                 user = self._server().store.authenticate_public_user(email, password)
                 token = self._server().user_sessions.create_session(user["id"])
                 session = self._server().user_sessions.get_session(token) or {}
@@ -869,7 +937,7 @@ class AppHandler(SimpleHTTPRequestHandler):
                             self._cookie_header(
                                 PUBLIC_SESSION_COOKIE,
                                 token,
-                                PUBLIC_SESSION_TTL_SECONDS,
+                                PUBLIC_SESSION_TTL_SECONDS if remember_me else None,
                                 self._config().public_cookie_samesite,
                             ),
                         )
@@ -877,6 +945,7 @@ class AppHandler(SimpleHTTPRequestHandler):
                 )
                 return
             if parsed.path == "/api/signup":
+                self._enforce_rate_limit("auth", "가입 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
                 user = self._server().store.register_public_user(payload)
                 token = self._server().user_sessions.create_session(user["id"])
                 session = self._server().user_sessions.get_session(token) or {}
@@ -907,6 +976,44 @@ class AppHandler(SimpleHTTPRequestHandler):
                 self._require_public_csrf(session)
                 self._enforce_rate_limit("orders", "주문 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
                 write_json(self, 200, self._server().store.create_order(payload, str(session["user"]["id"])))
+                return
+            if parsed.path == "/api/charge-orders":
+                session = self._require_public_auth()
+                self._require_public_csrf(session)
+                self._enforce_rate_limit("charge", "충전 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
+                write_json(self, 200, {"ok": True, **self._server().store.create_charge_order(payload, str(session["user"]["id"]))})
+                return
+            if parsed.path.startswith("/api/charge-orders/") and parsed.path.endswith("/start-payment"):
+                session = self._require_public_auth()
+                self._require_public_csrf(session)
+                self._enforce_rate_limit("charge", "충전 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
+                charge_order_id = parsed.path.split("/")[3]
+                write_json(
+                    self,
+                    200,
+                    {"ok": True, **self._server().store.start_charge_order_payment(charge_order_id, payload, str(session["user"]["id"]))},
+                )
+                return
+            if parsed.path.startswith("/api/charge-orders/") and parsed.path.endswith("/confirm"):
+                session = self._require_public_auth()
+                self._require_public_csrf(session)
+                charge_order_id = parsed.path.split("/")[3]
+                write_json(
+                    self,
+                    200,
+                    {"ok": True, **self._server().store.confirm_charge_order(charge_order_id, payload, str(session["user"]["id"]))},
+                )
+                return
+            if parsed.path.startswith("/api/charge-orders/") and parsed.path.endswith("/deposit-request"):
+                session = self._require_public_auth()
+                self._require_public_csrf(session)
+                self._enforce_rate_limit("charge", "충전 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
+                charge_order_id = parsed.path.split("/")[3]
+                write_json(
+                    self,
+                    200,
+                    {"ok": True, **self._server().store.submit_charge_order_deposit_request(charge_order_id, payload, str(session["user"]["id"]))},
+                )
                 return
             if parsed.path == "/api/analytics/track":
                 self._enforce_rate_limit("analytics", "방문 수집 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
@@ -1020,6 +1127,9 @@ class AppHandler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/admin/home-banners":
                 write_json(self, 200, {"ok": True, **self._server().store.save_home_banner(payload)})
                 return
+            if parsed.path == "/api/admin/platform-sections":
+                write_json(self, 200, {"ok": True, **self._server().store.save_platform_section(payload)})
+                return
             if parsed.path == "/api/admin/suppliers":
                 write_json(self, 200, {"ok": True, **self._server().store.save_supplier(payload)})
                 return
@@ -1065,19 +1175,17 @@ class AppHandler(SimpleHTTPRequestHandler):
                 write_json(self, 200, self._server().store.preview_link(payload))
                 return
             if parsed.path == "/api/charge":
-                session = self._require_public_auth()
-                self._require_public_csrf(session)
-                self._enforce_rate_limit("charge", "충전 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
-                amount = int(payload.get("amount") or 0)
-                write_json(self, 200, self._server().store.charge_balance(amount, str(session["user"]["id"])))
-                return
+                raise PanelError(
+                    "직접 잔액 충전 API는 종료되었습니다. /api/charge-orders 기반 충전 플로우를 사용해 주세요.",
+                    status=410,
+                )
             raise PanelError("지원하지 않는 API 경로입니다.", status=404)
         except Exception as exc:
             send_error_json(self, exc)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Pulse24 SMM panel")
+    parser = argparse.ArgumentParser(description=f"{DEFAULT_SITE_NAME} SMM panel")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     return parser.parse_args()
@@ -1093,7 +1201,7 @@ def main() -> None:
     rate_limiter = runtime.rate_limiter
     handler = partial(AppHandler, directory=str(STATIC_ROOT))
     httpd = PanelHTTPServer((args.host, args.port), handler, store, admin_sessions, user_sessions, config, rate_limiter)
-    print(f"Pulse24 panel running at http://{args.host}:{args.port}")
+    print(f"{DEFAULT_SITE_NAME} panel running at http://{args.host}:{args.port}")
     print(f"Storage backend: {store.backend}")
     if not admin_sessions.is_configured:
         print("Admin routes are locked. Set SMM_PANEL_ADMIN_PASSWORD to enable /admin.")

@@ -34,6 +34,10 @@ DATA_ROOT = APP_ROOT / "data"
 DB_PATH = DATA_ROOT / "smm_panel.db"
 DEMO_USER_ID = "user_demo"
 PREVIEW_TIMEOUT_SECONDS = 6
+DEFAULT_SITE_NAME = "인스타마트"
+DEFAULT_SITE_DESCRIPTION = "실제 판매형 SNS 마케팅 서비스 쇼핑몰"
+LEGACY_DEFAULT_SITE_NAMES = {"Pulse24", "Pulse24 Panel"}
+LEGACY_DEFAULT_SITE_DESCRIPTIONS = {"Reference-style SMM Growth Panel"}
 PREVIEW_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -75,6 +79,39 @@ LEGAL_DOCUMENT_VERSIONS = {
     "marketing": "2026-04-18",
     "age": "2026-04-18",
 }
+AUTH_VERIFICATION_PURPOSE_SIGNUP = "signup"
+AUTH_VERIFICATION_CODE_LENGTH = 6
+AUTH_VERIFICATION_TTL_SECONDS = 10 * 60
+AUTH_VERIFICATION_COMPLETE_TTL_SECONDS = 30 * 60
+AUTH_VERIFICATION_RESEND_INTERVAL_SECONDS = 60
+AUTH_VERIFICATION_MAX_ATTEMPTS = 5
+PUBLIC_PASSWORD_MIN_LENGTH = 10
+PUBLIC_PASSWORD_RECOMMENDED_LENGTH = 12
+PUBLIC_PASSWORD_VERY_STRONG_LENGTH = 14
+COMMON_PASSWORD_PATTERNS = {
+    "12345678",
+    "123456789",
+    "1234567890",
+    "11111111",
+    "00000000",
+    "password",
+    "password1",
+    "qwer1234",
+    "qwerty123",
+    "abc12345",
+    "letmein",
+    "welcome123",
+    "admin1234",
+    "instamart",
+    "인스타마트",
+}
+KEYBOARD_SEQUENCE_PATTERNS = (
+    "0123456789",
+    "abcdefghijklmnopqrstuvwxyz",
+    "qwertyuiop",
+    "asdfghjkl",
+    "zxcvbnm",
+)
 
 
 def env_flag(value: Any) -> bool:
@@ -105,6 +142,204 @@ def demo_seed_enabled() -> bool:
     )
 
 
+def payment_provider_name() -> str:
+    return str(os.environ.get("SMM_PANEL_PAYMENT_PROVIDER") or "").strip().lower()
+
+
+def payment_public_key() -> str:
+    return str(
+        os.environ.get("SMM_PANEL_PAYMENT_PUBLIC_KEY")
+        or os.environ.get("SMM_PANEL_PAYMENT_CLIENT_KEY")
+        or ""
+    ).strip()
+
+
+def payment_secret_key() -> str:
+    return str(os.environ.get("SMM_PANEL_PAYMENT_SECRET_KEY") or "").strip()
+
+
+def payment_webhook_secret() -> str:
+    return str(os.environ.get("SMM_PANEL_PAYMENT_WEBHOOK_SECRET") or "").strip()
+
+
+def card_payment_configured() -> bool:
+    return bool(payment_provider_name() and payment_public_key() and payment_secret_key())
+
+
+def bank_transfer_config() -> Dict[str, str]:
+    config = {
+        "bankName": str(os.environ.get("SMM_PANEL_BANK_NAME") or "").strip(),
+        "accountNumber": str(os.environ.get("SMM_PANEL_BANK_ACCOUNT") or "").strip(),
+        "accountHolder": str(os.environ.get("SMM_PANEL_BANK_ACCOUNT_HOLDER") or "").strip(),
+        "depositGuide": str(os.environ.get("SMM_PANEL_BANK_DEPOSIT_GUIDE") or "").strip(),
+    }
+    if not is_production_runtime() and not (config["bankName"] and config["accountNumber"] and config["accountHolder"]):
+        return {
+            "bankName": config["bankName"] or "테스트은행",
+            "accountNumber": config["accountNumber"] or "123-456-789012",
+            "accountHolder": config["accountHolder"] or "인스타마트",
+            "depositGuide": config["depositGuide"] or "개발 환경용 계좌 정보입니다. 실제 운영 시에는 환경변수로 교체하세요.",
+        }
+    return config
+
+
+def bank_transfer_configured() -> bool:
+    config = bank_transfer_config()
+    return bool(config["bankName"] and config["accountNumber"] and config["accountHolder"])
+
+
+def auth_email_provider_name() -> str:
+    return str(
+        os.environ.get("SMM_PANEL_AUTH_EMAIL_PROVIDER")
+        or os.environ.get("SMM_PANEL_EMAIL_PROVIDER")
+        or ""
+    ).strip().lower()
+
+
+def auth_email_from_address() -> str:
+    return str(
+        os.environ.get("SMM_PANEL_AUTH_EMAIL_FROM")
+        or os.environ.get("SMM_PANEL_EMAIL_FROM")
+        or ""
+    ).strip()
+
+
+def auth_email_sender_name() -> str:
+    return str(
+        os.environ.get("SMM_PANEL_AUTH_EMAIL_SENDER_NAME")
+        or os.environ.get("SMM_PANEL_EMAIL_SENDER_NAME")
+        or DEFAULT_SITE_NAME
+    ).strip()
+
+
+def hash_token_value(value: str) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def generate_email_verification_code() -> str:
+    return "".join(secrets.choice("0123456789") for _ in range(AUTH_VERIFICATION_CODE_LENGTH))
+
+
+def password_contains_sequence(password: str) -> bool:
+    normalized = str(password or "").lower()
+    for pattern in KEYBOARD_SEQUENCE_PATTERNS:
+        for index in range(len(pattern) - 3):
+            token = pattern[index : index + 4]
+            if token in normalized or token[::-1] in normalized:
+                return True
+    return False
+
+
+def password_contains_repeated_pattern(password: str) -> bool:
+    normalized = str(password or "").lower()
+    return bool(re.search(r"(.)\1{3,}", normalized))
+
+
+def _name_like_tokens(value: str) -> List[str]:
+    raw = str(value or "").strip().lower()
+    pieces = re.split(r"[^0-9a-zA-Z가-힣]+", raw)
+    return [piece for piece in pieces if len(piece) >= 3]
+
+
+def assess_public_password_strength(password: str, *, email: str = "", name: str = "") -> Dict[str, Any]:
+    raw = str(password or "")
+    normalized = raw.lower()
+    email_local = str(email or "").split("@", 1)[0].strip().lower()
+    email_tokens = _name_like_tokens(email_local)
+    name_tokens = _name_like_tokens(name)
+    warnings: List[str] = []
+    score = 0
+
+    if len(raw) >= PUBLIC_PASSWORD_MIN_LENGTH:
+        score += 1
+    if len(raw) >= PUBLIC_PASSWORD_RECOMMENDED_LENGTH:
+        score += 1
+    if len(raw) >= PUBLIC_PASSWORD_VERY_STRONG_LENGTH:
+        score += 1
+    if len(set(raw)) >= min(10, max(4, len(raw) // 2)):
+        score += 1
+    if re.search(r"[A-Za-z]", raw) and re.search(r"\d", raw):
+        score += 1
+    elif re.search(r"[^A-Za-z0-9\s]", raw):
+        score += 1
+
+    common_hit = normalized in COMMON_PASSWORD_PATTERNS or any(
+        pattern and pattern in normalized for pattern in COMMON_PASSWORD_PATTERNS
+    )
+    if common_hit:
+        warnings.append("너무 흔한 비밀번호는 사용할 수 없어요.")
+        score = max(0, score - 3)
+    if password_contains_sequence(raw):
+        warnings.append("연속된 문자나 키보드 패턴은 피해주세요.")
+        score = max(0, score - 2)
+    if password_contains_repeated_pattern(raw):
+        warnings.append("같은 문자 반복은 피해주세요.")
+        score = max(0, score - 2)
+    if any(token and token in normalized for token in email_tokens + name_tokens):
+        warnings.append("이메일이나 이름이 들어간 비밀번호는 사용할 수 없어요.")
+        score = max(0, score - 3)
+
+    if len(raw) < PUBLIC_PASSWORD_MIN_LENGTH:
+        warnings.append(f"{PUBLIC_PASSWORD_MIN_LENGTH}자 이상으로 입력해 주세요.")
+
+    if score <= 1:
+        label = "약함"
+        tone = "weak"
+        guidance = "길고 예측 어려운 비밀번호를 추천해요."
+    elif score == 2:
+        label = "보통"
+        tone = "fair"
+        guidance = "12자 이상으로 늘리면 더 안전해집니다."
+    elif score == 3:
+        label = "안전"
+        tone = "good"
+        guidance = "좋습니다. 숫자나 기호를 섞으면 더 안정적입니다."
+    else:
+        label = "매우 안전"
+        tone = "strong"
+        guidance = "현재 기준으로 충분히 강한 비밀번호입니다."
+
+    is_valid = (
+        len(raw) >= PUBLIC_PASSWORD_MIN_LENGTH
+        and not common_hit
+        and not password_contains_sequence(raw)
+        and not password_contains_repeated_pattern(raw)
+        and not any(token and token in normalized for token in email_tokens + name_tokens)
+    )
+
+    return {
+        "label": label,
+        "tone": tone,
+        "score": max(0, min(score, 4)),
+        "guidance": guidance,
+        "warnings": warnings,
+        "isValid": is_valid,
+    }
+
+
+def validate_public_password(password: str, *, email: str = "", name: str = "") -> None:
+    assessment = assess_public_password_strength(password, email=email, name=name)
+    if assessment["isValid"]:
+        return
+    if assessment["warnings"]:
+        raise PanelError(assessment["warnings"][0])
+    raise PanelError("비밀번호가 안전하지 않습니다. 더 길고 예측 어려운 비밀번호를 사용해 주세요.")
+
+
+def dispatch_signup_verification_email(email: str, code: str, *, site_name: str = DEFAULT_SITE_NAME) -> Dict[str, Any]:
+    provider = auth_email_provider_name()
+    sender = auth_email_sender_name() or site_name
+    from_address = auth_email_from_address()
+    if not provider:
+        if is_production_runtime():
+            raise PanelError("이메일 인증 설정이 완료되지 않았습니다. 운영팀에 문의해 주세요.", status=503)
+        return {"deliveryMode": "preview", "previewCode": code}
+    if provider in {"preview", "console", "log"}:
+        print(f"[auth-email:{provider}] {sender} <{from_address or 'preview@example.com'}> -> {email} code={code}")
+        return {"deliveryMode": provider, "previewCode": code if not is_production_runtime() else ""}
+    raise PanelError("현재 이메일 발송 provider 구현이 필요합니다. 운영 설정을 확인해 주세요.", status=503)
+
+
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
 
@@ -116,7 +351,7 @@ CREATE TABLE IF NOT EXISTS users (
     phone TEXT NOT NULL,
     tier TEXT NOT NULL DEFAULT 'STANDARD',
     role TEXT NOT NULL DEFAULT 'customer',
-    avatar_label TEXT NOT NULL DEFAULT 'P24',
+    avatar_label TEXT NOT NULL DEFAULT 'IM',
     balance INTEGER NOT NULL DEFAULT 0,
     is_active INTEGER NOT NULL DEFAULT 1,
     account_status TEXT NOT NULL DEFAULT 'active',
@@ -168,12 +403,37 @@ CREATE TABLE IF NOT EXISTS user_auth_tokens (
     UNIQUE(token_type, token_hash)
 );
 
+CREATE TABLE IF NOT EXISTS email_verification_challenges (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    code_hash TEXT NOT NULL,
+    verification_token_hash TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    send_count INTEGER NOT NULL DEFAULT 1,
+    last_sent_at TEXT NOT NULL DEFAULT '',
+    resend_available_at TEXT NOT NULL DEFAULT '',
+    expires_at TEXT NOT NULL,
+    verified_at TEXT NOT NULL DEFAULT '',
+    used_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_verification_challenges_email_purpose_created_at
+    ON email_verification_challenges(email, purpose, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_email_verification_challenges_status_expires_at
+    ON email_verification_challenges(status, expires_at);
+
 CREATE TABLE IF NOT EXISTS platform_sections (
     id TEXT PRIMARY KEY,
     slug TEXT NOT NULL UNIQUE,
     display_name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     icon TEXT NOT NULL DEFAULT '●',
+    image_url TEXT NOT NULL DEFAULT '',
     accent_color TEXT NOT NULL DEFAULT '#4c76ff',
     sort_order INTEGER NOT NULL DEFAULT 0
 );
@@ -321,8 +581,8 @@ CREATE TABLE IF NOT EXISTS order_fields (
 CREATE TABLE IF NOT EXISTS balance_transactions (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    amount INTEGER NOT NULL,
-    balance_after INTEGER NOT NULL,
+    amount BIGINT NOT NULL,
+    balance_after BIGINT NOT NULL,
     kind TEXT NOT NULL,
     memo TEXT NOT NULL,
     created_at TEXT NOT NULL
@@ -331,7 +591,7 @@ CREATE TABLE IF NOT EXISTS balance_transactions (
 CREATE TABLE IF NOT EXISTS payment_records (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    amount INTEGER NOT NULL,
+    amount BIGINT NOT NULL,
     payment_method TEXT NOT NULL,
     payment_status TEXT NOT NULL,
     reference TEXT NOT NULL DEFAULT '',
@@ -340,6 +600,119 @@ CREATE TABLE IF NOT EXISTS payment_records (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS wallets (
+    user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    available_balance BIGINT NOT NULL DEFAULT 0,
+    pending_balance BIGINT NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS charge_orders (
+    id TEXT PRIMARY KEY,
+    order_code TEXT NOT NULL UNIQUE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    amount BIGINT NOT NULL,
+    vat_amount BIGINT NOT NULL DEFAULT 0,
+    total_amount BIGINT NOT NULL,
+    payment_channel TEXT NOT NULL,
+    payment_method_detail TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'created',
+    depositor_name TEXT NOT NULL DEFAULT '',
+    receipt_type TEXT NOT NULL DEFAULT 'none',
+    receipt_payload_json TEXT NOT NULL DEFAULT '{}',
+    reference TEXT NOT NULL DEFAULT '',
+    pg_provider TEXT NOT NULL DEFAULT '',
+    pg_order_id TEXT NOT NULL DEFAULT '',
+    pg_payment_key TEXT NOT NULL DEFAULT '',
+    failure_reason TEXT NOT NULL DEFAULT '',
+    payment_payload_json TEXT NOT NULL DEFAULT '{}',
+    bank_account_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    confirmed_at TEXT NOT NULL DEFAULT '',
+    expires_at TEXT NOT NULL DEFAULT '',
+    paid_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_charge_orders_user_created_at
+    ON charge_orders(user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_charge_orders_status_created_at
+    ON charge_orders(status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_charge_orders_channel_status_created_at
+    ON charge_orders(payment_channel, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS wallet_ledger (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    entry_type TEXT NOT NULL,
+    amount BIGINT NOT NULL,
+    balance_after BIGINT NOT NULL,
+    related_charge_order_id TEXT REFERENCES charge_orders(id) ON DELETE SET NULL,
+    related_order_id TEXT REFERENCES orders(id) ON DELETE SET NULL,
+    memo TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_wallet_ledger_user_created_at
+    ON wallet_ledger(user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_wallet_ledger_entry_type_created_at
+    ON wallet_ledger(entry_type, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS payment_webhooks (
+    id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    event_key TEXT NOT NULL UNIQUE,
+    event_type TEXT NOT NULL DEFAULT '',
+    charge_order_id TEXT REFERENCES charge_orders(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'received',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    processed_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_payment_webhooks_charge_order_created_at
+    ON payment_webhooks(charge_order_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS cash_receipt_requests (
+    id TEXT PRIMARY KEY,
+    charge_order_id TEXT NOT NULL UNIQUE REFERENCES charge_orders(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    phone_number TEXT NOT NULL DEFAULT '',
+    business_number TEXT NOT NULL DEFAULT '',
+    purpose TEXT NOT NULL DEFAULT 'personal',
+    status TEXT NOT NULL DEFAULT 'requested',
+    requested_at TEXT NOT NULL,
+    issued_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cash_receipt_requests_user_created_at
+    ON cash_receipt_requests(user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS tax_invoice_requests (
+    id TEXT PRIMARY KEY,
+    charge_order_id TEXT NOT NULL UNIQUE REFERENCES charge_orders(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    business_name TEXT NOT NULL DEFAULT '',
+    business_number TEXT NOT NULL DEFAULT '',
+    recipient_email TEXT NOT NULL DEFAULT '',
+    contact_name TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'requested',
+    requested_at TEXT NOT NULL,
+    issued_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tax_invoice_requests_user_created_at
+    ON tax_invoice_requests(user_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS suppliers (
     id TEXT PRIMARY KEY,
@@ -426,6 +799,7 @@ CREATE TABLE IF NOT EXISTS site_settings (
     site_description TEXT NOT NULL DEFAULT '',
     use_mail_sms_site_name INTEGER NOT NULL DEFAULT 0,
     mail_sms_site_name TEXT NOT NULL DEFAULT '',
+    header_logo_url TEXT NOT NULL DEFAULT '',
     favicon_url TEXT NOT NULL DEFAULT '',
     share_image_url TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
@@ -710,11 +1084,30 @@ def money(value: int) -> str:
     return f"{value:,}원"
 
 
+def generate_charge_order_code() -> str:
+    return f"CHG-{dt.datetime.now().strftime('%Y%m%d')}-{secrets.token_hex(3).upper()}"
+
+
+def balance_transaction_kind_to_ledger_entry_type(kind: str) -> str:
+    labels = {
+        "charge": "charge",
+        "order": "order_debit",
+        "admin_adjust": "admin_adjustment",
+    }
+    key = str(kind or "").strip().lower()
+    return labels.get(key, key or "admin_adjustment")
+
+
 def payment_method_label(method: str) -> str:
     labels = {
+        "charge": "충전",
+        "order_debit": "주문 차감",
         "manual_balance": "운영 수동 충전",
-        "bank_transfer": "무통장 입금",
+        "admin_manual": "운영 수동 충전",
+        "bank_transfer": "계좌입금",
         "card": "카드 결제",
+        "card_easy_pay": "카드/간편결제",
+        "easy_pay": "간편결제",
         "virtual_account": "가상계좌",
         "admin_adjustment": "관리자 조정",
     }
@@ -724,13 +1117,30 @@ def payment_method_label(method: str) -> str:
 
 def payment_status_label(status: str) -> str:
     labels = {
+        "created": "생성됨",
+        "awaiting_payment": "결제 대기",
+        "awaiting_deposit": "입금 대기",
         "pending": "확인 대기",
         "processing": "처리 중",
+        "paid": "결제 완료",
         "completed": "완료",
         "failed": "실패",
+        "expired": "만료",
         "cancelled": "취소",
+        "refund_requested": "환불 요청",
+        "refunded": "환불 완료",
     }
     key = str(status or "").strip().lower()
+    return labels.get(key, key or "미정")
+
+
+def receipt_type_label(receipt_type: str) -> str:
+    labels = {
+        "none": "미신청",
+        "cash_receipt": "현금영수증",
+        "tax_invoice": "세금계산서",
+    }
+    key = str(receipt_type or "").strip().lower()
     return labels.get(key, key or "미정")
 
 
@@ -750,10 +1160,11 @@ def default_home_popup_record() -> Dict[str, Any]:
 
 def default_site_settings_record() -> Dict[str, Any]:
     return {
-        "siteName": "Pulse24",
-        "siteDescription": "Reference-style SMM Growth Panel",
+        "siteName": DEFAULT_SITE_NAME,
+        "siteDescription": DEFAULT_SITE_DESCRIPTION,
         "useMailSmsSiteName": False,
         "mailSmsSiteName": "",
+        "headerLogoUrl": "",
         "faviconUrl": "",
         "shareImageUrl": "",
     }
@@ -947,7 +1358,14 @@ def supplier_platform_label(platform_key: str) -> str:
 def avatar_label(name: str) -> str:
     cleaned = "".join(part for part in str(name or "").strip().split())
     if not cleaned:
-        return "P24"
+        return "IM"
+    return cleaned[:2].upper()
+
+
+def resolved_avatar_label(stored_label: str, name: str) -> str:
+    cleaned = str(stored_label or "").strip()
+    if not cleaned or cleaned == "P24":
+        return avatar_label(name)
     return cleaned[:2].upper()
 
 
@@ -1098,7 +1516,7 @@ def placeholder_thumbnail(label: str, accent_color: str) -> str:
       <circle cx="72" cy="74" r="34" fill="rgba(255,255,255,0.18)"/>
       <text x="72" y="85" text-anchor="middle" font-size="28" font-weight="700" fill="#FFFFFF">{html_escape(initials)}</text>
       <text x="28" y="150" font-size="22" font-weight="700" fill="#FFFFFF">{html_escape(safe_label[:20])}</text>
-      <text x="28" y="180" font-size="14" fill="rgba(255,255,255,0.72)">Pulse24 Link Preview</text>
+      <text x="28" y="180" font-size="14" fill="rgba(255,255,255,0.72)">{html_escape(DEFAULT_SITE_NAME)} Link Preview</text>
     </svg>
     """.strip()
     return f"data:image/svg+xml;charset=utf-8,{quote(svg)}"
@@ -3128,7 +3546,7 @@ def catalog_blueprints() -> List[Dict[str, Any]]:
             ("cat_seo_traffic", "검색형 웹사이트 유입", "키워드 기반 웹사이트 유입을 설계하는 상품", "랜딩 URL", "https://example.com", "유입 수량", 100, 100000, 10, "회"),
         ]),
         ("press", "언론보도", "PR", "#f97316", "브랜드 신뢰도", "기사형 콘텐츠와 보도자료 송출 중심 상품군", [
-            ("cat_press_release", "기사형 보도자료 송출", "브랜드 신뢰도 확보용 기사형 송출 상품", "브랜드명", "예: Pulse24", "송출 수량", 1, 30, 1, "건"),
+            ("cat_press_release", "기사형 보도자료 송출", "브랜드 신뢰도 확보용 기사형 송출 상품", "브랜드명", f"예: {DEFAULT_SITE_NAME}", "송출 수량", 1, 30, 1, "건"),
         ]),
         ("design", "디자인 서비스", "DS", "#ec4899", "디자인 제작", "썸네일과 배너, 상세페이지 제작 보조 상품군", [
             ("cat_design_thumbnail", "썸네일/배너 디자인", "콘텐츠 클릭률 개선을 위한 디자인 상품", "요청 채널", "예: 유튜브/상세페이지", "수량", 1, 50, 1, "건"),
@@ -3317,6 +3735,7 @@ class PanelStore:
                 self._seed_management_samples(conn)
                 self._ensure_management_order_samples(conn)
                 self._ensure_analytics_samples(conn)
+            self._sync_wallet_state(conn)
             conn.commit()
 
     def _apply_migrations(self, conn: DatabaseConnection) -> None:
@@ -3330,6 +3749,8 @@ class PanelStore:
         self._ensure_column(conn, "users", "suspended_reason", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "users", "notes", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "users", "last_login_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "platform_sections", "image_url", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "site_settings", "header_logo_url", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "home_banners", "image_url", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "home_banners", "is_active", "INTEGER NOT NULL DEFAULT 1")
         self._ensure_column(conn, "product_categories", "is_active", "INTEGER NOT NULL DEFAULT 1")
@@ -3338,6 +3759,20 @@ class PanelStore:
         self._ensure_column(conn, "suppliers", "bearer_token", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "home_popups", "image_url", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "site_visit_events", "exclude_from_stats", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "charge_orders", "payment_payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column(conn, "charge_orders", "bank_account_snapshot_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column(conn, "charge_orders", "confirmed_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_charge_support_tables(conn)
+        self._ensure_bigint_columns(
+            conn,
+            {
+                "wallets": ["available_balance", "pending_balance"],
+                "charge_orders": ["amount", "vat_amount", "total_amount"],
+                "wallet_ledger": ["amount", "balance_after"],
+                "payment_records": ["amount"],
+                "balance_transactions": ["amount", "balance_after"],
+            },
+        )
         conn.execute("UPDATE users SET email = lower(trim(email)) WHERE email != lower(trim(email))")
         conn.execute("UPDATE support_links SET route = '/help#faq' WHERE id = 'support_faq'")
         conn.execute("UPDATE support_links SET route = '/help#notice' WHERE id = 'support_notice'")
@@ -3347,6 +3782,73 @@ class PanelStore:
         )
         conn.execute("UPDATE users SET role = 'admin', is_active = 1, account_status = 'active' WHERE id = ?", (DEMO_USER_ID,))
         conn.execute("UPDATE users SET role = COALESCE(NULLIF(role, ''), 'customer') WHERE id != ?", (DEMO_USER_ID,))
+
+    def _ensure_charge_support_tables(self, conn: DatabaseConnection) -> None:
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_charge_orders_status_created_at
+                ON charge_orders(status, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_charge_orders_channel_status_created_at
+                ON charge_orders(payment_channel, status, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_wallet_ledger_entry_type_created_at
+                ON wallet_ledger(entry_type, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS payment_webhooks (
+                id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                event_key TEXT NOT NULL UNIQUE,
+                event_type TEXT NOT NULL DEFAULT '',
+                charge_order_id TEXT REFERENCES charge_orders(id) ON DELETE SET NULL,
+                status TEXT NOT NULL DEFAULT 'received',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                processed_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_payment_webhooks_charge_order_created_at
+                ON payment_webhooks(charge_order_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS cash_receipt_requests (
+                id TEXT PRIMARY KEY,
+                charge_order_id TEXT NOT NULL UNIQUE REFERENCES charge_orders(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                phone_number TEXT NOT NULL DEFAULT '',
+                business_number TEXT NOT NULL DEFAULT '',
+                purpose TEXT NOT NULL DEFAULT 'personal',
+                status TEXT NOT NULL DEFAULT 'requested',
+                requested_at TEXT NOT NULL,
+                issued_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_cash_receipt_requests_user_created_at
+                ON cash_receipt_requests(user_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS tax_invoice_requests (
+                id TEXT PRIMARY KEY,
+                charge_order_id TEXT NOT NULL UNIQUE REFERENCES charge_orders(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                business_name TEXT NOT NULL DEFAULT '',
+                business_number TEXT NOT NULL DEFAULT '',
+                recipient_email TEXT NOT NULL DEFAULT '',
+                contact_name TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'requested',
+                requested_at TEXT NOT NULL,
+                issued_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tax_invoice_requests_user_created_at
+                ON tax_invoice_requests(user_id, created_at DESC);
+            """
+        )
+
+    def _ensure_bigint_columns(self, conn: DatabaseConnection, table_columns: Dict[str, List[str]]) -> None:
+        if self.backend != "postgres":
+            return
+        for table, columns in table_columns.items():
+            for column in columns:
+                conn.execute(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE BIGINT")
 
     def _ensure_column(self, conn: DatabaseConnection, table: str, column: str, definition: str) -> None:
         if self.backend == "postgres":
@@ -3366,6 +3868,58 @@ class PanelStore:
         if column in columns:
             return
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _sync_wallet_state(self, conn: DatabaseConnection) -> None:
+        timestamp = now_iso()
+        user_rows = conn.execute("SELECT id, balance FROM users").fetchall()
+        for user in user_rows:
+            wallet = conn.execute(
+                "SELECT available_balance, pending_balance FROM wallets WHERE user_id = ?",
+                (user["id"],),
+            ).fetchone()
+            if wallet is None:
+                conn.execute(
+                    """
+                    INSERT INTO wallets (user_id, available_balance, pending_balance, created_at, updated_at)
+                    VALUES (?, ?, 0, ?, ?)
+                    """,
+                    (user["id"], int(user["balance"]), timestamp, timestamp),
+                )
+                continue
+            if int(wallet["available_balance"]) != int(user["balance"]):
+                conn.execute(
+                    "UPDATE users SET balance = ?, updated_at = ? WHERE id = ?",
+                    (int(wallet["available_balance"]), timestamp, user["id"]),
+                )
+
+        legacy_rows = conn.execute(
+            """
+            SELECT id, user_id, amount, balance_after, kind, memo, created_at
+            FROM balance_transactions
+            ORDER BY created_at ASC
+            """
+        ).fetchall()
+        for row in legacy_rows:
+            ledger_id = f"legacy_{row['id']}"
+            exists = conn.execute("SELECT 1 FROM wallet_ledger WHERE id = ?", (ledger_id,)).fetchone()
+            if exists is not None:
+                continue
+            conn.execute(
+                """
+                INSERT INTO wallet_ledger (
+                    id, user_id, entry_type, amount, balance_after, related_charge_order_id, related_order_id, memo, created_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                """,
+                (
+                    ledger_id,
+                    row["user_id"],
+                    balance_transaction_kind_to_ledger_entry_type(row["kind"]),
+                    int(row["amount"]),
+                    int(row["balance_after"]),
+                    row["memo"],
+                    row["created_at"],
+                ),
+            )
 
     def _seed_management_samples(self, conn: DatabaseConnection) -> None:
         now = now_iso()
@@ -3571,9 +4125,9 @@ class PanelStore:
         conn.execute(
             """
             INSERT INTO site_settings (
-                id, site_name, site_description, use_mail_sms_site_name, mail_sms_site_name,
+                id, site_name, site_description, use_mail_sms_site_name, mail_sms_site_name, header_logo_url,
                 favicon_url, share_image_url, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 1,
@@ -3581,6 +4135,7 @@ class PanelStore:
                 settings["siteDescription"],
                 bool_to_int(settings["useMailSmsSiteName"]),
                 settings["mailSmsSiteName"],
+                settings["headerLogoUrl"],
                 settings["faviconUrl"],
                 settings["shareImageUrl"],
                 timestamp,
@@ -3784,8 +4339,8 @@ class PanelStore:
         for platform_index, platform in enumerate(catalog_blueprints()):
             conn.execute(
                 """
-                INSERT INTO platform_sections (id, slug, display_name, description, icon, accent_color, sort_order)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO platform_sections (id, slug, display_name, description, icon, image_url, accent_color, sort_order)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     platform["id"],
@@ -3793,6 +4348,7 @@ class PanelStore:
                     platform["display_name"],
                     platform["description"],
                     platform["icon"],
+                    str(platform.get("image_url") or ""),
                     platform["accent_color"],
                     platform_index,
                 ),
@@ -4006,18 +4562,504 @@ class PanelStore:
         user = self._public_user_row(conn, user_id)
         if user is None:
             raise PanelError("로그인한 사용자를 찾을 수 없습니다.", status=401)
+        wallet = self._wallet_balances(conn, user_id)
         return {
             "id": user["id"],
             "name": user["name"],
             "emailMasked": mask_email(user["email"]),
             "phoneMasked": mask_phone(user["phone"]),
             "tier": user["tier"],
-            "avatarLabel": user["avatar_label"],
-            "balance": user["balance"],
-            "balanceLabel": money(user["balance"]),
+            "avatarLabel": resolved_avatar_label(user["avatar_label"], user["name"]),
+            "balance": wallet["available"],
+            "balanceLabel": money(wallet["available"]),
             "hasPassword": bool(user["password_hash"]),
             "accountStatus": user["account_status"],
             "marketingOptIn": bool(user["marketing_opt_in"]),
+        }
+
+    def _wallet_balances(self, conn: DatabaseConnection, user_id: str) -> Dict[str, int]:
+        user = self._public_user_row(conn, user_id)
+        if user is None:
+            raise PanelError("로그인한 사용자를 찾을 수 없습니다.", status=401)
+        wallet = conn.execute(
+            "SELECT available_balance, pending_balance FROM wallets WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        available_balance = int(wallet["available_balance"]) if wallet is not None else int(user["balance"])
+        pending_balance = int(wallet["pending_balance"]) if wallet is not None else 0
+        if wallet is None:
+            timestamp = now_iso()
+            conn.execute(
+                """
+                INSERT INTO wallets (user_id, available_balance, pending_balance, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (user_id, available_balance, pending_balance, timestamp, timestamp),
+            )
+        elif int(user["balance"]) != available_balance:
+            conn.execute("UPDATE users SET balance = ?, updated_at = ? WHERE id = ?", (available_balance, now_iso(), user_id))
+        return {"available": available_balance, "pending": pending_balance}
+
+    def _set_wallet_balances(
+        self,
+        conn: DatabaseConnection,
+        user_id: str,
+        *,
+        available_balance: int,
+        pending_balance: Optional[int] = None,
+    ) -> None:
+        wallet = conn.execute(
+            "SELECT pending_balance FROM wallets WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        current_pending = int(wallet["pending_balance"]) if wallet is not None else 0
+        next_pending = current_pending if pending_balance is None else int(pending_balance)
+        timestamp = now_iso()
+        if wallet is None:
+            conn.execute(
+                """
+                INSERT INTO wallets (user_id, available_balance, pending_balance, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (user_id, int(available_balance), next_pending, timestamp, timestamp),
+            )
+            return
+        conn.execute(
+            "UPDATE wallets SET available_balance = ?, pending_balance = ?, updated_at = ? WHERE user_id = ?",
+            (int(available_balance), next_pending, timestamp, user_id),
+        )
+        conn.execute("UPDATE users SET balance = ?, updated_at = ? WHERE id = ?", (int(available_balance), timestamp, user_id))
+
+    def _refresh_wallet_pending_balance(self, conn: DatabaseConnection, user_id: str) -> int:
+        pending_row = conn.execute(
+            """
+            SELECT COALESCE(SUM(amount), 0) AS pending_amount
+            FROM charge_orders
+            WHERE user_id = ?
+              AND status IN ('created', 'awaiting_payment', 'awaiting_deposit', 'processing')
+            """,
+            (user_id,),
+        ).fetchone()
+        pending_balance = int(pending_row["pending_amount"]) if pending_row is not None else 0
+        available_balance = self._wallet_balances(conn, user_id)["available"]
+        self._set_wallet_balances(
+            conn,
+            user_id,
+            available_balance=available_balance,
+            pending_balance=pending_balance,
+        )
+        return pending_balance
+
+    def _append_wallet_ledger_entry(
+        self,
+        conn: DatabaseConnection,
+        *,
+        ledger_id: str,
+        user_id: str,
+        entry_type: str,
+        amount: int,
+        balance_after: int,
+        memo: str,
+        related_charge_order_id: Optional[str] = None,
+        related_order_id: Optional[str] = None,
+        created_at: str,
+    ) -> None:
+        exists = conn.execute("SELECT 1 FROM wallet_ledger WHERE id = ?", (ledger_id,)).fetchone()
+        if exists is not None:
+            return
+        conn.execute(
+            """
+            INSERT INTO wallet_ledger (
+                id, user_id, entry_type, amount, balance_after, related_charge_order_id, related_order_id, memo, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ledger_id,
+                user_id,
+                entry_type,
+                int(amount),
+                int(balance_after),
+                related_charge_order_id,
+                related_order_id,
+                memo,
+                created_at,
+            ),
+        )
+
+    def _charge_order_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        row_map = dict(row)
+        payment_payload = parse_json(row_map.get("payment_payload_json"), {})
+        bank_snapshot = parse_json(row_map.get("bank_account_snapshot_json"), {})
+        receipt_payload = parse_json(row_map.get("receipt_payload_json"), {})
+        payload = {
+            "id": row_map["id"],
+            "orderCode": row_map["order_code"],
+            "amount": int(row_map["amount"]),
+            "amountLabel": money(int(row_map["amount"])),
+            "vatAmount": int(row_map["vat_amount"]),
+            "vatAmountLabel": money(int(row_map["vat_amount"])),
+            "totalAmount": int(row_map["total_amount"]),
+            "totalAmountLabel": money(int(row_map["total_amount"])),
+            "paymentChannel": row_map["payment_channel"],
+            "paymentChannelLabel": payment_method_label(row_map["payment_channel"]),
+            "paymentMethodDetail": row_map["payment_method_detail"],
+            "status": row_map["status"],
+            "statusLabel": payment_status_label(row_map["status"]),
+            "depositorName": row_map["depositor_name"],
+            "receiptType": row_map["receipt_type"],
+            "receiptTypeLabel": receipt_type_label(row_map["receipt_type"]),
+            "receiptPayload": receipt_payload,
+            "reference": row_map["reference"],
+            "pgProvider": row_map["pg_provider"],
+            "pgOrderId": row_map.get("pg_order_id", ""),
+            "pgPaymentKey": row_map.get("pg_payment_key", ""),
+            "failureReason": row_map["failure_reason"],
+            "paymentPayload": payment_payload,
+            "bankAccount": bank_snapshot,
+            "expiresAt": row_map["expires_at"],
+            "confirmedAt": row_map.get("confirmed_at", ""),
+            "paidAt": row_map["paid_at"],
+            "createdAt": row_map["created_at"],
+            "updatedAt": row_map["updated_at"],
+            "createdLabel": self._relative_date_label(row_map["created_at"]),
+        }
+        return payload
+
+    def _wallet_payload(self, conn: DatabaseConnection, user_id: str) -> Dict[str, Any]:
+        balances = self._wallet_balances(conn, user_id)
+        pending_balance = self._refresh_wallet_pending_balance(conn, user_id)
+        available_balance = balances["available"]
+        return {
+            "availableBalance": available_balance,
+            "availableBalanceLabel": money(available_balance),
+            "pendingBalance": pending_balance,
+            "pendingBalanceLabel": money(pending_balance),
+            "totalBalance": available_balance + pending_balance,
+            "totalBalanceLabel": money(available_balance + pending_balance),
+        }
+
+    def _charge_amount_breakdown(self, amount: int) -> Dict[str, int]:
+        normalized_amount = int(amount or 0)
+        vat_amount = normalized_amount // 10
+        total_amount = normalized_amount + vat_amount
+        return {
+            "amount": normalized_amount,
+            "vatAmount": vat_amount,
+            "totalAmount": total_amount,
+        }
+
+    def _normalized_charge_payment_channel(self, raw_value: Any) -> str:
+        value = str(raw_value or "").strip().lower()
+        aliases = {
+            "card_easy_pay": "card",
+            "card/easy_pay": "card",
+            "simple": "card",
+            "wire": "bank_transfer",
+            "deposit": "bank_transfer",
+        }
+        value = aliases.get(value, value)
+        if value not in {"card", "easy_pay", "bank_transfer", "virtual_account"}:
+            raise PanelError("지원하지 않는 결제 방식입니다.")
+        return value
+
+    def _resolve_charge_expiry(self, payment_channel: str) -> str:
+        now = dt.datetime.now().astimezone()
+        if payment_channel in {"card", "easy_pay"}:
+            return (now + dt.timedelta(minutes=15)).isoformat(timespec="seconds")
+        return (now + dt.timedelta(hours=24)).isoformat(timespec="seconds")
+
+    def _payment_method_detail_label(self, payment_channel: str, method_detail: str) -> str:
+        detail = str(method_detail or "").strip()
+        if payment_channel == "card" and detail:
+            labels = {
+                "general_card": "일반 카드",
+                "kakao_pay": "카카오페이",
+                "naver_pay": "네이버페이",
+                "tosspay": "토스페이",
+                "payco": "PAYCO",
+            }
+            return labels.get(detail, detail)
+        if payment_channel == "bank_transfer":
+            return "계좌입금"
+        return payment_method_label(payment_channel)
+
+    def _bank_transfer_public_payload(self) -> Dict[str, Any]:
+        config = bank_transfer_config()
+        return {
+            "enabled": bank_transfer_configured(),
+            "bankName": config["bankName"],
+            "accountNumber": config["accountNumber"],
+            "accountHolder": config["accountHolder"],
+            "depositGuide": config["depositGuide"] or "입금자명을 동일하게 입력하면 확인이 빨라집니다.",
+        }
+
+    def _payment_methods_public_payload(self) -> List[Dict[str, Any]]:
+        bank_transfer = self._bank_transfer_public_payload()
+        return [
+            {
+                "id": "card",
+                "label": "카드/간편결제",
+                "description": "PG 연동 후 카드와 간편결제로 즉시 충전됩니다.",
+                "enabled": card_payment_configured(),
+                "requiresProvider": True,
+            },
+            {
+                "id": "bank_transfer",
+                "label": "계좌입금",
+                "description": "입금 확인 후 보유금액으로 반영됩니다.",
+                "enabled": bank_transfer["enabled"],
+                "requiresProvider": False,
+            },
+        ]
+
+    def charge_config_public_payload(self) -> Dict[str, Any]:
+        return {
+            "methods": self._payment_methods_public_payload(),
+            "bankTransfer": self._bank_transfer_public_payload(),
+            "minimumAmount": 5_000,
+            "maximumAmount": 5_000_000,
+            "vatIncluded": False,
+            "policyHighlights": [
+                "결제 완료 또는 입금 확인 후에만 보유금액이 적립됩니다.",
+                "카드/간편결제는 서버 승인 기준으로만 처리되며, 결제 비밀키는 프론트에 저장되지 않습니다.",
+                "환불, 증빙, 취소 기준은 이용약관과 결제 안내를 따릅니다.",
+            ],
+        }
+
+    def _record_receipt_request(
+        self,
+        conn: DatabaseConnection,
+        *,
+        charge_order_id: str,
+        user_id: str,
+        receipt_type: str,
+        receipt_payload: Dict[str, Any],
+        timestamp: str,
+    ) -> None:
+        if receipt_type == "cash_receipt":
+            row = conn.execute("SELECT id FROM cash_receipt_requests WHERE charge_order_id = ?", (charge_order_id,)).fetchone()
+            values = (
+                str(receipt_payload.get("phoneNumber") or "").strip(),
+                str(receipt_payload.get("businessNumber") or "").strip(),
+                str(receipt_payload.get("purpose") or "personal").strip() or "personal",
+            )
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO cash_receipt_requests (
+                        id, charge_order_id, user_id, phone_number, business_number, purpose,
+                        status, requested_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'requested', ?, ?, ?)
+                    """,
+                    (f"cr_{uuid4().hex[:12]}", charge_order_id, user_id, *values, timestamp, timestamp, timestamp),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE cash_receipt_requests
+                    SET phone_number = ?, business_number = ?, purpose = ?, status = 'requested', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (*values, timestamp, row["id"]),
+                )
+            return
+
+        if receipt_type == "tax_invoice":
+            row = conn.execute("SELECT id FROM tax_invoice_requests WHERE charge_order_id = ?", (charge_order_id,)).fetchone()
+            values = (
+                str(receipt_payload.get("businessName") or "").strip(),
+                str(receipt_payload.get("businessNumber") or "").strip(),
+                str(receipt_payload.get("recipientEmail") or "").strip(),
+                str(receipt_payload.get("contactName") or "").strip(),
+            )
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO tax_invoice_requests (
+                        id, charge_order_id, user_id, business_name, business_number, recipient_email,
+                        contact_name, status, requested_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?, ?)
+                    """,
+                    (f"ti_{uuid4().hex[:12]}", charge_order_id, user_id, *values, timestamp, timestamp, timestamp),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE tax_invoice_requests
+                    SET business_name = ?, business_number = ?, recipient_email = ?, contact_name = ?, status = 'requested', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (*values, timestamp, row["id"]),
+                )
+
+
+    def _create_charge_order_record(
+        self,
+        conn: DatabaseConnection,
+        *,
+        user_id: str,
+        amount: int,
+        vat_amount: int,
+        total_amount: int,
+        payment_channel: str,
+        payment_method_detail: str,
+        status: str,
+        depositor_name: str = "",
+        receipt_type: str = "none",
+        receipt_payload: Optional[Dict[str, Any]] = None,
+        reference: str = "",
+        pg_provider: str = "",
+        payment_payload: Optional[Dict[str, Any]] = None,
+        bank_account_snapshot: Optional[Dict[str, Any]] = None,
+        expires_at: str = "",
+    ) -> Dict[str, Any]:
+        created_at = now_iso()
+        charge_order_id = f"chg_{uuid4().hex[:16]}"
+        order_code = generate_charge_order_code()
+        while conn.execute("SELECT 1 FROM charge_orders WHERE order_code = ?", (order_code,)).fetchone() is not None:
+            order_code = generate_charge_order_code()
+        conn.execute(
+            """
+            INSERT INTO charge_orders (
+                id, order_code, user_id, amount, vat_amount, total_amount,
+                payment_channel, payment_method_detail, status, depositor_name,
+                receipt_type, receipt_payload_json, reference,
+                pg_provider, pg_order_id, pg_payment_key, failure_reason,
+                payment_payload_json, bank_account_snapshot_json, confirmed_at,
+                expires_at, paid_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', '', ?, ?, ?, ?, '', ?, ?)
+            """,
+            (
+                charge_order_id,
+                order_code,
+                user_id,
+                int(amount),
+                int(vat_amount),
+                int(total_amount),
+                payment_channel,
+                payment_method_detail,
+                status,
+                depositor_name,
+                receipt_type,
+                as_json(receipt_payload or {}),
+                reference,
+                pg_provider,
+                as_json(payment_payload or {}),
+                as_json(bank_account_snapshot or {}),
+                "",
+                expires_at,
+                created_at,
+                created_at,
+            ),
+        )
+        row = conn.execute("SELECT * FROM charge_orders WHERE id = ?", (charge_order_id,)).fetchone()
+        return dict(row) if row is not None else {}
+
+    def _complete_charge_order(
+        self,
+        conn: DatabaseConnection,
+        charge_order_id: str,
+        *,
+        payment_method: str,
+        payment_status: str = "completed",
+        reference: str = "",
+        payment_payload: Optional[Dict[str, Any]] = None,
+        paid_total_amount: Optional[int] = None,
+        memo_prefix: str = "캐시 충전",
+    ) -> Dict[str, Any]:
+        charge_order = conn.execute("SELECT * FROM charge_orders WHERE id = ?", (charge_order_id,)).fetchone()
+        if charge_order is None:
+            raise PanelError("충전 주문을 찾을 수 없습니다.", status=404)
+        if charge_order["status"] == "paid":
+            wallet = self._wallet_payload(conn, str(charge_order["user_id"]))
+            return {
+                "chargeOrder": self._charge_order_payload(dict(charge_order)),
+                "wallet": wallet,
+                "paymentReference": charge_order["reference"],
+                "paymentId": f"payment_{charge_order_id}",
+            }
+        if charge_order["status"] in {"cancelled", "expired", "failed", "refunded"}:
+            raise PanelError("완료할 수 없는 충전 주문 상태입니다.")
+        expected_total_amount = int(charge_order["total_amount"])
+        if paid_total_amount is not None and int(paid_total_amount) != expected_total_amount:
+            raise PanelError("결제 금액 검증에 실패했습니다.")
+
+        user = conn.execute("SELECT balance FROM users WHERE id = ?", (charge_order["user_id"],)).fetchone()
+        if user is None:
+            raise PanelError("사용자를 찾을 수 없습니다.", status=404)
+
+        timestamp = now_iso()
+        payment_reference = reference or charge_order["reference"] or f"PMT-{dt.datetime.now().strftime('%Y%m%d')}-{secrets.token_hex(3).upper()}"
+        balance_after = int(user["balance"]) + int(charge_order["amount"])
+        merged_payment_payload = parse_json(charge_order["payment_payload_json"], {})
+        merged_payment_payload.update(payment_payload or {})
+        conn.execute(
+            """
+            UPDATE charge_orders
+            SET status = 'paid', reference = ?, payment_payload_json = ?, confirmed_at = ?, paid_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (payment_reference, as_json(merged_payment_payload), timestamp, timestamp, timestamp, charge_order_id),
+        )
+        conn.execute(
+            "UPDATE users SET balance = ?, updated_at = ? WHERE id = ?",
+            (balance_after, timestamp, charge_order["user_id"]),
+        )
+        self._set_wallet_balances(conn, str(charge_order["user_id"]), available_balance=balance_after)
+        tx_id = f"tx_charge_{charge_order_id}"
+        if conn.execute("SELECT 1 FROM balance_transactions WHERE id = ?", (tx_id,)).fetchone() is None:
+            conn.execute(
+                """
+                INSERT INTO balance_transactions (id, user_id, amount, balance_after, kind, memo, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    tx_id,
+                    charge_order["user_id"],
+                    int(charge_order["amount"]),
+                    balance_after,
+                    "charge",
+                    f"{memo_prefix} {money(int(charge_order['amount']))}",
+                    timestamp,
+                ),
+            )
+        self._append_wallet_ledger_entry(
+            conn,
+            ledger_id=f"ledger_charge_{charge_order_id}",
+            user_id=str(charge_order["user_id"]),
+            entry_type="charge",
+            amount=int(charge_order["amount"]),
+            balance_after=balance_after,
+            memo=f"{memo_prefix} {money(int(charge_order['amount']))}",
+            related_charge_order_id=charge_order_id,
+            created_at=timestamp,
+        )
+        payment_id = f"payment_{charge_order_id}"
+        if conn.execute("SELECT 1 FROM payment_records WHERE id = ?", (payment_id,)).fetchone() is None:
+            conn.execute(
+                """
+                INSERT INTO payment_records (
+                    id, user_id, amount, payment_method, payment_status, reference, failure_reason, admin_adjustment_reason, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, '', '', ?, ?)
+                """,
+                (
+                    payment_id,
+                    charge_order["user_id"],
+                    int(charge_order["total_amount"]),
+                    payment_method,
+                    payment_status,
+                    payment_reference,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        self._refresh_wallet_pending_balance(conn, str(charge_order["user_id"]))
+        updated = conn.execute("SELECT * FROM charge_orders WHERE id = ?", (charge_order_id,)).fetchone()
+        return {
+            "chargeOrder": self._charge_order_payload(dict(updated or charge_order)),
+            "wallet": self._wallet_payload(conn, str(charge_order["user_id"])),
+            "paymentReference": payment_reference,
+            "paymentId": f"payment_{charge_order_id}",
         }
 
     def _normalize_customer_email(self, email: str) -> str:
@@ -4041,6 +5083,167 @@ class PanelStore:
         exists = conn.execute(query, params).fetchone()
         if exists is not None:
             raise PanelError("이미 사용 중인 이메일입니다.")
+
+    def _latest_email_verification_challenge(
+        self,
+        conn: DatabaseConnection,
+        email: str,
+        purpose: str,
+    ) -> Optional[Dict[str, Any]]:
+        return conn.execute(
+            """
+            SELECT *
+            FROM email_verification_challenges
+            WHERE email = ? AND purpose = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (email, purpose),
+        ).fetchone()
+
+    def start_signup_email_verification(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        email = self._normalize_customer_email(payload.get("email") or "")
+        now = dt.datetime.now().astimezone()
+        timestamp = now.isoformat(timespec="seconds")
+        resend_available_at = (now + dt.timedelta(seconds=AUTH_VERIFICATION_RESEND_INTERVAL_SECONDS)).isoformat(timespec="seconds")
+        expires_at = (now + dt.timedelta(seconds=AUTH_VERIFICATION_TTL_SECONDS)).isoformat(timespec="seconds")
+        code = generate_email_verification_code()
+        code_hash = hash_token_value(code)
+
+        with self._connect() as conn:
+            self._assert_available_customer_email(conn, email)
+            row = self._latest_email_verification_challenge(conn, email, AUTH_VERIFICATION_PURPOSE_SIGNUP)
+            if row is not None and not row["used_at"]:
+                retry_after = parse_iso_datetime(row["resend_available_at"])
+                if row["status"] == "pending" and retry_after and retry_after > now:
+                    remaining = max(1, int((retry_after - now).total_seconds()))
+                    raise PanelError(f"{remaining}초 후에 인증코드를 다시 보낼 수 있어요.", status=429)
+
+            delivery = dispatch_signup_verification_email(email, code)
+            if row is not None and not row["used_at"]:
+                conn.execute(
+                    """
+                    UPDATE email_verification_challenges
+                    SET code_hash = ?,
+                        verification_token_hash = '',
+                        status = 'pending',
+                        attempt_count = 0,
+                        send_count = COALESCE(send_count, 0) + 1,
+                        last_sent_at = ?,
+                        resend_available_at = ?,
+                        expires_at = ?,
+                        verified_at = '',
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (code_hash, timestamp, resend_available_at, expires_at, timestamp, row["id"]),
+                )
+                challenge_id = row["id"]
+            else:
+                challenge_id = f"evc_{uuid4().hex[:16]}"
+                conn.execute(
+                    """
+                    INSERT INTO email_verification_challenges (
+                        id, email, purpose, code_hash, verification_token_hash, status,
+                        attempt_count, send_count, last_sent_at, resend_available_at,
+                        expires_at, verified_at, used_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, '', 'pending', 0, 1, ?, ?, ?, '', '', ?, ?)
+                    """,
+                    (
+                        challenge_id,
+                        email,
+                        AUTH_VERIFICATION_PURPOSE_SIGNUP,
+                        code_hash,
+                        timestamp,
+                        resend_available_at,
+                        expires_at,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            conn.commit()
+
+        result = {
+            "email": email,
+            "challengeId": challenge_id,
+            "expiresAt": expires_at,
+            "resendAvailableAt": resend_available_at,
+            "deliveryMode": delivery.get("deliveryMode", ""),
+            "sent": True,
+        }
+        preview_code = str(delivery.get("previewCode") or "").strip()
+        if preview_code and not is_production_runtime():
+            result["previewCode"] = preview_code
+        return result
+
+    def verify_signup_email_code(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        email = self._normalize_customer_email(payload.get("email") or "")
+        code = re.sub(r"\D+", "", str(payload.get("code") or ""))
+        if len(code) != AUTH_VERIFICATION_CODE_LENGTH:
+            raise PanelError(f"{AUTH_VERIFICATION_CODE_LENGTH}자리 인증코드를 입력해 주세요.")
+
+        now = dt.datetime.now().astimezone()
+        timestamp = now.isoformat(timespec="seconds")
+        with self._connect() as conn:
+            row = self._latest_email_verification_challenge(conn, email, AUTH_VERIFICATION_PURPOSE_SIGNUP)
+            if row is None or row["used_at"]:
+                raise PanelError("먼저 인증코드를 발송해 주세요.", status=404)
+            if row["status"] != "pending":
+                raise PanelError("새 인증코드를 다시 요청해 주세요.", status=409)
+
+            expires_at = parse_iso_datetime(row["expires_at"])
+            if expires_at is None or expires_at <= now:
+                conn.execute(
+                    "UPDATE email_verification_challenges SET status = 'expired', updated_at = ? WHERE id = ?",
+                    (timestamp, row["id"]),
+                )
+                conn.commit()
+                raise PanelError("인증코드가 만료되었습니다. 다시 요청해 주세요.", status=410)
+
+            attempt_count = int(row["attempt_count"] or 0)
+            if attempt_count >= AUTH_VERIFICATION_MAX_ATTEMPTS:
+                conn.execute(
+                    "UPDATE email_verification_challenges SET status = 'failed', updated_at = ? WHERE id = ?",
+                    (timestamp, row["id"]),
+                )
+                conn.commit()
+                raise PanelError("인증 시도 횟수를 초과했습니다. 새 코드를 요청해 주세요.", status=429)
+
+            if not hmac.compare_digest(hash_token_value(code), str(row["code_hash"] or "")):
+                attempt_count += 1
+                next_status = "failed" if attempt_count >= AUTH_VERIFICATION_MAX_ATTEMPTS else "pending"
+                conn.execute(
+                    "UPDATE email_verification_challenges SET attempt_count = ?, status = ?, updated_at = ? WHERE id = ?",
+                    (attempt_count, next_status, timestamp, row["id"]),
+                )
+                conn.commit()
+                remaining = max(0, AUTH_VERIFICATION_MAX_ATTEMPTS - attempt_count)
+                if remaining:
+                    raise PanelError(f"인증코드가 올바르지 않습니다. 남은 시도 {remaining}회", status=400)
+                raise PanelError("인증 시도 횟수를 초과했습니다. 새 코드를 요청해 주세요.", status=429)
+
+            verification_token = secrets.token_urlsafe(24)
+            complete_by = (now + dt.timedelta(seconds=AUTH_VERIFICATION_COMPLETE_TTL_SECONDS)).isoformat(timespec="seconds")
+            conn.execute(
+                """
+                UPDATE email_verification_challenges
+                SET status = 'verified',
+                    verification_token_hash = ?,
+                    verified_at = ?,
+                    expires_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (hash_token_value(verification_token), timestamp, complete_by, timestamp, row["id"]),
+            )
+            conn.commit()
+            return {
+                "email": email,
+                "verified": True,
+                "verifiedAt": timestamp,
+                "verificationToken": verification_token,
+                "completeBy": complete_by,
+            }
 
     def _record_user_consents(
         self,
@@ -4123,6 +5326,7 @@ class PanelStore:
         email = self._normalize_customer_email(payload.get("email") or "")
         password = str(payload.get("password") or "")
         password_confirmation = str(payload.get("passwordConfirmation") or "")
+        verification_token = str(payload.get("verificationToken") or "").strip()
         name = str(payload.get("name") or payload.get("nickname") or "").strip()
         terms_agreed = bool(payload.get("termsAgreed"))
         privacy_agreed = bool(payload.get("privacyAgreed"))
@@ -4131,8 +5335,9 @@ class PanelStore:
 
         if not name:
             raise PanelError("이름 또는 닉네임을 입력해 주세요.")
-        if len(password) < 8:
-            raise PanelError("비밀번호는 8자 이상으로 입력해 주세요.")
+        if not verification_token:
+            raise PanelError("이메일 인증을 먼저 완료해 주세요.", status=409)
+        validate_public_password(password, email=email, name=name)
         if password != password_confirmation:
             raise PanelError("비밀번호 확인이 일치하지 않습니다.")
         if not terms_agreed:
@@ -4146,6 +5351,17 @@ class PanelStore:
         user_id = f"user_{uuid4().hex[:12]}"
         with self._connect() as conn:
             self._assert_available_customer_email(conn, email)
+            verification_row = self._latest_email_verification_challenge(conn, email, AUTH_VERIFICATION_PURPOSE_SIGNUP)
+            if verification_row is None or verification_row["used_at"] or verification_row["status"] != "verified":
+                raise PanelError("이메일 인증을 다시 진행해 주세요.", status=409)
+            expires_at = parse_iso_datetime(verification_row["expires_at"])
+            if expires_at is None or expires_at <= dt.datetime.now().astimezone():
+                raise PanelError("이메일 인증이 만료되었습니다. 다시 진행해 주세요.", status=410)
+            if not hmac.compare_digest(
+                hash_token_value(verification_token),
+                str(verification_row["verification_token_hash"] or ""),
+            ):
+                raise PanelError("이메일 인증 확인 정보가 올바르지 않습니다. 다시 진행해 주세요.", status=409)
             conn.execute(
                 """
                 INSERT INTO users (
@@ -4173,6 +5389,21 @@ class PanelStore:
                 ) VALUES (?, ?, 'email', ?, ?, ?, ?, ?, ?)
                 """,
                 (f"identity_{uuid4().hex[:12]}", user_id, email, email, timestamp, timestamp, timestamp, timestamp),
+            )
+            conn.execute(
+                """
+                UPDATE email_verification_challenges
+                SET used_at = ?, status = 'used', updated_at = ?
+                WHERE id = ?
+                """,
+                (timestamp, timestamp, verification_row["id"]),
+            )
+            conn.execute(
+                """
+                INSERT INTO wallets (user_id, available_balance, pending_balance, created_at, updated_at)
+                VALUES (?, 0, 0, ?, ?)
+                """,
+                (user_id, timestamp, timestamp),
             )
             self._record_user_consents(
                 conn,
@@ -4231,7 +5462,7 @@ class PanelStore:
                 dict(row)
                 for row in conn.execute(
                     """
-                    SELECT id, slug, display_name, description, icon, accent_color
+                    SELECT id, slug, display_name, description, icon, image_url, accent_color
                     FROM platform_sections
                     WHERE EXISTS (
                         SELECT 1
@@ -4311,6 +5542,7 @@ class PanelStore:
                         "displayName": platform["display_name"],
                         "description": platform["description"],
                         "icon": platform["icon"],
+                        "logoImageUrl": platform["image_url"],
                         "accentColor": platform["accent_color"],
                     }
                     for platform in platforms
@@ -4364,20 +5596,20 @@ class PanelStore:
                     "signupEnabled": True,
                     "loginRoute": "/auth",
                     "passwordResetEnabled": False,
-                    "emailVerificationRequired": False,
+                    "signupRoute": "/auth/signup",
+                    "emailVerificationRequired": True,
+                    "verificationCodeLength": AUTH_VERIFICATION_CODE_LENGTH,
+                    "verificationExpiresInSeconds": AUTH_VERIFICATION_TTL_SECONDS,
+                    "verificationCompleteExpiresInSeconds": AUTH_VERIFICATION_COMPLETE_TTL_SECONDS,
+                    "verificationResendIntervalSeconds": AUTH_VERIFICATION_RESEND_INTERVAL_SECONDS,
+                    "passwordPolicy": {
+                        "minimumLength": PUBLIC_PASSWORD_MIN_LENGTH,
+                        "recommendedLength": PUBLIC_PASSWORD_RECOMMENDED_LENGTH,
+                        "veryStrongLength": PUBLIC_PASSWORD_VERY_STRONG_LENGTH,
+                    },
                     "oauthProviders": oauth_provider_catalog(),
                 },
-                "chargeConfig": {
-                    "methods": [
-                        {"id": "bank_transfer", "label": "무통장 입금", "description": "입금 확인 후 잔액이 반영되는 방식입니다."},
-                        {"id": "admin_manual", "label": "관리자 수동 충전", "description": "운영팀 확인 후 수동으로 반영되는 방식입니다."},
-                    ],
-                    "policyHighlights": [
-                        "결제수단 연동 전에는 운영팀 확인 후 충전이 반영될 수 있습니다.",
-                        "입금 확인 전 주문은 진행되지 않을 수 있습니다.",
-                        "환불 및 취소 기준은 이용약관과 개별 상품 정책을 따릅니다.",
-                    ],
-                },
+                "chargeConfig": self.charge_config_public_payload(),
                 "benefits": [
                     {
                         "id": item["id"],
@@ -4402,6 +5634,7 @@ class PanelStore:
                 ps.display_name AS platform_name,
                 ps.description AS platform_description,
                 ps.icon AS platform_icon,
+                ps.image_url AS platform_logo_image_url,
                 ps.accent_color AS platform_accent_color,
                 pg.id AS group_id,
                 pg.name AS group_name,
@@ -4450,6 +5683,7 @@ class PanelStore:
                     "displayName": row["platform_name"],
                     "description": row["platform_description"],
                     "icon": row["platform_icon"],
+                    "logoImageUrl": row["platform_logo_image_url"],
                     "accentColor": row["platform_accent_color"],
                     "groups": {},
                 },
@@ -4501,6 +5735,7 @@ class PanelStore:
                     ps.slug AS platform_slug,
                     ps.display_name AS platform_name,
                     ps.icon AS platform_icon,
+                    ps.image_url AS platform_logo_image_url,
                     ps.accent_color AS platform_accent_color
                 FROM product_categories pc
                 JOIN platform_groups pg ON pg.id = pc.platform_group_id
@@ -4574,6 +5809,7 @@ class PanelStore:
                     "slug": category["platform_slug"],
                     "displayName": category["platform_name"],
                     "icon": category["platform_icon"],
+                    "logoImageUrl": category["platform_logo_image_url"],
                     "accentColor": category["platform_accent_color"],
                 },
                 "group": {
@@ -4653,49 +5889,448 @@ class PanelStore:
             return {"orders": orders, "counts": counts}
 
     def list_transactions(self, user_id: str = "") -> Dict[str, Any]:
+        return {"transactions": self.list_wallet_ledger(user_id, limit=50)["entries"]}
+
+    def get_wallet(self, user_id: str = "") -> Dict[str, Any]:
         if not user_id:
             raise PanelError("로그인이 필요합니다.", status=401)
+        with self._connect() as conn:
+            wallet = self._wallet_payload(conn, user_id)
+        return {"wallet": wallet}
+
+    def list_wallet_ledger(
+        self,
+        user_id: str = "",
+        limit: int = 50,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not user_id:
+            raise PanelError("로그인이 필요합니다.", status=401)
+        filters = filters or {}
+        safe_limit = min(max(int(limit or 50), 1), 100)
+        params: List[Any] = [user_id]
+        conditions = ["wl.user_id = ?"]
+        entry_type = str(filters.get("entryType") or "").strip().lower()
+        if entry_type and entry_type != "all":
+            conditions.append("wl.entry_type = ?")
+            params.append(entry_type)
+        status = str(filters.get("status") or "").strip().lower()
+        if status and status != "all":
+            conditions.append("COALESCE(co.status, 'completed') = ?")
+            params.append(status)
+        payment_channel = str(filters.get("paymentChannel") or "").strip().lower()
+        if payment_channel and payment_channel != "all":
+            conditions.append("COALESCE(co.payment_channel, '') = ?")
+            params.append(payment_channel)
+        created_from = str(filters.get("createdFrom") or "").strip()
+        if created_from:
+            conditions.append("wl.created_at >= ?")
+            params.append(created_from)
+        created_to = str(filters.get("createdTo") or "").strip()
+        if created_to:
+            conditions.append("wl.created_at <= ?")
+            params.append(created_to)
+        params.append(safe_limit)
         rows = self._fetchall(
-            """
+            f"""
             SELECT
-                bt.*,
-                pr.payment_method,
-                pr.payment_status,
-                pr.reference,
-                pr.failure_reason,
-                pr.admin_adjustment_reason
-            FROM balance_transactions bt
-            LEFT JOIN payment_records pr
-              ON pr.user_id = bt.user_id
-             AND pr.amount = bt.amount
-             AND ABS(strftime('%s', pr.created_at) - strftime('%s', bt.created_at)) <= 5
-            WHERE bt.user_id = ?
-            ORDER BY bt.created_at DESC
+                wl.*,
+                co.order_code,
+                co.payment_channel,
+                co.payment_method_detail,
+                co.receipt_type,
+                co.status AS charge_status,
+                co.reference AS charge_reference,
+                co.failure_reason AS charge_failure_reason
+            FROM wallet_ledger wl
+            LEFT JOIN charge_orders co
+              ON co.id = wl.related_charge_order_id
+            WHERE {' AND '.join(conditions)}
+            ORDER BY wl.created_at DESC
+            LIMIT ?
             """,
-            (user_id,),
+            params,
         )
-        transactions = [
+        entries = [
             {
                 "id": row["id"],
-                "amount": row["amount"],
-                "amountLabel": ("+" if row["amount"] > 0 else "") + money(row["amount"]),
-                "balanceAfter": row["balance_after"],
-                "balanceAfterLabel": money(row["balance_after"]),
-                "kind": row["kind"],
+                "entryType": row["entry_type"],
+                "entryTypeLabel": payment_method_label(row["entry_type"]),
+                "amount": int(row["amount"]),
+                "amountLabel": ("+" if int(row["amount"]) > 0 else "") + money(int(row["amount"])),
+                "balanceAfter": int(row["balance_after"]),
+                "balanceAfterLabel": money(int(row["balance_after"])),
                 "memo": row["memo"],
-                "paymentMethod": row["payment_method"] or "",
-                "paymentMethodLabel": payment_method_label(row["payment_method"] or ""),
-                "paymentStatus": row["payment_status"] or "",
-                "paymentStatusLabel": payment_status_label(row["payment_status"] or ""),
-                "reference": row["reference"] or "",
-                "failureReason": row["failure_reason"] or "",
-                "adminAdjustmentReason": row["admin_adjustment_reason"] or "",
+                "relatedChargeOrderId": row["related_charge_order_id"] or "",
+                "relatedOrderId": row["related_order_id"] or "",
+                "chargeOrderCode": row["order_code"] or "",
+                "paymentChannel": row["payment_channel"] or "",
+                "paymentChannelLabel": payment_method_label(row["payment_channel"] or row["entry_type"]),
+                "paymentMethodDetail": row["payment_method_detail"] or "",
+                "paymentMethodDetailLabel": self._payment_method_detail_label(
+                    row["payment_channel"] or "",
+                    row["payment_method_detail"] or "",
+                ),
+                "receiptType": row["receipt_type"] or "none",
+                "receiptTypeLabel": receipt_type_label(row["receipt_type"] or "none"),
+                "status": row["charge_status"] or "completed",
+                "statusLabel": payment_status_label(row["charge_status"] or "completed"),
+                "reference": row["charge_reference"] or "",
+                "failureReason": row["charge_failure_reason"] or "",
                 "createdAt": row["created_at"],
                 "createdLabel": self._relative_date_label(row["created_at"]),
             }
             for row in rows
         ]
-        return {"transactions": transactions}
+        return {"wallet": self.get_wallet(user_id)["wallet"], "entries": entries}
+
+    def list_charge_orders(
+        self,
+        user_id: str = "",
+        limit: int = 50,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not user_id:
+            raise PanelError("로그인이 필요합니다.", status=401)
+        filters = filters or {}
+        safe_limit = min(max(int(limit or 50), 1), 100)
+        params: List[Any] = [user_id]
+        conditions = ["user_id = ?"]
+        status = str(filters.get("status") or "").strip().lower()
+        if status and status != "all":
+            conditions.append("status = ?")
+            params.append(status)
+        payment_channel = str(filters.get("paymentChannel") or "").strip().lower()
+        if payment_channel and payment_channel != "all":
+            conditions.append("payment_channel = ?")
+            params.append(payment_channel)
+        created_from = str(filters.get("createdFrom") or "").strip()
+        if created_from:
+            conditions.append("created_at >= ?")
+            params.append(created_from)
+        created_to = str(filters.get("createdTo") or "").strip()
+        if created_to:
+            conditions.append("created_at <= ?")
+            params.append(created_to)
+        params.append(safe_limit)
+        rows = self._fetchall(
+            f"""
+            SELECT *
+            FROM charge_orders
+            WHERE {' AND '.join(conditions)}
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            params,
+        )
+        return {
+            "wallet": self.get_wallet(user_id)["wallet"],
+            "chargeOrders": [self._charge_order_payload(row) for row in rows],
+        }
+
+    def get_charge_order(self, charge_order_id: str, user_id: str = "") -> Dict[str, Any]:
+        if not user_id:
+            raise PanelError("로그인이 필요합니다.", status=401)
+        row = self._fetchone(
+            """
+            SELECT *
+            FROM charge_orders
+            WHERE id = ? AND user_id = ?
+            """,
+            (charge_order_id, user_id),
+        )
+        payload = self._charge_order_payload(row)
+        with self._connect() as conn:
+            cash_receipt = conn.execute(
+                "SELECT * FROM cash_receipt_requests WHERE charge_order_id = ?",
+                (charge_order_id,),
+            ).fetchone()
+            tax_invoice = conn.execute(
+                "SELECT * FROM tax_invoice_requests WHERE charge_order_id = ?",
+                (charge_order_id,),
+            ).fetchone()
+        return {
+            "wallet": self.get_wallet(user_id)["wallet"],
+            "chargeOrder": payload,
+            "cashReceiptRequest": dict(cash_receipt) if cash_receipt is not None else None,
+            "taxInvoiceRequest": dict(tax_invoice) if tax_invoice is not None else None,
+        }
+
+    def create_charge_order(self, payload: Dict[str, Any], user_id: str = "") -> Dict[str, Any]:
+        if not user_id:
+            raise PanelError("로그인이 필요합니다.", status=401)
+        amount = int(float(payload.get("amount") or 0) or 0)
+        payment_channel = self._normalized_charge_payment_channel(payload.get("paymentChannel") or "")
+        payment_method_detail = str(payload.get("paymentMethodDetail") or "").strip().lower()
+        depositor_name = str(payload.get("depositorName") or "").strip()
+        receipt_type = str(payload.get("receiptType") or "none").strip().lower()
+        receipt_payload = payload.get("receiptPayload") if isinstance(payload.get("receiptPayload"), dict) else {}
+
+        if amount < 5_000:
+            raise PanelError("최소 충전 금액은 5,000원입니다.")
+        if amount > 5_000_000:
+            raise PanelError("한 번에 충전 가능한 금액은 500만원입니다.")
+        if amount % 100 != 0:
+            raise PanelError("충전 금액은 100원 단위로 입력해 주세요.")
+        if payment_channel in {"card", "easy_pay"} and not card_payment_configured():
+            raise PanelError("카드/간편결제는 현재 준비 중입니다. 계좌입금을 이용해 주세요.", status=503)
+        if payment_channel == "bank_transfer" and not bank_transfer_configured():
+            raise PanelError("계좌입금 설정이 완료되지 않았습니다. 운영팀에 문의해 주세요.", status=503)
+        if receipt_type not in {"none", "cash_receipt", "tax_invoice"}:
+            raise PanelError("지원하지 않는 증빙 신청 유형입니다.")
+        if payment_channel == "bank_transfer" and not depositor_name:
+            raise PanelError("입금자명을 입력해 주세요.")
+        if receipt_type == "cash_receipt" and not (
+            str(receipt_payload.get("phoneNumber") or "").strip() or str(receipt_payload.get("businessNumber") or "").strip()
+        ):
+            raise PanelError("현금영수증 신청 정보를 입력해 주세요.")
+        if receipt_type == "tax_invoice":
+            required_fields = ["businessName", "businessNumber", "recipientEmail"]
+            if any(not str(receipt_payload.get(field) or "").strip() for field in required_fields):
+                raise PanelError("세금계산서 신청 정보를 모두 입력해 주세요.")
+
+        breakdown = self._charge_amount_breakdown(amount)
+        status = "awaiting_payment" if payment_channel in {"card", "easy_pay"} else "awaiting_deposit"
+        expires_at = self._resolve_charge_expiry(payment_channel)
+        bank_snapshot = self._bank_transfer_public_payload() if payment_channel == "bank_transfer" else {}
+
+        with self._connect() as conn:
+            charge_order = self._create_charge_order_record(
+                conn,
+                user_id=user_id,
+                amount=breakdown["amount"],
+                vat_amount=breakdown["vatAmount"],
+                total_amount=breakdown["totalAmount"],
+                payment_channel=payment_channel,
+                payment_method_detail=payment_method_detail,
+                status=status,
+                depositor_name=depositor_name,
+                receipt_type=receipt_type,
+                receipt_payload=receipt_payload,
+                pg_provider=payment_provider_name(),
+                bank_account_snapshot=bank_snapshot,
+                expires_at=expires_at,
+            )
+            if receipt_type != "none":
+                self._record_receipt_request(
+                    conn,
+                    charge_order_id=str(charge_order["id"]),
+                    user_id=user_id,
+                    receipt_type=receipt_type,
+                    receipt_payload=receipt_payload,
+                    timestamp=now_iso(),
+                )
+            wallet = self._wallet_payload(conn, user_id)
+            conn.commit()
+        return {
+            "chargeOrder": self._charge_order_payload(charge_order),
+            "wallet": wallet,
+            "chargeConfig": self.charge_config_public_payload(),
+        }
+
+    def start_charge_order_payment(self, charge_order_id: str, payload: Dict[str, Any], user_id: str = "") -> Dict[str, Any]:
+        if not user_id:
+            raise PanelError("로그인이 필요합니다.", status=401)
+        method_detail = str(payload.get("paymentMethodDetail") or "").strip().lower()
+        if not card_payment_configured():
+            raise PanelError("카드/간편결제 PG 연동 설정이 필요합니다.", status=503)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM charge_orders WHERE id = ? AND user_id = ?",
+                (charge_order_id, user_id),
+            ).fetchone()
+            if row is None:
+                raise PanelError("충전 주문을 찾을 수 없습니다.", status=404)
+            if row["payment_channel"] not in {"card", "easy_pay"}:
+                raise PanelError("카드/간편결제 주문만 결제를 시작할 수 있습니다.")
+            if row["status"] == "paid":
+                return {"chargeOrder": self._charge_order_payload(dict(row)), "wallet": self._wallet_payload(conn, user_id)}
+            timestamp = now_iso()
+            payment_payload = parse_json(row["payment_payload_json"], {})
+            payment_payload.update(
+                {
+                    "provider": payment_provider_name(),
+                    "publicKey": payment_public_key(),
+                    "requestedAt": timestamp,
+                    "methodDetail": method_detail or row["payment_method_detail"],
+                }
+            )
+            pg_order_id = row["pg_order_id"] or f"pg_{uuid4().hex[:18]}"
+            conn.execute(
+                """
+                UPDATE charge_orders
+                SET payment_method_detail = ?, pg_provider = ?, pg_order_id = ?, payment_payload_json = ?, status = 'awaiting_payment', updated_at = ?
+                WHERE id = ?
+                """,
+                (method_detail or row["payment_method_detail"], payment_provider_name(), pg_order_id, as_json(payment_payload), timestamp, charge_order_id),
+            )
+            updated = conn.execute("SELECT * FROM charge_orders WHERE id = ?", (charge_order_id,)).fetchone()
+            conn.commit()
+        return {
+            "chargeOrder": self._charge_order_payload(dict(updated or row)),
+            "wallet": self.get_wallet(user_id)["wallet"],
+            "paymentSession": {
+                "provider": payment_provider_name(),
+                "providerConfigured": True,
+                "publicKey": payment_public_key(),
+                "orderId": charge_order_id,
+                "orderCode": str((updated or row)["order_code"]),
+                "pgOrderId": str((updated or row)["pg_order_id"]),
+                "amount": int((updated or row)["amount"]),
+                "vatAmount": int((updated or row)["vat_amount"]),
+                "totalAmount": int((updated or row)["total_amount"]),
+                "methodDetail": method_detail or str((updated or row)["payment_method_detail"] or ""),
+            },
+        }
+
+    def submit_charge_order_deposit_request(self, charge_order_id: str, payload: Dict[str, Any], user_id: str = "") -> Dict[str, Any]:
+        if not user_id:
+            raise PanelError("로그인이 필요합니다.", status=401)
+        depositor_name = str(payload.get("depositorName") or "").strip()
+        receipt_type = str(payload.get("receiptType") or "none").strip().lower()
+        receipt_payload = payload.get("receiptPayload") if isinstance(payload.get("receiptPayload"), dict) else {}
+        if not depositor_name:
+            raise PanelError("입금자명을 입력해 주세요.")
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM charge_orders WHERE id = ? AND user_id = ?",
+                (charge_order_id, user_id),
+            ).fetchone()
+            if row is None:
+                raise PanelError("충전 주문을 찾을 수 없습니다.", status=404)
+            if row["payment_channel"] != "bank_transfer":
+                raise PanelError("계좌입금 주문만 입금 요청을 접수할 수 있습니다.")
+            timestamp = now_iso()
+            bank_snapshot = parse_json(row["bank_account_snapshot_json"], {}) or self._bank_transfer_public_payload()
+            conn.execute(
+                """
+                UPDATE charge_orders
+                SET depositor_name = ?, receipt_type = ?, receipt_payload_json = ?, bank_account_snapshot_json = ?, status = 'awaiting_deposit', updated_at = ?
+                WHERE id = ?
+                """,
+                (depositor_name, receipt_type, as_json(receipt_payload), as_json(bank_snapshot), timestamp, charge_order_id),
+            )
+            if receipt_type != "none":
+                self._record_receipt_request(
+                    conn,
+                    charge_order_id=charge_order_id,
+                    user_id=user_id,
+                    receipt_type=receipt_type,
+                    receipt_payload=receipt_payload,
+                    timestamp=timestamp,
+                )
+            updated = conn.execute("SELECT * FROM charge_orders WHERE id = ?", (charge_order_id,)).fetchone()
+            wallet = self._wallet_payload(conn, user_id)
+            conn.commit()
+        return {
+            "chargeOrder": self._charge_order_payload(dict(updated or row)),
+            "wallet": wallet,
+            "bankTransfer": self._bank_transfer_public_payload(),
+        }
+
+    def confirm_charge_order(self, charge_order_id: str, payload: Dict[str, Any], user_id: str = "") -> Dict[str, Any]:
+        if not user_id:
+            raise PanelError("로그인이 필요합니다.", status=401)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM charge_orders WHERE id = ? AND user_id = ?",
+                (charge_order_id, user_id),
+            ).fetchone()
+            if row is None:
+                raise PanelError("충전 주문을 찾을 수 없습니다.", status=404)
+            if row["payment_channel"] == "bank_transfer":
+                raise PanelError("계좌입금은 입금 확인 후 반영됩니다.", status=409)
+            raise PanelError("현재 PG 승인 검증 모듈이 설정되지 않았습니다. 웹훅 또는 서버 연동으로 승인 처리해 주세요.", status=503)
+
+    def process_payment_webhook(self, payload: Dict[str, Any], *, provided_secret: str = "") -> Dict[str, Any]:
+        expected_secret = payment_webhook_secret()
+        if not expected_secret:
+            raise PanelError("웹훅 비밀키가 설정되지 않았습니다.", status=503)
+        if provided_secret != expected_secret:
+            raise PanelError("유효하지 않은 웹훅 요청입니다.", status=401)
+        provider = str(payload.get("provider") or payment_provider_name() or "unknown").strip().lower()
+        event_key = str(payload.get("eventKey") or payload.get("id") or payload.get("eventId") or "").strip()
+        event_type = str(payload.get("eventType") or payload.get("type") or "").strip()
+        if not event_key:
+            raise PanelError("웹훅 이벤트 키가 필요합니다.")
+        charge_order_id = str(payload.get("chargeOrderId") or "").strip()
+        order_code = str(payload.get("orderCode") or "").strip()
+        status = str(payload.get("status") or "").strip().lower()
+        paid_total_amount = int(float(payload.get("totalAmount") or payload.get("amount") or 0) or 0)
+        reference = str(payload.get("reference") or payload.get("paymentKey") or payload.get("transactionId") or "").strip()
+        timestamp = now_iso()
+
+        with self._connect() as conn:
+            existing = conn.execute("SELECT * FROM payment_webhooks WHERE event_key = ?", (event_key,)).fetchone()
+            if existing is not None:
+                return {
+                    "ok": True,
+                    "duplicate": True,
+                    "webhookId": existing["id"],
+                    "status": existing["status"],
+                }
+            charge_order = None
+            if charge_order_id:
+                charge_order = conn.execute("SELECT * FROM charge_orders WHERE id = ?", (charge_order_id,)).fetchone()
+            elif order_code:
+                charge_order = conn.execute("SELECT * FROM charge_orders WHERE order_code = ?", (order_code,)).fetchone()
+
+            webhook_id = f"wh_{uuid4().hex[:16]}"
+            conn.execute(
+                """
+                INSERT INTO payment_webhooks (
+                    id, provider, event_key, event_type, charge_order_id, status, payload_json, processed_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'received', ?, '', ?, ?)
+                """,
+                (webhook_id, provider, event_key, event_type, charge_order["id"] if charge_order is not None else None, as_json(payload), timestamp, timestamp),
+            )
+
+            result_payload: Dict[str, Any] = {"ok": True, "webhookId": webhook_id, "status": "received"}
+            if charge_order is None:
+                conn.execute("UPDATE payment_webhooks SET status = 'ignored', processed_at = ?, updated_at = ? WHERE id = ?", (timestamp, timestamp, webhook_id))
+                conn.commit()
+                result_payload["status"] = "ignored"
+                return result_payload
+
+            if status in {"paid", "succeeded", "success", "completed"}:
+                result = self._complete_charge_order(
+                    conn,
+                    str(charge_order["id"]),
+                    payment_method=str(charge_order["payment_channel"]),
+                    payment_status="completed",
+                    reference=reference,
+                    payment_payload=payload,
+                    paid_total_amount=paid_total_amount or int(charge_order["total_amount"]),
+                    memo_prefix="충전 결제",
+                )
+                conn.execute(
+                    "UPDATE payment_webhooks SET status = 'processed', processed_at = ?, updated_at = ? WHERE id = ?",
+                    (timestamp, timestamp, webhook_id),
+                )
+                conn.commit()
+                result_payload.update({"status": "processed", **result})
+                return result_payload
+
+            mapped_status = {
+                "failed": "failed",
+                "cancelled": "cancelled",
+                "canceled": "cancelled",
+                "expired": "expired",
+                "refund_requested": "refund_requested",
+                "refunded": "refunded",
+            }.get(status, "")
+            if mapped_status:
+                conn.execute(
+                    "UPDATE charge_orders SET status = ?, failure_reason = ?, updated_at = ? WHERE id = ?",
+                    (mapped_status, reference or str(payload.get("failureReason") or ""), timestamp, charge_order["id"]),
+                )
+            conn.execute(
+                "UPDATE payment_webhooks SET status = 'processed', processed_at = ?, updated_at = ? WHERE id = ?",
+                (timestamp, timestamp, webhook_id),
+            )
+            conn.commit()
+            result_payload["status"] = "processed"
+            return result_payload
 
     def record_site_visit(
         self,
@@ -5322,6 +6957,21 @@ class PanelStore:
             banner_rows = conn.execute("SELECT * FROM home_banners ORDER BY sort_order, id").fetchall()
             site_settings_row = self._site_settings_row(conn)
             analytics = self._admin_analytics_payload(conn)
+            platform_section_rows = conn.execute(
+                """
+                SELECT
+                    ps.*,
+                    COUNT(DISTINCT pg.id) AS group_count,
+                    COUNT(DISTINCT pc.id) AS category_count,
+                    COUNT(DISTINCT p.id) AS product_count
+                FROM platform_sections ps
+                LEFT JOIN platform_groups pg ON pg.platform_section_id = ps.id
+                LEFT JOIN product_categories pc ON pc.platform_group_id = pg.id
+                LEFT JOIN products p ON p.product_category_id = pc.id
+                GROUP BY ps.id
+                ORDER BY ps.sort_order, ps.display_name
+                """
+            ).fetchall()
             supplier_rows = conn.execute(
                 """
                 SELECT
@@ -5364,6 +7014,23 @@ class PanelStore:
                 for row in supplier_rows
             ]
 
+            platform_sections = [
+                {
+                    "id": row["id"],
+                    "slug": row["slug"],
+                    "displayName": row["display_name"],
+                    "description": row["description"],
+                    "icon": row["icon"],
+                    "logoImageUrl": row["image_url"],
+                    "accentColor": row["accent_color"],
+                    "sortOrder": row["sort_order"],
+                    "groupCount": row["group_count"],
+                    "categoryCount": row["category_count"],
+                    "productCount": row["product_count"],
+                }
+                for row in platform_section_rows
+            ]
+
             customer_rows = conn.execute(
                 """
                 SELECT
@@ -5386,7 +7053,7 @@ class PanelStore:
                     "phoneMasked": mask_phone(row["phone"]),
                     "tier": row["tier"],
                     "role": row["role"],
-                    "avatarLabel": row["avatar_label"],
+                    "avatarLabel": resolved_avatar_label(row["avatar_label"], row["name"]),
                     "balance": row["balance"],
                     "balanceLabel": money(row["balance"]),
                     "isActive": bool(row["is_active"]),
@@ -5661,6 +7328,7 @@ class PanelStore:
                 "siteSettings": self._site_settings_admin_payload(site_settings_row),
                 "popup": self._popup_admin_payload(popup_row) if popup_row else None,
                 "homeBanners": [self._home_banner_payload(row) for row in banner_rows],
+                "platformSections": platform_sections,
                 "analytics": analytics,
                 "suppliers": suppliers,
                 "customers": customers,
@@ -5942,11 +7610,45 @@ class PanelStore:
             conn.commit()
         return {"banner": self._home_banner_by_id(banner_id)}
 
+    def save_platform_section(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        platform_id = str(payload.get("id") or "").strip()
+        icon = str(payload.get("icon") or "").strip() or "●"
+        image_url = normalize_image_asset_source(payload.get("logoImageUrl") or "", "플랫폼 로고 이미지")
+        accent_color = str(payload.get("accentColor") or "#4c76ff").strip() or "#4c76ff"
+
+        if not platform_id:
+            raise PanelError("수정할 플랫폼을 선택해 주세요.")
+        if len(icon) > 6:
+            raise PanelError("대체 아이콘은 6자 이하로 입력해 주세요.")
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", accent_color):
+            raise PanelError("강조 색상은 #RRGGBB 형식으로 입력해 주세요.")
+
+        with self._connect() as conn:
+            existing = conn.execute("SELECT id FROM platform_sections WHERE id = ?", (platform_id,)).fetchone()
+            if existing is None:
+                raise PanelError("수정할 플랫폼을 찾을 수 없습니다.", status=404)
+            conn.execute(
+                """
+                UPDATE platform_sections
+                SET icon = ?, image_url = ?, accent_color = ?
+                WHERE id = ?
+                """,
+                (
+                    icon,
+                    image_url,
+                    accent_color,
+                    platform_id,
+                ),
+            )
+            conn.commit()
+        return {"platformSection": self._platform_section_by_id(platform_id)}
+
     def save_site_settings(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         site_name = str(payload.get("siteName") or "").strip()
         site_description = str(payload.get("siteDescription") or "").strip()
         use_mail_sms_site_name = bool(payload.get("useMailSmsSiteName", False))
         mail_sms_site_name = str(payload.get("mailSmsSiteName") or "").strip()
+        header_logo_url = normalize_image_asset_source(payload.get("headerLogoUrl") or "", "상단 로고 이미지")
         favicon_url = normalize_image_asset_source(payload.get("faviconUrl") or "", "파비콘")
         share_image_url = normalize_image_asset_source(payload.get("shareImageUrl") or "", "대표 이미지")
 
@@ -5968,7 +7670,7 @@ class PanelStore:
                 """
                 UPDATE site_settings
                 SET site_name = ?, site_description = ?, use_mail_sms_site_name = ?, mail_sms_site_name = ?,
-                    favicon_url = ?, share_image_url = ?, updated_at = ?
+                    header_logo_url = ?, favicon_url = ?, share_image_url = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -5976,6 +7678,7 @@ class PanelStore:
                     site_description,
                     bool_to_int(use_mail_sms_site_name),
                     mail_sms_site_name,
+                    header_logo_url,
                     favicon_url,
                     share_image_url,
                     timestamp,
@@ -6340,12 +8043,23 @@ class PanelStore:
             if balance_after < 0:
                 raise PanelError("잔액이 0원보다 작아질 수 없습니다.")
             conn.execute("UPDATE users SET balance = ?, updated_at = ? WHERE id = ?", (balance_after, timestamp, customer_id))
+            self._set_wallet_balances(conn, customer_id, available_balance=balance_after)
             conn.execute(
                 """
                 INSERT INTO balance_transactions (id, user_id, amount, balance_after, kind, memo, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (f"tx_{uuid4().hex[:12]}", customer_id, amount, balance_after, "admin_adjust", memo, timestamp),
+            )
+            self._append_wallet_ledger_entry(
+                conn,
+                ledger_id=f"ledger_admin_adjust_{uuid4().hex[:12]}",
+                user_id=customer_id,
+                entry_type="admin_adjustment",
+                amount=amount,
+                balance_after=balance_after,
+                memo=memo,
+                created_at=timestamp,
             )
             conn.commit()
         return {"customer": self._customer_by_id(customer_id), "balanceAfter": balance_after, "balanceAfterLabel": money(balance_after)}
@@ -6709,6 +8423,28 @@ class PanelStore:
             row = conn.execute("SELECT * FROM site_settings ORDER BY updated_at DESC LIMIT 1").fetchone()
         if row is None:
             raise PanelError("사이트 설정을 불러오지 못했습니다.", status=500)
+        site_name = str(row["site_name"] or "").strip()
+        site_description = str(row["site_description"] or "").strip()
+        should_normalize_name = site_name in LEGACY_DEFAULT_SITE_NAMES
+        should_normalize_description = (not site_description) or site_description in LEGACY_DEFAULT_SITE_DESCRIPTIONS
+        if should_normalize_name or should_normalize_description:
+            conn.execute(
+                """
+                UPDATE site_settings
+                SET site_name = ?, site_description = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    DEFAULT_SITE_NAME if should_normalize_name else site_name,
+                    DEFAULT_SITE_DESCRIPTION if should_normalize_description else site_description,
+                    now_iso(),
+                    row["id"],
+                ),
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM site_settings WHERE id = ?", (row["id"],)).fetchone()
+            if row is None:
+                raise PanelError("사이트 설정을 불러오지 못했습니다.", status=500)
         return row
 
     def _site_settings_public_payload(self, row: sqlite3.Row) -> Dict[str, Any]:
@@ -6723,6 +8459,7 @@ class PanelStore:
             "useMailSmsSiteName": bool(row["use_mail_sms_site_name"]),
             "mailSmsSiteName": row["mail_sms_site_name"],
             "effectiveMailSmsSiteName": effective_mail_sms_site_name,
+            "headerLogoUrl": row["header_logo_url"],
             "faviconUrl": row["favicon_url"],
             "shareImageUrl": row["share_image_url"],
         }
@@ -6778,6 +8515,18 @@ class PanelStore:
             "sortOrder": row["sort_order"],
         }
 
+    def _platform_section_payload(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "slug": row["slug"],
+            "displayName": row["display_name"],
+            "description": row["description"],
+            "icon": row["icon"],
+            "logoImageUrl": row["image_url"],
+            "accentColor": row["accent_color"],
+            "sortOrder": row["sort_order"],
+        }
+
     def _home_popup_by_id(self, popup_id: str) -> Dict[str, Any]:
         row = self._fetchone("SELECT * FROM home_popups WHERE id = ?", (popup_id,))
         return self._popup_admin_payload(row)
@@ -6785,6 +8534,10 @@ class PanelStore:
     def _home_banner_by_id(self, banner_id: str) -> Dict[str, Any]:
         row = self._fetchone("SELECT * FROM home_banners WHERE id = ?", (banner_id,))
         return self._home_banner_payload(row)
+
+    def _platform_section_by_id(self, platform_id: str) -> Dict[str, Any]:
+        row = self._fetchone("SELECT * FROM platform_sections WHERE id = ?", (platform_id,))
+        return self._platform_section_payload(row)
 
     def _customer_by_id(self, customer_id: str, *, include_private: bool = True) -> Dict[str, Any]:
         with self._connect() as conn:
@@ -6829,7 +8582,7 @@ class PanelStore:
             "phoneMasked": mask_phone(row["phone"]),
             "tier": row["tier"],
             "role": row["role"],
-            "avatarLabel": row["avatar_label"],
+            "avatarLabel": resolved_avatar_label(row["avatar_label"], row["name"]),
             "balance": row["balance"],
             "balanceLabel": money(row["balance"]),
             "isActive": bool(row["is_active"]),
@@ -7115,43 +8868,10 @@ class PanelStore:
         }
 
     def charge_balance(self, amount: int, user_id: str = "") -> Dict[str, Any]:
-        if not user_id:
-            raise PanelError("로그인이 필요합니다.", status=401)
-        if amount <= 0:
-            raise PanelError("충전 금액은 0보다 커야 합니다.")
-        if amount > 5_000_000:
-            raise PanelError("한 번에 충전 가능한 금액을 초과했습니다.")
-
-        with self._connect() as conn:
-            user = conn.execute("SELECT balance FROM users WHERE id = ?", (user_id,)).fetchone()
-            if user is None:
-                raise PanelError("사용자를 찾을 수 없습니다.", status=404)
-            balance_after = int(user["balance"]) + amount
-            timestamp = now_iso()
-            tx_id = f"tx_{uuid4().hex[:16]}"
-            payment_id = f"pay_{uuid4().hex[:12]}"
-            reference = f"PMT-{dt.datetime.now().strftime('%Y%m%d')}-{secrets.token_hex(3).upper()}"
-            conn.execute("UPDATE users SET balance = ?, updated_at = ? WHERE id = ?", (balance_after, timestamp, user_id))
-            conn.execute(
-                "INSERT INTO balance_transactions (id, user_id, amount, balance_after, kind, memo, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (tx_id, user_id, amount, balance_after, "charge", f"캐시 충전 {money(amount)}", timestamp),
-            )
-            conn.execute(
-                """
-                INSERT INTO payment_records (
-                    id, user_id, amount, payment_method, payment_status, reference, failure_reason, admin_adjustment_reason, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, '', '', ?, ?)
-                """,
-                (payment_id, user_id, amount, "manual_balance", "completed", reference, timestamp, timestamp),
-            )
-            conn.commit()
-            return {
-                "ok": True,
-                "balance": balance_after,
-                "balanceLabel": money(balance_after),
-                "paymentId": payment_id,
-                "paymentReference": reference,
-            }
+        raise PanelError(
+            "직접 잔액 충전 API는 더 이상 지원되지 않습니다. 새로운 충전 주문 플로우를 사용해 주세요.",
+            status=410,
+        )
 
     def create_order(self, payload: Dict[str, Any], user_id: str = "") -> Dict[str, Any]:
         if not user_id:
@@ -7200,7 +8920,8 @@ class PanelStore:
             user = conn.execute("SELECT balance, phone FROM users WHERE id = ?", (user_id,)).fetchone()
             if user is None:
                 raise PanelError("사용자를 찾을 수 없습니다.", status=404)
-            if int(user["balance"]) < total_price:
+            wallet_balances = self._wallet_balances(conn, user_id)
+            if int(wallet_balances["available"]) < total_price:
                 raise PanelError("보유 캐시가 부족합니다. 충전 후 다시 시도해 주세요.")
 
             mapping_row = conn.execute(
@@ -7247,7 +8968,7 @@ class PanelStore:
             if request_memo:
                 notes["memo"] = request_memo
 
-            balance_after = int(user["balance"]) - total_price
+            balance_after = int(wallet_balances["available"]) - total_price
             conn.execute(
                 """
                 INSERT INTO orders (
@@ -7291,6 +9012,7 @@ class PanelStore:
                 "UPDATE users SET balance = ?, updated_at = ? WHERE id = ?",
                 (balance_after, timestamp, user_id),
             )
+            self._set_wallet_balances(conn, user_id, available_balance=balance_after)
             conn.execute(
                 "INSERT INTO balance_transactions (id, user_id, amount, balance_after, kind, memo, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
@@ -7302,6 +9024,17 @@ class PanelStore:
                     f"{product['name']} 주문",
                     timestamp,
                 ),
+            )
+            self._append_wallet_ledger_entry(
+                conn,
+                ledger_id=f"ledger_{order_id}",
+                user_id=user_id,
+                entry_type="order_debit",
+                amount=-total_price,
+                balance_after=balance_after,
+                memo=f"{product['name']} 주문",
+                related_order_id=order_id,
+                created_at=timestamp,
             )
             conn.commit()
 
