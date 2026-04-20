@@ -4420,119 +4420,120 @@ class PanelStore:
                             ),
                         )
 
-        transactions = [
-            ("tx_initial", DEMO_USER_ID, 350000, 350000, "charge", "초기 데모 캐시 충전", (now - dt.timedelta(days=10)).isoformat(timespec="seconds")),
-            ("tx_order_1", DEMO_USER_ID, -50000, 300000, "order", "유튜브 조회수 주문", (now - dt.timedelta(days=9)).isoformat(timespec="seconds")),
-            ("tx_order_2", DEMO_USER_ID, -36000, 264000, "order", "인스타그램 프로필 방문 주문", (now - dt.timedelta(days=6)).isoformat(timespec="seconds")),
-            ("tx_order_3", DEMO_USER_ID, -79000, 185000, "order", "숏폼 런칭 패키지 주문", (now - dt.timedelta(days=2)).isoformat(timespec="seconds")),
-        ]
-        conn.executemany(
-            "INSERT INTO balance_transactions (id, user_id, amount, balance_after, kind, memo, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            transactions,
-        )
-
-        orders = [
-            {
-                "id": "order_seed_1",
-                "order_number": "P240001",
-                "platform_section_id": "pf_youtube",
-                "product_category_id": "cat_youtube_views",
-                "product_id": "prd_youtube_views_standard",
-                "product_name": "유튜브 조회수",
-                "option_name": "스탠다드",
-                "target_value": "https://youtube.com/watch?v=pulse-demo-1",
-                "contact_phone": "01024512400",
-                "quantity": 5000,
-                "unit_price": 10,
-                "total_price": 50000,
-                "status": "completed",
-                "notes": {"memo": "런칭 첫날 저녁 시간 집중"},
-                "created_at": (now - dt.timedelta(days=9)).isoformat(timespec="seconds"),
-                "updated_at": (now - dt.timedelta(days=8, hours=20)).isoformat(timespec="seconds"),
-                "fields": [
-                    ("targetUrl", "영상 URL", "https://youtube.com/watch?v=pulse-demo-1"),
-                    ("orderedCount", "조회 수량", "5000"),
-                ],
-            },
-            {
-                "id": "order_seed_2",
-                "order_number": "P240002",
-                "platform_section_id": "pf_instagram",
-                "product_category_id": "cat_instagram_profile_visit",
-                "product_id": "prd_instagram_profile_visit_basic",
-                "product_name": "인스타그램 프로필 방문",
-                "option_name": "기본",
-                "target_value": "pulse24_official",
-                "contact_phone": "01024512400",
-                "quantity": 850,
-                "unit_price": 42,
-                "total_price": 35700,
-                "status": "in_progress",
-                "notes": {"memo": "이벤트 공지 게시물 이후 프로필 유입 보강"},
-                "created_at": (now - dt.timedelta(days=6)).isoformat(timespec="seconds"),
-                "updated_at": (now - dt.timedelta(days=6, hours=-2)).isoformat(timespec="seconds"),
-                "fields": [
-                    ("targetValue", "계정(ID)", "pulse24_official"),
-                    ("orderedCount", "방문 수량", "850"),
-                ],
-            },
-            {
-                "id": "order_seed_3",
-                "order_number": "P240003",
-                "platform_section_id": "pf_popular",
-                "product_category_id": "cat_shortform_launch",
-                "product_id": "prd_shortform_launch_boost",
-                "product_name": "숏폼 런칭 패키지",
-                "option_name": "부스트",
-                "target_value": "https://instagram.com/reel/pulse24-launch",
-                "contact_phone": "01024512400",
-                "quantity": 1,
-                "unit_price": 79000,
-                "total_price": 79000,
-                "status": "queued",
-                "notes": {"memo": "브랜드 신제품 공개 주간 집중 운영"},
-                "created_at": (now - dt.timedelta(days=2)).isoformat(timespec="seconds"),
-                "updated_at": (now - dt.timedelta(days=2)).isoformat(timespec="seconds"),
-                "fields": [
-                    ("targetUrl", "영상 URL", "https://instagram.com/reel/pulse24-launch"),
-                ],
-            },
-        ]
-
-        for order in orders:
-            conn.execute(
-                """
-                INSERT INTO orders (
-                    id, order_number, user_id, platform_section_id, product_category_id, product_id,
-                    product_name_snapshot, option_name_snapshot, target_value, contact_phone, quantity,
-                    unit_price, total_price, status, notes_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    order["id"],
-                    order["order_number"],
-                    DEMO_USER_ID,
-                    order["platform_section_id"],
-                    order["product_category_id"],
-                    order["product_id"],
-                    order["product_name"],
-                    order["option_name"],
-                    order["target_value"],
-                    order["contact_phone"],
-                    order["quantity"],
-                    order["unit_price"],
-                    order["total_price"],
-                    order["status"],
-                    as_json(order["notes"]),
-                    order["created_at"],
-                    order["updated_at"],
-                ),
+        if demo_seed_enabled():
+            transactions = [
+                ("tx_initial", DEMO_USER_ID, 350000, 350000, "charge", "초기 데모 캐시 충전", (now - dt.timedelta(days=10)).isoformat(timespec="seconds")),
+                ("tx_order_1", DEMO_USER_ID, -50000, 300000, "order", "유튜브 조회수 주문", (now - dt.timedelta(days=9)).isoformat(timespec="seconds")),
+                ("tx_order_2", DEMO_USER_ID, -36000, 264000, "order", "인스타그램 프로필 방문 주문", (now - dt.timedelta(days=6)).isoformat(timespec="seconds")),
+                ("tx_order_3", DEMO_USER_ID, -79000, 185000, "order", "숏폼 런칭 패키지 주문", (now - dt.timedelta(days=2)).isoformat(timespec="seconds")),
+            ]
+            conn.executemany(
+                "INSERT INTO balance_transactions (id, user_id, amount, balance_after, kind, memo, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                transactions,
             )
-            for index, (field_key, field_label, field_value) in enumerate(order["fields"]):
+
+            orders = [
+                {
+                    "id": "order_seed_1",
+                    "order_number": "P240001",
+                    "platform_section_id": "pf_youtube",
+                    "product_category_id": "cat_youtube_views",
+                    "product_id": "prd_youtube_views_standard",
+                    "product_name": "유튜브 조회수",
+                    "option_name": "스탠다드",
+                    "target_value": "https://youtube.com/watch?v=pulse-demo-1",
+                    "contact_phone": "01024512400",
+                    "quantity": 5000,
+                    "unit_price": 10,
+                    "total_price": 50000,
+                    "status": "completed",
+                    "notes": {"memo": "런칭 첫날 저녁 시간 집중"},
+                    "created_at": (now - dt.timedelta(days=9)).isoformat(timespec="seconds"),
+                    "updated_at": (now - dt.timedelta(days=8, hours=20)).isoformat(timespec="seconds"),
+                    "fields": [
+                        ("targetUrl", "영상 URL", "https://youtube.com/watch?v=pulse-demo-1"),
+                        ("orderedCount", "조회 수량", "5000"),
+                    ],
+                },
+                {
+                    "id": "order_seed_2",
+                    "order_number": "P240002",
+                    "platform_section_id": "pf_instagram",
+                    "product_category_id": "cat_instagram_profile_visit",
+                    "product_id": "prd_instagram_profile_visit_basic",
+                    "product_name": "인스타그램 프로필 방문",
+                    "option_name": "기본",
+                    "target_value": "pulse24_official",
+                    "contact_phone": "01024512400",
+                    "quantity": 850,
+                    "unit_price": 42,
+                    "total_price": 35700,
+                    "status": "in_progress",
+                    "notes": {"memo": "이벤트 공지 게시물 이후 프로필 유입 보강"},
+                    "created_at": (now - dt.timedelta(days=6)).isoformat(timespec="seconds"),
+                    "updated_at": (now - dt.timedelta(days=6, hours=-2)).isoformat(timespec="seconds"),
+                    "fields": [
+                        ("targetValue", "계정(ID)", "pulse24_official"),
+                        ("orderedCount", "방문 수량", "850"),
+                    ],
+                },
+                {
+                    "id": "order_seed_3",
+                    "order_number": "P240003",
+                    "platform_section_id": "pf_popular",
+                    "product_category_id": "cat_shortform_launch",
+                    "product_id": "prd_shortform_launch_boost",
+                    "product_name": "숏폼 런칭 패키지",
+                    "option_name": "부스트",
+                    "target_value": "https://instagram.com/reel/pulse24-launch",
+                    "contact_phone": "01024512400",
+                    "quantity": 1,
+                    "unit_price": 79000,
+                    "total_price": 79000,
+                    "status": "queued",
+                    "notes": {"memo": "브랜드 신제품 공개 주간 집중 운영"},
+                    "created_at": (now - dt.timedelta(days=2)).isoformat(timespec="seconds"),
+                    "updated_at": (now - dt.timedelta(days=2)).isoformat(timespec="seconds"),
+                    "fields": [
+                        ("targetUrl", "영상 URL", "https://instagram.com/reel/pulse24-launch"),
+                    ],
+                },
+            ]
+
+            for order in orders:
                 conn.execute(
-                    "INSERT INTO order_fields (id, order_id, field_key, field_label, field_value) VALUES (?, ?, ?, ?, ?)",
-                    (f"{order['id']}_field_{index}", order["id"], field_key, field_label, field_value),
+                    """
+                    INSERT INTO orders (
+                        id, order_number, user_id, platform_section_id, product_category_id, product_id,
+                        product_name_snapshot, option_name_snapshot, target_value, contact_phone, quantity,
+                        unit_price, total_price, status, notes_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        order["id"],
+                        order["order_number"],
+                        DEMO_USER_ID,
+                        order["platform_section_id"],
+                        order["product_category_id"],
+                        order["product_id"],
+                        order["product_name"],
+                        order["option_name"],
+                        order["target_value"],
+                        order["contact_phone"],
+                        order["quantity"],
+                        order["unit_price"],
+                        order["total_price"],
+                        order["status"],
+                        as_json(order["notes"]),
+                        order["created_at"],
+                        order["updated_at"],
+                    ),
                 )
+                for index, (field_key, field_label, field_value) in enumerate(order["fields"]):
+                    conn.execute(
+                        "INSERT INTO order_fields (id, order_id, field_key, field_label, field_value) VALUES (?, ?, ?, ?, ?)",
+                        (f"{order['id']}_field_{index}", order["id"], field_key, field_label, field_value),
+                    )
 
     def _fetchall(self, query: str, params: Iterable[Any] = ()) -> List[sqlite3.Row]:
         with self._connect() as conn:
