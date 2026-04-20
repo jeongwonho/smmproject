@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root"
+
+if [ -d "smm_panel" ]; then
+  split_ref="$(git subtree split --prefix smm_panel)"
+  exec git push --force-with-lease origin "$split_ref":main
+fi
+
+branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+[ -n "$branch" ] || exit 0
+exec git push origin "$branch"
