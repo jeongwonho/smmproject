@@ -23,6 +23,10 @@ export function renderChargePage(runtime, renderFrame) {
   const draft = ensureChargeDraft();
   const summary = chargeAmountSummary(draft.amountInput);
   const methods = chargeConfig.methods || [];
+  const visibleMethods = methods.filter((method) => method.enabled);
+  if (visibleMethods.length && !visibleMethods.some((method) => method.id === draft.paymentChannel)) {
+    draft.paymentChannel = visibleMethods[0].id;
+  }
   const activeMethod = chargeMethodConfig(draft.paymentChannel) || methods[0] || null;
   const chargeOrders = filteredChargeOrders();
   const walletEntries = filteredWalletEntries();
@@ -50,7 +54,7 @@ export function renderChargePage(runtime, renderFrame) {
   const ctaReason = !amountReady
     ? `최소 충전 금액은 ${formatMoney(chargeConfig.minimumAmount || 5000)}입니다.`
     : !methodReady
-      ? "선택한 결제수단은 아직 사용할 수 없습니다."
+      ? "현재 이용 가능한 결제수단이 없습니다. 고객센터로 문의해 주세요."
       : !depositorReady
         ? "입금자명을 입력해 주세요."
         : !receiptReady
@@ -96,6 +100,11 @@ export function renderChargePage(runtime, renderFrame) {
               <span>입금 대기 ${escapeHtml(wallet.pendingBalanceLabel)}</span>
               <span>총합 ${escapeHtml(wallet.totalBalanceLabel)}</span>
             </div>
+          </div>
+          <div class="charge-flow-note" aria-label="충전 진행 흐름">
+            <span class="charge-flow-note__item">금액 입력</span>
+            <span class="charge-flow-note__item">결제/입금 요청</span>
+            <span class="charge-flow-note__item">확인 후 보유금액 반영</span>
           </div>
           <div class="charge-subtabs" role="tablist" aria-label="충전 탭">
             <button class="charge-subtab ${state.ui.chargeTab === "create" ? "is-active" : ""}" type="button" data-charge-tab="create">충전하기</button>
@@ -146,7 +155,7 @@ export function renderChargePage(runtime, renderFrame) {
                       ]
                         .map(
                           ([amount, label]) => `
-                            <button class="charge-quick-chip" type="button" data-charge-quick-amount="${amount}">
+                            <button class="charge-quick-chip ${summary.amount === amount ? "is-active" : ""}" type="button" data-charge-quick-amount="${amount}">
                               ${escapeHtml(label)}
                             </button>
                           `
@@ -175,6 +184,7 @@ export function renderChargePage(runtime, renderFrame) {
                       </div>
                       <div class="charge-method-segment">
                         ${methods
+                          .filter((method) => method.enabled)
                           .map(
                             (method) => `
                               <button
@@ -183,12 +193,17 @@ export function renderChargePage(runtime, renderFrame) {
                                 data-charge-payment-channel="${escapeHtml(method.id)}"
                               >
                                 <strong>${escapeHtml(method.label)}</strong>
-                                <span>${escapeHtml(method.enabled ? method.description : "준비 중")}</span>
+                                <span>${escapeHtml(method.description)}</span>
                               </button>
                             `
                           )
                           .join("")}
                       </div>
+                      ${
+                        !visibleMethods.length
+                          ? `<p class="charge-inline-note is-warning">현재 이용 가능한 결제수단이 없습니다. 고객센터로 문의해 주세요.</p>`
+                          : ""
+                      }
 
                       ${
                         draft.paymentChannel === "card"
@@ -219,8 +234,8 @@ export function renderChargePage(runtime, renderFrame) {
                               <p class="charge-inline-note ${activeMethod?.enabled ? "" : "is-warning"}">
                                 ${escapeHtml(
                                   activeMethod?.enabled
-                                    ? "서버에서 충전 주문을 생성한 뒤 PG 결제 세션을 시작합니다."
-                                    : "카드/간편결제는 PG 연동 후 활성화됩니다. 현재는 계좌입금을 이용해 주세요."
+                                    ? "충전 주문 생성 후 결제창에서 승인을 완료하면 보유금액으로 반영됩니다."
+                                    : "현재 선택할 수 없는 결제수단입니다. 계좌입금을 선택하거나 고객센터로 문의해 주세요."
                                 )}
                               </p>
                             </div>
@@ -438,7 +453,11 @@ export function renderChargePage(runtime, renderFrame) {
                       : `
                         <article class="empty-card empty-card--compact">
                           <strong>아직 이용내역이 없습니다.</strong>
-                          <p>충전 주문을 만들거나 보유금액이 변동되면 이곳에 기록됩니다.</p>
+                          <p>충전 주문을 만들거나 보유금액이 변동되면 이곳에 기록됩니다. 먼저 필요한 금액을 충전해 보세요.</p>
+                          <div class="charge-history-empty-actions">
+                            <button class="full-width-cta" type="button" data-charge-tab="create">충전하기</button>
+                            <button class="ghost-secondary-button" type="button" data-route="/help">충전 안내 보기</button>
+                          </div>
                         </article>
                       `
                   }

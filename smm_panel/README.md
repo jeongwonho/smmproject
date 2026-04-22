@@ -90,16 +90,18 @@ python3 smm_panel/server.py --host 0.0.0.0 --port 8024
 Vercel 프로젝트에는 최소한 아래 환경변수를 설정하는 것을 권장합니다.
 
 - `SMM_PANEL_SESSION_SECRET`: 세션 서명용 긴 랜덤 문자열
+- `SMM_PANEL_SECRET_ENCRYPTION_KEY`: 공급사 API 키 암호화용 긴 랜덤 문자열
 - `SMM_PANEL_ADMIN_PASSWORD`: 관리자 로그인 비밀번호
 - `SMM_PANEL_DATABASE_URL`: Supabase/Postgres 연결 문자열
 
 같은 Vercel 프로젝트에서 프런트와 `/api/*` 함수를 같이 배포하면 `SMM_PANEL_PUBLIC_API_BASE_URL` 은 비워 두면 됩니다. 별도 백엔드 프로젝트로 나눌 때만 `https://api.example.com` 같은 공개 주소를 넣으면 됩니다.
-`SMM_PANEL_DATABASE_URL` 이 비어 있으면 Vercel 함수는 `/tmp/smm_panel.db` 임시 SQLite 로라도 부팅하지만, 이 경우 데이터는 영속되지 않으므로 실제 운영에서는 반드시 Supabase/Postgres 연결 문자열을 넣어야 합니다. 운영 환경에서는 `SMM_PANEL_SESSION_SECRET` 이 없으면 서버가 시작되지 않도록 강제됩니다.
+운영 환경에서는 `SMM_PANEL_DATABASE_URL` 또는 `SMM_PANEL_SUPABASE_DB_URL` 이 없으면 서버가 시작되지 않습니다. Vercel에서 임시 SQLite(`/tmp`)로 부팅하지 않도록 막아 데이터 유실을 방지합니다. 운영 환경에서는 `SMM_PANEL_SESSION_SECRET` 이 없으면 서버가 시작되지 않도록 강제됩니다.
 
 ## 권장 환경변수
 
 - `SMM_PANEL_DATABASE_URL`: SQLite 대신 Supabase/Postgres 를 사용할 때의 연결 문자열
 - `SMM_PANEL_SESSION_SECRET`: 세션 서명 비밀값
+- `SMM_PANEL_SECRET_ENCRYPTION_KEY`: 공급사 API 키와 토큰 암호화 비밀값
 - `SMM_PANEL_PUBLIC_API_BASE_URL`: 프론트가 호출할 API 기본 주소
 - `SMM_PANEL_ALLOWED_ORIGINS`: CORS 허용 Origin 목록
 - `SMM_PANEL_PUBLIC_APP_ORIGIN`: 대표 프론트 Origin
@@ -124,7 +126,7 @@ Supabase 관련 선택 환경변수:
 ## 주요 화면
 
 - 홈: 블루 히어로, 플랫폼 탭, 배너 캐러셀, 추천 서비스, 공개 지원 허브
-- 인증: 이메일 회원가입/로그인, 필수 약관 동의, 소셜 로그인 확장 포인트
+- 인증: 이메일 회원가입/로그인, 필수 약관 동의, 소셜 로그인 연동 준비 구조
 - 주문: 모바일 우선 플랫폼 칩 + 상품 카드형 목록
 - 상세: 옵션 칩, 동적 주문 폼, 요청 메모, 주의/환불/예상 소요시간
 - 충전: 결제수단 안내, 거래 상태, 참조번호 포함 거래 내역

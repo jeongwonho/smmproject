@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from collections import Counter, defaultdict
 import datetime as dt
 import hashlib
@@ -88,6 +89,10 @@ AUTH_VERIFICATION_MAX_ATTEMPTS = 5
 PUBLIC_PASSWORD_MIN_LENGTH = 10
 PUBLIC_PASSWORD_RECOMMENDED_LENGTH = 12
 PUBLIC_PASSWORD_VERY_STRONG_LENGTH = 14
+ORDER_IDEMPOTENCY_KEY_MAX_LENGTH = 120
+WEBHOOK_SIGNATURE_TOLERANCE_SECONDS = 5 * 60
+SECRET_ENVELOPE_PREFIX = "enc:v1:"
+SECRET_ENCRYPTION_KEY_MIN_LENGTH = 24
 COMMON_PASSWORD_PATTERNS = {
     "12345678",
     "123456789",
@@ -162,6 +167,52 @@ def payment_webhook_secret() -> str:
     return str(os.environ.get("SMM_PANEL_PAYMENT_WEBHOOK_SECRET") or "").strip()
 
 
+def legacy_payment_webhook_secret_allowed() -> bool:
+    return (not is_production_runtime()) or env_flag(os.environ.get("SMM_PANEL_ALLOW_LEGACY_WEBHOOK_SECRET"))
+
+
+def normalize_webhook_signature(raw_signature: str) -> List[str]:
+    values: List[str] = []
+    for part in re.split(r"[,\s]+", str(raw_signature or "").strip()):
+        if not part:
+            continue
+        key, _, value = part.partition("=")
+        candidate = value if value else key
+        candidate = candidate.strip()
+        if candidate:
+            values.append(candidate)
+    return values
+
+
+def verify_payment_webhook_signature(
+    secret: str,
+    raw_body: bytes,
+    provided_signature: str,
+    provided_timestamp: str = "",
+) -> bool:
+    if not secret or not raw_body or not provided_signature:
+        return False
+    timestamp = str(provided_timestamp or "").strip()
+    signed_payloads = [raw_body]
+    if timestamp:
+        try:
+            timestamp_value = float(timestamp)
+        except ValueError:
+            return False
+        if abs(dt.datetime.now(dt.timezone.utc).timestamp() - timestamp_value) > WEBHOOK_SIGNATURE_TOLERANCE_SECONDS:
+            return False
+        signed_payloads.insert(0, f"{timestamp}.".encode("utf-8") + raw_body)
+    expected_values = {
+        hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+        for payload in signed_payloads
+    }
+    return any(
+        hmac.compare_digest(candidate, expected)
+        for candidate in normalize_webhook_signature(provided_signature)
+        for expected in expected_values
+    )
+
+
 def card_payment_configured() -> bool:
     return bool(payment_provider_name() and payment_public_key() and payment_secret_key())
 
@@ -175,10 +226,10 @@ def bank_transfer_config() -> Dict[str, str]:
     }
     if not is_production_runtime() and not (config["bankName"] and config["accountNumber"] and config["accountHolder"]):
         return {
-            "bankName": config["bankName"] or "테스트은행",
+            "bankName": config["bankName"] or "로컬은행",
             "accountNumber": config["accountNumber"] or "123-456-789012",
             "accountHolder": config["accountHolder"] or "인스타마트",
-            "depositGuide": config["depositGuide"] or "개발 환경용 계좌 정보입니다. 실제 운영 시에는 환경변수로 교체하세요.",
+            "depositGuide": config["depositGuide"] or "로컬 확인용 계좌 정보입니다. 운영 환경에서는 실제 입금 계좌를 설정해 주세요.",
         }
     return config
 
@@ -333,6 +384,7 @@ def dispatch_signup_verification_email(email: str, code: str, *, site_name: str 
     if not provider:
         if is_production_runtime():
             raise PanelError("이메일 인증 설정이 완료되지 않았습니다. 운영팀에 문의해 주세요.", status=503)
+        print(f"[auth-email:preview] {sender} <{from_address or 'preview@example.com'}> -> {email} code={code}")
         return {"deliveryMode": "preview", "previewCode": code}
     if provider in {"preview", "console", "log"}:
         print(f"[auth-email:{provider}] {sender} <{from_address or 'preview@example.com'}> -> {email} code={code}")
@@ -566,6 +618,7 @@ CREATE TABLE IF NOT EXISTS orders (
     total_price INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued',
     notes_json TEXT NOT NULL DEFAULT '{}',
+    idempotency_key TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -832,6 +885,23 @@ CREATE INDEX IF NOT EXISTS idx_site_visit_events_route
 
 CREATE INDEX IF NOT EXISTS idx_site_visit_events_session
     ON site_visit_events(session_id);
+
+CREATE TABLE IF NOT EXISTS admin_audit_logs (
+    id TEXT PRIMARY KEY,
+    actor TEXT NOT NULL DEFAULT 'admin',
+    action TEXT NOT NULL,
+    entity_type TEXT NOT NULL DEFAULT '',
+    entity_id TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_created_at
+    ON admin_audit_logs(created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_entity
+    ON admin_audit_logs(entity_type, entity_id, created_at DESC);
 """
 
 
@@ -913,6 +983,10 @@ def normalize_database_row(row: Any, description: Any = None) -> Optional[Dict[s
 class DatabaseCursor:
     def __init__(self, raw_cursor: Any) -> None:
         self.raw_cursor = raw_cursor
+
+    @property
+    def rowcount(self) -> int:
+        return int(getattr(self.raw_cursor, "rowcount", -1) or 0)
 
     @property
     def description(self) -> Any:
@@ -1148,7 +1222,7 @@ def default_home_popup_record() -> Dict[str, Any]:
     return {
         "id": "popup_home_youtube_rank",
         "name": "홈 유튜브 상위노출 팝업",
-        "badgeText": "상단(1~5위) 노출 보장!",
+        "badgeText": "검색 노출 개선 집중",
         "title": "유튜브 상위노출\n서비스 출시!",
         "description": "신규 런칭 기념으로 빠르게 확인할 수 있는 홈 프로모션 팝업입니다.",
         "imageUrl": "",
@@ -1249,6 +1323,163 @@ def mask_secret(secret: str, visible_suffix: int = 4) -> str:
     return f"{'*' * max(6, len(raw) - visible_suffix)}{raw[-visible_suffix:]}"
 
 
+def secret_encryption_material() -> bytes:
+    raw = str(
+        os.environ.get("SMM_PANEL_SECRET_ENCRYPTION_KEY")
+        or os.environ.get("SMM_PANEL_SESSION_SECRET")
+        or ""
+    ).strip()
+    if len(raw) < SECRET_ENCRYPTION_KEY_MIN_LENGTH:
+        return b""
+    return hashlib.sha256(raw.encode("utf-8")).digest()
+
+
+def secret_encryption_available() -> bool:
+    return bool(secret_encryption_material())
+
+
+def secret_is_encrypted(value: Any) -> bool:
+    return str(value or "").startswith(SECRET_ENVELOPE_PREFIX)
+
+
+def _secret_encryption_required() -> bool:
+    return is_production_runtime() or env_flag(os.environ.get("SMM_PANEL_REQUIRE_SECRET_ENCRYPTION"))
+
+
+def _secret_keystream(key: bytes, nonce: bytes, length: int) -> bytes:
+    chunks: List[bytes] = []
+    counter = 0
+    while sum(len(chunk) for chunk in chunks) < length:
+        counter += 1
+        chunks.append(hmac.new(key, nonce + counter.to_bytes(4, "big"), hashlib.sha256).digest())
+    return b"".join(chunks)[:length]
+
+
+def encrypt_secret_value(value: Any, *, require_key: bool = False) -> str:
+    raw = str(value or "").strip()
+    if not raw or secret_is_encrypted(raw):
+        return raw
+    key = secret_encryption_material()
+    if not key:
+        if require_key or _secret_encryption_required():
+            raise PanelError("민감 키 암호화 키가 설정되지 않았습니다. SMM_PANEL_SECRET_ENCRYPTION_KEY를 설정해 주세요.")
+        return raw
+    nonce = secrets.token_bytes(16)
+    plain = raw.encode("utf-8")
+    stream = _secret_keystream(key, nonce, len(plain))
+    cipher = bytes(left ^ right for left, right in zip(plain, stream))
+    mac = hmac.new(key, b"enc:v1:" + nonce + cipher, hashlib.sha256).digest()
+    envelope = base64.urlsafe_b64encode(nonce + mac + cipher).decode("ascii").rstrip("=")
+    return f"{SECRET_ENVELOPE_PREFIX}{envelope}"
+
+
+def decrypt_secret_value(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw or not secret_is_encrypted(raw):
+        return raw
+    key = secret_encryption_material()
+    if not key:
+        raise PanelError("공급사 비밀키 복호화 키가 설정되지 않았습니다. SMM_PANEL_SECRET_ENCRYPTION_KEY를 확인해 주세요.")
+    encoded = raw[len(SECRET_ENVELOPE_PREFIX) :]
+    padded = encoded + "=" * (-len(encoded) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+    except Exception as exc:
+        raise PanelError("공급사 비밀키 형식이 올바르지 않습니다.") from exc
+    if len(decoded) <= 48:
+        raise PanelError("공급사 비밀키 형식이 올바르지 않습니다.")
+    nonce = decoded[:16]
+    mac = decoded[16:48]
+    cipher = decoded[48:]
+    expected_mac = hmac.new(key, b"enc:v1:" + nonce + cipher, hashlib.sha256).digest()
+    if not hmac.compare_digest(mac, expected_mac):
+        raise PanelError("공급사 비밀키 검증에 실패했습니다.")
+    stream = _secret_keystream(key, nonce, len(cipher))
+    plain = bytes(left ^ right for left, right in zip(cipher, stream))
+    try:
+        return plain.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PanelError("공급사 비밀키 복호화에 실패했습니다.") from exc
+
+
+def safe_mask_secret(value: Any, visible_suffix: int = 4) -> str:
+    try:
+        return mask_secret(decrypt_secret_value(value), visible_suffix)
+    except PanelError:
+        return "암호화 키 확인 필요"
+
+
+class RichTextSanitizer(HTMLParser):
+    ALLOWED_TAGS = {"p", "strong", "b", "em", "i", "u", "br", "ul", "ol", "li", "a"}
+    VOID_TAGS = {"br"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: List[str] = []
+        self.skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: List[tuple]) -> None:
+        normalized = tag.lower()
+        if normalized in {"script", "style"}:
+            self.skip_depth += 1
+            return
+        if self.skip_depth or normalized not in self.ALLOWED_TAGS:
+            return
+        if normalized == "a":
+            safe_attrs = []
+            href = ""
+            for name, value in attrs:
+                if name.lower() == "href":
+                    href = str(value or "").strip()
+                    break
+            parsed = urlparse(href)
+            if href and parsed.scheme.lower() in {"http", "https", "mailto"}:
+                safe_attrs.append(f'href="{html_escape(href, quote=True)}"')
+                if parsed.scheme.lower() in {"http", "https"}:
+                    safe_attrs.append('target="_blank"')
+                    safe_attrs.append('rel="noopener noreferrer"')
+            self.parts.append(f"<a{' ' + ' '.join(safe_attrs) if safe_attrs else ''}>")
+            return
+        self.parts.append(f"<{normalized}>")
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized = tag.lower()
+        if normalized in {"script", "style"} and self.skip_depth:
+            self.skip_depth -= 1
+            return
+        if self.skip_depth or normalized not in self.ALLOWED_TAGS or normalized in self.VOID_TAGS:
+            return
+        self.parts.append(f"</{normalized}>")
+
+    def handle_data(self, data: str) -> None:
+        if not self.skip_depth:
+            self.parts.append(html_escape(data))
+
+    def handle_entityref(self, name: str) -> None:
+        if not self.skip_depth:
+            self.parts.append(f"&{html_escape(name)};")
+
+    def handle_charref(self, name: str) -> None:
+        if not self.skip_depth:
+            self.parts.append(f"&#{html_escape(name)};")
+
+    def sanitized(self) -> str:
+        return "".join(self.parts).strip()
+
+
+def sanitize_rich_html(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    sanitizer = RichTextSanitizer()
+    try:
+        sanitizer.feed(raw)
+        sanitizer.close()
+    except Exception:
+        return html_escape(raw)
+    return sanitizer.sanitized()
+
+
 def legal_document_catalog() -> List[Dict[str, Any]]:
     return [
         {
@@ -1258,8 +1489,8 @@ def legal_document_catalog() -> List[Dict[str, Any]]:
             "required": True,
             "summary": "회원가입, 주문, 서비스 이용 조건에 대한 기본 약관입니다.",
             "body": [
-                "본 문서는 실제 운영 전 법률 검토가 필요한 초안입니다.",
-                "서비스 특성상 주문이 시작된 이후에는 환불·취소 기준이 제한될 수 있습니다.",
+                "회원은 정확한 계정·URL·수량 정보를 입력해야 하며, 잘못된 정보 입력으로 발생한 처리 지연은 회원 책임에 해당할 수 있습니다.",
+                "서비스 특성상 주문 접수 또는 공급사 처리 단계 진입 이후에는 환불·취소 기준이 제한될 수 있습니다.",
                 "허위 정보 입력, 타인 권리 침해, 정책 위반 주문은 제한될 수 있습니다.",
             ],
         },
@@ -1272,7 +1503,7 @@ def legal_document_catalog() -> List[Dict[str, Any]]:
             "body": [
                 "이메일, 이름(또는 닉네임), 로그인 기록, 주문 이력, 잔액 내역 등을 처리할 수 있습니다.",
                 "공급사 연동에 필요한 최소 주문 정보만 외부 공급사로 전달합니다.",
-                "실서비스 오픈 전에는 수집 항목, 보관 기간, 위탁 현황을 실제 운영 기준으로 확정해야 합니다.",
+                "개인정보는 주문 처리, 고객 지원, 부정 이용 방지, 법령상 의무 이행 목적 범위에서 보관·이용합니다.",
             ],
         },
         {
@@ -1282,8 +1513,8 @@ def legal_document_catalog() -> List[Dict[str, Any]]:
             "required": True,
             "summary": "만 14세 이상 또는 법정대리인 동의 필요 여부 확인 문구입니다.",
             "body": [
-                "만 14세 미만 이용자는 법정대리인 동의가 필요할 수 있습니다.",
-                "실제 운영 전 업종·판매 방식에 맞는 연령 문구 검토가 필요합니다.",
+                "만 14세 미만 이용자는 회원가입 및 서비스 이용이 제한될 수 있습니다.",
+                "연령 또는 법정대리인 동의 확인이 필요한 경우 추가 확인을 요청할 수 있습니다.",
             ],
         },
         {
@@ -1294,7 +1525,7 @@ def legal_document_catalog() -> List[Dict[str, Any]]:
             "summary": "이벤트, 상품 안내, 혜택 알림 수신 동의입니다.",
             "body": [
                 "선택 동의이며, 동의하지 않아도 서비스 이용에 제한은 없습니다.",
-                "이메일, 문자 등 채널별 수신 정책은 실제 운영 전 별도 정리해야 합니다.",
+                "회원은 언제든지 마케팅 수신 동의를 철회할 수 있습니다.",
             ],
         },
     ]
@@ -1333,6 +1564,20 @@ def generate_public_order_number() -> str:
     return f"SMM-{dt.datetime.now().strftime('%Y%m%d')}-{secrets.token_hex(4).upper()}"
 
 
+def sanitize_idempotency_key(raw: Any) -> str:
+    value = re.sub(r"[^A-Za-z0-9._:-]", "", str(raw or "").strip())
+    return value[:ORDER_IDEMPOTENCY_KEY_MAX_LENGTH]
+
+
+def is_unique_constraint_error(exc: BaseException) -> bool:
+    if isinstance(exc, sqlite3.IntegrityError):
+        return True
+    error_name = exc.__class__.__name__.lower()
+    if "unique" in error_name or "integrity" in error_name:
+        return True
+    return "unique" in str(exc).lower()
+
+
 def normalize_supplier_integration_type(raw: Any) -> str:
     value = str(raw or "").strip().lower()
     if value == SUPPLIER_INTEGRATION_MKT24:
@@ -1346,6 +1591,35 @@ def supplier_supports_balance_check(integration_type: str) -> bool:
 
 def supplier_supports_auto_dispatch(integration_type: str) -> bool:
     return normalize_supplier_integration_type(integration_type) == SUPPLIER_INTEGRATION_CLASSIC
+
+
+def normalize_supplier_order_status_payload(payload: Any) -> str:
+    if isinstance(payload, dict):
+        raw_status = str(
+            payload.get("status")
+            or payload.get("Status")
+            or payload.get("state")
+            or payload.get("order_status")
+            or ""
+        ).strip()
+    else:
+        raw_status = str(payload or "").strip()
+    normalized = raw_status.lower().replace("_", " ").replace("-", " ")
+    if not normalized:
+        return "submitted"
+    if any(token in normalized for token in ("complete", "completed", "완료")):
+        return "completed"
+    if any(token in normalized for token in ("progress", "processing", "in progress", "진행")):
+        return "in_progress"
+    if any(token in normalized for token in ("partial", "부분")):
+        return "partial"
+    if any(token in normalized for token in ("cancel", "canceled", "cancelled", "취소")):
+        return "cancelled"
+    if any(token in normalized for token in ("fail", "failed", "error", "reject", "실패", "오류")):
+        return "failed"
+    if any(token in normalized for token in ("pending", "queue", "wait", "대기")):
+        return "pending"
+    return "submitted"
 
 
 def supplier_platform_label(platform_key: str) -> str:
@@ -2802,7 +3076,7 @@ def catalog_blueprints() -> List[Dict[str, Any]]:
                                 [
                                     "영상 공개 초반 노출 가속 구간을 활용하기 좋습니다.",
                                     "조회수와 반응을 균형 있게 구성해 과도한 왜곡을 줄였습니다.",
-                                    "숏폼 퍼포먼스 테스트용으로도 적합합니다.",
+                                    "숏폼 초기 반응 확인용으로도 적합합니다.",
                                 ],
                                 [
                                     "영상 URL을 입력해 주세요.",
@@ -2916,7 +3190,7 @@ def catalog_blueprints() -> List[Dict[str, Any]]:
                                 "브랜드 릴스, 이벤트 릴스, 제품 소개 영상에 가장 많이 사용되는 대표 숏폼 노출 상품입니다.",
                                 [
                                     "업로드 직후 성과를 만들고 싶을 때 적합합니다.",
-                                    "광고 소재 테스트 시 초기 반응 체크용으로 활용할 수 있습니다.",
+                                    "광고 소재의 초기 반응 확인용으로 활용할 수 있습니다.",
                                     "속도 옵션을 선택해 노출 페이스를 조절할 수 있습니다.",
                                 ],
                                 [
@@ -3356,7 +3630,7 @@ def catalog_blueprints() -> List[Dict[str, Any]]:
                                 [
                                     "검색 키워드 기반 유입이 필요한 블로그·홈페이지에 적합합니다.",
                                     "광고 클릭 이후 체감 체류를 보강할 때도 자주 사용됩니다.",
-                                    "브랜드 키워드 테스트나 블로그 체류 실험에도 활용할 수 있습니다.",
+                                    "브랜드 키워드 검증이나 블로그 체류 개선에도 활용할 수 있습니다.",
                                 ],
                                 [
                                     "목표 키워드를 입력해 주세요.",
@@ -3642,14 +3916,14 @@ def catalog_blueprints() -> List[Dict[str, Any]]:
                     [
                         f"{display_name} 채널에 맞춰 주문 흐름을 단순화했습니다.",
                         "작업 시작 전 입력한 정보를 다시 한 번 검수해 주세요.",
-                        "필요 시 운영 메모를 함께 남기면 담당자가 참고합니다.",
+                        "필요 시 추가 요청사항을 함께 남기면 담당자가 참고합니다.",
                     ],
                     [
                         "대상 채널 또는 URL을 입력해 주세요.",
                         "원하는 수량을 설정해 주세요.",
                         "주문 후 진행 상태는 내역 화면에서 확인할 수 있어요.",
                     ],
-                    "레퍼런스 패널 구조를 따르되, 실제 운영에 맞게 입력 흐름을 단순화했습니다.",
+                    "주문 전 필요한 정보를 한 화면에서 확인할 수 있도록 구성했습니다.",
                 ),
                 products=[product],
                 caution=default_caution,
@@ -3700,9 +3974,12 @@ class PanelStore:
             os.environ.get("SMM_PANEL_DATABASE_URL", "").strip()
             or os.environ.get("SMM_PANEL_SUPABASE_DB_URL", "").strip()
         )
+        if not database_url and is_production_runtime():
+            raise RuntimeError(
+                "SMM_PANEL_DATABASE_URL or SMM_PANEL_SUPABASE_DB_URL is required in production. "
+                "Refusing to start with a temporary SQLite database."
+            )
         effective_db_path = db_path
-        if not database_url and os.environ.get("VERCEL"):
-            effective_db_path = Path(os.environ.get("SMM_PANEL_SQLITE_TMP_PATH", "/tmp/smm_panel.db"))
         return cls(db_path=effective_db_path, database_url=database_url)
 
     def _connect(self) -> DatabaseConnection:
@@ -3762,6 +4039,14 @@ class PanelStore:
         self._ensure_column(conn, "charge_orders", "payment_payload_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column(conn, "charge_orders", "bank_account_snapshot_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column(conn, "charge_orders", "confirmed_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "orders", "idempotency_key", "TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_user_idempotency_key
+                ON orders(user_id, idempotency_key)
+                WHERE idempotency_key <> ''
+            """
+        )
         self._ensure_charge_support_tables(conn)
         self._ensure_bigint_columns(
             conn,
@@ -3782,6 +4067,22 @@ class PanelStore:
         )
         conn.execute("UPDATE users SET role = 'admin', is_active = 1, account_status = 'active' WHERE id = ?", (DEMO_USER_ID,))
         conn.execute("UPDATE users SET role = COALESCE(NULLIF(role, ''), 'customer') WHERE id != ?", (DEMO_USER_ID,))
+        self._migrate_supplier_secrets(conn)
+
+    def _migrate_supplier_secrets(self, conn: DatabaseConnection) -> None:
+        if not secret_encryption_available():
+            return
+        rows = conn.execute("SELECT id, api_key, bearer_token FROM suppliers").fetchall()
+        for row in rows:
+            api_key = str(row["api_key"] or "")
+            bearer_token = str(row["bearer_token"] or "")
+            encrypted_api_key = encrypt_secret_value(api_key)
+            encrypted_bearer_token = encrypt_secret_value(bearer_token)
+            if encrypted_api_key != api_key or encrypted_bearer_token != bearer_token:
+                conn.execute(
+                    "UPDATE suppliers SET api_key = ?, bearer_token = ?, updated_at = ? WHERE id = ?",
+                    (encrypted_api_key, encrypted_bearer_token, now_iso(), row["id"]),
+                )
 
     def _ensure_charge_support_tables(self, conn: DatabaseConnection) -> None:
         conn.executescript(
@@ -4027,7 +4328,7 @@ class PanelStore:
                 "unit_price": 18,
                 "total_price": 21600,
                 "status": "queued",
-                "notes": {"memo": "키워드 유입 테스트"},
+                "notes": {"memo": "키워드 유입 확인"},
                 "created_at": (now - dt.timedelta(days=4)).isoformat(timespec="seconds"),
                 "updated_at": (now - dt.timedelta(days=4)).isoformat(timespec="seconds"),
                 "fields": [("targetKeyword", "키워드", "성수 카페 추천"), ("orderedCount", "수량", "1200")],
@@ -4242,7 +4543,7 @@ class PanelStore:
                 """,
                 (
                     DEMO_USER_ID,
-                    "데모 관리자",
+                    "기본 관리자",
                     "demo@pulse24.local",
                     "",
                     "01024512400",
@@ -4252,7 +4553,7 @@ class PanelStore:
                     185000,
                     1,
                     "active",
-                    "현재 데모 패널 운영 계정",
+                    "기본 패널 운영 계정",
                     created_at,
                     created_at,
                 ),
@@ -4304,7 +4605,7 @@ class PanelStore:
         )
 
         benefits = [
-            ("benefit_safe", "100% 운영 안정성 우선", "급격한 수치 상승보다 안정적인 속도와 채널 안전을 우선합니다.", "🛡", 0),
+            ("benefit_safe", "안정적인 처리 우선", "급격한 수치 상승보다 안정적인 속도와 채널 안전을 우선합니다.", "🛡", 0),
             ("benefit_fast", "빠른 주문 흐름", "모바일 우선 주문 구조로 원하는 상품을 빠르게 찾을 수 있어요.", "⚡", 1),
             ("benefit_flexible", "플랫폼별 맞춤 폼 구조", "URL형, 계정형, 키워드형 주문 폼을 상품 특성에 맞게 구성했습니다.", "🧩", 2),
             ("benefit_support", "상담형 상품 확장", "원하는 상품이 없으면 맞춤 서비스로 자연스럽게 이어지도록 설계했습니다.", "🤝", 3),
@@ -4422,7 +4723,7 @@ class PanelStore:
 
         if demo_seed_enabled():
             transactions = [
-                ("tx_initial", DEMO_USER_ID, 350000, 350000, "charge", "초기 데모 캐시 충전", (now - dt.timedelta(days=10)).isoformat(timespec="seconds")),
+                ("tx_initial", DEMO_USER_ID, 350000, 350000, "charge", "초기 운영 확인 캐시 충전", (now - dt.timedelta(days=10)).isoformat(timespec="seconds")),
                 ("tx_order_1", DEMO_USER_ID, -50000, 300000, "order", "유튜브 조회수 주문", (now - dt.timedelta(days=9)).isoformat(timespec="seconds")),
                 ("tx_order_2", DEMO_USER_ID, -36000, 264000, "order", "인스타그램 프로필 방문 주문", (now - dt.timedelta(days=6)).isoformat(timespec="seconds")),
                 ("tx_order_3", DEMO_USER_ID, -79000, 185000, "order", "숏폼 런칭 패키지 주문", (now - dt.timedelta(days=2)).isoformat(timespec="seconds")),
@@ -4631,6 +4932,50 @@ class PanelStore:
         )
         conn.execute("UPDATE users SET balance = ?, updated_at = ? WHERE id = ?", (int(available_balance), timestamp, user_id))
 
+    def _change_wallet_available_balance(
+        self,
+        conn: DatabaseConnection,
+        user_id: str,
+        delta: int,
+        *,
+        require_sufficient: bool = False,
+        timestamp: Optional[str] = None,
+    ) -> int:
+        self._wallet_balances(conn, user_id)
+        timestamp = timestamp or now_iso()
+        if require_sufficient and int(delta) < 0:
+            debit_amount = abs(int(delta))
+            cursor = conn.execute(
+                """
+                UPDATE wallets
+                SET available_balance = available_balance - ?, updated_at = ?
+                WHERE user_id = ? AND available_balance >= ?
+                """,
+                (debit_amount, timestamp, user_id, debit_amount),
+            )
+        else:
+            cursor = conn.execute(
+                """
+                UPDATE wallets
+                SET available_balance = available_balance + ?, updated_at = ?
+                WHERE user_id = ?
+                """,
+                (int(delta), timestamp, user_id),
+            )
+        if cursor.rowcount != 1:
+            if require_sufficient and int(delta) < 0:
+                raise PanelError("보유 캐시가 부족합니다. 충전 후 다시 시도해 주세요.")
+            raise PanelError("지갑 잔액을 갱신할 수 없습니다.", status=409)
+        wallet = conn.execute(
+            "SELECT available_balance FROM wallets WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if wallet is None:
+            raise PanelError("지갑 정보를 찾을 수 없습니다.", status=404)
+        balance_after = int(wallet["available_balance"])
+        conn.execute("UPDATE users SET balance = ?, updated_at = ? WHERE id = ?", (balance_after, timestamp, user_id))
+        return balance_after
+
     def _refresh_wallet_pending_balance(self, conn: DatabaseConnection, user_id: str) -> int:
         pending_row = conn.execute(
             """
@@ -4726,6 +5071,51 @@ class PanelStore:
         }
         return payload
 
+    def _admin_charge_order_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        row_map = dict(row)
+        payload = self._charge_order_payload(row_map)
+        customer_name = str(row_map.get("customer_name") or "")
+        customer_email = str(row_map.get("customer_email") or "")
+        payload.update(
+            {
+                "customerId": row_map.get("user_id", ""),
+                "customerName": customer_name,
+                "customerEmailMasked": mask_email(customer_email),
+                "searchText": " ".join(
+                    filter(
+                        None,
+                        [
+                            str(payload.get("orderCode") or ""),
+                            customer_name,
+                            customer_email,
+                            str(payload.get("depositorName") or ""),
+                            str(payload.get("reference") or ""),
+                            str(payload.get("status") or ""),
+                            str(payload.get("paymentChannelLabel") or ""),
+                        ],
+                    )
+                ).lower(),
+            }
+        )
+        return payload
+
+    def _admin_charge_order_by_id(self, conn: DatabaseConnection, charge_order_id: str) -> Dict[str, Any]:
+        row = conn.execute(
+            """
+            SELECT
+                co.*,
+                u.name AS customer_name,
+                u.email AS customer_email
+            FROM charge_orders co
+            JOIN users u ON u.id = co.user_id
+            WHERE co.id = ?
+            """,
+            (charge_order_id,),
+        ).fetchone()
+        if row is None:
+            raise PanelError("충전 주문을 찾을 수 없습니다.", status=404)
+        return self._admin_charge_order_payload(row)
+
     def _wallet_payload(self, conn: DatabaseConnection, user_id: str) -> Dict[str, Any]:
         balances = self._wallet_balances(conn, user_id)
         pending_balance = self._refresh_wallet_pending_balance(conn, user_id)
@@ -4800,7 +5190,7 @@ class PanelStore:
             {
                 "id": "card",
                 "label": "카드/간편결제",
-                "description": "PG 연동 후 카드와 간편결제로 즉시 충전됩니다.",
+                "description": "결제 승인 후 보유금액으로 즉시 반영됩니다.",
                 "enabled": card_payment_configured(),
                 "requiresProvider": True,
             },
@@ -4822,7 +5212,7 @@ class PanelStore:
             "vatIncluded": False,
             "policyHighlights": [
                 "결제 완료 또는 입금 확인 후에만 보유금액이 적립됩니다.",
-                "카드/간편결제는 서버 승인 기준으로만 처리되며, 결제 비밀키는 프론트에 저장되지 않습니다.",
+                "카드/간편결제는 결제 승인 확인 후에만 보유금액으로 반영됩니다.",
                 "환불, 증빙, 취소 기준은 이용약관과 결제 안내를 따릅니다.",
             ],
         }
@@ -4985,28 +5375,36 @@ class PanelStore:
         if paid_total_amount is not None and int(paid_total_amount) != expected_total_amount:
             raise PanelError("결제 금액 검증에 실패했습니다.")
 
-        user = conn.execute("SELECT balance FROM users WHERE id = ?", (charge_order["user_id"],)).fetchone()
-        if user is None:
-            raise PanelError("사용자를 찾을 수 없습니다.", status=404)
-
         timestamp = now_iso()
         payment_reference = reference or charge_order["reference"] or f"PMT-{dt.datetime.now().strftime('%Y%m%d')}-{secrets.token_hex(3).upper()}"
-        balance_after = int(user["balance"]) + int(charge_order["amount"])
         merged_payment_payload = parse_json(charge_order["payment_payload_json"], {})
         merged_payment_payload.update(payment_payload or {})
-        conn.execute(
+        transition = conn.execute(
             """
             UPDATE charge_orders
             SET status = 'paid', reference = ?, payment_payload_json = ?, confirmed_at = ?, paid_at = ?, updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND status NOT IN ('paid', 'cancelled', 'expired', 'failed', 'refunded')
             """,
             (payment_reference, as_json(merged_payment_payload), timestamp, timestamp, timestamp, charge_order_id),
         )
-        conn.execute(
-            "UPDATE users SET balance = ?, updated_at = ? WHERE id = ?",
-            (balance_after, timestamp, charge_order["user_id"]),
+        if transition.rowcount != 1:
+            refreshed = conn.execute("SELECT * FROM charge_orders WHERE id = ?", (charge_order_id,)).fetchone()
+            if refreshed is not None and refreshed["status"] == "paid":
+                wallet = self._wallet_payload(conn, str(refreshed["user_id"]))
+                return {
+                    "chargeOrder": self._charge_order_payload(dict(refreshed)),
+                    "wallet": wallet,
+                    "paymentReference": refreshed["reference"],
+                    "paymentId": f"payment_{charge_order_id}",
+                }
+            raise PanelError("완료할 수 없는 충전 주문 상태입니다.", status=409)
+
+        balance_after = self._change_wallet_available_balance(
+            conn,
+            str(charge_order["user_id"]),
+            int(charge_order["amount"]),
+            timestamp=timestamp,
         )
-        self._set_wallet_balances(conn, str(charge_order["user_id"]), available_balance=balance_after)
         tx_id = f"tx_charge_{charge_order_id}"
         if conn.execute("SELECT 1 FROM balance_transactions WHERE id = ?", (tx_id,)).fetchone() is None:
             conn.execute(
@@ -5492,7 +5890,7 @@ class PanelStore:
             company = {
                 "name": site_settings["siteName"],
                 "representative": "운영 관리자",
-                "contact": "support@example.com",
+                "contact": str(os.environ.get("SMM_PANEL_SUPPORT_CONTACT") or "").strip(),
                 "hours": "평일 10:00 - 19:00",
             }
             legal_documents = legal_document_catalog()
@@ -5802,7 +6200,7 @@ class PanelStore:
                 "heroTitle": category["hero_title"],
                 "heroSubtitle": category["hero_subtitle"],
                 "categoryKind": category["category_kind"],
-                "serviceDescriptionHtml": category["service_description_html"],
+                "serviceDescriptionHtml": sanitize_rich_html(category["service_description_html"]),
                 "caution": parse_json(category["caution_json"], []),
                 "refundNotice": parse_json(category["refund_notice_json"], []),
                 "platform": {
@@ -6074,7 +6472,7 @@ class PanelStore:
         if amount % 100 != 0:
             raise PanelError("충전 금액은 100원 단위로 입력해 주세요.")
         if payment_channel in {"card", "easy_pay"} and not card_payment_configured():
-            raise PanelError("카드/간편결제는 현재 준비 중입니다. 계좌입금을 이용해 주세요.", status=503)
+            raise PanelError("현재 선택할 수 없는 결제수단입니다. 계좌입금을 선택하거나 고객센터로 문의해 주세요.", status=503)
         if payment_channel == "bank_transfer" and not bank_transfer_configured():
             raise PanelError("계좌입금 설정이 완료되지 않았습니다. 운영팀에 문의해 주세요.", status=503)
         if receipt_type not in {"none", "cash_receipt", "tax_invoice"}:
@@ -6134,7 +6532,7 @@ class PanelStore:
             raise PanelError("로그인이 필요합니다.", status=401)
         method_detail = str(payload.get("paymentMethodDetail") or "").strip().lower()
         if not card_payment_configured():
-            raise PanelError("카드/간편결제 PG 연동 설정이 필요합니다.", status=503)
+            raise PanelError("현재 선택할 수 없는 결제수단입니다. 계좌입금을 선택하거나 고객센터로 문의해 주세요.", status=503)
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM charge_orders WHERE id = ? AND user_id = ?",
@@ -6241,13 +6639,28 @@ class PanelStore:
                 raise PanelError("충전 주문을 찾을 수 없습니다.", status=404)
             if row["payment_channel"] == "bank_transfer":
                 raise PanelError("계좌입금은 입금 확인 후 반영됩니다.", status=409)
-            raise PanelError("현재 PG 승인 검증 모듈이 설정되지 않았습니다. 웹훅 또는 서버 연동으로 승인 처리해 주세요.", status=503)
+            raise PanelError("결제 승인 확인이 완료되지 않았습니다. 잠시 후 다시 시도하거나 고객센터로 문의해 주세요.", status=503)
 
-    def process_payment_webhook(self, payload: Dict[str, Any], *, provided_secret: str = "") -> Dict[str, Any]:
+    def process_payment_webhook(
+        self,
+        payload: Dict[str, Any],
+        *,
+        provided_secret: str = "",
+        provided_signature: str = "",
+        provided_timestamp: str = "",
+        raw_body: bytes = b"",
+    ) -> Dict[str, Any]:
         expected_secret = payment_webhook_secret()
         if not expected_secret:
             raise PanelError("웹훅 비밀키가 설정되지 않았습니다.", status=503)
-        if provided_secret != expected_secret:
+        signature_valid = verify_payment_webhook_signature(
+            expected_secret,
+            raw_body,
+            provided_signature,
+            provided_timestamp,
+        )
+        legacy_secret_valid = provided_secret == expected_secret and legacy_payment_webhook_secret_allowed()
+        if not signature_valid and not legacy_secret_valid:
             raise PanelError("유효하지 않은 웹훅 요청입니다.", status=401)
         provider = str(payload.get("provider") or payment_provider_name() or "unknown").strip().lower()
         event_key = str(payload.get("eventKey") or payload.get("id") or payload.get("eventId") or "").strip()
@@ -6277,14 +6690,24 @@ class PanelStore:
                 charge_order = conn.execute("SELECT * FROM charge_orders WHERE order_code = ?", (order_code,)).fetchone()
 
             webhook_id = f"wh_{uuid4().hex[:16]}"
-            conn.execute(
+            insert_cursor = conn.execute(
                 """
                 INSERT INTO payment_webhooks (
                     id, provider, event_key, event_type, charge_order_id, status, payload_json, processed_at, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, 'received', ?, '', ?, ?)
+                ON CONFLICT(event_key) DO NOTHING
                 """,
                 (webhook_id, provider, event_key, event_type, charge_order["id"] if charge_order is not None else None, as_json(payload), timestamp, timestamp),
             )
+            if insert_cursor.rowcount != 1:
+                existing = conn.execute("SELECT * FROM payment_webhooks WHERE event_key = ?", (event_key,)).fetchone()
+                conn.commit()
+                return {
+                    "ok": True,
+                    "duplicate": True,
+                    "webhookId": existing["id"] if existing is not None else "",
+                    "status": existing["status"] if existing is not None else "duplicate",
+                }
 
             result_payload: Dict[str, Any] = {"ok": True, "webhookId": webhook_id, "status": "received"}
             if charge_order is None:
@@ -6994,9 +7417,9 @@ class PanelStore:
                     "apiUrl": row["api_url"],
                     "integrationType": normalize_supplier_integration_type(row["integration_type"]),
                     "hasApiKey": bool(row["api_key"]),
-                    "apiKeyMasked": mask_secret(row["api_key"]),
+                    "apiKeyMasked": safe_mask_secret(row["api_key"]),
                     "hasBearerToken": bool(row["bearer_token"]),
-                    "bearerTokenMasked": mask_secret(row["bearer_token"]),
+                    "bearerTokenMasked": safe_mask_secret(row["bearer_token"]),
                     "supportsBalanceCheck": supplier_supports_balance_check(row["integration_type"]),
                     "supportsAutoDispatch": supplier_supports_auto_dispatch(row["integration_type"]),
                     "isActive": bool(row["is_active"]),
@@ -7143,7 +7566,7 @@ class PanelStore:
                     "optionLabelName": row["option_label_name"],
                     "heroTitle": row["hero_title"],
                     "heroSubtitle": row["hero_subtitle"],
-                    "serviceDescriptionHtml": row["service_description_html"],
+                    "serviceDescriptionHtml": sanitize_rich_html(row["service_description_html"]),
                     "cautionText": "\n".join(parse_json(row["caution_json"], [])),
                     "refundText": "\n".join(parse_json(row["refund_notice_json"], [])),
                     "isActive": bool(row["is_active"]),
@@ -7251,13 +7674,21 @@ class PanelStore:
                     u.role AS customer_role,
                     ps.display_name AS platform_name,
                     ps.icon AS platform_icon,
+                    so.id AS supplier_order_id,
                     so.status AS supplier_status,
                     so.supplier_external_order_id,
+                    so.updated_at AS supplier_updated_at,
                     s.name AS supplier_name
                 FROM orders o
                 JOIN users u ON u.id = o.user_id
                 JOIN platform_sections ps ON ps.id = o.platform_section_id
-                LEFT JOIN supplier_orders so ON so.order_id = o.id
+                LEFT JOIN supplier_orders so ON so.id = (
+                    SELECT so2.id
+                    FROM supplier_orders so2
+                    WHERE so2.order_id = o.id
+                    ORDER BY so2.created_at DESC
+                    LIMIT 1
+                )
                 LEFT JOIN suppliers s ON s.id = so.supplier_id
                 ORDER BY o.created_at DESC
                 LIMIT 60
@@ -7283,8 +7714,10 @@ class PanelStore:
                     "status": row["status"],
                     "notes": parse_json(row["notes_json"], {}),
                     "supplierStatus": row["supplier_status"] or "",
+                    "supplierOrderId": row["supplier_order_id"] or "",
                     "supplierName": row["supplier_name"] or "",
                     "supplierExternalOrderId": row["supplier_external_order_id"] or "",
+                    "supplierUpdatedAt": row["supplier_updated_at"] or "",
                     "supplierDispatchLabel": (
                         "발주 성공"
                         if row["supplier_external_order_id"]
@@ -7318,12 +7751,36 @@ class PanelStore:
                 for row in admin_order_rows
             ]
 
+            admin_charge_rows = conn.execute(
+                """
+                SELECT
+                    co.*,
+                    u.name AS customer_name,
+                    u.email AS customer_email
+                FROM charge_orders co
+                JOIN users u ON u.id = co.user_id
+                ORDER BY co.created_at DESC
+                LIMIT 100
+                """
+            ).fetchall()
+            admin_charge_orders = [self._admin_charge_order_payload(row) for row in admin_charge_rows]
+            notice_rows = conn.execute("SELECT * FROM notices ORDER BY pinned DESC, published_at DESC, id").fetchall()
+            faq_rows = conn.execute("SELECT * FROM faqs ORDER BY sort_order, id").fetchall()
+            audit_rows = conn.execute(
+                "SELECT * FROM admin_audit_logs ORDER BY created_at DESC LIMIT 80"
+            ).fetchall()
+
             mapped_product_count = sum(1 for item in internal_products if item["mapping"])
             total_service_count = sum(int(item["serviceCount"]) for item in suppliers)
             active_suppliers = sum(1 for item in suppliers if item["isActive"])
             active_customers = sum(1 for item in customers if item["isActive"] and item["role"] == "customer")
             active_products = sum(1 for item in internal_products if item["isActive"])
             analytics_overview = analytics.get("windows", {}).get("30d", {}).get("overview", {})
+            pending_charge_count = sum(
+                1
+                for item in admin_charge_orders
+                if item["status"] in {"created", "awaiting_payment", "awaiting_deposit", "refund_requested"}
+            )
 
             return {
                 "siteSettings": self._site_settings_admin_payload(site_settings_row),
@@ -7337,6 +7794,10 @@ class PanelStore:
                 "categories": categories,
                 "internalProducts": internal_products,
                 "adminOrders": admin_orders,
+                "adminChargeOrders": admin_charge_orders,
+                "notices": [self._notice_payload(row) for row in notice_rows],
+                "faqs": [self._faq_payload(row) for row in faq_rows],
+                "auditLogs": [self._admin_audit_payload(row) for row in audit_rows],
                 "stats": {
                     "supplierCount": len(suppliers),
                     "activeSupplierCount": active_suppliers,
@@ -7347,6 +7808,8 @@ class PanelStore:
                     "productCount": len(internal_products),
                     "activeProductCount": active_products,
                     "orderCount": len(admin_orders),
+                    "chargeOrderCount": len(admin_charge_orders),
+                    "pendingChargeCount": pending_charge_count,
                     "visitorCount": int(analytics_overview.get("uniqueVisitors") or 0),
                     "salesTotal": int(analytics_overview.get("sales") or 0),
                 },
@@ -7414,6 +7877,70 @@ class PanelStore:
         }
         return payload
 
+    def _admin_actor(self, payload: Optional[Dict[str, Any]] = None) -> str:
+        actor = str((payload or {}).get("_adminActor") or "").strip()
+        return actor or "admin"
+
+    def _record_admin_audit(
+        self,
+        conn: DatabaseConnection,
+        *,
+        actor: str = "admin",
+        action: str,
+        entity_type: str = "",
+        entity_id: str = "",
+        message: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO admin_audit_logs (
+                id, actor, action, entity_type, entity_id, message, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"audit_{uuid4().hex[:16]}",
+                actor or "admin",
+                action,
+                entity_type,
+                entity_id,
+                message,
+                as_json(metadata or {}),
+                now_iso(),
+            ),
+        )
+
+    def _admin_audit_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "actor": row["actor"],
+            "action": row["action"],
+            "entityType": row["entity_type"],
+            "entityId": row["entity_id"],
+            "message": row["message"],
+            "metadata": parse_json(row["metadata_json"], {}),
+            "createdAt": row["created_at"],
+            "createdLabel": self._relative_date_label(row["created_at"]),
+        }
+
+    def _notice_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "title": row["title"],
+            "body": row["body"],
+            "tag": row["tag"],
+            "pinned": bool(row["pinned"]),
+            "publishedAt": row["published_at"],
+        }
+
+    def _faq_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "question": row["question"],
+            "answer": row["answer"],
+            "sortOrder": row["sort_order"],
+        }
+
     def save_supplier(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         supplier_id = str(payload.get("id") or "").strip()
         name = str(payload.get("name") or "").strip()
@@ -7423,6 +7950,7 @@ class PanelStore:
         bearer_token = str(payload.get("bearerToken") or "").strip()
         notes = str(payload.get("notes") or "").strip()
         is_active = bool(payload.get("isActive", True))
+        actor = self._admin_actor(payload)
 
         if not name:
             raise PanelError("공급사 이름을 입력해 주세요.")
@@ -7440,9 +7968,9 @@ class PanelStore:
                 existing_type = normalize_supplier_integration_type(existing["integration_type"])
                 integration_changed = existing_type != integration_type
                 if not api_key and not integration_changed:
-                    api_key = existing["api_key"]
+                    api_key = decrypt_secret_value(existing["api_key"])
                 if integration_type == SUPPLIER_INTEGRATION_MKT24 and not bearer_token and not integration_changed:
-                    bearer_token = existing["bearer_token"]
+                    bearer_token = decrypt_secret_value(existing["bearer_token"])
             if integration_type == SUPPLIER_INTEGRATION_MKT24:
                 if not api_key:
                     raise PanelError("x-api-key를 입력해 주세요.")
@@ -7452,6 +7980,9 @@ class PanelStore:
                 if not api_key:
                     raise PanelError("API 키를 입력해 주세요.")
                 bearer_token = ""
+
+            stored_api_key = encrypt_secret_value(api_key, require_key=_secret_encryption_required())
+            stored_bearer_token = encrypt_secret_value(bearer_token, require_key=_secret_encryption_required())
 
             if supplier_id and existing is not None:
                 conn.execute(
@@ -7464,8 +7995,8 @@ class PanelStore:
                         name,
                         api_url,
                         integration_type,
-                        api_key,
-                        bearer_token,
+                        stored_api_key,
+                        stored_bearer_token,
                         bool_to_int(is_active),
                         notes,
                         timestamp,
@@ -7485,14 +8016,23 @@ class PanelStore:
                         name,
                         api_url,
                         integration_type,
-                        api_key,
-                        bearer_token,
+                        stored_api_key,
+                        stored_bearer_token,
                         bool_to_int(is_active),
                         notes,
                         timestamp,
                         timestamp,
                     ),
                 )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="supplier.update" if existing is not None else "supplier.create",
+                entity_type="supplier",
+                entity_id=supplier_id,
+                message=f"공급사 저장: {name}",
+                metadata={"integrationType": integration_type, "isActive": is_active},
+            )
             conn.commit()
 
         return {"supplier": self._supplier_by_id(supplier_id)}
@@ -7507,6 +8047,7 @@ class PanelStore:
         route = normalize_navigation_target(payload.get("route") or "/")
         theme = str(payload.get("theme") or "coral").strip().lower() or "coral"
         is_active = bool(payload.get("isActive", False))
+        actor = self._admin_actor(payload)
 
         if not title:
             raise PanelError("팝업 제목을 입력해 주세요.")
@@ -7564,6 +8105,15 @@ class PanelStore:
                         popup_id,
                     ),
                 )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="site.popup_update",
+                entity_type="home_popup",
+                entity_id=popup_id,
+                message=f"홈 팝업 저장: {name}",
+                metadata={"isActive": is_active, "route": route},
+            )
             conn.commit()
         return {"popup": self._home_popup_by_id(popup_id)}
 
@@ -7577,6 +8127,7 @@ class PanelStore:
         theme = str(payload.get("theme") or "blue").strip().lower() or "blue"
         is_active = bool(payload.get("isActive", True))
         sort_order = int(payload.get("sortOrder") or 0)
+        actor = self._admin_actor(payload)
 
         if not banner_id:
             raise PanelError("수정할 홈 배너를 선택해 주세요.")
@@ -7608,6 +8159,15 @@ class PanelStore:
                     banner_id,
                 ),
             )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="site.banner_update",
+                entity_type="home_banner",
+                entity_id=banner_id,
+                message=f"홈 배너 저장: {title}",
+                metadata={"isActive": is_active, "route": route, "sortOrder": sort_order},
+            )
             conn.commit()
         return {"banner": self._home_banner_by_id(banner_id)}
 
@@ -7616,6 +8176,7 @@ class PanelStore:
         icon = str(payload.get("icon") or "").strip() or "●"
         image_url = normalize_image_asset_source(payload.get("logoImageUrl") or "", "플랫폼 로고 이미지")
         accent_color = str(payload.get("accentColor") or "#4c76ff").strip() or "#4c76ff"
+        actor = self._admin_actor(payload)
 
         if not platform_id:
             raise PanelError("수정할 플랫폼을 선택해 주세요.")
@@ -7641,6 +8202,15 @@ class PanelStore:
                     platform_id,
                 ),
             )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="site.platform_logo_update",
+                entity_type="platform_section",
+                entity_id=platform_id,
+                message="플랫폼 로고/색상 저장",
+                metadata={"hasImage": bool(image_url), "accentColor": accent_color},
+            )
             conn.commit()
         return {"platformSection": self._platform_section_by_id(platform_id)}
 
@@ -7652,6 +8222,7 @@ class PanelStore:
         header_logo_url = normalize_image_asset_source(payload.get("headerLogoUrl") or "", "상단 로고 이미지")
         favicon_url = normalize_image_asset_source(payload.get("faviconUrl") or "", "파비콘")
         share_image_url = normalize_image_asset_source(payload.get("shareImageUrl") or "", "대표 이미지")
+        actor = self._admin_actor(payload)
 
         if not site_name:
             raise PanelError("사이트 이름을 입력해 주세요.")
@@ -7686,6 +8257,19 @@ class PanelStore:
                     existing["id"],
                 ),
             )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="site.settings_update",
+                entity_type="site_settings",
+                entity_id=existing["id"],
+                message=f"사이트 기본 설정 저장: {site_name}",
+                metadata={
+                    "hasHeaderLogo": bool(header_logo_url),
+                    "hasFavicon": bool(favicon_url),
+                    "hasShareImage": bool(share_image_url),
+                },
+            )
             conn.commit()
         return {"siteSettings": self.admin_site_settings()["siteSettings"]}
 
@@ -7697,6 +8281,7 @@ class PanelStore:
         api_url = str(payload.get("apiUrl") or (supplier["apiUrl"] if supplier else "")).strip()
         api_key = str(payload.get("apiKey") or (supplier["apiKey"] if supplier else "")).strip()
         bearer_token = str(payload.get("bearerToken") or (supplier["bearerToken"] if supplier else "")).strip()
+        actor = self._admin_actor(payload)
 
         if not api_url:
             raise PanelError("API URL을 입력해 주세요.")
@@ -7715,6 +8300,11 @@ class PanelStore:
 
         if supplier_id:
             persisted_api_url = result.get("persistedApiUrl") or result["resolvedApiUrl"]
+            stored_api_key = encrypt_secret_value(api_key, require_key=_secret_encryption_required())
+            stored_bearer_token = encrypt_secret_value(
+                bearer_token if integration_type == SUPPLIER_INTEGRATION_MKT24 else "",
+                require_key=_secret_encryption_required(),
+            )
             with self._connect() as conn:
                 conn.execute(
                     """
@@ -7726,8 +8316,8 @@ class PanelStore:
                     (
                         persisted_api_url,
                         integration_type,
-                        api_key,
-                        bearer_token if integration_type == SUPPLIER_INTEGRATION_MKT24 else "",
+                        stored_api_key,
+                        stored_bearer_token,
                         result["status"],
                         result["message"],
                         result["balance"],
@@ -7738,11 +8328,20 @@ class PanelStore:
                         supplier_id,
                     ),
                 )
+                self._record_admin_audit(
+                    conn,
+                    actor=actor,
+                    action="supplier.connection_test",
+                    entity_type="supplier",
+                    entity_id=supplier_id,
+                    message="공급사 API 연결 확인",
+                    metadata={"status": result["status"], "serviceCount": result["serviceCount"]},
+                )
                 conn.commit()
 
         return {"result": result}
 
-    def sync_supplier_services(self, supplier_id: str) -> Dict[str, Any]:
+    def sync_supplier_services(self, supplier_id: str, *, actor: str = "admin") -> Dict[str, Any]:
         supplier = self._supplier_by_id(supplier_id, include_api_key=True)
         result = self._run_supplier_connection_test(
             supplier["apiUrl"],
@@ -7839,6 +8438,15 @@ class PanelStore:
                     supplier_id,
                 ),
             )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="supplier.services_sync",
+                entity_type="supplier",
+                entity_id=supplier_id,
+                message="공급사 서비스 목록 동기화",
+                metadata={"serviceCount": result["serviceCount"]},
+            )
             conn.commit()
 
         return {
@@ -7855,6 +8463,7 @@ class PanelStore:
         price_multiplier = safe_float(payload.get("priceMultiplier"), 1.0)
         fixed_markup = int(float(payload.get("fixedMarkup") or 0) or 0)
         is_primary = bool(payload.get("isPrimary", True))
+        actor = self._admin_actor(payload)
 
         if not product_id:
             raise PanelError("내부 상품을 선택해 주세요.")
@@ -7930,12 +8539,22 @@ class PanelStore:
                         timestamp,
                     ),
                 )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="supplier.mapping_update",
+                entity_type="product_supplier_mapping",
+                entity_id=mapping_id,
+                message="상품 공급사 매핑 저장",
+                metadata={"productId": product_id, "supplierId": supplier_id, "supplierServiceId": supplier_service_id},
+            )
             conn.commit()
 
         return {"mapping": self._mapping_summary_by_product(product_id)}
 
     def delete_product_mapping(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         mapping_id = str(payload.get("mappingId") or "").strip()
+        actor = self._admin_actor(payload)
         if not mapping_id:
             raise PanelError("삭제할 매핑 정보를 찾을 수 없습니다.")
         with self._connect() as conn:
@@ -7943,6 +8562,15 @@ class PanelStore:
             if row is None:
                 raise PanelError("삭제할 매핑을 찾을 수 없습니다.", status=404)
             conn.execute("DELETE FROM product_supplier_mappings WHERE id = ?", (mapping_id,))
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="supplier.mapping_delete",
+                entity_type="product_supplier_mapping",
+                entity_id=mapping_id,
+                message="상품 공급사 매핑 삭제",
+                metadata={"productId": row["product_id"]},
+            )
             conn.commit()
             return {"mapping": self._mapping_summary_by_product(row["product_id"])}
 
@@ -7957,6 +8585,7 @@ class PanelStore:
         notes = str(payload.get("notes") or "").strip()
         is_active = bool(payload.get("isActive", True))
         account_status = "active" if is_active else "suspended"
+        actor = self._admin_actor(payload)
 
         if not name:
             raise PanelError("고객 이름을 입력해 주세요.")
@@ -7999,6 +8628,15 @@ class PanelStore:
                     """,
                     (customer_id, name, email, password_hash, phone, tier, role, avatar_label(name), bool_to_int(is_active), account_status, notes, timestamp, timestamp),
                 )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="customer.update" if payload.get("id") else "customer.create",
+                entity_type="customer",
+                entity_id=customer_id,
+                message=f"고객 계정 저장: {name}",
+                metadata={"role": role, "isActive": is_active},
+            )
             conn.commit()
         return {"customer": self._customer_by_id(customer_id)}
 
@@ -8007,10 +8645,11 @@ class PanelStore:
 
     def delete_customer(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         customer_id = str(payload.get("customerId") or "").strip()
+        actor = self._admin_actor(payload)
         if not customer_id:
             raise PanelError("삭제할 고객을 선택해 주세요.")
         if customer_id == DEMO_USER_ID:
-            raise PanelError("현재 데모 운영 계정은 삭제할 수 없습니다.")
+            raise PanelError("기본 운영 계정은 삭제할 수 없습니다.")
 
         with self._connect() as conn:
             user = conn.execute("SELECT id FROM users WHERE id = ?", (customer_id,)).fetchone()
@@ -8023,6 +8662,14 @@ class PanelStore:
             else:
                 conn.execute("DELETE FROM users WHERE id = ?", (customer_id,))
                 action = "deleted"
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action=f"customer.{action}",
+                entity_type="customer",
+                entity_id=customer_id,
+                message=f"고객 계정 {action}",
+            )
             conn.commit()
         return {"ok": True, "action": action, "customerId": customer_id}
 
@@ -8030,6 +8677,7 @@ class PanelStore:
         customer_id = str(payload.get("customerId") or "").strip()
         amount = int(float(payload.get("amount") or 0) or 0)
         memo = str(payload.get("memo") or "").strip() or "관리자 잔액 조정"
+        actor = self._admin_actor(payload)
         if not customer_id:
             raise PanelError("고객을 선택해 주세요.")
         if amount == 0:
@@ -8062,8 +8710,375 @@ class PanelStore:
                 memo=memo,
                 created_at=timestamp,
             )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="customer.balance_adjust",
+                entity_type="customer",
+                entity_id=customer_id,
+                message="고객 보유금액 수동 조정",
+                metadata={"amount": amount, "balanceAfter": balance_after, "memo": memo},
+            )
             conn.commit()
         return {"customer": self._customer_by_id(customer_id), "balanceAfter": balance_after, "balanceAfterLabel": money(balance_after)}
+
+    def admin_update_charge_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        charge_order_id = str(payload.get("chargeOrderId") or "").strip()
+        action = str(payload.get("action") or "").strip()
+        reference = str(payload.get("reference") or "").strip()
+        admin_memo = str(payload.get("adminMemo") or "").strip()
+        actor = self._admin_actor(payload)
+        if not charge_order_id:
+            raise PanelError("처리할 충전 주문을 선택해 주세요.")
+        if action not in {"approve_deposit", "mark_failed", "cancel"}:
+            raise PanelError("지원하지 않는 충전 처리 방식입니다.")
+
+        timestamp = now_iso()
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM charge_orders WHERE id = ?", (charge_order_id,)).fetchone()
+            if row is None:
+                raise PanelError("충전 주문을 찾을 수 없습니다.", status=404)
+
+            if action == "approve_deposit":
+                if row["payment_channel"] != "bank_transfer":
+                    raise PanelError("계좌입금 주문만 입금 확인 처리할 수 있습니다.")
+                result = self._complete_charge_order(
+                    conn,
+                    charge_order_id,
+                    payment_method="bank_transfer",
+                    payment_status="completed",
+                    reference=reference or f"ADMIN-{dt.datetime.now().strftime('%Y%m%d')}-{secrets.token_hex(3).upper()}",
+                    payment_payload={"approvedBy": "admin", "adminMemo": admin_memo, "approvedAt": timestamp},
+                    paid_total_amount=int(row["total_amount"]),
+                    memo_prefix="입금 확인 충전",
+                )
+                self._record_admin_audit(
+                    conn,
+                    actor=actor,
+                    action="charge.approve_deposit",
+                    entity_type="charge_order",
+                    entity_id=charge_order_id,
+                    message="충전 주문 입금 확인 및 보유금액 반영",
+                    metadata={"reference": reference, "adminMemo": admin_memo},
+                )
+                conn.commit()
+                return {
+                    "chargeOrder": self._admin_charge_order_by_id(conn, charge_order_id),
+                    "wallet": result.get("wallet"),
+                }
+
+            if row["status"] == "paid":
+                raise PanelError("이미 결제 완료된 충전 주문은 실패/취소 처리할 수 없습니다.")
+            next_status = "failed" if action == "mark_failed" else "cancelled"
+            failure_reason = admin_memo or ("관리자 실패 처리" if action == "mark_failed" else "관리자 취소 처리")
+            payment_payload = parse_json(row["payment_payload_json"], {})
+            payment_payload.update({"adminMemo": admin_memo, "updatedBy": "admin", "updatedAt": timestamp})
+            conn.execute(
+                """
+                UPDATE charge_orders
+                SET status = ?, reference = ?, failure_reason = ?, payment_payload_json = ?, updated_at = ?
+                WHERE id = ? AND status != 'paid'
+                """,
+                (
+                    next_status,
+                    reference,
+                    failure_reason,
+                    as_json(payment_payload),
+                    timestamp,
+                    charge_order_id,
+                ),
+            )
+            self._refresh_wallet_pending_balance(conn, str(row["user_id"]))
+            charge_order = self._admin_charge_order_by_id(conn, charge_order_id)
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action=f"charge.{action}",
+                entity_type="charge_order",
+                entity_id=charge_order_id,
+                message=f"충전 주문 {next_status} 처리",
+                metadata={"reference": reference, "adminMemo": admin_memo},
+            )
+            conn.commit()
+        return {"chargeOrder": charge_order}
+
+    def save_notice(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        notice_id = str(payload.get("id") or "").strip()
+        title = str(payload.get("title") or "").strip()
+        body = str(payload.get("body") or "").strip()
+        tag = str(payload.get("tag") or "공지").strip() or "공지"
+        pinned = bool(payload.get("pinned", False))
+        published_at = str(payload.get("publishedAt") or "").strip() or now_iso()
+        actor = self._admin_actor(payload)
+        if not title:
+            raise PanelError("공지 제목을 입력해 주세요.")
+        if not body:
+            raise PanelError("공지 내용을 입력해 주세요.")
+
+        with self._connect() as conn:
+            action = "notice.update" if notice_id else "notice.create"
+            if notice_id:
+                exists = conn.execute("SELECT id FROM notices WHERE id = ?", (notice_id,)).fetchone()
+                if exists is None:
+                    raise PanelError("수정할 공지를 찾을 수 없습니다.", status=404)
+                conn.execute(
+                    "UPDATE notices SET title = ?, body = ?, tag = ?, pinned = ?, published_at = ? WHERE id = ?",
+                    (title, body, tag, bool_to_int(pinned), published_at, notice_id),
+                )
+            else:
+                notice_id = f"notice_{uuid4().hex[:12]}"
+                conn.execute(
+                    "INSERT INTO notices (id, title, body, tag, pinned, published_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (notice_id, title, body, tag, bool_to_int(pinned), published_at),
+                )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action=action,
+                entity_type="notice",
+                entity_id=notice_id,
+                message=f"공지 저장: {title}",
+                metadata={"pinned": pinned, "tag": tag},
+            )
+            conn.commit()
+            notice = conn.execute("SELECT * FROM notices WHERE id = ?", (notice_id,)).fetchone()
+        return {"notice": self._notice_payload(notice)}
+
+    def delete_notice(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        notice_id = str(payload.get("noticeId") or payload.get("id") or "").strip()
+        actor = self._admin_actor(payload)
+        if not notice_id:
+            raise PanelError("삭제할 공지를 선택해 주세요.")
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM notices WHERE id = ?", (notice_id,)).fetchone()
+            if row is None:
+                raise PanelError("삭제할 공지를 찾을 수 없습니다.", status=404)
+            conn.execute("DELETE FROM notices WHERE id = ?", (notice_id,))
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="notice.delete",
+                entity_type="notice",
+                entity_id=notice_id,
+                message=f"공지 삭제: {row['title']}",
+            )
+            conn.commit()
+        return {"ok": True, "noticeId": notice_id}
+
+    def save_faq(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        faq_id = str(payload.get("id") or "").strip()
+        question = str(payload.get("question") or "").strip()
+        answer = str(payload.get("answer") or "").strip()
+        sort_order = int(float(payload.get("sortOrder") or 0) or 0)
+        actor = self._admin_actor(payload)
+        if not question:
+            raise PanelError("FAQ 질문을 입력해 주세요.")
+        if not answer:
+            raise PanelError("FAQ 답변을 입력해 주세요.")
+
+        with self._connect() as conn:
+            action = "faq.update" if faq_id else "faq.create"
+            if faq_id:
+                exists = conn.execute("SELECT id FROM faqs WHERE id = ?", (faq_id,)).fetchone()
+                if exists is None:
+                    raise PanelError("수정할 FAQ를 찾을 수 없습니다.", status=404)
+                conn.execute(
+                    "UPDATE faqs SET question = ?, answer = ?, sort_order = ? WHERE id = ?",
+                    (question, answer, sort_order, faq_id),
+                )
+            else:
+                faq_id = f"faq_{uuid4().hex[:12]}"
+                conn.execute(
+                    "INSERT INTO faqs (id, question, answer, sort_order) VALUES (?, ?, ?, ?)",
+                    (faq_id, question, answer, sort_order),
+                )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action=action,
+                entity_type="faq",
+                entity_id=faq_id,
+                message=f"FAQ 저장: {question}",
+                metadata={"sortOrder": sort_order},
+            )
+            conn.commit()
+            faq = conn.execute("SELECT * FROM faqs WHERE id = ?", (faq_id,)).fetchone()
+        return {"faq": self._faq_payload(faq)}
+
+    def delete_faq(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        faq_id = str(payload.get("faqId") or payload.get("id") or "").strip()
+        actor = self._admin_actor(payload)
+        if not faq_id:
+            raise PanelError("삭제할 FAQ를 선택해 주세요.")
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM faqs WHERE id = ?", (faq_id,)).fetchone()
+            if row is None:
+                raise PanelError("삭제할 FAQ를 찾을 수 없습니다.", status=404)
+            conn.execute("DELETE FROM faqs WHERE id = ?", (faq_id,))
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="faq.delete",
+                entity_type="faq",
+                entity_id=faq_id,
+                message=f"FAQ 삭제: {row['question']}",
+            )
+            conn.commit()
+        return {"ok": True, "faqId": faq_id}
+
+    def _supplier_dispatch_context(self, conn: DatabaseConnection, order_id: str) -> Dict[str, Any]:
+        row = conn.execute(
+            """
+            SELECT
+                o.id AS order_id,
+                o.quantity,
+                o.target_value,
+                p.id AS product_id,
+                p.name AS product_name,
+                p.product_code,
+                p.price_strategy,
+                ps.slug AS platform_slug,
+                psm.supplier_id,
+                psm.supplier_service_id,
+                psm.supplier_external_service_id,
+                s.api_url,
+                s.integration_type,
+                s.api_key,
+                s.bearer_token,
+                s.name AS supplier_name,
+                s.is_active AS supplier_is_active
+            FROM orders o
+            JOIN products p ON p.id = o.product_id
+            JOIN product_categories pc ON pc.id = p.product_category_id
+            JOIN platform_groups pg ON pg.id = pc.platform_group_id
+            JOIN platform_sections ps ON ps.id = pg.platform_section_id
+            JOIN product_supplier_mappings psm ON psm.product_id = p.id AND psm.is_primary = 1 AND psm.is_active = 1
+            JOIN suppliers s ON s.id = psm.supplier_id
+            WHERE o.id = ?
+            LIMIT 1
+            """,
+            (order_id,),
+        ).fetchone()
+        if row is None:
+            raise PanelError("이 주문에 연결된 활성 공급사 매핑이 없습니다.", status=404)
+        if not bool(row["supplier_is_active"]):
+            raise PanelError("연결된 공급사가 비활성 상태입니다.")
+        fields = {
+            field["field_key"]: field["field_value"]
+            for field in conn.execute("SELECT field_key, field_value FROM order_fields WHERE order_id = ?", (order_id,)).fetchall()
+        }
+        if not any(fields.get(key) for key in ("targetUrl", "targetValue", "targetKeyword")):
+            fields["targetValue"] = row["target_value"]
+        if not fields.get("orderedCount"):
+            fields["orderedCount"] = str(row["quantity"])
+        product = {
+            "id": row["product_id"],
+            "name": row["product_name"],
+            "product_code": row["product_code"],
+            "platform_slug": row["platform_slug"],
+            "price_strategy": row["price_strategy"],
+        }
+        mapping = {
+            "supplier_id": row["supplier_id"],
+            "supplier_service_id": row["supplier_service_id"],
+            "supplier_external_service_id": row["supplier_external_service_id"],
+            "api_url": row["api_url"],
+            "integration_type": row["integration_type"],
+            "api_key": row["api_key"],
+            "bearer_token": row["bearer_token"],
+        }
+        return {"product": product, "fields": fields, "mapping": mapping, "supplierName": row["supplier_name"]}
+
+    def retry_supplier_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        order_id = str(payload.get("orderId") or "").strip()
+        actor = self._admin_actor(payload)
+        if not order_id:
+            raise PanelError("재전송할 주문을 선택해 주세요.")
+        with self._connect() as conn:
+            order_exists = conn.execute("SELECT id FROM orders WHERE id = ?", (order_id,)).fetchone()
+            if order_exists is None:
+                raise PanelError("주문을 찾을 수 없습니다.", status=404)
+            context = self._supplier_dispatch_context(conn, order_id)
+        dispatch = self._dispatch_supplier_order(order_id, context["product"], context["fields"], context["mapping"])
+        with self._connect() as conn:
+            if dispatch["status"] in {"submitted", "accepted"}:
+                conn.execute("UPDATE orders SET status = ?, updated_at = ? WHERE id = ?", ("in_progress", now_iso(), order_id))
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="order.supplier_retry",
+                entity_type="order",
+                entity_id=order_id,
+                message="공급사 발주 재전송",
+                metadata={"supplier": context.get("supplierName"), "dispatchStatus": dispatch["status"]},
+            )
+            conn.commit()
+        return {"dispatch": dispatch}
+
+    def refresh_supplier_order_status(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        order_id = str(payload.get("orderId") or "").strip()
+        actor = self._admin_actor(payload)
+        if not order_id:
+            raise PanelError("상태를 조회할 주문을 선택해 주세요.")
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    so.*,
+                    s.api_url,
+                    s.integration_type,
+                    s.api_key,
+                    s.bearer_token,
+                    s.name AS supplier_name
+                FROM supplier_orders so
+                JOIN suppliers s ON s.id = so.supplier_id
+                WHERE so.order_id = ?
+                ORDER BY so.created_at DESC
+                LIMIT 1
+                """,
+                (order_id,),
+            ).fetchone()
+            if row is None:
+                raise PanelError("조회할 공급사 발주 기록이 없습니다.", status=404)
+            external_order_id = str(row["supplier_external_order_id"] or "").strip()
+            if not external_order_id:
+                raise PanelError("공급사 외부 주문번호가 없어 상태 조회가 불가합니다.")
+
+            client = SupplierApiClient(
+                str(row["api_url"]),
+                decrypt_secret_value(row["api_key"]),
+                integration_type=str(row["integration_type"]),
+                bearer_token=decrypt_secret_value(row["bearer_token"]),
+            )
+            status_payload = client.status(external_order_id)
+            next_supplier_status = normalize_supplier_order_status_payload(status_payload)
+            response_json = parse_json(row["response_json"], {})
+            response_json["lastStatusCheck"] = {
+                "checkedAt": now_iso(),
+                "payload": status_payload,
+            }
+            timestamp = now_iso()
+            conn.execute(
+                "UPDATE supplier_orders SET status = ?, response_json = ?, updated_at = ? WHERE id = ?",
+                (next_supplier_status, as_json(response_json), timestamp, row["id"]),
+            )
+            if next_supplier_status == "completed":
+                conn.execute("UPDATE orders SET status = ?, updated_at = ? WHERE id = ?", ("completed", timestamp, order_id))
+            elif next_supplier_status in {"in_progress", "pending", "submitted", "partial"}:
+                conn.execute("UPDATE orders SET status = ?, updated_at = ? WHERE id = ?", ("in_progress", timestamp, order_id))
+            elif next_supplier_status in {"failed", "cancelled"}:
+                conn.execute("UPDATE orders SET status = ?, updated_at = ? WHERE id = ?", (next_supplier_status, timestamp, order_id))
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="order.supplier_status_refresh",
+                entity_type="order",
+                entity_id=order_id,
+                message="공급사 주문 상태 조회",
+                metadata={"supplierStatus": next_supplier_status, "externalOrderId": external_order_id},
+            )
+            conn.commit()
+        return {"supplierStatus": next_supplier_status, "supplierOrderId": row["id"], "statusPayload": status_payload}
 
     def save_category(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         category_id = str(payload.get("id") or "").strip()
@@ -8078,6 +9093,7 @@ class PanelStore:
         refund_text = str(payload.get("refundText") or "").strip()
         is_active = bool(payload.get("isActive", True))
         sort_order = int(float(payload.get("sortOrder") or 0) or 0)
+        actor = self._admin_actor(payload)
 
         if not group_id:
             raise PanelError("플랫폼 그룹을 선택해 주세요.")
@@ -8088,6 +9104,7 @@ class PanelStore:
         refund_items = split_lines(refund_text) or ["작업이 시작된 이후에는 취소 및 환불이 제한될 수 있어요."]
         if not service_description_html:
             service_description_html = f"<p><strong>{html_escape(name)}</strong></p><p>{html_escape(description or hero_subtitle or '상세 설명을 입력해 주세요.')}</p>"
+        service_description_html = sanitize_rich_html(service_description_html)
 
         timestamp = now_iso()
         with self._connect() as conn:
@@ -8145,11 +9162,21 @@ class PanelStore:
                         sort_order,
                     ),
                 )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="catalog.category_update" if payload.get("id") else "catalog.category_create",
+                entity_type="product_category",
+                entity_id=category_id,
+                message=f"상품 카테고리 저장: {name}",
+                metadata={"groupId": group_id, "isActive": is_active},
+            )
             conn.commit()
         return {"category": self._category_by_id(category_id)}
 
     def delete_category(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         category_id = str(payload.get("categoryId") or "").strip()
+        actor = self._admin_actor(payload)
         if not category_id:
             raise PanelError("삭제할 카테고리를 선택해 주세요.")
         with self._connect() as conn:
@@ -8165,6 +9192,15 @@ class PanelStore:
             else:
                 conn.execute("DELETE FROM product_categories WHERE id = ?", (category_id,))
                 action = "deleted"
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action=f"catalog.category_{action}",
+                entity_type="product_category",
+                entity_id=category_id,
+                message=f"상품 카테고리 {action}",
+                metadata={"orderCount": int(order_count), "productCount": int(product_count)},
+            )
             conn.commit()
         return {"ok": True, "action": action, "categoryId": category_id}
 
@@ -8186,6 +9222,7 @@ class PanelStore:
         is_discounted = bool(payload.get("isDiscounted", False))
         is_active = bool(payload.get("isActive", True))
         sort_order = int(float(payload.get("sortOrder") or 0) or 0)
+        actor = self._admin_actor(payload)
 
         if not category_id:
             raise PanelError("상품 카테고리를 선택해 주세요.")
@@ -8287,11 +9324,21 @@ class PanelStore:
             self._sync_category_order_options(conn, category_id)
             if previous_category_id != category_id:
                 self._sync_category_order_options(conn, previous_category_id)
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="catalog.product_update" if payload.get("id") else "catalog.product_create",
+                entity_type="product",
+                entity_id=product_id,
+                message=f"상품 저장: {name}",
+                metadata={"categoryId": category_id, "price": price, "isActive": is_active},
+            )
             conn.commit()
         return {"product": self._catalog_product_by_id(product_id)}
 
     def delete_catalog_product(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         product_id = str(payload.get("productId") or "").strip()
+        actor = self._admin_actor(payload)
         if not product_id:
             raise PanelError("삭제할 상품을 선택해 주세요.")
         with self._connect() as conn:
@@ -8306,6 +9353,15 @@ class PanelStore:
                 conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
                 action = "deleted"
             self._sync_category_order_options(conn, product["product_category_id"])
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action=f"catalog.product_{action}",
+                entity_type="product",
+                entity_id=product_id,
+                message=f"상품 {action}",
+                metadata={"categoryId": product["product_category_id"], "orderCount": int(order_count)},
+            )
             conn.commit()
         return {"ok": True, "action": action, "productId": product_id}
 
@@ -8313,9 +9369,10 @@ class PanelStore:
         order_id = str(payload.get("orderId") or "").strip()
         status = str(payload.get("status") or "").strip()
         admin_memo = str(payload.get("adminMemo") or "").strip()
+        actor = self._admin_actor(payload)
         if not order_id:
             raise PanelError("주문을 선택해 주세요.")
-        if status not in {"queued", "in_progress", "completed"}:
+        if status not in {"queued", "in_progress", "completed", "failed", "cancelled"}:
             raise PanelError("지원하지 않는 주문 상태입니다.")
 
         with self._connect() as conn:
@@ -8328,6 +9385,15 @@ class PanelStore:
             conn.execute(
                 "UPDATE orders SET status = ?, notes_json = ?, updated_at = ? WHERE id = ?",
                 (status, as_json(notes), now_iso(), order_id),
+            )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="order.status_update",
+                entity_type="order",
+                entity_id=order_id,
+                message=f"주문 상태 변경: {status}",
+                metadata={"adminMemo": admin_memo},
             )
             conn.commit()
         return {"ok": True, "orderId": order_id, "status": status}
@@ -8388,9 +9454,9 @@ class PanelStore:
             "apiUrl": row["api_url"],
             "integrationType": integration_type,
             "hasApiKey": bool(row["api_key"]),
-            "apiKeyMasked": mask_secret(row["api_key"]),
+            "apiKeyMasked": safe_mask_secret(row["api_key"]),
             "hasBearerToken": bool(row["bearer_token"]),
-            "bearerTokenMasked": mask_secret(row["bearer_token"]),
+            "bearerTokenMasked": safe_mask_secret(row["bearer_token"]),
             "supportsBalanceCheck": supplier_supports_balance_check(integration_type),
             "supportsAutoDispatch": supplier_supports_auto_dispatch(integration_type),
             "isActive": bool(row["is_active"]),
@@ -8405,8 +9471,8 @@ class PanelStore:
             "updatedAt": row["updated_at"],
         }
         if include_api_key:
-            payload["apiKey"] = row["api_key"]
-            payload["bearerToken"] = row["bearer_token"]
+            payload["apiKey"] = decrypt_secret_value(row["api_key"])
+            payload["bearerToken"] = decrypt_secret_value(row["bearer_token"])
         return payload
 
     def public_site_settings(self) -> Dict[str, Any]:
@@ -8660,7 +9726,7 @@ class PanelStore:
             "optionLabelName": row["option_label_name"],
             "heroTitle": row["hero_title"],
             "heroSubtitle": row["hero_subtitle"],
-            "serviceDescriptionHtml": row["service_description_html"],
+            "serviceDescriptionHtml": sanitize_rich_html(row["service_description_html"]),
             "cautionText": "\n".join(parse_json(row["caution_json"], [])),
             "refundText": "\n".join(parse_json(row["refund_notice_json"], [])),
             "isActive": bool(row["is_active"]),
@@ -8874,6 +9940,39 @@ class PanelStore:
             status=410,
         )
 
+    def _order_submission_payload(
+        self,
+        conn: DatabaseConnection,
+        order_row: Dict[str, Any],
+        *,
+        duplicate: bool = False,
+    ) -> Dict[str, Any]:
+        wallet = self._wallet_balances(conn, str(order_row["user_id"]))
+        payload = {
+            "ok": True,
+            "orderId": order_row["id"],
+            "orderNumber": order_row["order_number"],
+            "totalPrice": int(order_row["total_price"]),
+            "totalPriceLabel": money(int(order_row["total_price"])),
+            "balanceAfter": wallet["available"],
+            "balanceAfterLabel": money(wallet["available"]),
+        }
+        if duplicate:
+            payload["duplicate"] = True
+        return payload
+
+    def _existing_order_by_idempotency(self, user_id: str, idempotency_key: str) -> Optional[Dict[str, Any]]:
+        if not idempotency_key:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM orders WHERE user_id = ? AND idempotency_key = ?",
+                (user_id, idempotency_key),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._order_submission_payload(conn, dict(row), duplicate=True)
+
     def create_order(self, payload: Dict[str, Any], user_id: str = "") -> Dict[str, Any]:
         if not user_id:
             raise PanelError("로그인이 필요합니다.", status=401)
@@ -8883,161 +9982,181 @@ class PanelStore:
             raise PanelError("주문할 상품이 선택되지 않았습니다.")
         if not isinstance(fields, dict):
             raise PanelError("주문 폼 정보가 올바르지 않습니다.")
+        idempotency_key = sanitize_idempotency_key(payload.get("idempotencyKey"))
+        existing_order = self._existing_order_by_idempotency(user_id, idempotency_key)
+        if existing_order is not None:
+            return existing_order
 
         supplier_mapping: Optional[Dict[str, Any]] = None
         product_data: Optional[Dict[str, Any]] = None
-        with self._connect() as conn:
-            product = conn.execute(
-                """
-                SELECT
-                    p.*,
-                    pc.id AS category_id,
-                    pc.name AS category_name,
-                    pg.platform_section_id,
-                    ps.slug AS platform_slug,
-                    ps.accent_color AS accent_color
-                FROM products p
-                JOIN product_categories pc ON pc.id = p.product_category_id
-                JOIN platform_groups pg ON pg.id = pc.platform_group_id
-                JOIN platform_sections ps ON ps.id = pg.platform_section_id
-                WHERE p.id = ? AND p.is_active = 1 AND pc.is_active = 1
-                """,
-                (product_id,),
-            ).fetchone()
-            if product is None:
-                raise PanelError("주문할 상품을 찾을 수 없습니다.", status=404)
+        try:
+            with self._connect() as conn:
+                if idempotency_key:
+                    existing_row = conn.execute(
+                        "SELECT * FROM orders WHERE user_id = ? AND idempotency_key = ?",
+                        (user_id, idempotency_key),
+                    ).fetchone()
+                    if existing_row is not None:
+                        return self._order_submission_payload(conn, dict(existing_row), duplicate=True)
+                product = conn.execute(
+                    """
+                    SELECT
+                        p.*,
+                        pc.id AS category_id,
+                        pc.name AS category_name,
+                        pg.platform_section_id,
+                        ps.slug AS platform_slug,
+                        ps.accent_color AS accent_color
+                    FROM products p
+                    JOIN product_categories pc ON pc.id = p.product_category_id
+                    JOIN platform_groups pg ON pg.id = pc.platform_group_id
+                    JOIN platform_sections ps ON ps.id = pg.platform_section_id
+                    WHERE p.id = ? AND p.is_active = 1 AND pc.is_active = 1
+                    """,
+                    (product_id,),
+                ).fetchone()
+                if product is None:
+                    raise PanelError("주문할 상품을 찾을 수 없습니다.", status=404)
 
-            form_structure = ensure_request_memo_form_structure(
-                parse_json(product["form_structure_json"], {}),
-                "추가 요청사항",
-            )
-            rules = form_structure.get("schema", {})
-            self._validate_fields(fields, rules)
-            self._validate_product_target(product, fields, require_preview=True)
+                form_structure = ensure_request_memo_form_structure(
+                    parse_json(product["form_structure_json"], {}),
+                    "추가 요청사항",
+                )
+                rules = form_structure.get("schema", {})
+                self._validate_fields(fields, rules)
+                self._validate_product_target(product, fields, require_preview=True)
 
-            quantity = self._resolve_quantity(product, fields)
-            total_price = int(product["price"]) if product["price_strategy"] == "fixed" else int(product["price"]) * quantity
+                quantity = self._resolve_quantity(product, fields)
+                total_price = int(product["price"]) if product["price_strategy"] == "fixed" else int(product["price"]) * quantity
 
-            user = conn.execute("SELECT balance, phone FROM users WHERE id = ?", (user_id,)).fetchone()
-            if user is None:
-                raise PanelError("사용자를 찾을 수 없습니다.", status=404)
-            wallet_balances = self._wallet_balances(conn, user_id)
-            if int(wallet_balances["available"]) < total_price:
-                raise PanelError("보유 캐시가 부족합니다. 충전 후 다시 시도해 주세요.")
+                user = conn.execute("SELECT balance, phone FROM users WHERE id = ?", (user_id,)).fetchone()
+                if user is None:
+                    raise PanelError("사용자를 찾을 수 없습니다.", status=404)
+                wallet_balances = self._wallet_balances(conn, user_id)
+                if int(wallet_balances["available"]) < total_price:
+                    raise PanelError("보유 캐시가 부족합니다. 충전 후 다시 시도해 주세요.")
 
-            mapping_row = conn.execute(
-                """
-                SELECT
-                    psm.*,
-                    s.api_url,
-                    s.integration_type,
-                    s.api_key,
-                    s.bearer_token,
-                    s.name AS supplier_name,
-                    s.is_active AS supplier_is_active,
-                    ss.name AS supplier_service_name,
-                    ss.raw_json AS supplier_service_raw_json
-                FROM product_supplier_mappings psm
-                JOIN suppliers s ON s.id = psm.supplier_id
-                JOIN supplier_services ss ON ss.id = psm.supplier_service_id
-                WHERE psm.product_id = ? AND psm.is_primary = 1 AND psm.is_active = 1
-                LIMIT 1
-                """,
-                (product_id,),
-            ).fetchone()
-            if mapping_row is not None and bool(mapping_row["supplier_is_active"]):
-                supplier_mapping = dict(mapping_row)
-            product_data = dict(product)
+                mapping_row = conn.execute(
+                    """
+                    SELECT
+                        psm.*,
+                        s.api_url,
+                        s.integration_type,
+                        s.api_key,
+                        s.bearer_token,
+                        s.name AS supplier_name,
+                        s.is_active AS supplier_is_active,
+                        ss.name AS supplier_service_name,
+                        ss.raw_json AS supplier_service_raw_json
+                    FROM product_supplier_mappings psm
+                    JOIN suppliers s ON s.id = psm.supplier_id
+                    JOIN supplier_services ss ON ss.id = psm.supplier_service_id
+                    WHERE psm.product_id = ? AND psm.is_primary = 1 AND psm.is_active = 1
+                    LIMIT 1
+                    """,
+                    (product_id,),
+                ).fetchone()
+                if mapping_row is not None and bool(mapping_row["supplier_is_active"]):
+                    supplier_mapping = dict(mapping_row)
+                product_data = dict(product)
 
-            timestamp = now_iso()
-            order_number = generate_public_order_number()
-            while conn.execute("SELECT 1 FROM orders WHERE order_number = ? LIMIT 1", (order_number,)).fetchone() is not None:
+                timestamp = now_iso()
                 order_number = generate_public_order_number()
-            order_id = f"order_{uuid4().hex[:16]}"
-            target_value = (
-                str(fields.get("targetValue") or "")
-                or str(fields.get("targetUrl") or "")
-                or str(fields.get("targetKeyword") or "")
-            ).strip()
-            contact_phone = str(fields.get("contactPhone") or user["phone"] or "").strip()
-            notes = {
-                key: value
-                for key, value in fields.items()
-                if key not in {"targetValue", "targetUrl", "targetKeyword", "orderedCount", "contactPhone"}
-            }
-            request_memo = str(fields.get("requestMemo") or "").strip()
-            if request_memo:
-                notes["memo"] = request_memo
+                while conn.execute("SELECT 1 FROM orders WHERE order_number = ? LIMIT 1", (order_number,)).fetchone() is not None:
+                    order_number = generate_public_order_number()
+                order_id = f"order_{uuid4().hex[:16]}"
+                target_value = (
+                    str(fields.get("targetValue") or "")
+                    or str(fields.get("targetUrl") or "")
+                    or str(fields.get("targetKeyword") or "")
+                ).strip()
+                contact_phone = str(fields.get("contactPhone") or user["phone"] or "").strip()
+                notes = {
+                    key: value
+                    for key, value in fields.items()
+                    if key not in {"targetValue", "targetUrl", "targetKeyword", "orderedCount", "contactPhone"}
+                }
+                request_memo = str(fields.get("requestMemo") or "").strip()
+                if request_memo:
+                    notes["memo"] = request_memo
 
-            balance_after = int(wallet_balances["available"]) - total_price
-            conn.execute(
-                """
-                INSERT INTO orders (
-                    id, order_number, user_id, platform_section_id, product_category_id, product_id,
-                    product_name_snapshot, option_name_snapshot, target_value, contact_phone,
-                    quantity, unit_price, total_price, status, notes_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    order_id,
-                    order_number,
-                    user_id,
-                    product["platform_section_id"],
-                    product["category_id"],
-                    product["id"],
-                    product["name"],
-                    product["option_name"],
-                    target_value,
-                    contact_phone,
-                    quantity,
-                    product["price"],
-                    total_price,
-                    "queued",
-                    as_json(notes),
-                    timestamp,
-                    timestamp,
-                ),
-            )
-
-            template = form_structure.get("template", {})
-            for field_index, (field_key, field_value) in enumerate(fields.items()):
-                if field_value in ("", None):
-                    continue
-                field_label = self._field_label(template.get(field_key, {}), field_key)
                 conn.execute(
-                    "INSERT INTO order_fields (id, order_id, field_key, field_label, field_value) VALUES (?, ?, ?, ?, ?)",
-                    (f"{order_id}_field_{field_index}", order_id, field_key, field_label, str(field_value)),
+                    """
+                    INSERT INTO orders (
+                        id, order_number, user_id, platform_section_id, product_category_id, product_id,
+                        product_name_snapshot, option_name_snapshot, target_value, contact_phone,
+                        quantity, unit_price, total_price, status, notes_json, idempotency_key, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        order_id,
+                        order_number,
+                        user_id,
+                        product["platform_section_id"],
+                        product["category_id"],
+                        product["id"],
+                        product["name"],
+                        product["option_name"],
+                        target_value,
+                        contact_phone,
+                        quantity,
+                        product["price"],
+                        total_price,
+                        "queued",
+                        as_json(notes),
+                        idempotency_key,
+                        timestamp,
+                        timestamp,
+                    ),
                 )
 
-            conn.execute(
-                "UPDATE users SET balance = ?, updated_at = ? WHERE id = ?",
-                (balance_after, timestamp, user_id),
-            )
-            self._set_wallet_balances(conn, user_id, available_balance=balance_after)
-            conn.execute(
-                "INSERT INTO balance_transactions (id, user_id, amount, balance_after, kind, memo, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    f"tx_{order_id}",
+                template = form_structure.get("template", {})
+                for field_index, (field_key, field_value) in enumerate(fields.items()):
+                    if field_value in ("", None):
+                        continue
+                    field_label = self._field_label(template.get(field_key, {}), field_key)
+                    conn.execute(
+                        "INSERT INTO order_fields (id, order_id, field_key, field_label, field_value) VALUES (?, ?, ?, ?, ?)",
+                        (f"{order_id}_field_{field_index}", order_id, field_key, field_label, str(field_value)),
+                    )
+
+                balance_after = self._change_wallet_available_balance(
+                    conn,
                     user_id,
                     -total_price,
-                    balance_after,
-                    "order",
-                    f"{product['name']} 주문",
-                    timestamp,
-                ),
-            )
-            self._append_wallet_ledger_entry(
-                conn,
-                ledger_id=f"ledger_{order_id}",
-                user_id=user_id,
-                entry_type="order_debit",
-                amount=-total_price,
-                balance_after=balance_after,
-                memo=f"{product['name']} 주문",
-                related_order_id=order_id,
-                created_at=timestamp,
-            )
-            conn.commit()
+                    require_sufficient=True,
+                    timestamp=timestamp,
+                )
+                conn.execute(
+                    "INSERT INTO balance_transactions (id, user_id, amount, balance_after, kind, memo, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        f"tx_{order_id}",
+                        user_id,
+                        -total_price,
+                        balance_after,
+                        "order",
+                        f"{product['name']} 주문",
+                        timestamp,
+                    ),
+                )
+                self._append_wallet_ledger_entry(
+                    conn,
+                    ledger_id=f"ledger_{order_id}",
+                    user_id=user_id,
+                    entry_type="order_debit",
+                    amount=-total_price,
+                    balance_after=balance_after,
+                    memo=f"{product['name']} 주문",
+                    related_order_id=order_id,
+                    created_at=timestamp,
+                )
+                conn.commit()
+        except Exception as exc:
+            if idempotency_key and is_unique_constraint_error(exc):
+                existing_order = self._existing_order_by_idempotency(user_id, idempotency_key)
+                if existing_order is not None:
+                    return existing_order
+            raise
 
         supplier_dispatch = None
         if supplier_mapping and product_data is not None:
@@ -9071,11 +10190,13 @@ class PanelStore:
         response_payload: Any = {}
 
         try:
+            api_key = decrypt_secret_value(mapping["api_key"])
+            bearer_token = decrypt_secret_value(mapping.get("bearer_token") or "")
             client = SupplierApiClient(
                 str(mapping["api_url"]),
-                str(mapping["api_key"]),
+                api_key,
                 integration_type=str(mapping.get("integration_type") or SUPPLIER_INTEGRATION_CLASSIC),
-                bearer_token=str(mapping.get("bearer_token") or ""),
+                bearer_token=bearer_token,
             )
             response_payload = client.order(request_payload)
             if isinstance(response_payload, dict):

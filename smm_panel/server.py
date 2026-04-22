@@ -351,13 +351,19 @@ class UserSessionStore:
 
 
 def read_json(handler: SimpleHTTPRequestHandler) -> Dict[str, Any]:
+    payload, _ = read_json_with_raw_body(handler)
+    return payload
+
+
+def read_json_with_raw_body(handler: SimpleHTTPRequestHandler) -> tuple[Dict[str, Any], bytes]:
     length = int(handler.headers.get("Content-Length", "0"))
     if not length:
-        return {}
+        return {}, b""
     if length > MAX_JSON_BODY_BYTES:
         raise PanelError("요청 본문이 너무 큽니다.", status=413)
+    raw_body = handler.rfile.read(length)
     try:
-        return json.loads(handler.rfile.read(length).decode("utf-8"))
+        return json.loads(raw_body.decode("utf-8")), raw_body
     except json.JSONDecodeError as exc:
         raise PanelError("요청 형식이 올바르지 않습니다.", status=400) from exc
 
@@ -891,7 +897,7 @@ class AppHandler(SimpleHTTPRequestHandler):
         self._request_path = parsed.path
         try:
             if parsed.path == "/api/payments/webhook":
-                payload = read_json(self)
+                payload, raw_body = read_json_with_raw_body(self)
                 write_json(
                     self,
                     200,
@@ -900,6 +906,11 @@ class AppHandler(SimpleHTTPRequestHandler):
                         **self._server().store.process_payment_webhook(
                             payload,
                             provided_secret=self.headers.get("X-SMM-Webhook-Secret", ""),
+                            provided_signature=self.headers.get("X-SMM-Webhook-Signature", "")
+                            or self.headers.get("X-Payment-Signature", ""),
+                            provided_timestamp=self.headers.get("X-SMM-Webhook-Timestamp", "")
+                            or self.headers.get("X-Payment-Timestamp", ""),
+                            raw_body=raw_body,
                         ),
                     },
                 )
@@ -1077,6 +1088,7 @@ class AppHandler(SimpleHTTPRequestHandler):
             if parsed.path.startswith("/api/admin/"):
                 session = self._require_admin_auth()
                 self._require_admin_csrf(session)
+                payload["_adminActor"] = str(session.get("username") or "admin")
             if parsed.path == "/api/logout":
                 session = self._public_session()
                 if session is not None:
@@ -1142,6 +1154,9 @@ class AppHandler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/admin/customers/balance":
                 write_json(self, 200, {"ok": True, **self._server().store.adjust_customer_balance(payload)})
                 return
+            if parsed.path == "/api/admin/charge-orders/action":
+                write_json(self, 200, {"ok": True, **self._server().store.admin_update_charge_order(payload)})
+                return
             if parsed.path == "/api/admin/categories":
                 write_json(self, 200, {"ok": True, **self._server().store.save_category(payload)})
                 return
@@ -1157,12 +1172,40 @@ class AppHandler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/admin/orders/status":
                 write_json(self, 200, {"ok": True, **self._server().store.update_admin_order_status(payload)})
                 return
+            if parsed.path == "/api/admin/orders/retry-supplier":
+                write_json(self, 200, {"ok": True, **self._server().store.retry_supplier_order(payload)})
+                return
+            if parsed.path == "/api/admin/orders/supplier-status":
+                write_json(self, 200, {"ok": True, **self._server().store.refresh_supplier_order_status(payload)})
+                return
+            if parsed.path == "/api/admin/notices":
+                write_json(self, 200, {"ok": True, **self._server().store.save_notice(payload)})
+                return
+            if parsed.path == "/api/admin/notices/delete":
+                write_json(self, 200, {"ok": True, **self._server().store.delete_notice(payload)})
+                return
+            if parsed.path == "/api/admin/faqs":
+                write_json(self, 200, {"ok": True, **self._server().store.save_faq(payload)})
+                return
+            if parsed.path == "/api/admin/faqs/delete":
+                write_json(self, 200, {"ok": True, **self._server().store.delete_faq(payload)})
+                return
             if parsed.path == "/api/admin/suppliers/test":
                 write_json(self, 200, {"ok": True, **self._server().store.test_supplier_connection(payload)})
                 return
             if parsed.path.startswith("/api/admin/suppliers/") and parsed.path.endswith("/sync-services"):
                 supplier_id = parsed.path.split("/")[4]
-                write_json(self, 200, {"ok": True, **self._server().store.sync_supplier_services(supplier_id)})
+                write_json(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        **self._server().store.sync_supplier_services(
+                            supplier_id,
+                            actor=str(payload.get("_adminActor") or "admin"),
+                        ),
+                    },
+                )
                 return
             if parsed.path == "/api/admin/mappings":
                 write_json(self, 200, {"ok": True, **self._server().store.save_product_mapping(payload)})
