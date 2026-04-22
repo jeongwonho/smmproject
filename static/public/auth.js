@@ -8,7 +8,7 @@ function enabledProviders(authConfig) {
 
 function brandMarkup(siteSettings, escapeHtml) {
   const siteName = escapeHtml(siteSettings?.siteName || "인스타마트");
-  const logoUrl = String(DEFAULT_LIGHT_BRAND_LOGO_URL || siteSettings?.headerLogoUrl || "").trim();
+  const logoUrl = String(siteSettings?.headerLogoUrl || DEFAULT_LIGHT_BRAND_LOGO_URL || "").trim();
   return `
     <div class="auth-brand">
       ${
@@ -169,11 +169,6 @@ function signupVerifyStepMarkup(signupState, escapeHtml) {
         ${expiresAt ? `<span>코드 만료: ${escapeHtml(expiresAt)}</span>` : ""}
         ${resendAvailableAt ? `<span>재전송 가능: ${escapeHtml(resendAvailableAt)}</span>` : ""}
       </div>
-      ${
-        signupState.previewCode
-          ? `<div class="auth-dev-preview"><strong>개발용 코드</strong><span>${escapeHtml(signupState.previewCode)}</span></div>`
-          : ""
-      }
     </div>
   `;
 }

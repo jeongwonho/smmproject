@@ -65,7 +65,7 @@ function renderHomeFooter(data) {
   const detailRows = [
     ["서비스명", siteName],
     ["운영자", data?.company?.representative || "운영 관리자"],
-    ["문의", data?.company?.contact || "support@example.com"],
+    ["문의", data?.company?.contact || "고객센터 문의"],
     ["운영시간", data?.company?.hours || "평일 10:00 - 19:00"],
   ];
 
@@ -184,22 +184,6 @@ function buildHomeHeroStats(formatNumber) {
   ];
 }
 
-function renderInterestTags(tags = []) {
-  const { escapeHtml } = useRuntime();
-  if (!tags.length) return "";
-  return `
-    <div class="home-interest-row">
-      ${tags
-        .map(
-          (tag) => `
-            <button class="interest-tag" type="button" data-route="${escapeHtml(tag.route)}">${escapeHtml(tag.title)}</button>
-          `
-        )
-        .join("")}
-    </div>
-  `;
-}
-
 export function renderAuthPage() {
   const { getRoute, state, escapeHtml } = useRuntime();
   const route = getRoute();
@@ -256,6 +240,7 @@ export function renderHome() {
   const featuredServices = (data.featuredServices || []).slice(0, 6);
   const supportLinks = (data.supportLinks || []).slice(0, 3);
   const heroStats = buildHomeHeroStats(formatNumber);
+  const loginCardRoute = "/products";
 
   return renderFrame(
     `
@@ -282,11 +267,11 @@ export function renderHome() {
             <button
               class="home-login-card ${authenticated ? "is-authenticated" : ""}"
               type="button"
-              ${authenticated ? 'data-route="/my"' : 'data-route="/auth"'}
+              data-route="${loginCardRoute}"
             >
               <div class="home-login-card__copy">
                 <strong>${escapeHtml(authenticated ? `${user.name}님, 바로 주문할까요?` : "지금 필요한 서비스를 바로 찾으세요")}</strong>
-                <span>${escapeHtml(authenticated ? `보유 캐시 ${user.balanceLabel} · 누적 주문 ${formatNumber(state.orderCounts.all || 0)}건` : "플랫폼을 고르고 상품을 확인한 뒤 바로 주문까지 이어갈 수 있습니다.")}</span>
+                <span>${escapeHtml(authenticated ? `보유 캐시 ${user.balanceLabel} · 상품 선택 후 바로 주문할 수 있습니다.` : "로그인은 주문 직전만 필요합니다. 먼저 상품과 가격부터 확인하세요.")}</span>
               </div>
               <span class="home-login-card__arrow">›</span>
             </button>
@@ -337,9 +322,16 @@ export function renderHome() {
               )
               .join("")}
           </div>
-          <div class="home-sales-strip">
-            <span class="mini-badge">빠른 선택</span>
-            <p>자주 찾는 플랫폼부터 바로 들어가고, 상세에서 가격과 정책을 확인한 뒤 주문하세요.</p>
+          <div class="home-sales-strip home-sales-strip--steps">
+            <div class="home-sales-strip__head">
+              <span class="mini-badge">빠른 선택</span>
+              <p>상품 확인부터 주문까지 3단계로 진행됩니다.</p>
+            </div>
+            <div class="home-sales-steps" aria-label="주문 흐름">
+              <span class="home-sales-step"><b>1</b> 플랫폼 선택</span>
+              <span class="home-sales-step"><b>2</b> 가격 확인</span>
+              <span class="home-sales-step"><b>3</b> 충전 후 주문</span>
+            </div>
           </div>
         </section>
 
@@ -450,6 +442,7 @@ export function renderProducts() {
   const platforms = filteredCatalog();
   const activePlatform = getCurrentPlatform(platforms);
   const activeProductCount = activePlatform ? activePlatform.groups.reduce((total, group) => total + group.productCategories.length, 0) : 0;
+  const firstCategory = activePlatform?.groups?.flatMap((group) => group.productCategories)?.[0] || null;
 
   return renderFrame(
     `
@@ -476,6 +469,26 @@ export function renderProducts() {
               <h2>상품 목록</h2>
               <p>${escapeHtml(activePlatform ? `${activePlatform.displayName} 카테고리 ${activeProductCount}개` : "검색어에 맞는 플랫폼과 상품을 찾지 못했습니다.")}</p>
             </div>
+            ${
+              activePlatform
+                ? `
+                  <div class="catalog-entry-card">
+                    <div>
+                      <strong>로그인 없이 상품을 먼저 비교하세요</strong>
+                      <p>가격, 수량, 예상 소요시간, 주의사항을 확인한 뒤 주문 직전에 로그인하면 됩니다.</p>
+                    </div>
+                    <div class="catalog-entry-actions">
+                      ${
+                        firstCategory
+                          ? `<button class="catalog-entry-action is-primary" type="button" data-route="/products/${firstCategory.id}">첫 상품 보기</button>`
+                          : ""
+                      }
+                      <button class="catalog-entry-action" type="button" data-route="/help">주문 가이드</button>
+                    </div>
+                  </div>
+                `
+                : ""
+            }
             <aside class="platform-rail public-platform-rail">
               ${platforms
                 .map(
@@ -501,14 +514,20 @@ export function renderProducts() {
               activePlatform
                 ? `
                   <div class="catalog-hero catalog-hero--public">
-                    <span class="catalog-hero__eyebrow">${escapeHtml(activePlatform.displayName)}</span>
-                    <h2>${escapeHtml(activePlatform.description)}</h2>
-                    <div class="catalog-hero__summary">
-                      <span class="meta-chip">${escapeHtml(String(activePlatform.groups.length))}개 그룹</span>
-                      <span class="meta-chip">${escapeHtml(String(activeProductCount))}개 카테고리</span>
-                      <button class="meta-chip meta-chip--button" type="button" data-route="/help">이용 가이드</button>
+                      <span class="catalog-hero__eyebrow">${escapeHtml(activePlatform.displayName)}</span>
+                      <h2>${escapeHtml(activePlatform.description)}</h2>
+                      <div class="catalog-hero__summary">
+                        <span class="meta-chip">${escapeHtml(String(activePlatform.groups.length))}개 그룹</span>
+                        <span class="meta-chip">${escapeHtml(String(activeProductCount))}개 카테고리</span>
+                        <span class="meta-chip">로그인 없이 탐색</span>
+                        <button class="meta-chip meta-chip--button" type="button" data-route="/help">이용 가이드</button>
+                      </div>
                     </div>
-                  </div>
+                    <div class="catalog-purchase-strip" aria-label="구매 전 확인사항">
+                      <span class="catalog-purchase-point">가격 공개</span>
+                      <span class="catalog-purchase-point">입력값 검수</span>
+                      <span class="catalog-purchase-point">정책 확인 후 주문</span>
+                    </div>
                   ${activePlatform.groups
                     .map(
                       (group) => `
@@ -534,9 +553,10 @@ export function renderProducts() {
                                       <div class="catalog-card__meta">
                                         <span>${escapeHtml(category.startingPriceLabel)}부터</span>
                                         <span>${escapeHtml(String(category.optionCount))}개 옵션</span>
+                                        <span>상세에서 정책 확인</span>
                                       </div>
                                     </div>
-                                    <span class="catalog-card__arrow">›</span>
+                                    <span class="catalog-card__cta">보기</span>
                                   </button>
                                 `
                               )
@@ -551,8 +571,11 @@ export function renderProducts() {
                   <div class="empty-card">
                     <span class="empty-card__eyebrow">NO RESULT</span>
                     <strong>검색 결과가 없습니다.</strong>
-                    <p>다른 키워드로 다시 검색해 주세요.</p>
-                    <button class="ghost-secondary-button" type="button" data-route="/help">상품 찾는 방법 보기</button>
+                    <p>플랫폼명이나 서비스명을 짧게 입력해 보세요. 원하는 상품이 없으면 상담 안내에서 요청할 수 있습니다.</p>
+                    <div class="empty-card__actions">
+                      <button class="ghost-secondary-button" type="button" data-route="/products" data-clear-search>전체 상품 보기</button>
+                      <button class="ghost-secondary-button" type="button" data-route="/help">상품 찾는 방법</button>
+                    </div>
                   </div>
                 `
             }
@@ -586,6 +609,11 @@ export function renderDetail(detail) {
   const previewSource = getPreviewSource(detail, selectedProduct);
   const orderValidation = getOrderValidationState(detail, selectedProduct);
   const loggedIn = isLoggedIn();
+  const stickyHint = orderValidation.blocked
+    ? orderValidation.reason || "입력값을 확인해 주세요."
+    : loggedIn
+      ? "보유금액에서 차감 후 주문이 접수됩니다."
+      : "로그인 후 주문과 내역 관리를 이어갑니다.";
 
   return renderFrame(
     `
@@ -626,14 +654,28 @@ export function renderDetail(detail) {
           </div>
         </section>
 
+        <section class="content-section content-section--tight">
+          <div class="detail-checklist-card">
+            <div class="detail-checklist-card__head">
+              <strong>주문 전 핵심 체크</strong>
+              <span>확인 후 주문하면 반려 가능성이 줄어듭니다.</span>
+            </div>
+            <div class="detail-checklist-card__grid">
+              <span class="detail-checklist-card__item">계정·게시물 공개 상태</span>
+              <span class="detail-checklist-card__item">링크 형식 정상 여부</span>
+              <span class="detail-checklist-card__item">환불·리필 기준</span>
+            </div>
+          </div>
+        </section>
+
         ${
           !loggedIn
             ? `
               <section class="content-section">
                 <div class="detail-login-gate">
                   <div class="detail-login-gate__copy">
-                    <strong>상품 확인 후 로그인하면 바로 주문을 이어갈 수 있습니다</strong>
-                    <p>주문·충전·내역 확인은 고객 계정에서만 관리됩니다. 상품 탐색과 정책 확인은 로그인 없이 가능합니다.</p>
+                    <strong>주문 직전 로그인하면 됩니다</strong>
+                    <p>상품 탐색과 정책 확인은 열려 있습니다. 주문·충전·내역 관리는 로그인 후 이용할 수 있습니다.</p>
                   </div>
                   <button class="full-width-cta" type="button" data-route="/auth">로그인 / 회원가입</button>
                 </div>
@@ -648,7 +690,7 @@ export function renderDetail(detail) {
               <section class="content-section">
                 <div class="section-head section-head--compact">
                   <h2>${escapeHtml(detail.optionLabelName || "옵션 선택")}</h2>
-                  <p>레퍼런스의 옵션 칩 UI를 참고해 한 화면에서 바로 비교할 수 있게 구성했습니다.</p>
+                  <p>옵션별 가격과 조건을 한 화면에서 비교한 뒤 바로 주문할 수 있습니다.</p>
                 </div>
                 <div class="option-chip-row">
                   ${detail.products
@@ -770,7 +812,7 @@ export function renderDetail(detail) {
         <section class="content-section">
           <div class="section-head section-head--compact">
             <h2>서비스 설명</h2>
-            <p>HTML 상세 설명 영역도 로컬 DB에서 읽어와 동일한 흐름으로 붙였습니다.</p>
+            <p>서비스 진행 방식과 주문 전 확인사항을 정리했습니다.</p>
           </div>
           <article class="html-card">${detail.serviceDescriptionHtml}</article>
         </section>
@@ -806,6 +848,7 @@ export function renderDetail(detail) {
         <div class="sticky-order-bar__price">
           <span>총 결제금액</span>
           <strong id="sticky-total">${escapeHtml(summary ? formatMoney(summary.total) : "0원")}</strong>
+          <em data-order-sticky-hint>${escapeHtml(stickyHint)}</em>
         </div>
         <button class="sticky-order-bar__button" type="submit" form="order-form" data-order-submit-button ${orderValidation.blocked ? "disabled" : ""}>
           ${orderValidation.blocked ? "주문 불가" : loggedIn ? "주문하기" : "로그인 후 주문"}
@@ -901,8 +944,11 @@ export function renderOrders() {
               : `
                 <article class="empty-card">
                   <strong>${activeFilter === "all" ? "주문 내역이 아직 없습니다." : "이 상태의 주문이 없습니다."}</strong>
-                  <p>서비스를 탐색한 뒤 첫 주문을 생성하거나, 필터를 바꿔 다른 상태의 주문을 확인해 주세요.</p>
-                  <button class="full-width-cta" type="button" data-route="/products">서비스 둘러보기</button>
+                  <p>상품을 먼저 둘러보고 가격과 정책을 확인한 뒤 첫 주문을 시작해 보세요.</p>
+                  <div class="empty-card__actions">
+                    <button class="full-width-cta" type="button" data-route="/products">서비스 둘러보기</button>
+                    <button class="ghost-secondary-button" type="button" data-route="/help">주문 전 가이드</button>
+                  </div>
                 </article>
               `}
           </div>
@@ -949,6 +995,19 @@ export function renderMy() {
               <strong>회원 등급</strong>
               <p>${escapeHtml(data.user.tier)}</p>
             </article>
+          </div>
+        </section>
+
+        <section class="content-section content-section--tight">
+          <div class="my-action-strip">
+            <button class="my-primary-action" type="button" data-route="/products">
+              <span>바로 주문</span>
+              <strong>상품 선택하기</strong>
+            </button>
+            <button class="my-primary-action" type="button" data-route="/charge">
+              <span>보유금액</span>
+              <strong>충전하기</strong>
+            </button>
           </div>
         </section>
 

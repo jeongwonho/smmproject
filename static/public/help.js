@@ -52,7 +52,7 @@ export function renderHelpMarkup({ data, escapeHtml }) {
         </div>
         <article class="guide-card help-contact-card">
           <strong>운영 문의</strong>
-          <p>문의 채널: ${escapeHtml(company.contact || "support@example.com")}</p>
+          <p>문의 채널: ${escapeHtml(company.contact || "고객센터 문의 채널")}</p>
           <p>운영 시간: ${escapeHtml(company.hours || "평일 10:00 - 19:00")}</p>
         </article>
       </section>
@@ -148,7 +148,7 @@ export function renderLegalPageMarkup({ documentItem, escapeHtml }) {
           <span class="mini-badge">v${escapeHtml(documentItem.version)}</span>
           <h2>${escapeHtml(documentItem.title)}</h2>
           <p>${escapeHtml(documentItem.summary)}</p>
-          <div class="legal-card__note">아래 내용은 서비스 운영에 맞춰 관리자에서 갱신할 수 있는 정책 전문 영역입니다.</div>
+          <div class="legal-card__note">주문 전 확인해야 하는 서비스 정책 전문입니다.</div>
           <div class="guide-list">
             ${documentItem.body.map((line) => `<article class="guide-card"><p>${escapeHtml(line)}</p></article>`).join("")}
           </div>

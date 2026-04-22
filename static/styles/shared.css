@@ -173,7 +173,6 @@ select {
 
 .chip-link,
 .platform-pill,
-.interest-tag,
 .filter-chip,
 .charge-chip,
 .option-chip {
@@ -1012,20 +1011,6 @@ select {
   margin-top: 10px;
 }
 
-.interest-grid {
-  flex-wrap: wrap;
-  overflow: visible;
-}
-
-.interest-tag {
-  padding: 11px 14px;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  box-shadow: var(--shadow-sm);
-  color: var(--text);
-  font-size: 0.84rem;
-}
-
 .full-width-cta {
   width: 100%;
   margin-top: 14px;
@@ -1037,7 +1022,6 @@ select {
 
 .spotlight-list,
 .benefit-list,
-.transaction-list,
 .order-list,
 .notice-list,
 .faq-list,
@@ -1053,7 +1037,6 @@ select {
 .support-card,
 .benefit-card,
 .catalog-card,
-.transaction-card,
 .order-card,
 .notice-card,
 .guide-card,
@@ -1062,8 +1045,7 @@ select {
 .detail-form-card,
 .html-card,
 .empty-card,
-.profile-card,
-.wallet-board {
+.profile-card {
   background: var(--surface);
   border: 1px solid rgba(221, 228, 246, 0.92);
   box-shadow: var(--shadow-sm);
@@ -1099,13 +1081,11 @@ select {
 
 .spotlight-card__copy strong,
 .catalog-card__title strong,
-.transaction-card strong,
 .order-card strong,
 .notice-card strong,
 .guide-card strong,
 .related-card strong,
-.profile-card strong,
-.wallet-board strong {
+.profile-card strong {
   display: block;
   font-size: 0.96rem;
   letter-spacing: -0.02em;
@@ -1122,7 +1102,6 @@ select {
 .html-card p,
 .footer-meta p,
 .footer-fold__copyright,
-.wallet-board span,
 .profile-card p,
 .profile-card span,
 .empty-card p,
@@ -1170,7 +1149,6 @@ select {
 }
 
 .benefit-card,
-.transaction-card,
 .order-card,
 .notice-card,
 .guide-card,
@@ -1600,7 +1578,6 @@ select {
 .option-chip.is-active,
 .filter-chip.is-active,
 .charge-chip:hover,
-.interest-tag:hover,
 .platform-pill:hover,
 .catalog-card:hover,
 .spotlight-card:hover,
@@ -1911,31 +1888,6 @@ select {
   flex-shrink: 0;
 }
 
-.wallet-board {
-  margin: 16px 20px 0;
-  padding: 22px 20px;
-  border-radius: 28px;
-  background:
-    radial-gradient(circle at top right, rgba(255, 255, 255, 0.18), transparent 24%),
-    linear-gradient(135deg, #1d2736 0%, #2e3b50 100%);
-  color: #ffffff;
-}
-
-.wallet-board__eyebrow {
-  margin: 0;
-  color: rgba(255, 255, 255, 0.66);
-  font-size: 0.82rem;
-}
-
-.wallet-board strong {
-  margin-top: 8px;
-  font-size: 1.54rem;
-}
-
-.wallet-board span {
-  color: rgba(255, 255, 255, 0.74);
-}
-
 .detail-trust-row {
   display: grid;
   gap: 12px;
@@ -1960,24 +1912,11 @@ select {
   font-size: 0.84rem;
 }
 
-.transaction-card,
 .order-card,
 .notice-card {
   display: flex;
   justify-content: space-between;
   gap: 14px;
-}
-
-.transaction-card__amount {
-  text-align: right;
-}
-
-.transaction-card__amount.is-positive strong {
-  color: var(--mint);
-}
-
-.transaction-card__amount.is-negative strong {
-  color: #ef4444;
 }
 
 .order-card {
@@ -2031,6 +1970,16 @@ select {
 .status-pill.is-complete {
   background: rgba(16, 185, 129, 0.12);
   color: #047857;
+}
+
+.status-pill.is-failed {
+  background: rgba(239, 68, 68, 0.12);
+  color: #b91c1c;
+}
+
+.status-pill.is-cancelled {
+  background: rgba(100, 116, 139, 0.14);
+  color: #475569;
 }
 
 .profile-card {
@@ -4099,52 +4048,6 @@ select {
   gap: 12px 10px;
 }
 
-.home-platform-stack {
-  position: relative;
-}
-
-.home-platform-scroller {
-  max-height: 436px;
-  overflow-y: auto;
-  overscroll-behavior-y: auto;
-  -webkit-overflow-scrolling: touch;
-  touch-action: pan-y;
-  padding-bottom: 26px;
-  scrollbar-width: none;
-}
-
-.home-platform-scroller::-webkit-scrollbar {
-  display: none;
-}
-
-.home-platform-scroller__fade {
-  position: absolute;
-  right: 0;
-  bottom: 34px;
-  left: 0;
-  height: 116px;
-  pointer-events: none;
-  background: linear-gradient(180deg, rgba(247, 249, 255, 0) 0%, rgba(247, 249, 255, 0.92) 50%, rgba(247, 249, 255, 1) 100%);
-}
-
-.home-platform-scroller__hint {
-  position: absolute;
-  right: 10px;
-  bottom: 0;
-  left: 10px;
-  min-height: 26px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.9);
-  color: var(--text-secondary);
-  font-size: 0.74rem;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-  box-shadow: 0 10px 26px rgba(35, 53, 110, 0.08);
-}
-
 .home-platform-card {
   min-width: 0;
   display: flex;
@@ -4249,16 +4152,6 @@ select {
 
 .banner-dots--home {
   margin-top: 12px;
-}
-
-.home-section-grid {
-  display: grid;
-  gap: 20px;
-}
-
-.home-section-grid__main,
-.home-section-grid__side {
-  min-width: 0;
 }
 
 .support-grid--compact .support-card {
@@ -4557,11 +4450,6 @@ select {
     height: 78px;
     border-radius: 24px;
     font-size: 1.24rem;
-  }
-
-  .home-section-grid {
-    grid-template-columns: minmax(0, 1.15fr) minmax(340px, 0.85fr);
-    align-items: start;
   }
 
   .support-grid--compact {
@@ -4974,13 +4862,6 @@ select {
   height: 100%;
   object-fit: contain;
   display: block;
-}
-
-.transaction-card__submeta {
-  margin: 6px 0 0;
-  color: #6a7591;
-  font-size: 0.82rem;
-  line-height: 1.5;
 }
 
 .admin-erp-header__summary {

@@ -383,14 +383,18 @@ function renderAdminActiveSection(sectionId, context) {
     renderSupplierAdminSection,
     renderCustomerAdminSection,
     renderCatalogAdminSection,
+    renderAdminChargesSection,
+    renderContentAdminSection,
     renderAdminOrdersSection,
     renderAdminOverviewSection,
   } = useRuntime();
   if (sectionId === "analytics") return renderAnalyticsAdminSection();
   if (sectionId === "settings") return renderSiteSettingsAdminSection();
   if (sectionId === "popup") return renderPopupAdminSection();
+  if (sectionId === "content") return renderContentAdminSection();
   if (sectionId === "suppliers") return renderSupplierAdminSection(context);
   if (sectionId === "customers") return renderCustomerAdminSection();
+  if (sectionId === "charges") return renderAdminChargesSection();
   if (sectionId === "catalog") return renderCatalogAdminSection();
   if (sectionId === "orders") return renderAdminOrdersSection();
   return renderAdminOverviewSection(context.stats, context.popup);

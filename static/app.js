@@ -76,6 +76,8 @@ const state = {
     adminAnalyticsRange: "30d",
     adminCustomerFilter: "all",
     adminCustomerSearch: "",
+    adminChargeFilter: "all",
+    adminChargeSearch: "",
     adminSupplierMode: "edit",
     adminSelectedPlatformSectionId: "",
     adminSelectedSupplierId: "",
@@ -91,6 +93,11 @@ const state = {
     adminSelectedManageProductId: "",
     adminOrderFilter: "all",
     adminOrderSearch: "",
+    adminContentTab: "notices",
+    adminNoticeMode: "edit",
+    adminSelectedNoticeId: "",
+    adminFaqMode: "edit",
+    adminSelectedFaqId: "",
     closedPopups: {},
   },
 };
@@ -110,6 +117,8 @@ const statusMap = {
   queued: { label: "접수 대기", className: "is-queued" },
   in_progress: { label: "진행 중", className: "is-progress" },
   completed: { label: "완료", className: "is-complete" },
+  failed: { label: "실패", className: "is-failed" },
+  cancelled: { label: "취소", className: "is-cancelled" },
 };
 
 const navItems = [
@@ -132,8 +141,10 @@ const adminSectionBlueprints = [
   { id: "analytics", label: "통계", icon: "▥", description: "매출, 방문, 유입, 재구매", title: "통계 분석 센터", summary: "매출, 방문자, 유입 경로, 재구매 흐름을 하나의 워크스페이스에서 분석합니다." },
   { id: "settings", label: "기본 설정", icon: "⚙", description: "사이트명, 메타, 파비콘", title: "사이트 기본 설정", summary: "사이트 이름, 설명, 메일·SMS 표기, 파비콘, 대표 이미지를 실제 사이트에 반영합니다." },
   { id: "popup", label: "팝업/노출", icon: "▣", description: "메인 팝업 노출 관리", title: "홈 노출 관리", summary: "메인 팝업과 홈 프로모션 노출을 관리합니다." },
+  { id: "content", label: "콘텐츠", icon: "≡", description: "공지, FAQ, 운영 로그", title: "콘텐츠/운영 로그", summary: "공지사항, FAQ, 관리자 작업 로그를 관리합니다." },
   { id: "suppliers", label: "공급사", icon: "⇄", description: "API 연결과 서비스 동기화", title: "공급사 연동 센터", summary: "공급사 API 연결, 서비스 동기화, 상품 매핑을 운영합니다." },
   { id: "customers", label: "회원정보", icon: "☻", description: "계정, 잔액, 운영 메모", title: "고객/계정 관리", summary: "회원 계정, 등급, 잔액, 내부 운영 메모를 관리합니다." },
+  { id: "charges", label: "충전관리", icon: "₩", description: "입금 확인과 결제 상태", title: "충전 운영 센터", summary: "충전 주문, 입금 확인, 실패/취소 상태를 관리합니다." },
   { id: "catalog", label: "상품관리", icon: "▤", description: "카테고리와 상품 편집", title: "카탈로그 관리", summary: "카테고리와 상품 편집, 정렬, 판매 노출 상태를 관리합니다." },
   { id: "orders", label: "주문통제", icon: "◎", description: "상태 변경과 처리 메모", title: "주문 운영 센터", summary: "주문 상태 변경과 운영 메모를 기록하고 처리 현황을 추적합니다." },
 ];
@@ -377,8 +388,10 @@ function adminSectionItems(stats = {}, popup = null) {
     if (section.id === "analytics") stat = `${formatCompactNumber(stats.visitorCount || 0)}명`;
     if (section.id === "settings") stat = siteSettings?.siteName || "설정";
     if (section.id === "popup") stat = popup?.isActive ? "노출중" : "꺼짐";
+    if (section.id === "content") stat = `${Number(state.adminBootstrap?.notices?.length || 0)}개 공지`;
     if (section.id === "suppliers") stat = `${Number(stats.supplierCount || 0)}개`;
     if (section.id === "customers") stat = `${Number(stats.customerCount || 0)}명`;
+    if (section.id === "charges") stat = `${Number(stats.pendingChargeCount || 0)}대기`;
     if (section.id === "catalog") stat = `${Number(stats.productCount || 0)}개`;
     if (section.id === "orders") stat = `${Number(stats.orderCount || 0)}건`;
     return { ...section, stat };
@@ -642,46 +655,6 @@ function setHomeBannerIndex(nextIndex, { render = false } = {}) {
   });
 }
 
-function updateHomePlatformScrollerState(scroller = document.querySelector("[data-home-platform-scroller]")) {
-  if (!scroller) return;
-  const stack = scroller.closest("[data-home-platform-stack]");
-  const fade = stack?.querySelector("[data-home-platform-fade]");
-  const hint = stack?.querySelector("[data-home-platform-hint]");
-  const remaining = Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop);
-  const isScrollable = scroller.scrollHeight - scroller.clientHeight > 12;
-  const isEnd = remaining <= 6;
-  scroller.classList.toggle("is-scrollable", isScrollable);
-  scroller.classList.toggle("is-end", isEnd);
-  if (fade) fade.hidden = !isScrollable || isEnd;
-  if (hint) hint.hidden = !isScrollable || isEnd;
-}
-
-function getHomePlatformScroller(target) {
-  if (!(target instanceof Element)) return null;
-  return target.closest("[data-home-platform-scroller]");
-}
-
-function homePlatformScrollerAtBoundary(scroller, deltaY) {
-  if (!scroller || !deltaY) return false;
-  const maxScrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
-  if (deltaY > 0) {
-    return scroller.scrollTop >= maxScrollTop - 2;
-  }
-  return scroller.scrollTop <= 2;
-}
-
-function relayHomePlatformScroll(scroller, deltaY) {
-  const pageScroller = document.scrollingElement || document.documentElement;
-  if (!pageScroller || !deltaY) return;
-  pageScroller.scrollTop += deltaY;
-  updateHomePlatformScrollerState(scroller);
-}
-
-const homePlatformTouchState = {
-  scroller: null,
-  lastY: 0,
-};
-
 function readFileAsDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -917,6 +890,48 @@ function productToDraft(product) {
   };
 }
 
+function blankNoticeDraft() {
+  return {
+    id: "",
+    title: "",
+    body: "",
+    tag: "공지",
+    pinned: false,
+    publishedAt: new Date().toISOString(),
+  };
+}
+
+function noticeToDraft(notice) {
+  if (!notice) return blankNoticeDraft();
+  return {
+    id: notice.id || "",
+    title: notice.title || "",
+    body: notice.body || "",
+    tag: notice.tag || "공지",
+    pinned: Boolean(notice.pinned),
+    publishedAt: notice.publishedAt || new Date().toISOString(),
+  };
+}
+
+function blankFaqDraft() {
+  return {
+    id: "",
+    question: "",
+    answer: "",
+    sortOrder: 0,
+  };
+}
+
+function faqToDraft(faq) {
+  if (!faq) return blankFaqDraft();
+  return {
+    id: faq.id || "",
+    question: faq.question || "",
+    answer: faq.answer || "",
+    sortOrder: Number(faq.sortOrder || 0),
+  };
+}
+
 function getAdminSuppliers() {
   return state.adminBootstrap?.suppliers || [];
 }
@@ -927,6 +942,10 @@ function getAdminProducts() {
 
 function getAdminCustomers() {
   return state.adminBootstrap?.customers || [];
+}
+
+function getAdminChargeOrders() {
+  return state.adminBootstrap?.adminChargeOrders || [];
 }
 
 function getAdminCategories() {
@@ -1091,6 +1110,18 @@ function getAdminAnalytics() {
   return state.adminBootstrap?.analytics || null;
 }
 
+function getAdminNotices() {
+  return state.adminBootstrap?.notices || [];
+}
+
+function getAdminFaqs() {
+  return state.adminBootstrap?.faqs || [];
+}
+
+function getAdminAuditLogs() {
+  return state.adminBootstrap?.auditLogs || [];
+}
+
 function currentViewer() {
   return state.bootstrap?.viewer || { authenticated: false, csrfToken: "", user: null };
 }
@@ -1132,6 +1163,14 @@ function getSelectedManageProduct() {
   return getManageProducts().find((product) => product.id === state.ui.adminSelectedManageProductId) || null;
 }
 
+function getSelectedAdminNotice() {
+  return getAdminNotices().find((notice) => notice.id === state.ui.adminSelectedNoticeId) || null;
+}
+
+function getSelectedAdminFaq() {
+  return getAdminFaqs().find((faq) => faq.id === state.ui.adminSelectedFaqId) || null;
+}
+
 function syncAdminSelections({ preserveDraft = true } = {}) {
   const suppliers = getAdminSuppliers();
   const products = getAdminProducts();
@@ -1142,6 +1181,8 @@ function syncAdminSelections({ preserveDraft = true } = {}) {
   const homeBanners = getAdminHomeBanners();
   const platformSections = getAdminPlatformSections();
   const siteSettings = getAdminSiteSettings();
+  const notices = getAdminNotices();
+  const faqs = getAdminFaqs();
 
   if (!preserveDraft || !state.adminSiteSettingsDraft) {
     state.adminSiteSettingsDraft = siteSettingsToDraft(siteSettings);
@@ -1339,6 +1380,57 @@ function syncAdminSelections({ preserveDraft = true } = {}) {
       }
     }
   }
+
+  if (state.ui.adminNoticeMode !== "new") {
+    if (
+      state.ui.adminSelectedNoticeId &&
+      !notices.some((notice) => notice.id === state.ui.adminSelectedNoticeId)
+    ) {
+      state.ui.adminSelectedNoticeId = "";
+    }
+    if (!state.ui.adminSelectedNoticeId && notices.length) {
+      state.ui.adminSelectedNoticeId = notices[0].id;
+    }
+  }
+  if (state.ui.adminNoticeMode === "new") {
+    if (!preserveDraft || !state.adminNoticeDraft) {
+      state.adminNoticeDraft = blankNoticeDraft();
+    }
+  } else {
+    const selectedNotice = getSelectedAdminNotice();
+    if (!preserveDraft || !state.adminNoticeDraft) {
+      state.adminNoticeDraft = noticeToDraft(selectedNotice);
+    } else if (state.adminNoticeDraft.id) {
+      const matchingNotice = notices.find((notice) => notice.id === state.adminNoticeDraft.id);
+      if (matchingNotice) {
+        state.adminNoticeDraft = noticeToDraft(matchingNotice);
+      }
+    }
+  }
+
+  if (state.ui.adminFaqMode !== "new") {
+    if (state.ui.adminSelectedFaqId && !faqs.some((faq) => faq.id === state.ui.adminSelectedFaqId)) {
+      state.ui.adminSelectedFaqId = "";
+    }
+    if (!state.ui.adminSelectedFaqId && faqs.length) {
+      state.ui.adminSelectedFaqId = faqs[0].id;
+    }
+  }
+  if (state.ui.adminFaqMode === "new") {
+    if (!preserveDraft || !state.adminFaqDraft) {
+      state.adminFaqDraft = blankFaqDraft();
+    }
+  } else {
+    const selectedFaq = getSelectedAdminFaq();
+    if (!preserveDraft || !state.adminFaqDraft) {
+      state.adminFaqDraft = faqToDraft(selectedFaq);
+    } else if (state.adminFaqDraft.id) {
+      const matchingFaq = faqs.find((faq) => faq.id === state.adminFaqDraft.id);
+      if (matchingFaq) {
+        state.adminFaqDraft = faqToDraft(matchingFaq);
+      }
+    }
+  }
 }
 
 function resetAdminState({ preserveSession = false } = {}) {
@@ -1353,6 +1445,8 @@ function resetAdminState({ preserveSession = false } = {}) {
   state.adminCustomerDraft = null;
   state.adminCategoryDraft = null;
   state.adminProductDraft = null;
+  state.adminNoticeDraft = null;
+  state.adminFaqDraft = null;
   state.ui.adminActiveSection = "overview";
   state.ui.adminAnalyticsTab = "dashboard";
   state.ui.adminAnalyticsRange = "30d";
@@ -1372,6 +1466,13 @@ function resetAdminState({ preserveSession = false } = {}) {
   state.ui.adminSelectedManageProductId = "";
   state.ui.adminOrderFilter = "all";
   state.ui.adminOrderSearch = "";
+  state.ui.adminContentTab = "notices";
+  state.ui.adminNoticeMode = "edit";
+  state.ui.adminSelectedNoticeId = "";
+  state.ui.adminFaqMode = "edit";
+  state.ui.adminSelectedFaqId = "";
+  state.ui.adminChargeFilter = "all";
+  state.ui.adminChargeSearch = "";
   if (!preserveSession) {
     state.adminSession = null;
     state.adminCsrfToken = "";
@@ -1780,6 +1881,13 @@ function ensureSelection(detail) {
   return cached;
 }
 
+function createOrderIdempotencyKey() {
+  if (window.crypto?.randomUUID) {
+    return `order:${window.crypto.randomUUID()}`;
+  }
+  return `order:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 12)}`;
+}
+
 function getSelectedProduct(detail) {
   const selection = ensureSelection(detail);
   if (!selection) return null;
@@ -2163,6 +2271,13 @@ function updateOrderValidation(detail) {
   document.querySelectorAll("[data-order-submit-button]").forEach((button) => {
     button.disabled = Boolean(validation.blocked);
     button.textContent = validation.blocked ? "주문 불가" : loggedIn ? "주문하기" : "로그인 후 주문";
+  });
+  document.querySelectorAll("[data-order-sticky-hint]").forEach((hint) => {
+    hint.textContent = validation.blocked
+      ? validation.reason || "입력값을 확인해 주세요."
+      : loggedIn
+        ? "보유금액에서 차감 후 주문이 접수됩니다."
+        : "로그인 후 주문과 내역 관리를 이어갑니다.";
   });
 }
 
@@ -2845,7 +2960,7 @@ function renderPopupAdminSection() {
               <label class="form-field">
                 <span class="field-label">뱃지 문구</span>
                 <div class="field-shell">
-                  <input class="field-input" type="text" name="badgeText" value="${escapeHtml(draft.badgeText)}" placeholder="예: 상단(1~5위) 노출 보장!" data-admin-popup-field="badgeText" />
+                  <input class="field-input" type="text" name="badgeText" value="${escapeHtml(draft.badgeText)}" placeholder="예: 검색 노출 개선 집중" data-admin-popup-field="badgeText" />
                 </div>
               </label>
               <label class="form-field">
@@ -3670,6 +3785,8 @@ function renderAdminOrdersSection() {
   const queuedCount = adminOrders.filter((order) => order.status === "queued").length;
   const inProgressCount = adminOrders.filter((order) => order.status === "in_progress").length;
   const completedCount = adminOrders.filter((order) => order.status === "completed").length;
+  const failedCount = adminOrders.filter((order) => order.status === "failed").length;
+  const cancelledCount = adminOrders.filter((order) => order.status === "cancelled").length;
   const dispatchIssueCount = adminOrders.filter((order) => isSupplierDispatchIssue(order)).length;
 
   return `
@@ -3695,6 +3812,8 @@ function renderAdminOrdersSection() {
           ["queued", `대기 ${adminOrders.filter((order) => order.status === "queued").length}`],
           ["in_progress", `진행 ${adminOrders.filter((order) => order.status === "in_progress").length}`],
           ["completed", `완료 ${adminOrders.filter((order) => order.status === "completed").length}`],
+          ["failed", `실패 ${failedCount}`],
+          ["cancelled", `취소 ${cancelledCount}`],
         ]
           .map(
             ([key, label]) => `
@@ -3758,6 +3877,10 @@ function renderAdminOrdersSection() {
                     <p>${escapeHtml(order.optionName || "기본 옵션")}</p>
                   </article>
                 </div>
+                <div class="admin-action-row">
+                  ${order.supplierExternalOrderId ? `<button class="admin-secondary-button" type="button" data-admin-order-refresh-supplier="${escapeHtml(order.id)}">공급사 상태 조회</button>` : ""}
+                  ${hasDispatchIssue || !order.supplierExternalOrderId ? `<button class="admin-secondary-button" type="button" data-admin-order-retry-supplier="${escapeHtml(order.id)}">발주 재전송</button>` : ""}
+                </div>
                 <form class="admin-order-form" data-admin-order-status-form>
                   <input type="hidden" name="orderId" value="${escapeHtml(order.id)}" />
                   <div class="admin-three-column">
@@ -3769,6 +3892,8 @@ function renderAdminOrdersSection() {
                             ["queued", "접수 대기"],
                             ["in_progress", "진행 중"],
                             ["completed", "완료"],
+                            ["failed", "실패"],
+                            ["cancelled", "취소"],
                           ]
                             .map(([value, label]) => `<option value="${value}" ${order.status === value ? "selected" : ""}>${label}</option>`)
                             .join("")}
@@ -3792,6 +3917,357 @@ function renderAdminOrdersSection() {
               .join("")
           : `<div class="admin-empty-card"><strong>조건에 맞는 주문이 없습니다.</strong><p>상태 필터나 검색어를 바꿔 다시 확인해 주세요.</p></div>`}
       </div>
+    </section>
+  `;
+}
+
+function renderAdminChargesSection() {
+  const chargeOrders = getAdminChargeOrders();
+  const activeFilter = state.ui.adminChargeFilter;
+  const search = state.ui.adminChargeSearch.trim().toLowerCase();
+  const filteredOrders = activeFilter === "all" ? chargeOrders : chargeOrders.filter((order) => order.status === activeFilter);
+  const visibleOrders = filteredOrders.filter((order) => !search || String(order.searchText || "").includes(search));
+  const awaitingDepositCount = chargeOrders.filter((order) => order.status === "awaiting_deposit").length;
+  const awaitingPaymentCount = chargeOrders.filter((order) => order.status === "awaiting_payment").length;
+  const paidCount = chargeOrders.filter((order) => order.status === "paid").length;
+  const issueCount = chargeOrders.filter((order) => ["failed", "expired", "cancelled", "refund_requested"].includes(order.status)).length;
+
+  const filters = [
+    ["all", `전체 ${chargeOrders.length}`],
+    ["awaiting_deposit", `입금대기 ${awaitingDepositCount}`],
+    ["awaiting_payment", `결제대기 ${awaitingPaymentCount}`],
+    ["paid", `완료 ${paidCount}`],
+    ["failed", `실패 ${chargeOrders.filter((order) => order.status === "failed").length}`],
+    ["cancelled", `취소 ${chargeOrders.filter((order) => order.status === "cancelled").length}`],
+  ];
+
+  return `
+    <section class="admin-card">
+      <div class="section-head section-head--compact">
+        <h2>충전 운영</h2>
+        <p>계좌입금 충전 요청을 확인하고 보유금액 반영, 실패, 취소 처리를 기록합니다.</p>
+      </div>
+
+      ${renderAdminInsightStrip(
+        [
+          { label: "입금 대기", value: `${awaitingDepositCount}건`, description: "관리자 확인 후 보유금액 반영 필요" },
+          { label: "결제 대기", value: `${awaitingPaymentCount}건`, description: "카드/간편결제 승인 대기" },
+          { label: "완료", value: `${paidCount}건`, description: "보유금액 반영 완료" },
+          { label: "확인 필요", value: `${issueCount}건`, description: "실패, 취소, 환불 요청 상태" },
+        ],
+        "admin-insight-grid--compact"
+      )}
+
+      <div class="filter-row admin-filter-row">
+        ${filters
+          .map(
+            ([key, label]) => `
+              <button class="filter-chip ${activeFilter === key ? "is-active" : ""}" type="button" data-admin-charge-filter="${key}">
+                ${escapeHtml(label)}
+              </button>
+            `
+          )
+          .join("")}
+      </div>
+
+      <div class="admin-toolbar admin-toolbar--stack">
+        <div class="search-shell">
+          <input
+            class="search-input"
+            type="text"
+            value="${escapeHtml(state.ui.adminChargeSearch)}"
+            placeholder="충전번호, 고객명, 이메일, 입금자명, 참조번호 검색"
+            data-admin-charge-search
+          />
+        </div>
+        <p class="admin-inline-note">현재 표시: ${escapeHtml(String(visibleOrders.length))}건</p>
+      </div>
+
+      <div class="admin-order-list">
+        ${visibleOrders.length
+          ? visibleOrders
+              .map((order) => {
+                const isPending = ["created", "awaiting_deposit", "awaiting_payment"].includes(order.status);
+                const isRisk = ["failed", "expired", "cancelled", "refund_requested"].includes(order.status);
+                return `
+                  <article class="admin-order-card ${isRisk ? "is-risk" : ""}">
+                    <div class="admin-order-card__top">
+                      <div>
+                        <span class="order-card__platform">${escapeHtml(order.paymentChannelLabel || "충전")}</span>
+                        <strong>${escapeHtml(order.orderCode)}</strong>
+                        <p>${escapeHtml(order.customerName || "고객")} · ${escapeHtml(order.customerEmailMasked || "비공개")}</p>
+                      </div>
+                      <div class="admin-order-card__statusbox">
+                        <span class="admin-order-card__number">${escapeHtml(order.createdLabel || order.createdAt || "")}</span>
+                        <span class="admin-badge ${isRisk ? "is-warning" : order.status === "paid" ? "is-success" : "is-neutral"}">${escapeHtml(order.statusLabel || order.status)}</span>
+                      </div>
+                    </div>
+                    <div class="admin-order-card__fact-grid">
+                      <article><span>충전 금액</span><strong>${escapeHtml(order.amountLabel)}</strong></article>
+                      <article><span>부가세</span><strong>${escapeHtml(order.vatAmountLabel)}</strong></article>
+                      <article><span>최종 결제</span><strong>${escapeHtml(order.totalAmountLabel)}</strong></article>
+                      <article><span>증빙</span><strong>${escapeHtml(order.receiptTypeLabel || "안함")}</strong></article>
+                    </div>
+                    <div class="admin-order-callout-grid">
+                      <article class="admin-mini-card">
+                        <span>입금자명</span>
+                        <strong>${escapeHtml(order.depositorName || "미입력")}</strong>
+                        <p>${escapeHtml(order.reference || "참조번호 없음")}</p>
+                      </article>
+                      <article class="admin-mini-card ${isRisk ? "is-risk" : ""}">
+                        <span>처리 상태</span>
+                        <strong>${escapeHtml(order.statusLabel || order.status)}</strong>
+                        <p>${escapeHtml(order.failureReason || order.confirmedAt || order.expiresAt || "확인 대기")}</p>
+                      </article>
+                    </div>
+                    ${isPending
+                      ? `
+                        <form class="admin-order-form" data-admin-charge-action-form>
+                          <input type="hidden" name="chargeOrderId" value="${escapeHtml(order.id)}" />
+                          <div class="admin-three-column">
+                            <label class="form-field">
+                              <span class="field-label">처리</span>
+                              <div class="field-shell">
+                                <select class="field-select" name="action">
+                                  <option value="approve_deposit">입금 확인</option>
+                                  <option value="mark_failed">실패 처리</option>
+                                  <option value="cancel">취소 처리</option>
+                                </select>
+                              </div>
+                            </label>
+                            <label class="form-field">
+                              <span class="field-label">참조번호</span>
+                              <div class="field-shell">
+                                <input class="field-input" type="text" name="reference" value="${escapeHtml(order.reference || "")}" placeholder="입금 확인 번호 또는 메모" />
+                              </div>
+                            </label>
+                            <label class="form-field admin-order-form__memo">
+                              <span class="field-label">운영 메모</span>
+                              <div class="field-shell">
+                                <input class="field-input" type="text" name="adminMemo" placeholder="처리 사유를 입력해 주세요." />
+                              </div>
+                            </label>
+                          </div>
+                          <div class="admin-action-row">
+                            <button class="admin-secondary-button" type="submit">처리 저장</button>
+                          </div>
+                        </form>
+                      `
+                      : ""}
+                  </article>
+                `;
+              })
+              .join("")
+          : `<div class="admin-empty-card"><strong>조건에 맞는 충전 주문이 없습니다.</strong><p>상태 필터나 검색어를 바꿔 다시 확인해 주세요.</p></div>`}
+      </div>
+    </section>
+  `;
+}
+
+function renderContentAdminSection() {
+  const notices = getAdminNotices();
+  const faqs = getAdminFaqs();
+  const auditLogs = getAdminAuditLogs();
+  const tab = state.ui.adminContentTab || "notices";
+  const noticeDraft = state.adminNoticeDraft || noticeToDraft(getSelectedAdminNotice());
+  const faqDraft = state.adminFaqDraft || faqToDraft(getSelectedAdminFaq());
+
+  const noticePanel = `
+    <div class="admin-management-layout admin-management-layout--catalog-top">
+      <div class="admin-card admin-subcard">
+        <div class="admin-subcard__head">
+          <strong>공지 목록</strong>
+          <button class="admin-secondary-button" type="button" data-admin-notice-new>새 공지</button>
+        </div>
+        <div class="admin-product-list">
+          ${
+            notices.length
+              ? notices
+                  .map(
+                    (notice) => `
+                      <button
+                        class="admin-product-card ${state.ui.adminSelectedNoticeId === notice.id && state.ui.adminNoticeMode !== "new" ? "is-active" : ""}"
+                        type="button"
+                        data-admin-notice-select="${escapeHtml(notice.id)}"
+                      >
+                        <div class="admin-product-card__top">
+                          <strong>${escapeHtml(notice.title)}</strong>
+                          <span class="admin-badge ${notice.pinned ? "is-success" : "is-neutral"}">${notice.pinned ? "고정" : escapeHtml(notice.tag || "공지")}</span>
+                        </div>
+                        <p>${escapeHtml(notice.body)}</p>
+                        <div class="admin-product-card__meta">
+                          <span>${escapeHtml(notice.publishedAt || "-")}</span>
+                        </div>
+                      </button>
+                    `
+                  )
+                  .join("")
+              : `<div class="admin-empty-card"><strong>등록된 공지가 없습니다.</strong><p>첫 공지를 작성하면 고객 도움말 공지 영역에 반영됩니다.</p></div>`
+          }
+        </div>
+      </div>
+
+      <div class="admin-card admin-subcard admin-pane">
+        <div class="admin-subcard__head">
+          <strong>${noticeDraft.id ? "공지 수정" : "공지 작성"}</strong>
+        </div>
+        <form class="admin-form" data-admin-notice-form>
+          <div class="admin-two-column">
+            <label class="form-field">
+              <span class="field-label">제목</span>
+              <div class="field-shell">
+                <input class="field-input" type="text" name="title" value="${escapeHtml(noticeDraft.title)}" data-admin-notice-field="title" />
+              </div>
+            </label>
+            <label class="form-field">
+              <span class="field-label">태그</span>
+              <div class="field-shell">
+                <input class="field-input" type="text" name="tag" value="${escapeHtml(noticeDraft.tag)}" data-admin-notice-field="tag" />
+              </div>
+            </label>
+          </div>
+          <label class="form-field">
+            <span class="field-label">내용</span>
+            <textarea class="field-textarea" name="body" rows="6" data-admin-notice-field="body">${escapeHtml(noticeDraft.body)}</textarea>
+          </label>
+          <div class="admin-two-column">
+            <label class="form-field">
+              <span class="field-label">게시 시각</span>
+              <div class="field-shell">
+                <input class="field-input" type="text" name="publishedAt" value="${escapeHtml(noticeDraft.publishedAt)}" data-admin-notice-field="publishedAt" />
+              </div>
+            </label>
+            <label class="admin-toggle">
+              <input type="checkbox" name="pinned" ${noticeDraft.pinned ? "checked" : ""} data-admin-notice-field="pinned" />
+              <span>상단 고정</span>
+            </label>
+          </div>
+          <div class="admin-action-row">
+            <button class="admin-primary-button" type="submit">${noticeDraft.id ? "공지 저장" : "공지 등록"}</button>
+            ${noticeDraft.id ? `<button class="admin-secondary-button" type="button" data-admin-notice-delete="${escapeHtml(noticeDraft.id)}">공지 삭제</button>` : ""}
+          </div>
+        </form>
+      </div>
+    </div>
+  `;
+
+  const faqPanel = `
+    <div class="admin-management-layout admin-management-layout--catalog-top">
+      <div class="admin-card admin-subcard">
+        <div class="admin-subcard__head">
+          <strong>FAQ 목록</strong>
+          <button class="admin-secondary-button" type="button" data-admin-faq-new>새 FAQ</button>
+        </div>
+        <div class="admin-product-list">
+          ${
+            faqs.length
+              ? faqs
+                  .map(
+                    (faq) => `
+                      <button
+                        class="admin-product-card ${state.ui.adminSelectedFaqId === faq.id && state.ui.adminFaqMode !== "new" ? "is-active" : ""}"
+                        type="button"
+                        data-admin-faq-select="${escapeHtml(faq.id)}"
+                      >
+                        <div class="admin-product-card__top">
+                          <strong>${escapeHtml(faq.question)}</strong>
+                          <span class="admin-badge is-neutral">#${escapeHtml(String(faq.sortOrder || 0))}</span>
+                        </div>
+                        <p>${escapeHtml(faq.answer)}</p>
+                      </button>
+                    `
+                  )
+                  .join("")
+              : `<div class="admin-empty-card"><strong>등록된 FAQ가 없습니다.</strong><p>고객 문의를 줄일 수 있는 FAQ를 먼저 등록해 주세요.</p></div>`
+          }
+        </div>
+      </div>
+      <div class="admin-card admin-subcard admin-pane">
+        <div class="admin-subcard__head">
+          <strong>${faqDraft.id ? "FAQ 수정" : "FAQ 작성"}</strong>
+        </div>
+        <form class="admin-form" data-admin-faq-form>
+          <label class="form-field">
+            <span class="field-label">질문</span>
+            <div class="field-shell">
+              <input class="field-input" type="text" name="question" value="${escapeHtml(faqDraft.question)}" data-admin-faq-field="question" />
+            </div>
+          </label>
+          <label class="form-field">
+            <span class="field-label">답변</span>
+            <textarea class="field-textarea" name="answer" rows="7" data-admin-faq-field="answer">${escapeHtml(faqDraft.answer)}</textarea>
+          </label>
+          <label class="form-field">
+            <span class="field-label">정렬 순서</span>
+            <div class="field-shell">
+              <input class="field-input" type="number" name="sortOrder" value="${escapeHtml(String(faqDraft.sortOrder || 0))}" data-admin-faq-field="sortOrder" />
+            </div>
+          </label>
+          <div class="admin-action-row">
+            <button class="admin-primary-button" type="submit">${faqDraft.id ? "FAQ 저장" : "FAQ 등록"}</button>
+            ${faqDraft.id ? `<button class="admin-secondary-button" type="button" data-admin-faq-delete="${escapeHtml(faqDraft.id)}">FAQ 삭제</button>` : ""}
+          </div>
+        </form>
+      </div>
+    </div>
+  `;
+
+  const auditPanel = `
+    <div class="admin-card admin-subcard">
+      <div class="admin-subcard__head">
+        <strong>최근 관리자 작업 로그</strong>
+        <span class="admin-badge is-neutral">최근 ${escapeHtml(String(auditLogs.length))}건</span>
+      </div>
+      <div class="admin-detail-list">
+        ${
+          auditLogs.length
+            ? auditLogs
+                .map(
+                  (log) => `
+                    <article>
+                      <strong>${escapeHtml(log.message || log.action)}</strong>
+                      <span>${escapeHtml(log.createdLabel || log.createdAt || "-")} · ${escapeHtml(log.actor || "admin")} · ${escapeHtml(log.entityType || "-")}/${escapeHtml(log.entityId || "-")}</span>
+                    </article>
+                  `
+                )
+                .join("")
+            : `<article><strong>기록된 관리자 작업이 없습니다.</strong><span>위험 작업을 처리하면 이곳에 기록됩니다.</span></article>`
+        }
+      </div>
+    </div>
+  `;
+
+  return `
+    <section class="admin-card">
+      <div class="section-head section-head--compact">
+        <h2>콘텐츠/운영 로그</h2>
+        <p>고객에게 노출되는 공지와 FAQ를 직접 관리하고 주요 운영 작업 기록을 확인합니다.</p>
+      </div>
+      ${renderAdminInsightStrip(
+        [
+          { label: "공지", value: `${notices.length}개`, description: "도움말 공지 영역에 노출" },
+          { label: "고정 공지", value: `${notices.filter((notice) => notice.pinned).length}개`, description: "상단 우선 표시" },
+          { label: "FAQ", value: `${faqs.length}개`, description: "고객 문의 전환 방어" },
+          { label: "운영 로그", value: `${auditLogs.length}건`, description: "최근 관리자 작업 기록" },
+        ],
+        "admin-insight-grid--compact"
+      )}
+      <div class="filter-row admin-filter-row">
+        ${[
+          ["notices", "공지"],
+          ["faqs", "FAQ"],
+          ["logs", "운영 로그"],
+        ]
+          .map(
+            ([key, label]) => `
+              <button class="filter-chip ${tab === key ? "is-active" : ""}" type="button" data-admin-content-tab="${key}">
+                ${escapeHtml(label)}
+              </button>
+            `
+          )
+          .join("")}
+      </div>
+      ${tab === "faqs" ? faqPanel : tab === "logs" ? auditPanel : noticePanel}
     </section>
   `;
 }
@@ -5039,7 +5515,7 @@ function renderSiteBrandLogoMarkup(siteSettings, className, options = {}) {
   const siteName = siteNameOrDefault(siteSettings?.siteName);
   const surface = options.surface === "light" ? "light" : "dark";
   const darkLogoImageUrl = String(siteSettings?.headerLogoUrl || "").trim();
-  const logoImageUrl = surface === "light" ? DEFAULT_LIGHT_BRAND_LOGO_URL || darkLogoImageUrl : darkLogoImageUrl;
+  const logoImageUrl = surface === "light" ? darkLogoImageUrl || DEFAULT_LIGHT_BRAND_LOGO_URL : darkLogoImageUrl;
   if (logoImageUrl) {
     return `
       <span class="${escapeHtml(className)} is-image" aria-label="${escapeHtml(siteName)}">
@@ -5054,22 +5530,18 @@ function renderLoginRequiredPage(title, description, activeKey = "home") {
   return renderFrame(
     `
       <div class="page page-login-required">
-        <section class="empty-card empty-card--center empty-card--auth">
+        <section class="empty-card empty-card--center empty-card--auth login-required-card">
           <span class="empty-card__eyebrow">로그인 필요</span>
           <strong>${escapeHtml(title)}</strong>
           <p>${escapeHtml(description)}</p>
-          <div class="guide-list">
-            <article class="guide-card">
-              <strong>로그인 후 가능</strong>
-              <p>주문 내역, 잔액, 충전, 계정별 진행 현황을 한 화면에서 확인할 수 있습니다.</p>
-            </article>
-            <article class="guide-card">
-              <strong>탐색은 로그인 없이 가능</strong>
-              <p>상품 탐색, 상세 확인, FAQ, 공지, 정책 문서는 로그인 없이 열람할 수 있습니다.</p>
-            </article>
+          <div class="login-required-card__quick">
+            <span>상품 탐색은 로그인 없이 가능합니다.</span>
+            <span>충전·주문·내역 관리는 로그인 후 이어집니다.</span>
           </div>
-          <button class="full-width-cta" type="button" data-route="/auth">로그인 / 회원가입</button>
-          <button class="ghost-secondary-button" type="button" data-route="/products">서비스 둘러보기</button>
+          <div class="login-required-card__actions">
+            <button class="full-width-cta" type="button" data-route="/auth">로그인 / 회원가입</button>
+            <button class="ghost-secondary-button" type="button" data-route="/products">서비스 둘러보기</button>
+          </div>
         </section>
       </div>
     `,
@@ -5227,9 +5699,11 @@ configureAdminPages({
   renderAnalyticsAdminSection,
   renderSiteSettingsAdminSection,
   renderPopupAdminSection,
+  renderContentAdminSection,
   renderSupplierAdminSection,
   renderCustomerAdminSection,
   renderCatalogAdminSection,
+  renderAdminChargesSection,
   renderAdminOrdersSection,
   renderAdminOverviewSection,
 });
@@ -5332,9 +5806,6 @@ async function renderRoute() {
     scrollToActiveHash();
     if (route.name === "detail" && route.id && state.categoryCache[route.id]) {
       scheduleLinkPreview(state.categoryCache[route.id], { immediate: true });
-    }
-    if (route.name === "home") {
-      requestAnimationFrame(() => updateHomePlatformScrollerState());
     }
     ensureBannerTimer();
     trackPublicRoute(route);
@@ -5694,7 +6165,7 @@ document.addEventListener("click", async (event) => {
     const provider = oauthProviderButton.getAttribute("data-oauth-provider") || "";
     const providerConfig = (state.bootstrap?.authConfig?.oauthProviders || []).find((item) => item.provider === provider);
     if (!providerConfig?.enabled) {
-      showToast(`${providerConfig?.label || provider} 연동은 환경변수 설정 후 활성화됩니다.`, "error");
+      showToast("현재 해당 간편 로그인은 사용할 수 없습니다. 이메일로 로그인해 주세요.", "error");
       return;
     }
     navigate(providerConfig.startPath);
@@ -5789,8 +6260,13 @@ document.addEventListener("click", async (event) => {
   if (routeButton) {
     const path = routeButton.getAttribute("data-route");
     const platformId = routeButton.getAttribute("data-platform-id");
+    const shouldClearSearch = routeButton.hasAttribute("data-clear-search");
     if (state.ui.loginModalOpen) {
       closeLoginModal({ preserveRedirect: Boolean(path && path.startsWith("/auth")) });
+    }
+    if (shouldClearSearch) {
+      state.ui.search = "";
+      state.ui.activePlatform = "";
     }
     if (platformId) {
       state.ui.activePlatform = platformId;
@@ -6234,6 +6710,114 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
+  const adminChargeFilterButton = closest("[data-admin-charge-filter]");
+  if (adminChargeFilterButton) {
+    state.ui.adminChargeFilter = adminChargeFilterButton.getAttribute("data-admin-charge-filter") || "all";
+    renderRoute();
+    return;
+  }
+
+  const adminContentTabButton = closest("[data-admin-content-tab]");
+  if (adminContentTabButton) {
+    state.ui.adminContentTab = adminContentTabButton.getAttribute("data-admin-content-tab") || "notices";
+    renderRoute();
+    return;
+  }
+
+  const newNoticeButton = closest("[data-admin-notice-new]");
+  if (newNoticeButton) {
+    state.ui.adminNoticeMode = "new";
+    state.ui.adminSelectedNoticeId = "";
+    state.adminNoticeDraft = blankNoticeDraft();
+    renderRoute();
+    return;
+  }
+
+  const selectNoticeButton = closest("[data-admin-notice-select]");
+  if (selectNoticeButton) {
+    const noticeId = selectNoticeButton.getAttribute("data-admin-notice-select") || "";
+    state.ui.adminNoticeMode = "edit";
+    state.ui.adminSelectedNoticeId = noticeId;
+    state.adminNoticeDraft = noticeToDraft(getAdminNotices().find((notice) => notice.id === noticeId) || null);
+    renderRoute();
+    return;
+  }
+
+  const deleteNoticeButton = closest("[data-admin-notice-delete]");
+  if (deleteNoticeButton) {
+    const noticeId = deleteNoticeButton.getAttribute("data-admin-notice-delete") || "";
+    try {
+      await apiPost("/api/admin/notices/delete", { noticeId });
+      await Promise.all([refreshCoreData(), refreshAdminData({ preserveDraft: false })]);
+      showToast("공지를 삭제했습니다.");
+      renderRoute();
+    } catch (error) {
+      showToast(error.message || "공지 삭제에 실패했습니다.", "error");
+    }
+    return;
+  }
+
+  const newFaqButton = closest("[data-admin-faq-new]");
+  if (newFaqButton) {
+    state.ui.adminFaqMode = "new";
+    state.ui.adminSelectedFaqId = "";
+    state.adminFaqDraft = blankFaqDraft();
+    renderRoute();
+    return;
+  }
+
+  const selectFaqButton = closest("[data-admin-faq-select]");
+  if (selectFaqButton) {
+    const faqId = selectFaqButton.getAttribute("data-admin-faq-select") || "";
+    state.ui.adminFaqMode = "edit";
+    state.ui.adminSelectedFaqId = faqId;
+    state.adminFaqDraft = faqToDraft(getAdminFaqs().find((faq) => faq.id === faqId) || null);
+    renderRoute();
+    return;
+  }
+
+  const deleteFaqButton = closest("[data-admin-faq-delete]");
+  if (deleteFaqButton) {
+    const faqId = deleteFaqButton.getAttribute("data-admin-faq-delete") || "";
+    try {
+      await apiPost("/api/admin/faqs/delete", { faqId });
+      await Promise.all([refreshCoreData(), refreshAdminData({ preserveDraft: false })]);
+      showToast("FAQ를 삭제했습니다.");
+      renderRoute();
+    } catch (error) {
+      showToast(error.message || "FAQ 삭제에 실패했습니다.", "error");
+    }
+    return;
+  }
+
+  const retrySupplierOrderButton = closest("[data-admin-order-retry-supplier]");
+  if (retrySupplierOrderButton) {
+    const orderId = retrySupplierOrderButton.getAttribute("data-admin-order-retry-supplier") || "";
+    try {
+      const result = await apiPost("/api/admin/orders/retry-supplier", { orderId });
+      await refreshAdminData({ preserveDraft: true });
+      showToast(`공급사 재전송 완료: ${result.dispatch?.status || "처리됨"}`);
+      renderRoute();
+    } catch (error) {
+      showToast(error.message || "공급사 재전송에 실패했습니다.", "error");
+    }
+    return;
+  }
+
+  const refreshSupplierOrderButton = closest("[data-admin-order-refresh-supplier]");
+  if (refreshSupplierOrderButton) {
+    const orderId = refreshSupplierOrderButton.getAttribute("data-admin-order-refresh-supplier") || "";
+    try {
+      const result = await apiPost("/api/admin/orders/supplier-status", { orderId });
+      await refreshAdminData({ preserveDraft: true });
+      showToast(`공급사 상태 확인: ${result.supplierStatus || "확인됨"}`);
+      renderRoute();
+    } catch (error) {
+      showToast(error.message || "공급사 상태 조회에 실패했습니다.", "error");
+    }
+    return;
+  }
+
   const platformButton = closest("[data-platform-select]");
   if (platformButton) {
     state.ui.activePlatform = platformButton.getAttribute("data-platform-select");
@@ -6255,6 +6839,7 @@ document.addEventListener("click", async (event) => {
     if (route.name === "detail" && categoryId && productId) {
       const selection = ensureSelection(state.categoryCache[categoryId]);
       selection.productId = productId;
+      delete selection.orderIdempotencyKey;
       renderRoute();
     }
     return;
@@ -6298,7 +6883,7 @@ document.addEventListener("click", async (event) => {
     const nextChannel = chargePaymentChannelButton.getAttribute("data-charge-payment-channel") || "card";
     const method = chargeMethodConfig(nextChannel);
     if (method && !method.enabled) {
-      showToast(method.label === "카드/간편결제" ? "카드/간편결제는 준비 중입니다." : "계좌입금 설정이 필요합니다.", "error");
+      showToast("현재 선택할 수 없는 결제수단입니다. 다른 결제수단을 선택해 주세요.", "error");
       return;
     }
     const draft = ensureChargeDraft();
@@ -6546,12 +7131,43 @@ document.addEventListener("input", (event) => {
     return;
   }
 
+  if (target.matches("[data-admin-charge-search]")) {
+    const cursor = target.selectionStart || target.value.length;
+    state.ui.adminChargeSearch = target.value;
+    renderRoute().then(() => {
+      const input = document.querySelector("[data-admin-charge-search]");
+      if (input) {
+        input.focus();
+        input.setSelectionRange(cursor, cursor);
+      }
+    });
+    return;
+  }
+
   if (target.matches("[data-admin-customer-field]")) {
     const field = target.getAttribute("data-admin-customer-field");
     if (!state.adminCustomerDraft) {
       state.adminCustomerDraft = blankCustomerDraft();
     }
     state.adminCustomerDraft[field] = target.type === "checkbox" ? target.checked : target.value;
+    return;
+  }
+
+  if (target.matches("[data-admin-notice-field]")) {
+    const field = target.getAttribute("data-admin-notice-field");
+    if (!state.adminNoticeDraft) {
+      state.adminNoticeDraft = blankNoticeDraft();
+    }
+    state.adminNoticeDraft[field] = target.type === "checkbox" ? target.checked : target.value;
+    return;
+  }
+
+  if (target.matches("[data-admin-faq-field]")) {
+    const field = target.getAttribute("data-admin-faq-field");
+    if (!state.adminFaqDraft) {
+      state.adminFaqDraft = blankFaqDraft();
+    }
+    state.adminFaqDraft[field] = field === "sortOrder" ? Number(target.value || 0) : target.value;
     return;
   }
 
@@ -6861,7 +7477,7 @@ document.addEventListener("submit", async (event) => {
       return;
     }
     if (!method?.enabled) {
-      showToast("선택한 결제수단은 아직 사용할 수 없습니다.", "error");
+      showToast("현재 선택할 수 없는 결제수단입니다.", "error");
       return;
     }
     const payload = {
@@ -6896,7 +7512,7 @@ document.addEventListener("submit", async (event) => {
       state.chargeDraft = blankChargeDraft(state.bootstrap?.chargeConfig);
       renderRoute();
       if (started.paymentSession?.providerConfigured) {
-        showToast("결제 세션이 준비되었습니다. PG SDK 연결 단계가 남아 있습니다.");
+        showToast("결제창을 준비했습니다. 승인 후 보유금액이 반영됩니다.");
       } else {
         showToast("결제 준비에 실패했습니다.", "error");
       }
@@ -7166,6 +7782,73 @@ document.addEventListener("submit", async (event) => {
     return;
   }
 
+  if (form.matches("[data-admin-charge-action-form]")) {
+    event.preventDefault();
+    const formData = new FormData(form);
+    try {
+      await apiPost("/api/admin/charge-orders/action", {
+        chargeOrderId: formData.get("chargeOrderId"),
+        action: formData.get("action"),
+        reference: formData.get("reference"),
+        adminMemo: formData.get("adminMemo"),
+      });
+      await refreshAdminData({ preserveDraft: true });
+      showToast("충전 주문 처리를 저장했습니다.");
+      renderRoute();
+    } catch (error) {
+      showToast(error.message || "충전 주문 처리에 실패했습니다.", "error");
+    }
+    return;
+  }
+
+  if (form.matches("[data-admin-notice-form]")) {
+    event.preventDefault();
+    const draft = state.adminNoticeDraft || blankNoticeDraft();
+    try {
+      const result = await apiPost("/api/admin/notices", {
+        id: draft.id,
+        title: draft.title,
+        body: draft.body,
+        tag: draft.tag,
+        pinned: draft.pinned,
+        publishedAt: draft.publishedAt,
+      });
+      state.ui.adminContentTab = "notices";
+      state.ui.adminNoticeMode = "edit";
+      state.ui.adminSelectedNoticeId = result.notice.id;
+      state.adminNoticeDraft = noticeToDraft(result.notice);
+      await Promise.all([refreshCoreData(), refreshAdminData({ preserveDraft: false })]);
+      showToast("공지를 저장했습니다.");
+      renderRoute();
+    } catch (error) {
+      showToast(error.message || "공지 저장에 실패했습니다.", "error");
+    }
+    return;
+  }
+
+  if (form.matches("[data-admin-faq-form]")) {
+    event.preventDefault();
+    const draft = state.adminFaqDraft || blankFaqDraft();
+    try {
+      const result = await apiPost("/api/admin/faqs", {
+        id: draft.id,
+        question: draft.question,
+        answer: draft.answer,
+        sortOrder: draft.sortOrder,
+      });
+      state.ui.adminContentTab = "faqs";
+      state.ui.adminFaqMode = "edit";
+      state.ui.adminSelectedFaqId = result.faq.id;
+      state.adminFaqDraft = faqToDraft(result.faq);
+      await Promise.all([refreshCoreData(), refreshAdminData({ preserveDraft: false })]);
+      showToast("FAQ를 저장했습니다.");
+      renderRoute();
+    } catch (error) {
+      showToast(error.message || "FAQ 저장에 실패했습니다.", "error");
+    }
+    return;
+  }
+
   if (form.matches("[data-admin-supplier-form]")) {
     event.preventDefault();
     const draft = state.adminSupplierDraft || blankSupplierDraft();
@@ -7246,9 +7929,14 @@ document.addEventListener("submit", async (event) => {
 
   const summary = calculateSummary(detail);
   if (!summary) return;
+  const selection = ensureSelection(detail);
+  if (!selection) return;
   const formData = new FormData(form);
   const fields = Object.fromEntries(formData.entries());
-  state.productSelections[detail.id].fields = { ...state.productSelections[detail.id].fields, ...fields };
+  selection.fields = { ...selection.fields, ...fields };
+  if (!selection.orderIdempotencyKey) {
+    selection.orderIdempotencyKey = createOrderIdempotencyKey();
+  }
   const validation = getOrderValidationState(detail, summary.product);
   if (validation.blocked) {
     showToast(validation.reason || "주문 정보를 다시 확인해 주세요.", "error");
@@ -7259,7 +7947,9 @@ document.addEventListener("submit", async (event) => {
     const result = await apiPost("/api/orders", {
       productId: summary.product.id,
       fields,
+      idempotencyKey: selection.orderIdempotencyKey,
     });
+    delete selection.orderIdempotencyKey;
     await refreshCoreData();
     showToast(`주문이 접수되었습니다. ${result.totalPriceLabel} 결제 완료`);
     navigate("/orders");
@@ -7267,66 +7957,6 @@ document.addEventListener("submit", async (event) => {
     showToast(error.message || "주문 접수에 실패했습니다.", "error");
   }
 });
-
-document.addEventListener(
-  "scroll",
-  (event) => {
-    const target = event.target;
-    if (target instanceof HTMLElement && target.matches("[data-home-platform-scroller]")) {
-      updateHomePlatformScrollerState(target);
-    }
-  },
-  true
-);
-
-document.addEventListener(
-  "wheel",
-  (event) => {
-    const scroller = getHomePlatformScroller(event.target);
-    if (!scroller) return;
-    if (!homePlatformScrollerAtBoundary(scroller, event.deltaY)) return;
-    event.preventDefault();
-    relayHomePlatformScroll(scroller, event.deltaY);
-  },
-  { passive: false }
-);
-
-document.addEventListener(
-  "touchstart",
-  (event) => {
-    const scroller = getHomePlatformScroller(event.target);
-    if (!scroller || event.touches.length !== 1) {
-      homePlatformTouchState.scroller = null;
-      return;
-    }
-    homePlatformTouchState.scroller = scroller;
-    homePlatformTouchState.lastY = event.touches[0].clientY;
-  },
-  { passive: true }
-);
-
-document.addEventListener(
-  "touchmove",
-  (event) => {
-    const scroller = homePlatformTouchState.scroller;
-    if (!scroller || event.touches.length !== 1) return;
-    const currentY = event.touches[0].clientY;
-    const deltaY = homePlatformTouchState.lastY - currentY;
-    homePlatformTouchState.lastY = currentY;
-    if (!homePlatformScrollerAtBoundary(scroller, deltaY)) return;
-    event.preventDefault();
-    relayHomePlatformScroll(scroller, deltaY);
-  },
-  { passive: false }
-);
-
-document.addEventListener(
-  "touchend",
-  () => {
-    homePlatformTouchState.scroller = null;
-  },
-  { passive: true }
-);
 
 document.addEventListener("keydown", (event) => {
   const target = event.target;
