@@ -1645,6 +1645,30 @@ async function parseApiResponse(response) {
   }
 }
 
+function readableApiErrorMessage(errorPayload, fallback = "요청 처리 중 오류가 발생했습니다.") {
+  if (!errorPayload) return fallback;
+  if (typeof errorPayload === "string") return errorPayload;
+  if (typeof errorPayload === "object") {
+    return (
+      errorPayload.message ||
+      errorPayload.detail ||
+      errorPayload.reason ||
+      errorPayload.error ||
+      fallback
+    );
+  }
+  return String(errorPayload);
+}
+
+function isTransientApiError(error) {
+  const status = Number(error?.status || 0);
+  return error?.name === "TypeError" || status === 0 || status === 408 || status === 429 || status >= 500;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 async function apiGet(path) {
   const response = await fetch(apiUrl(path), {
     headers: { Accept: "application/json" },
@@ -1661,7 +1685,7 @@ async function apiGet(path) {
     clearAdminSessionState(false);
   }
   if (!response.ok || data.ok === false) {
-    const error = new Error(data.error || "요청 처리 중 오류가 발생했습니다.");
+    const error = new Error(readableApiErrorMessage(data.error));
     error.status = response.status;
     throw error;
   }
@@ -1700,7 +1724,7 @@ async function apiPost(path, payload) {
     clearAdminSessionState(false);
   }
   if (!response.ok || data.ok === false) {
-    const error = new Error(data.error || "요청 처리 중 오류가 발생했습니다.");
+    const error = new Error(readableApiErrorMessage(data.error));
     error.status = response.status;
     throw error;
   }
@@ -7973,10 +7997,24 @@ window.addEventListener("popstate", () => {
 async function init() {
   showLoading();
   try {
-    await Promise.all([refreshCoreData(), loadCatalog()]);
+    await refreshCoreData();
+    await loadCatalog();
     await renderRoute();
   } catch (error) {
-    app.innerHTML = renderNotFound(error.message || "패널 초기화에 실패했습니다.");
+    if (isTransientApiError(error) && !init._retried) {
+      init._retried = true;
+      showLoading("연결을 다시 확인하는 중...");
+      try {
+        await delay(1200);
+        await refreshCoreData();
+        await loadCatalog();
+        await renderRoute();
+        return;
+      } catch (retryError) {
+        error = retryError;
+      }
+    }
+    app.innerHTML = renderNotFound(readableApiErrorMessage(error?.message || error, "패널 초기화에 실패했습니다."));
   }
 }
 
