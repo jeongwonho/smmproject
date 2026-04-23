@@ -6051,7 +6051,25 @@ class PanelStore:
             JOIN platform_sections ps ON ps.id = pg.platform_section_id
             JOIN products p ON p.product_category_id = pc.id AND p.is_active = 1
             WHERE pc.is_active = 1
-            GROUP BY pc.id
+            GROUP BY
+                ps.id,
+                ps.slug,
+                ps.display_name,
+                ps.description,
+                ps.icon,
+                ps.image_url,
+                ps.accent_color,
+                ps.sort_order,
+                pg.id,
+                pg.name,
+                pg.description,
+                pg.sort_order,
+                pc.id,
+                pc.name,
+                pc.description,
+                pc.option_label_name,
+                pc.hero_subtitle,
+                pc.sort_order
             ORDER BY ps.sort_order, pg.sort_order, pc.sort_order
             """
         )
@@ -7549,7 +7567,14 @@ class PanelStore:
                 JOIN platform_groups pg ON pg.id = pc.platform_group_id
                 JOIN platform_sections ps ON ps.id = pg.platform_section_id
                 LEFT JOIN products p ON p.product_category_id = pc.id
-                GROUP BY pc.id
+                GROUP BY
+                    pc.id,
+                    pg.id,
+                    pg.name,
+                    ps.id,
+                    ps.display_name,
+                    ps.sort_order,
+                    pg.sort_order
                 ORDER BY ps.sort_order, pg.sort_order, pc.sort_order
                 """
             ).fetchall()
@@ -9709,7 +9734,12 @@ class PanelStore:
                 JOIN platform_sections ps ON ps.id = pg.platform_section_id
                 LEFT JOIN products p ON p.product_category_id = pc.id
                 WHERE pc.id = ?
-                GROUP BY pc.id
+                GROUP BY
+                    pc.id,
+                    pg.id,
+                    pg.name,
+                    ps.id,
+                    ps.display_name
                 """,
                 (category_id,),
             ).fetchone()
