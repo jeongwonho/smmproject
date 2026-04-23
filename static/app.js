@@ -1756,9 +1756,13 @@ async function refreshCoreData() {
     state.orderCounts = { all: 0, queued: 0, in_progress: 0, completed: 0 };
     state.transactions = [];
     state.wallet = null;
-  state.walletLedger = [];
-  state.chargeOrders = [];
-  state.chargeDraft = null;
+    state.walletLedger = [];
+    state.chargeOrders = [];
+    state.chargeDraft = null;
+  }
+  if (!state.ui.activePlatform && bootstrapData.platforms.length) {
+    state.ui.activePlatform = bootstrapData.platforms[0].id;
+  }
 }
 
 function resetSignupFlow() {
@@ -1806,10 +1810,6 @@ function updateSignupPasswordFeedback(scope) {
   }
   if (bar instanceof HTMLElement) {
     bar.style.width = rawPassword ? `${Math.max(0, Math.min(feedback.score, 4)) * 25}%` : "0%";
-  }
-}
-  if (!state.ui.activePlatform && bootstrapData.platforms.length) {
-    state.ui.activePlatform = bootstrapData.platforms[0].id;
   }
 }
 
