@@ -904,6 +904,8 @@ CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_entity
     ON admin_audit_logs(entity_type, entity_id, created_at DESC);
 """
 
+RUNTIME_SCHEMA_VERSION = "2026-04-23-01"
+
 
 class PanelError(Exception):
     def __init__(self, message: str, *, status: int = 400) -> None:
@@ -4002,7 +4004,18 @@ class PanelStore:
     def _initialize(self) -> None:
         with self._connect() as conn:
             conn.executescript(SCHEMA_SQL)
-            self._apply_migrations(conn)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runtime_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            if self._runtime_metadata_value(conn, "schema_version") != RUNTIME_SCHEMA_VERSION:
+                self._apply_migrations(conn)
+                self._set_runtime_metadata(conn, "schema_version", RUNTIME_SCHEMA_VERSION)
             has_categories = conn.execute("SELECT COUNT(*) AS count FROM product_categories").fetchone()["count"]
             if not has_categories:
                 self._seed(conn)
@@ -4012,8 +4025,59 @@ class PanelStore:
                 self._seed_management_samples(conn)
                 self._ensure_management_order_samples(conn)
                 self._ensure_analytics_samples(conn)
-            self._sync_wallet_state(conn)
+            if self._wallet_runtime_repair_needed(conn):
+                self._sync_wallet_state(conn)
             conn.commit()
+
+    def _runtime_metadata_value(self, conn: DatabaseConnection, key: str) -> str:
+        row = conn.execute("SELECT value FROM runtime_metadata WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return ""
+        return str(row["value"] or "")
+
+    def _set_runtime_metadata(self, conn: DatabaseConnection, key: str, value: str) -> None:
+        conn.execute(
+            """
+            INSERT INTO runtime_metadata (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (key, value, now_iso()),
+        )
+
+    def _wallet_runtime_repair_needed(self, conn: DatabaseConnection) -> bool:
+        missing_wallet = conn.execute(
+            """
+            SELECT 1
+            FROM users u
+            LEFT JOIN wallets w ON w.user_id = u.id
+            WHERE w.user_id IS NULL
+            LIMIT 1
+            """
+        ).fetchone()
+        if missing_wallet is not None:
+            return True
+        balance_drift = conn.execute(
+            """
+            SELECT 1
+            FROM users u
+            JOIN wallets w ON w.user_id = u.id
+            WHERE COALESCE(u.balance, 0) <> COALESCE(w.available_balance, 0)
+            LIMIT 1
+            """
+        ).fetchone()
+        if balance_drift is not None:
+            return True
+        unmigrated_legacy = conn.execute(
+            """
+            SELECT 1
+            FROM balance_transactions bt
+            LEFT JOIN wallet_ledger wl ON wl.id = ('legacy_' || bt.id)
+            WHERE wl.id IS NULL
+            LIMIT 1
+            """
+        ).fetchone()
+        return unmigrated_legacy is not None
 
     def _apply_migrations(self, conn: DatabaseConnection) -> None:
         self._ensure_column(conn, "users", "password_hash", "TEXT NOT NULL DEFAULT ''")
@@ -5822,6 +5886,138 @@ class PanelStore:
             if row is None:
                 return None
             return self._user_summary(conn, user_id)
+
+    def public_shell(self, user_id: str = "") -> Dict[str, Any]:
+        with self._connect() as conn:
+            user = self._user_summary(conn, user_id) if user_id else None
+            popup_row = conn.execute("SELECT * FROM home_popups ORDER BY updated_at DESC LIMIT 1").fetchone()
+            site_settings_row = self._site_settings_row(conn)
+            site_settings = self._site_settings_public_payload(site_settings_row)
+            banners = [
+                dict(row)
+                for row in conn.execute("SELECT * FROM home_banners WHERE is_active = 1 ORDER BY sort_order")
+            ]
+            featured = [
+                dict(row)
+                for row in conn.execute("SELECT * FROM home_spotlights WHERE section_key = 'featured' ORDER BY sort_order LIMIT 6")
+            ]
+            supports = [
+                dict(row)
+                for row in conn.execute("SELECT * FROM support_links ORDER BY sort_order LIMIT 4")
+            ]
+            notices = [
+                {
+                    **dict(row),
+                    "publishedLabel": self._relative_date_label(row["published_at"]),
+                }
+                for row in conn.execute("SELECT * FROM notices ORDER BY pinned DESC, published_at DESC LIMIT 1")
+            ]
+            platforms = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT id, slug, display_name, description, icon, image_url, accent_color
+                    FROM platform_sections
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM platform_groups pg
+                        JOIN product_categories pc ON pc.platform_group_id = pg.id AND pc.is_active = 1
+                        JOIN products p ON p.product_category_id = pc.id AND p.is_active = 1
+                        WHERE pg.platform_section_id = platform_sections.id
+                    )
+                    ORDER BY sort_order
+                    """
+                )
+            ]
+            company = {
+                "name": site_settings["siteName"],
+                "representative": "운영 관리자",
+                "contact": str(os.environ.get("SMM_PANEL_SUPPORT_CONTACT") or "").strip(),
+                "hours": "평일 10:00 - 19:00",
+            }
+            return {
+                "app": {
+                    "name": site_settings["siteName"],
+                    "subtitle": "고객 친화형 SMM 서비스 쇼핑몰",
+                    "accentColor": "#b96bc6",
+                },
+                "siteSettings": site_settings,
+                "user": user,
+                "viewer": {
+                    "authenticated": bool(user),
+                },
+                "topLinks": [
+                    {"label": "서비스 소개서", "route": "/products"},
+                    {"label": "이용 가이드", "route": "/help"},
+                ],
+                "popup": self._popup_public_payload(popup_row) if popup_row else None,
+                "platforms": [
+                    {
+                        "id": platform["id"],
+                        "slug": platform["slug"],
+                        "displayName": platform["display_name"],
+                        "description": platform["description"],
+                        "icon": platform["icon"],
+                        "logoImageUrl": platform["image_url"],
+                        "accentColor": platform["accent_color"],
+                    }
+                    for platform in platforms
+                ],
+                "banners": [
+                    {
+                        "id": banner["id"],
+                        "title": banner["title"],
+                        "subtitle": banner["subtitle"],
+                        "ctaLabel": banner["cta_label"],
+                        "route": banner["route"],
+                        "imageUrl": banner["image_url"],
+                        "theme": banner["theme"],
+                        "isActive": bool(banner["is_active"]),
+                    }
+                    for banner in banners
+                ],
+                "featuredServices": [
+                    {
+                        "id": item["id"],
+                        "title": item["title"],
+                        "subtitle": item["subtitle"],
+                        "route": item["route"],
+                        "icon": item["icon"],
+                    }
+                    for item in featured
+                ],
+                "supportLinks": [
+                    {
+                        "id": item["id"],
+                        "title": item["title"],
+                        "subtitle": item["subtitle"],
+                        "route": item["route"],
+                        "icon": item["icon"],
+                        "externalUrl": item["external_url"],
+                    }
+                    for item in supports
+                ],
+                "notices": notices,
+                "authConfig": {
+                    "signupEnabled": True,
+                    "loginRoute": "/auth",
+                    "passwordResetEnabled": False,
+                    "signupRoute": "/auth/signup",
+                    "emailVerificationRequired": True,
+                    "verificationCodeLength": AUTH_VERIFICATION_CODE_LENGTH,
+                    "verificationExpiresInSeconds": AUTH_VERIFICATION_TTL_SECONDS,
+                    "verificationCompleteExpiresInSeconds": AUTH_VERIFICATION_COMPLETE_TTL_SECONDS,
+                    "verificationResendIntervalSeconds": AUTH_VERIFICATION_RESEND_INTERVAL_SECONDS,
+                    "passwordPolicy": {
+                        "minimumLength": PUBLIC_PASSWORD_MIN_LENGTH,
+                        "recommendedLength": PUBLIC_PASSWORD_RECOMMENDED_LENGTH,
+                        "veryStrongLength": PUBLIC_PASSWORD_VERY_STRONG_LENGTH,
+                    },
+                    "oauthProviders": oauth_provider_catalog(),
+                },
+                "company": company,
+                "isShell": True,
+            }
 
     def bootstrap(self, user_id: str = "") -> Dict[str, Any]:
         with self._connect() as conn:

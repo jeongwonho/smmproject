@@ -27,6 +27,7 @@ const toast = document.querySelector("#toast");
 
 const state = {
   bootstrap: null,
+  bootstrapMode: "none",
   publicCsrfToken: "",
   publicAuth: blankPublicAuthState(),
   catalog: [],
@@ -103,6 +104,7 @@ const state = {
 };
 
 let bannerIntervalId = null;
+let catalogLoadPromise = null;
 let previewSequence = 0;
 let adminSectionObserver = null;
 let lastTrackedPublicPath = "";
@@ -1692,6 +1694,18 @@ async function apiGet(path) {
   return data;
 }
 
+async function apiGetWithRetry(path, { retries = 1, retryDelay = 900 } = {}) {
+  try {
+    return await apiGet(path);
+  } catch (error) {
+    if (retries <= 0 || !isTransientApiError(error)) {
+      throw error;
+    }
+    await delay(retryDelay);
+    return apiGetWithRetry(path, { retries: retries - 1, retryDelay: Math.round(retryDelay * 1.5) });
+  }
+}
+
 async function apiPost(path, payload) {
   const headers = {
     Accept: "application/json",
@@ -1755,16 +1769,29 @@ function showToast(message, variant = "default") {
   }, 2600);
 }
 
-async function refreshCoreData() {
-  const bootstrapData = await apiGet("/api/bootstrap");
+function routeCanUsePublicShell(route) {
+  if (!route) return true;
+  return ["home", "products", "detail", "admin"].includes(route.name);
+}
+
+function routeNeedsFullBootstrap(route) {
+  if (!route) return false;
+  if (["auth", "help", "legal"].includes(route.name)) return true;
+  return isLoggedIn() && ["charge", "orders", "my"].includes(route.name);
+}
+
+async function refreshCoreData({ shell = false } = {}) {
+  const endpoint = shell ? "/api/public-shell" : "/api/bootstrap";
+  const bootstrapData = await apiGetWithRetry(endpoint);
   state.bootstrap = bootstrapData;
+  state.bootstrapMode = shell ? "shell" : "full";
   state.publicCsrfToken = bootstrapData.viewer?.csrfToken || "";
-  if (bootstrapData.viewer?.authenticated) {
+  if (bootstrapData.viewer?.authenticated && !shell) {
     const [ordersData, walletData, walletLedgerData, chargeOrdersData] = await Promise.all([
-      apiGet("/api/orders"),
-      apiGet("/api/wallet"),
-      apiGet("/api/wallet/ledger?limit=100"),
-      apiGet("/api/charge-orders?limit=100"),
+      apiGetWithRetry("/api/orders"),
+      apiGetWithRetry("/api/wallet"),
+      apiGetWithRetry("/api/wallet/ledger?limit=100"),
+      apiGetWithRetry("/api/charge-orders?limit=100"),
     ]);
     state.orders = ordersData.orders;
     state.orderCounts = ordersData.counts;
@@ -1775,7 +1802,7 @@ async function refreshCoreData() {
     if (!state.chargeDraft) {
       state.chargeDraft = blankChargeDraft(bootstrapData.chargeConfig);
     }
-  } else {
+  } else if (!bootstrapData.viewer?.authenticated) {
     state.orders = [];
     state.orderCounts = { all: 0, queued: 0, in_progress: 0, completed: 0 };
     state.transactions = [];
@@ -1837,17 +1864,26 @@ function updateSignupPasswordFeedback(scope) {
   }
 }
 
-async function loadCatalog() {
-  const data = await apiGet("/api/products");
-  state.catalog = data.platforms;
-  if (!state.ui.activePlatform && state.catalog.length) {
-    state.ui.activePlatform = state.catalog[0].id;
-  }
+async function loadCatalog({ force = false } = {}) {
+  if (state.catalog.length && !force) return state.catalog;
+  if (catalogLoadPromise && !force) return catalogLoadPromise;
+  catalogLoadPromise = apiGetWithRetry("/api/products")
+    .then((data) => {
+      state.catalog = data.platforms;
+      if (!state.ui.activePlatform && state.catalog.length) {
+        state.ui.activePlatform = state.catalog[0].id;
+      }
+      return state.catalog;
+    })
+    .finally(() => {
+      catalogLoadPromise = null;
+    });
+  return catalogLoadPromise;
 }
 
 async function ensureCategory(categoryId) {
   if (!state.categoryCache[categoryId]) {
-    const data = await apiGet(`/api/product-categories/${encodeURIComponent(categoryId)}`);
+    const data = await apiGetWithRetry(`/api/product-categories/${encodeURIComponent(categoryId)}`);
     state.categoryCache[categoryId] = data.category;
   }
   return state.categoryCache[categoryId];
@@ -5736,9 +5772,17 @@ async function renderRoute() {
   const route = getRoute();
   syncShellMode(route);
   try {
-    if (!state.bootstrap || !state.catalog.length) {
+    if (!state.bootstrap) {
       showLoading();
       return;
+    }
+    if (routeNeedsFullBootstrap(route) && state.bootstrapMode !== "full") {
+      showLoading("필요한 정보를 불러오는 중...");
+      await refreshCoreData({ shell: false });
+    }
+    if (route.name === "products" && !state.catalog.length) {
+      showLoading("상품 목록을 불러오는 중...");
+      await loadCatalog();
     }
     if (route.name === "admin") {
       state.ui.adminActiveSection = normalizeAdminSectionId(route.section);
@@ -5833,6 +5877,9 @@ async function renderRoute() {
     }
     ensureBannerTimer();
     trackPublicRoute(route);
+    if (route.name === "home" && !state.catalog.length) {
+      loadCatalog().catch(() => {});
+    }
   } catch (error) {
     if (route.name === "admin" && (error.status === 401 || error.status === 503)) {
       try {
@@ -5844,7 +5891,7 @@ async function renderRoute() {
       app.innerHTML = renderAdminAuth();
       return;
     }
-    app.innerHTML = renderNotFound(error.message || "데이터를 불러오는 중 오류가 발생했습니다.");
+    app.innerHTML = renderNotFound(readableApiErrorMessage(error?.message || error, "데이터를 불러오는 중 오류가 발생했습니다."));
   }
 }
 
@@ -7997,8 +8044,8 @@ window.addEventListener("popstate", () => {
 async function init() {
   showLoading();
   try {
-    await refreshCoreData();
-    await loadCatalog();
+    const route = getRoute();
+    await refreshCoreData({ shell: routeCanUsePublicShell(route) });
     await renderRoute();
   } catch (error) {
     if (isTransientApiError(error) && !init._retried) {
@@ -8006,8 +8053,8 @@ async function init() {
       showLoading("연결을 다시 확인하는 중...");
       try {
         await delay(1200);
-        await refreshCoreData();
-        await loadCatalog();
+        const route = getRoute();
+        await refreshCoreData({ shell: routeCanUsePublicShell(route) });
         await renderRoute();
         return;
       } catch (retryError) {
