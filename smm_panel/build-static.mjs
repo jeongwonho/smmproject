@@ -23,6 +23,14 @@ async function build() {
   );
 
   await writeFile(path.join(distDir, "index.html"), indexHtml, "utf8");
+
+  const adminHtml = indexHtml
+    .replaceAll('data-route-surface="public"', 'data-route-surface="admin"')
+    .replace(
+      '<link rel="stylesheet" href="/static/styles/public.css" data-surface-style="public" />',
+      '<link rel="stylesheet" href="/static/styles/admin.css" data-surface-style="admin" />'
+    );
+  await writeFile(path.join(distDir, "admin.html"), adminHtml, "utf8");
 }
 
 build().catch((error) => {

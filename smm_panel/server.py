@@ -372,12 +372,13 @@ def write_json(
     handler: SimpleHTTPRequestHandler,
     status: int,
     payload: Dict[str, Any],
+    cache_control: str = "no-store",
     extra_headers: Sequence[tuple[str, str]] = (),
 ) -> None:
     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Cache-Control", cache_control)
     handler.send_header("Content-Length", str(len(raw)))
     for header_name, header_value in extra_headers:
         handler.send_header(header_name, header_value)
@@ -468,6 +469,12 @@ def render_index_html(store: PanelStore, request_path: str, config: AppConfig) -
         '<meta name="smm-api-base-url" content="" data-managed-runtime="api-base" />',
         f'<meta name="smm-api-base-url" content="{html.escape(config.public_api_base_url, quote=True)}" data-managed-runtime="api-base" />',
     )
+    if is_admin:
+        document = document.replace('data-route-surface="public"', 'data-route-surface="admin"')
+        document = document.replace(
+            '<link rel="stylesheet" href="/static/styles/public.css" data-surface-style="public" />',
+            '<link rel="stylesheet" href="/static/styles/admin.css" data-surface-style="admin" />',
+        )
     return document.replace("<!-- SMM_MANAGED_HEAD -->", head_markup)
 
 
@@ -768,6 +775,12 @@ class AppHandler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/session":
                 write_json(self, 200, {"ok": True, **self._public_session_payload()})
                 return
+            if parsed.path == "/api/public-shell":
+                session = self._public_session()
+                payload = self._server().store.public_shell(str((session or {}).get("user", {}).get("id") or ""))
+                payload["viewer"] = self._public_session_payload()
+                write_json(self, 200, {"ok": True, **payload})
+                return
             if parsed.path == "/api/bootstrap":
                 session = self._public_session()
                 payload = self._server().store.bootstrap(str((session or {}).get("user", {}).get("id") or ""))
@@ -791,7 +804,12 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             if parsed.path == "/api/products":
                 search = parse_qs(parsed.query).get("q", [""])[0]
-                write_json(self, 200, {"ok": True, **self._server().store.list_catalog(search)})
+                write_json(
+                    self,
+                    200,
+                    {"ok": True, **self._server().store.list_catalog(search)},
+                    cache_control="public, max-age=30, s-maxage=120, stale-while-revalidate=600",
+                )
                 return
             if parsed.path.startswith("/api/admin/suppliers/") and parsed.path.endswith("/services"):
                 supplier_id = parsed.path.split("/")[4]
@@ -800,7 +818,12 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             if parsed.path.startswith("/api/product-categories/"):
                 category_id = parsed.path.rsplit("/", 1)[-1]
-                write_json(self, 200, {"ok": True, "category": self._server().store.get_product_category(category_id)})
+                write_json(
+                    self,
+                    200,
+                    {"ok": True, "category": self._server().store.get_product_category(category_id)},
+                    cache_control="public, max-age=30, s-maxage=120, stale-while-revalidate=600",
+                )
                 return
             if parsed.path == "/api/orders":
                 session = self._require_public_auth()
