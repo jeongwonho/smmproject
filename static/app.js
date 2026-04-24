@@ -1776,7 +1776,7 @@ function routeCanUsePublicShell(route) {
 
 function routeNeedsFullBootstrap(route) {
   if (!route) return false;
-  if (["auth", "help", "legal"].includes(route.name)) return true;
+  if (["help", "legal"].includes(route.name)) return true;
   return isLoggedIn() && ["charge", "orders", "my"].includes(route.name);
 }
 
