@@ -3968,7 +3968,7 @@ class PanelStore:
         else:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             self.backend = "sqlite"
-        self._initialize()
+        self._boot()
 
     @classmethod
     def from_env(cls, db_path: Path = DB_PATH) -> "PanelStore":
@@ -4000,6 +4000,17 @@ class PanelStore:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return DatabaseConnection(self.backend, conn)
+
+    def _boot(self) -> None:
+        if self.backend == "postgres" and is_production_runtime():
+            try:
+                with self._connect() as conn:
+                    schema_version = self._runtime_metadata_value_if_available(conn, "schema_version")
+                    if schema_version == RUNTIME_SCHEMA_VERSION:
+                        return
+            except Exception:
+                pass
+        self._initialize()
 
     def _initialize(self) -> None:
         with self._connect() as conn:
@@ -4034,6 +4045,12 @@ class PanelStore:
         if row is None:
             return ""
         return str(row["value"] or "")
+
+    def _runtime_metadata_value_if_available(self, conn: DatabaseConnection, key: str) -> str:
+        try:
+            return self._runtime_metadata_value(conn, key)
+        except Exception:
+            return ""
 
     def _set_runtime_metadata(self, conn: DatabaseConnection, key: str, value: str) -> None:
         conn.execute(
