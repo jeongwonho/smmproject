@@ -779,13 +779,23 @@ class AppHandler(SimpleHTTPRequestHandler):
                 session = self._public_session()
                 payload = self._server().store.public_shell(str((session or {}).get("user", {}).get("id") or ""))
                 payload["viewer"] = self._public_session_payload()
-                write_json(self, 200, {"ok": True, **payload})
+                write_json(
+                    self,
+                    200,
+                    {"ok": True, **payload},
+                    cache_control="no-store" if session else "public, max-age=15, s-maxage=60, stale-while-revalidate=300",
+                )
                 return
             if parsed.path == "/api/bootstrap":
                 session = self._public_session()
                 payload = self._server().store.bootstrap(str((session or {}).get("user", {}).get("id") or ""))
                 payload["viewer"] = self._public_session_payload()
-                write_json(self, 200, {"ok": True, **payload})
+                write_json(
+                    self,
+                    200,
+                    {"ok": True, **payload},
+                    cache_control="no-store" if session else "public, max-age=15, s-maxage=60, stale-while-revalidate=300",
+                )
                 return
             if parsed.path.startswith("/api/auth/oauth/") and parsed.path.endswith("/start"):
                 provider = parsed.path.split("/")[4]
