@@ -3080,6 +3080,36 @@ class Cafe24ApiClient:
     def update_order(self, order_id: str, payload: Dict[str, Any]) -> Any:
         return self._request("PUT", f"/admin/orders/{quote(str(order_id), safe='')}", payload=payload)
 
+    def products(self, *, keyword: str = "", product_no: str = "", limit: int = 20, offset: int = 0) -> Any:
+        query: Dict[str, Any] = {
+            "limit": min(max(int(limit or 20), 1), 100),
+            "offset": max(int(offset or 0), 0),
+            "embed": "options,variants",
+        }
+        normalized_product_no = str(product_no or "").strip()
+        normalized_keyword = str(keyword or "").strip()
+        if normalized_product_no:
+            query["product_no"] = normalized_product_no
+        elif normalized_keyword:
+            if normalized_keyword.isdigit():
+                query["product_no"] = normalized_keyword
+            else:
+                query["product_name"] = normalized_keyword
+        return self._request("GET", "/admin/products", query=query)
+
+    def product(self, product_no: str) -> Any:
+        return self._request(
+            "GET",
+            f"/admin/products/{quote(str(product_no), safe='')}",
+            query={"embed": "options,variants"},
+        )
+
+    def product_options(self, product_no: str) -> Any:
+        return self._request("GET", f"/admin/products/{quote(str(product_no), safe='')}/options")
+
+    def product_variants(self, product_no: str) -> Any:
+        return self._request("GET", f"/admin/products/{quote(str(product_no), safe='')}/variants")
+
 
 def service_html(title: str, lead: str, points: List[str], steps: List[str], note: str) -> str:
     parts = [
@@ -9705,6 +9735,163 @@ class PanelStore:
                 clear_lock=False,
             )
         return Cafe24ApiClient(mall_id, access_token, shop_no=int(row["shop_no"] or CAFE24_DEFAULT_SHOP_NO))
+
+    def _cafe24_payload_collection(self, payload: Any, keys: Iterable[str]) -> List[Dict[str, Any]]:
+        if isinstance(payload, dict):
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return [item for item in value if isinstance(item, dict)]
+                if isinstance(value, dict):
+                    nested = self._cafe24_payload_collection(value, keys)
+                    return nested or [value]
+            return [payload]
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        return []
+
+    def _cafe24_product_options_from_payload(self, payload: Any) -> List[Dict[str, Any]]:
+        return self._cafe24_payload_collection(payload, ("options", "option", "option_values", "optionValues", "values"))
+
+    def _cafe24_product_variants_from_payload(self, payload: Any) -> List[Dict[str, Any]]:
+        return self._cafe24_payload_collection(payload, ("variants", "variant", "items", "item"))
+
+    def _cafe24_option_payload(self, option: Dict[str, Any]) -> Dict[str, Any]:
+        value_candidates = (
+            option.get("option_values")
+            or option.get("optionValues")
+            or option.get("values")
+            or option.get("value")
+            or option.get("option_value")
+            or ""
+        )
+        if isinstance(value_candidates, list):
+            values = [
+                str(value.get("option_text") or value.get("text") or value.get("value") or value.get("name") or value).strip()
+                if isinstance(value, dict)
+                else str(value).strip()
+                for value in value_candidates
+            ]
+        else:
+            values = [text.strip() for text in re.split(r"[,/|]", str(value_candidates or "")) if text.strip()]
+        return {
+            "name": cafe24_payload_value(option, ("option_name", "name", "label", "key")),
+            "value": cafe24_payload_value(option, ("option_value", "value", "text", "option_text")),
+            "values": values,
+            "raw": option,
+        }
+
+    def _cafe24_variant_payload(self, variant: Dict[str, Any]) -> Dict[str, Any]:
+        option_text = cafe24_payload_value(
+            variant,
+            ("options", "option_value", "option_values", "variant_option", "option_text", "option_name"),
+        )
+        return {
+            "variantCode": cafe24_payload_value(variant, ("variant_code", "option_code", "item_code", "product_code")),
+            "customProductCode": cafe24_payload_value(variant, ("custom_product_code", "custom_variant_code", "custom_item_code")),
+            "productCode": cafe24_payload_value(variant, ("product_code", "item_code")),
+            "optionText": option_text,
+            "display": cafe24_payload_value(variant, ("display", "display_status", "use_display")),
+            "selling": cafe24_payload_value(variant, ("selling", "selling_status", "use_selling")),
+            "price": cafe24_payload_value(variant, ("price", "additional_amount", "option_price")),
+            "stockQuantity": cafe24_payload_value(variant, ("quantity", "stock_quantity", "stock")),
+            "raw": variant,
+        }
+
+    def _cafe24_product_payload(self, product: Dict[str, Any], *, include_raw: bool = False) -> Dict[str, Any]:
+        raw_options = self._cafe24_product_options_from_payload(product.get("options") or product.get("option") or [])
+        raw_variants = self._cafe24_product_variants_from_payload(product.get("variants") or product.get("variant") or [])
+        payload = {
+            "productNo": cafe24_payload_value(product, ("product_no", "product_id", "id")),
+            "productName": cafe24_payload_value(product, ("product_name", "name", "display_product_name")),
+            "productCode": cafe24_payload_value(product, ("product_code", "code")),
+            "customProductCode": cafe24_payload_value(product, ("custom_product_code", "custom_code")),
+            "price": cafe24_payload_value(product, ("price", "retail_price", "selling_price")),
+            "display": cafe24_payload_value(product, ("display", "display_status", "use_display")),
+            "selling": cafe24_payload_value(product, ("selling", "selling_status", "use_selling")),
+            "options": [self._cafe24_option_payload(option) for option in raw_options],
+            "variants": [self._cafe24_variant_payload(variant) for variant in raw_variants],
+        }
+        if include_raw:
+            payload["raw"] = product
+        return payload
+
+    def _cafe24_products_from_payload(self, payload: Any) -> List[Dict[str, Any]]:
+        return self._cafe24_payload_collection(payload, ("products", "product"))
+
+    def list_cafe24_products(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        integration_id = str(payload.get("integrationId") or "").strip()
+        keyword = str(payload.get("q") or payload.get("keyword") or "").strip()
+        product_no = str(payload.get("productNo") or payload.get("product_no") or "").strip()
+        try:
+            limit = min(max(int(payload.get("limit") or 20), 1), 100)
+            offset = max(int(payload.get("offset") or 0), 0)
+        except (TypeError, ValueError):
+            raise PanelError("조회 개수/페이지 값이 올바르지 않습니다.", status=400)
+        with self._connect() as conn:
+            integration = self._cafe24_integration_row(conn, integration_id)
+            client = self._cafe24_client_for_row(conn, integration)
+            response = client.products(keyword=keyword, product_no=product_no, limit=limit, offset=offset)
+            products = [self._cafe24_product_payload(product) for product in self._cafe24_products_from_payload(response)]
+            self._log_cafe24_event(
+                conn,
+                mall_id=str(integration["mall_id"]),
+                shop_no=int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                event_type="products.lookup",
+                status="success",
+                request_payload={"keyword": keyword, "productNo": product_no, "limit": limit, "offset": offset},
+                response_payload={"count": len(products)},
+            )
+            conn.commit()
+        return {
+            "products": products,
+            "count": len(products),
+            "query": {"keyword": keyword, "productNo": product_no, "limit": limit, "offset": offset},
+        }
+
+    def get_cafe24_product_detail(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        integration_id = str(payload.get("integrationId") or "").strip()
+        product_no = str(payload.get("productNo") or payload.get("product_no") or "").strip()
+        if not product_no:
+            raise PanelError("조회할 Cafe24 상품번호가 필요합니다.", status=400)
+        warnings: List[str] = []
+        with self._connect() as conn:
+            integration = self._cafe24_integration_row(conn, integration_id)
+            client = self._cafe24_client_for_row(conn, integration)
+            product_response = client.product(product_no)
+            product_rows = self._cafe24_products_from_payload(product_response)
+            if not product_rows:
+                raise PanelError("Cafe24 상품을 찾지 못했습니다.", status=404)
+            product_payload = self._cafe24_product_payload(product_rows[0], include_raw=True)
+            try:
+                option_response = client.product_options(product_no)
+                product_payload["options"] = [
+                    self._cafe24_option_payload(option) for option in self._cafe24_product_options_from_payload(option_response)
+                ] or product_payload["options"]
+            except Exception as exc:
+                warnings.append(f"옵션 조회 실패: {exc}")
+            try:
+                variant_response = client.product_variants(product_no)
+                product_payload["variants"] = [
+                    self._cafe24_variant_payload(variant) for variant in self._cafe24_product_variants_from_payload(variant_response)
+                ] or product_payload["variants"]
+            except Exception as exc:
+                warnings.append(f"품목 조회 실패: {exc}")
+            self._log_cafe24_event(
+                conn,
+                mall_id=str(integration["mall_id"]),
+                shop_no=int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                event_type="products.detail",
+                status="success" if not warnings else "partial",
+                request_payload={"productNo": product_no},
+                response_payload={
+                    "optionCount": len(product_payload.get("options") or []),
+                    "variantCount": len(product_payload.get("variants") or []),
+                    "warnings": warnings,
+                },
+            )
+            conn.commit()
+        return {"product": product_payload, "warnings": warnings}
 
     def _cafe24_orders_from_payload(self, payload: Any) -> List[Dict[str, Any]]:
         if isinstance(payload, dict):

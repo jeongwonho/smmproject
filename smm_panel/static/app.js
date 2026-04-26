@@ -36,6 +36,11 @@ import {
   updateAdminPlatformSectionPreview,
   updateAdminSiteSettingsPreview,
 } from "./admin/sections.js";
+import {
+  configureCafe24AdminActions,
+  handleCafe24AdminClick,
+  handleCafe24AdminSubmit,
+} from "./admin/cafe24.js";
 import { parseRoute } from "./shared/routes.js";
 import { createRuntimeConfig } from "./shared/runtime.js";
 import { blankPublicAuthState, blankSignupState, evaluatePublicPasswordStrength } from "./public/auth-state.js";
@@ -63,6 +68,7 @@ const state = {
   adminSession: null,
   adminCsrfToken: "",
   adminSupplierServices: {},
+  adminCafe24ProductLookup: { products: [], detail: null, query: {}, warnings: [] },
   adminCustomerDetails: {},
   adminSiteSettingsDraft: null,
   adminPopupDraft: null,
@@ -1464,6 +1470,7 @@ function syncAdminSelections({ preserveDraft = true } = {}) {
 function resetAdminState({ preserveSession = false } = {}) {
   state.adminBootstrap = null;
   state.adminSupplierServices = {};
+  state.adminCafe24ProductLookup = { products: [], detail: null, query: {}, warnings: [] };
   state.adminCustomerDetails = {};
   state.adminSiteSettingsDraft = null;
   state.adminPopupDraft = null;
@@ -2731,6 +2738,15 @@ configureAdminPages({
   renderAdminOverviewSection,
 });
 
+configureCafe24AdminActions({
+  state,
+  apiGet,
+  apiPost,
+  refreshAdminData,
+  renderRoute,
+  showToast,
+});
+
 async function renderRoute() {
   const route = getRoute();
   syncShellMode(route);
@@ -3190,6 +3206,10 @@ async function applyAdminSiteSettingsImage(kind, file) {
 document.addEventListener("click", async (event) => {
   const targetElement = event.target instanceof Element ? event.target : event.target?.parentElement;
   const closest = (selector) => targetElement?.closest(selector);
+
+  if (await handleCafe24AdminClick(closest)) {
+    return;
+  }
 
   const authTabButton = closest("[data-auth-tab]");
   if (authTabButton) {
@@ -3856,87 +3876,6 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const cafe24OauthStartButton = closest("[data-admin-cafe24-oauth-start]");
-  if (cafe24OauthStartButton) {
-    const form = cafe24OauthStartButton.closest("[data-admin-cafe24-integration-form]");
-    const formData = form ? new FormData(form) : new FormData();
-    try {
-      const result = await apiPost("/api/admin/cafe24/oauth/start", {
-        mallId: formData.get("mallId"),
-        shopNo: formData.get("shopNo"),
-        scopes: formData.get("scopes"),
-      });
-      showToast("Cafe24 승인 페이지로 이동합니다.");
-      window.location.href = result.authorizeUrl;
-    } catch (error) {
-      showToast(error.message || "Cafe24 OAuth 연결을 시작하지 못했습니다.", "error");
-    }
-    return;
-  }
-
-  const cafe24PollButton = closest("[data-admin-cafe24-poll]");
-  if (cafe24PollButton) {
-    const integrationId = cafe24PollButton.getAttribute("data-admin-cafe24-poll") || "";
-    const form = document.querySelector("[data-admin-cafe24-integration-form]");
-    const formData = form ? new FormData(form) : new FormData();
-    try {
-      const result = await apiPost("/api/admin/cafe24/poll", {
-        integrationId: integrationId || formData.get("id"),
-        submitReady: true,
-        startDate: formData.get("pollStartDate"),
-        endDate: formData.get("pollEndDate"),
-      });
-      await refreshAdminData({ preserveDraft: true });
-      showToast(`Cafe24 수집 완료: ${result.processed || 0}개 처리, ${result.submitted || 0}개 전송`);
-      renderRoute();
-    } catch (error) {
-      showToast(error.message || "Cafe24 주문 수집에 실패했습니다.", "error");
-    }
-    return;
-  }
-
-  const cafe24DeleteMappingButton = closest("[data-admin-cafe24-delete-mapping]");
-  if (cafe24DeleteMappingButton) {
-    const mappingId = cafe24DeleteMappingButton.getAttribute("data-admin-cafe24-delete-mapping") || "";
-    try {
-      await apiPost("/api/admin/cafe24/mappings/delete", { mappingId });
-      await refreshAdminData({ preserveDraft: true });
-      showToast("Cafe24 상품 매핑을 비활성화했습니다.");
-      renderRoute();
-    } catch (error) {
-      showToast(error.message || "Cafe24 상품 매핑 정리에 실패했습니다.", "error");
-    }
-    return;
-  }
-
-  const cafe24RetryButton = closest("[data-admin-cafe24-retry-item]");
-  if (cafe24RetryButton) {
-    const itemId = cafe24RetryButton.getAttribute("data-admin-cafe24-retry-item") || "";
-    try {
-      const result = await apiPost("/api/admin/cafe24/order-items/retry", { itemId });
-      await refreshAdminData({ preserveDraft: true });
-      showToast(`Cafe24 품주 재처리: ${result.result?.status || "처리됨"}`);
-      renderRoute();
-    } catch (error) {
-      showToast(error.message || "Cafe24 품주 재처리에 실패했습니다.", "error");
-    }
-    return;
-  }
-
-  const cafe24ResyncButton = closest("[data-admin-cafe24-resync-item]");
-  if (cafe24ResyncButton) {
-    const itemId = cafe24ResyncButton.getAttribute("data-admin-cafe24-resync-item") || "";
-    try {
-      const result = await apiPost("/api/admin/cafe24/order-items/resync", { itemId });
-      await refreshAdminData({ preserveDraft: true });
-      showToast(`Cafe24 품주 재동기화: ${result.result?.status || "확인됨"}`);
-      renderRoute();
-    } catch (error) {
-      showToast(error.message || "Cafe24 품주 재동기화에 실패했습니다.", "error");
-    }
-    return;
-  }
-
   const platformButton = closest("[data-platform-select]");
   if (platformButton) {
     state.ui.activePlatform = platformButton.getAttribute("data-platform-select");
@@ -4478,6 +4417,10 @@ document.addEventListener("mouseleave", (event) => {
 
 document.addEventListener("submit", async (event) => {
   const form = event.target;
+  if (await handleCafe24AdminSubmit(form, event)) {
+    return;
+  }
+
   if (form.matches("[data-public-login-form]")) {
     event.preventDefault();
     const formData = new FormData(form);
@@ -4879,76 +4822,6 @@ document.addEventListener("submit", async (event) => {
       renderRoute();
     } catch (error) {
       showToast(error.message || "상품 저장에 실패했습니다.", "error");
-    }
-    return;
-  }
-
-  if (form.matches("[data-admin-cafe24-integration-form]")) {
-    event.preventDefault();
-    const formData = new FormData(form);
-    try {
-      const result = await apiPost("/api/admin/cafe24/integrations", {
-        id: formData.get("id"),
-        mallId: formData.get("mallId"),
-        shopNo: formData.get("shopNo"),
-        accessToken: formData.get("accessToken"),
-        refreshToken: formData.get("refreshToken"),
-        expiresAt: formData.get("expiresAt"),
-        refreshTokenExpiresAt: formData.get("refreshTokenExpiresAt"),
-        scopes: formData.get("scopes"),
-        autoSubmit: Boolean(formData.get("autoSubmit")),
-        isActive: Boolean(formData.get("isActive")),
-      });
-      await refreshAdminData({ preserveDraft: true });
-      showToast(`${result.integration.mallId} Cafe24 연동을 저장했습니다.`);
-      renderRoute();
-    } catch (error) {
-      showToast(error.message || "Cafe24 연동 저장에 실패했습니다.", "error");
-    }
-    return;
-  }
-
-  if (form.matches("[data-admin-cafe24-mapping-form]")) {
-    event.preventDefault();
-    const formData = new FormData(form);
-    try {
-      const result = await apiPost("/api/admin/cafe24/mappings", {
-        mallId: formData.get("mallId"),
-        shopNo: formData.get("shopNo"),
-        cafe24ProductNo: formData.get("cafe24ProductNo"),
-        cafe24VariantCode: formData.get("cafe24VariantCode"),
-        cafe24CustomProductCode: formData.get("cafe24CustomProductCode"),
-        internalProductId: formData.get("internalProductId"),
-        supplierId: formData.get("supplierId"),
-        supplierProductUuid: formData.get("supplierProductUuid"),
-        supplierProductCode: formData.get("supplierProductCode"),
-        fieldMappingJson: formData.get("fieldMappingJson"),
-        enabled: true,
-      });
-      await refreshAdminData({ preserveDraft: true });
-      showToast(`${result.mapping.internalProductName || "Cafe24"} 매핑을 저장했습니다.`);
-      form.reset();
-      renderRoute();
-    } catch (error) {
-      showToast(error.message || "Cafe24 상품 매핑 저장에 실패했습니다.", "error");
-    }
-    return;
-  }
-
-  if (form.matches("[data-admin-cafe24-item-status-form]")) {
-    event.preventDefault();
-    const formData = new FormData(form);
-    try {
-      await apiPost("/api/admin/cafe24/order-items/status", {
-        itemId: formData.get("itemId"),
-        status: formData.get("status"),
-        memo: formData.get("memo"),
-      });
-      await refreshAdminData({ preserveDraft: true });
-      showToast("Cafe24 품주 상태를 저장했습니다.");
-      renderRoute();
-    } catch (error) {
-      showToast(error.message || "Cafe24 품주 상태 저장에 실패했습니다.", "error");
     }
     return;
   }
