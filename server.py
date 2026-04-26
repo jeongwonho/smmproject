@@ -17,7 +17,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from core import APP_ROOT, DEFAULT_SITE_NAME, PanelError, PanelStore
 
@@ -579,6 +579,18 @@ class AppHandler(SimpleHTTPRequestHandler):
     def _request_origin(self) -> str:
         return normalize_origin(f"{self._request_scheme()}://{self._request_host()}")
 
+    def _cafe24_oauth_redirect_uri(self) -> str:
+        configured = normalize_public_url(os.environ.get("SMM_PANEL_CAFE24_REDIRECT_URI", ""))
+        if configured:
+            return configured
+        return f"{self._request_origin()}/api/admin/cafe24/oauth/callback"
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _static_asset_path(self, request_path: str) -> Path:
         raw_path = str(request_path or "/").split("?", 1)[0].split("#", 1)[0]
         normalized = raw_path.lstrip("/")
@@ -803,6 +815,32 @@ class AppHandler(SimpleHTTPRequestHandler):
                     f"{provider} OAuth는 환경변수 설정 후 활성화됩니다. 현재는 구조만 준비된 상태입니다.",
                     status=503,
                 )
+            if parsed.path == "/api/admin/cafe24/oauth/callback":
+                query = parse_qs(parsed.query)
+                error = query.get("error", [""])[0]
+                if error:
+                    self._redirect(
+                        "/admin/cafe24?"
+                        + urlencode(
+                            {
+                                "cafe24OAuth": "error",
+                                "message": query.get("error_description", [error])[0],
+                            }
+                        )
+                    )
+                    return
+                try:
+                    self._server().store.complete_cafe24_oauth_callback(
+                        {
+                            "state": query.get("state", [""])[0],
+                            "code": query.get("code", [""])[0],
+                        }
+                    )
+                    self._redirect("/admin/cafe24?cafe24OAuth=success")
+                except Exception as exc:
+                    message = str(exc) if isinstance(exc, PanelError) else "Cafe24 OAuth 토큰 저장에 실패했습니다."
+                    self._redirect("/admin/cafe24?" + urlencode({"cafe24OAuth": "error", "message": message}))
+                return
             if parsed.path.startswith("/api/admin/"):
                 self._require_admin_auth()
             if parsed.path == "/api/admin/bootstrap":
@@ -1177,6 +1215,31 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             if parsed.path == "/api/admin/suppliers":
                 write_json(self, 200, {"ok": True, **self._server().store.save_supplier(payload)})
+                return
+            if parsed.path == "/api/admin/cafe24/oauth/start":
+                payload["redirectUri"] = payload.get("redirectUri") or self._cafe24_oauth_redirect_uri()
+                write_json(self, 200, {"ok": True, **self._server().store.create_cafe24_oauth_authorize_url(payload)})
+                return
+            if parsed.path == "/api/admin/cafe24/integrations":
+                write_json(self, 200, {"ok": True, **self._server().store.save_cafe24_integration(payload)})
+                return
+            if parsed.path == "/api/admin/cafe24/mappings":
+                write_json(self, 200, {"ok": True, **self._server().store.save_cafe24_product_mapping(payload)})
+                return
+            if parsed.path == "/api/admin/cafe24/mappings/delete":
+                write_json(self, 200, {"ok": True, **self._server().store.delete_cafe24_product_mapping(payload)})
+                return
+            if parsed.path == "/api/admin/cafe24/poll":
+                write_json(self, 200, {"ok": True, **self._server().store.poll_cafe24_orders(payload)})
+                return
+            if parsed.path == "/api/admin/cafe24/order-items/retry":
+                write_json(self, 200, {"ok": True, **self._server().store.retry_cafe24_order_item(payload)})
+                return
+            if parsed.path == "/api/admin/cafe24/order-items/resync":
+                write_json(self, 200, {"ok": True, **self._server().store.resync_cafe24_order_item(payload)})
+                return
+            if parsed.path == "/api/admin/cafe24/order-items/status":
+                write_json(self, 200, {"ok": True, **self._server().store.update_cafe24_order_item_status(payload)})
                 return
             if parsed.path == "/api/admin/customers":
                 write_json(self, 200, {"ok": True, **self._server().store.save_customer(payload)})

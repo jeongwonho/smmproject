@@ -347,6 +347,11 @@ function renderAdminModuleHeader(sectionId) {
       <button class="admin-secondary-button" type="button" data-admin-refresh>연동 현황 갱신</button>
       <button class="admin-primary-button" type="button" data-admin-supplier-new>새 공급사</button>
     `;
+  } else if (sectionId === "cafe24") {
+    actions = `
+      <button class="admin-secondary-button" type="button" data-admin-refresh>Cafe24 데이터 갱신</button>
+      <button class="admin-primary-button" type="button" data-admin-cafe24-poll>주문 수집</button>
+    `;
   } else if (sectionId === "customers") {
     actions = `
       <button class="admin-secondary-button" type="button" data-admin-refresh>회원 목록 갱신</button>
@@ -383,6 +388,7 @@ function renderAdminActiveSection(sectionId, context) {
     renderSupplierAdminSection,
     renderCustomerAdminSection,
     renderCatalogAdminSection,
+    renderCafe24AdminSection,
     renderAdminChargesSection,
     renderContentAdminSection,
     renderAdminOrdersSection,
@@ -393,6 +399,7 @@ function renderAdminActiveSection(sectionId, context) {
   if (sectionId === "popup") return renderPopupAdminSection();
   if (sectionId === "content") return renderContentAdminSection();
   if (sectionId === "suppliers") return renderSupplierAdminSection(context);
+  if (sectionId === "cafe24") return renderCafe24AdminSection();
   if (sectionId === "customers") return renderCustomerAdminSection();
   if (sectionId === "charges") return renderAdminChargesSection();
   if (sectionId === "catalog") return renderCatalogAdminSection();
