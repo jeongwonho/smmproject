@@ -10,6 +10,51 @@ from urllib.parse import parse_qs, urlparse
 from smm_panel.core import PanelError, PanelStore, now_iso
 
 
+class FakeCafe24ProductClient:
+    def products(self, *, keyword="", product_no="", limit=20, offset=0):
+        return {
+            "products": [
+                {
+                    "product_no": "1001",
+                    "product_name": "인스타 팔로워",
+                    "custom_product_code": "IG-FOLLOWER",
+                    "price": "1000.00",
+                    "options": [{"option_name": "SNS 링크", "option_values": ["프로필 URL"]}],
+                    "variants": [
+                        {
+                            "variant_code": "P00000AA000A",
+                            "custom_product_code": "IG-FOLLOWER-100",
+                            "option_value": "100개",
+                        }
+                    ],
+                }
+            ]
+        }
+
+    def product(self, product_no):
+        return {
+            "product": {
+                "product_no": str(product_no),
+                "product_name": "인스타 팔로워",
+                "custom_product_code": "IG-FOLLOWER",
+            }
+        }
+
+    def product_options(self, product_no):
+        return {"options": [{"option_name": "수량", "option_values": ["100개", "500개"]}]}
+
+    def product_variants(self, product_no):
+        return {
+            "variants": [
+                {
+                    "variant_code": "P00000AA000A",
+                    "custom_product_code": "IG-FOLLOWER-100",
+                    "option_value": "100개",
+                }
+            ]
+        }
+
+
 class Cafe24OrderIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.db_path = Path(tempfile.gettempdir()) / "instamart_cafe24_orders_test.db"
@@ -305,6 +350,29 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(row["token_status"], "reconnect_required")
         self.assertTrue(row["reconnect_required_at"])
         self.assertIn("만료", row["reconnect_reason"])
+
+    def test_cafe24_product_lookup_normalizes_products_before_mapping(self):
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=FakeCafe24ProductClient()):
+            result = self.store.list_cafe24_products(
+                {"integrationId": self.integration["id"], "q": "인스타", "limit": 20, "offset": 0}
+            )
+
+        self.assertEqual(result["count"], 1)
+        product = result["products"][0]
+        self.assertEqual(product["productNo"], "1001")
+        self.assertEqual(product["customProductCode"], "IG-FOLLOWER")
+        self.assertEqual(product["variants"][0]["variantCode"], "P00000AA000A")
+
+    def test_cafe24_product_detail_includes_options_and_variants_for_mapping(self):
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=FakeCafe24ProductClient()):
+            result = self.store.get_cafe24_product_detail(
+                {"integrationId": self.integration["id"], "productNo": "1001"}
+            )
+
+        product = result["product"]
+        self.assertEqual(product["productNo"], "1001")
+        self.assertEqual(product["options"][0]["name"], "수량")
+        self.assertEqual(product["variants"][0]["customProductCode"], "IG-FOLLOWER-100")
 
 
 if __name__ == "__main__":

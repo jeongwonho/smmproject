@@ -862,6 +862,42 @@ class AppHandler(SimpleHTTPRequestHandler):
                 customer_id = parsed.path.rsplit("/", 1)[-1]
                 write_json(self, 200, {"ok": True, **self._server().store.get_customer_detail(customer_id)})
                 return
+            if parsed.path == "/api/admin/cafe24/products":
+                query = parse_qs(parsed.query)
+                write_json(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        **self._server().store.list_cafe24_products(
+                            {
+                                "integrationId": query.get("integrationId", [""])[0],
+                                "q": query.get("q", [""])[0],
+                                "productNo": query.get("productNo", [""])[0],
+                                "limit": query.get("limit", ["20"])[0],
+                                "offset": query.get("offset", ["0"])[0],
+                            }
+                        ),
+                    },
+                )
+                return
+            if parsed.path.startswith("/api/admin/cafe24/products/"):
+                query = parse_qs(parsed.query)
+                product_no = parsed.path.rsplit("/", 1)[-1]
+                write_json(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        **self._server().store.get_cafe24_product_detail(
+                            {
+                                "integrationId": query.get("integrationId", [""])[0],
+                                "productNo": product_no,
+                            }
+                        ),
+                    },
+                )
+                return
             if parsed.path == "/api/products":
                 search = parse_qs(parsed.query).get("q", [""])[0]
                 write_json(
