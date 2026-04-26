@@ -17,7 +17,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse
 
 from core import APP_ROOT, DEFAULT_SITE_NAME, PanelError, PanelStore
 
@@ -610,9 +610,16 @@ class AppHandler(SimpleHTTPRequestHandler):
 
     def _incoming_request_path(self, raw_path: str) -> str:
         parsed = urlparse(raw_path)
-        rewritten = parse_qs(parsed.query).get(VERCEL_REWRITE_PATH_QUERY_KEY, [""])[0]
+        rewritten = ""
+        preserved_query_items: list[tuple[str, str]] = []
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            if key == VERCEL_REWRITE_PATH_QUERY_KEY and not rewritten:
+                rewritten = value
+                continue
+            preserved_query_items.append((key, value))
         if rewritten:
-            return str(rewritten)
+            query = urlencode(preserved_query_items)
+            return f"{rewritten}?{query}" if query else str(rewritten)
         return parsed.path
 
     def _allowed_cors_origin(self) -> str:
