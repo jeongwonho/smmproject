@@ -580,8 +580,11 @@ class AppHandler(SimpleHTTPRequestHandler):
         return normalize_origin(f"{self._request_scheme()}://{self._request_host()}")
 
     def _cafe24_oauth_redirect_uri(self) -> str:
-        configured = normalize_public_url(os.environ.get("SMM_PANEL_CAFE24_REDIRECT_URI", ""))
-        if configured:
+        configured = os.environ.get("SMM_PANEL_CAFE24_REDIRECT_URI", "").strip()
+        parsed = urlparse(configured)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            # OAuth redirect_uri matching is exact. Do not strip a trailing slash
+            # or otherwise normalize the path after the operator configured it.
             return configured
         return f"{self._request_origin()}/api/admin/cafe24/oauth/callback"
 
