@@ -1,6 +1,7 @@
 import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { runArchitectureCheck } from "./scripts/architecture-check.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -12,6 +13,8 @@ const distStaticDir = path.join(distDir, "static");
 const apiBaseUrl = String(process.env.SMM_PANEL_PUBLIC_API_BASE_URL || "").trim();
 
 async function build() {
+  await runArchitectureCheck({ root: __dirname });
+
   await rm(distDir, { recursive: true, force: true });
   await mkdir(distStaticDir, { recursive: true });
   await cp(staticDir, distStaticDir, { recursive: true });

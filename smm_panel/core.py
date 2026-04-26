@@ -13,6 +13,7 @@ import secrets
 import socket
 import ssl
 import sqlite3
+import time
 from html import escape as html_escape
 from html.parser import HTMLParser
 from pathlib import Path
@@ -90,6 +91,58 @@ PUBLIC_PASSWORD_MIN_LENGTH = 10
 PUBLIC_PASSWORD_RECOMMENDED_LENGTH = 12
 PUBLIC_PASSWORD_VERY_STRONG_LENGTH = 14
 ORDER_IDEMPOTENCY_KEY_MAX_LENGTH = 120
+ORDER_EXTERNAL_REFERENCE_MAX_LENGTH = 160
+ORDER_CHANNEL_WEB = "web"
+ORDER_CHANNEL_CAFE24 = "cafe24"
+ORDER_CHANNEL_MANUAL = "manual"
+ORDER_CHANNELS = {ORDER_CHANNEL_WEB, ORDER_CHANNEL_CAFE24, ORDER_CHANNEL_MANUAL}
+ORDER_DISPATCH_UNMAPPED = "unmapped"
+ORDER_DISPATCH_READY = "ready"
+ORDER_DISPATCH_SUBMITTED = "submitted"
+ORDER_DISPATCH_ACCEPTED = "accepted"
+ORDER_DISPATCH_IN_PROGRESS = "in_progress"
+ORDER_DISPATCH_COMPLETED = "completed"
+ORDER_DISPATCH_PARTIAL = "partial"
+ORDER_DISPATCH_CANCELLED = "cancelled"
+ORDER_DISPATCH_FAILED = "failed"
+ORDER_DISPATCH_STATUSES = {
+    ORDER_DISPATCH_UNMAPPED,
+    ORDER_DISPATCH_READY,
+    ORDER_DISPATCH_SUBMITTED,
+    ORDER_DISPATCH_ACCEPTED,
+    ORDER_DISPATCH_IN_PROGRESS,
+    ORDER_DISPATCH_COMPLETED,
+    ORDER_DISPATCH_PARTIAL,
+    ORDER_DISPATCH_CANCELLED,
+    ORDER_DISPATCH_FAILED,
+}
+CAFE24_ORDER_CHANNEL = ORDER_CHANNEL_CAFE24
+CAFE24_DEFAULT_SHOP_NO = 1
+CAFE24_OAUTH_STATE_TTL_SECONDS = 10 * 60
+CAFE24_DEFAULT_SCOPES = ("mall.read_order", "mall.write_order", "mall.read_product")
+CAFE24_REFRESH_LOCK_SECONDS = 90
+CAFE24_REFRESH_TOKEN_EXPIRY_WARNING_DAYS = 2
+CAFE24_TOKEN_STATUS_CONNECTED = "connected"
+CAFE24_TOKEN_STATUS_EXPIRING = "token_expiring"
+CAFE24_TOKEN_STATUS_REFRESHING = "refreshing"
+CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED = "reconnect_required"
+CAFE24_TOKEN_STATUS_FAILED = "failed"
+CAFE24_ORDER_OVERLAP_MINUTES = 20
+CAFE24_ORDER_ELIGIBLE_STATUSES = {"N10", "N20", "N21", "N22", "N30", "N40"}
+CAFE24_ORDER_UNPAID_STATUSES = {"N00"}
+CAFE24_ORDER_CANCELLED_PREFIXES = ("C", "R", "E")
+CAFE24_STANDARD_STATUSES = {
+    "received",
+    "validated",
+    "waiting_input",
+    "ready_to_submit",
+    "submitting",
+    "supplier_submitted",
+    "supplier_progress",
+    "completed",
+    "failed",
+    "cancelled",
+}
 WEBHOOK_SIGNATURE_TOLERANCE_SECONDS = 5 * 60
 SECRET_ENVELOPE_PREFIX = "enc:v1:"
 SECRET_ENCRYPTION_KEY_MIN_LENGTH = 24
@@ -149,6 +202,22 @@ def demo_seed_enabled() -> bool:
 
 def payment_provider_name() -> str:
     return str(os.environ.get("SMM_PANEL_PAYMENT_PROVIDER") or "").strip().lower()
+
+
+def cafe24_client_id() -> str:
+    return str(os.environ.get("SMM_PANEL_CAFE24_CLIENT_ID") or "").strip()
+
+
+def cafe24_client_secret() -> str:
+    return str(os.environ.get("SMM_PANEL_CAFE24_CLIENT_SECRET") or "").strip()
+
+
+def cafe24_redirect_uri() -> str:
+    return str(os.environ.get("SMM_PANEL_CAFE24_REDIRECT_URI") or "").strip()
+
+
+def cafe24_api_base_url(mall_id: str) -> str:
+    return f"https://{str(mall_id or '').strip()}.cafe24api.com/api/v2"
 
 
 def payment_public_key() -> str:
@@ -617,6 +686,13 @@ CREATE TABLE IF NOT EXISTS orders (
     unit_price INTEGER NOT NULL,
     total_price INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued',
+    order_channel TEXT NOT NULL DEFAULT 'web',
+    external_order_id TEXT NOT NULL DEFAULT '',
+    external_order_item_id TEXT NOT NULL DEFAULT '',
+    dispatch_status TEXT NOT NULL DEFAULT 'unmapped',
+    dispatch_attempts INTEGER NOT NULL DEFAULT 0,
+    supplier_last_error TEXT NOT NULL DEFAULT '',
+    external_payload_json TEXT NOT NULL DEFAULT '{}',
     notes_json TEXT NOT NULL DEFAULT '{}',
     idempotency_key TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
@@ -832,6 +908,127 @@ CREATE TABLE IF NOT EXISTS supplier_orders (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS cafe24_oauth_states (
+    state TEXT PRIMARY KEY,
+    mall_id TEXT NOT NULL,
+    shop_no INTEGER NOT NULL DEFAULT 1,
+    scopes_json TEXT NOT NULL DEFAULT '[]',
+    redirect_uri TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT 'admin',
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_cafe24_oauth_states_expires_at
+    ON cafe24_oauth_states(expires_at);
+
+CREATE TABLE IF NOT EXISTS cafe24_integrations (
+    id TEXT PRIMARY KEY,
+    mall_id TEXT NOT NULL,
+    shop_no INTEGER NOT NULL DEFAULT 1,
+    scopes_json TEXT NOT NULL DEFAULT '[]',
+    access_token TEXT NOT NULL DEFAULT '',
+    refresh_token TEXT NOT NULL DEFAULT '',
+    expires_at TEXT NOT NULL DEFAULT '',
+    refresh_token_expires_at TEXT NOT NULL DEFAULT '',
+    last_poll_at TEXT NOT NULL DEFAULT '',
+    poll_cursor TEXT NOT NULL DEFAULT '',
+    auto_submit INTEGER NOT NULL DEFAULT 1,
+    completion_policy TEXT NOT NULL DEFAULT 'memo_only',
+    token_status TEXT NOT NULL DEFAULT 'connected',
+    token_last_checked_at TEXT NOT NULL DEFAULT '',
+    token_last_refreshed_at TEXT NOT NULL DEFAULT '',
+    token_refresh_lock_until TEXT NOT NULL DEFAULT '',
+    token_refresh_lock_owner TEXT NOT NULL DEFAULT '',
+    reconnect_required_at TEXT NOT NULL DEFAULT '',
+    reconnect_reason TEXT NOT NULL DEFAULT '',
+    is_active INTEGER NOT NULL DEFAULT 1,
+    last_sync_status TEXT NOT NULL DEFAULT 'never',
+    last_sync_message TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(mall_id, shop_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cafe24_integrations_active
+    ON cafe24_integrations(is_active, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS cafe24_product_mappings (
+    id TEXT PRIMARY KEY,
+    mall_id TEXT NOT NULL,
+    shop_no INTEGER NOT NULL DEFAULT 1,
+    cafe24_product_no TEXT NOT NULL DEFAULT '',
+    cafe24_variant_code TEXT NOT NULL DEFAULT '',
+    cafe24_custom_product_code TEXT NOT NULL DEFAULT '',
+    internal_product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    supplier_id TEXT NOT NULL DEFAULT '',
+    supplier_product_uuid TEXT NOT NULL DEFAULT '',
+    supplier_product_code TEXT NOT NULL DEFAULT '',
+    field_mapping_json TEXT NOT NULL DEFAULT '{}',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(mall_id, shop_no, cafe24_product_no, cafe24_variant_code, cafe24_custom_product_code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cafe24_product_mappings_product
+    ON cafe24_product_mappings(internal_product_id, enabled);
+
+CREATE TABLE IF NOT EXISTS cafe24_order_items (
+    id TEXT PRIMARY KEY,
+    mall_id TEXT NOT NULL,
+    shop_no INTEGER NOT NULL DEFAULT 1,
+    cafe24_order_id TEXT NOT NULL,
+    cafe24_order_item_code TEXT NOT NULL DEFAULT '',
+    cafe24_product_no TEXT NOT NULL DEFAULT '',
+    cafe24_variant_code TEXT NOT NULL DEFAULT '',
+    cafe24_custom_product_code TEXT NOT NULL DEFAULT '',
+    buyer_name TEXT NOT NULL DEFAULT '',
+    buyer_email TEXT NOT NULL DEFAULT '',
+    buyer_phone TEXT NOT NULL DEFAULT '',
+    receiver_name TEXT NOT NULL DEFAULT '',
+    order_status_code TEXT NOT NULL DEFAULT '',
+    source_status TEXT NOT NULL DEFAULT '',
+    standard_status TEXT NOT NULL DEFAULT 'received',
+    internal_order_id TEXT NOT NULL DEFAULT '',
+    mapping_id TEXT NOT NULL DEFAULT '',
+    product_id TEXT NOT NULL DEFAULT '',
+    normalized_fields_json TEXT NOT NULL DEFAULT '{}',
+    supplier_payload_json TEXT NOT NULL DEFAULT '{}',
+    raw_payload_json TEXT NOT NULL DEFAULT '{}',
+    error_message TEXT NOT NULL DEFAULT '',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    supplier_order_id TEXT NOT NULL DEFAULT '',
+    supplier_order_uuid TEXT NOT NULL DEFAULT '',
+    last_submitted_at TEXT NOT NULL DEFAULT '',
+    last_synced_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(mall_id, shop_no, cafe24_order_id, cafe24_order_item_code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_status_updated_at
+    ON cafe24_order_items(standard_status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_internal_order
+    ON cafe24_order_items(internal_order_id);
+
+CREATE TABLE IF NOT EXISTS cafe24_api_events (
+    id TEXT PRIMARY KEY,
+    mall_id TEXT NOT NULL,
+    shop_no INTEGER NOT NULL DEFAULT 1,
+    event_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    request_json TEXT NOT NULL DEFAULT '{}',
+    response_json TEXT NOT NULL DEFAULT '{}',
+    error_message TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cafe24_api_events_created_at
+    ON cafe24_api_events(created_at DESC);
+
 CREATE TABLE IF NOT EXISTS home_popups (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -904,7 +1101,7 @@ CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_entity
     ON admin_audit_logs(entity_type, entity_id, created_at DESC);
 """
 
-RUNTIME_SCHEMA_VERSION = "2026-04-23-01"
+RUNTIME_SCHEMA_VERSION = "2026-04-26-04"
 
 
 class PanelError(Exception):
@@ -1569,6 +1766,210 @@ def generate_public_order_number() -> str:
 def sanitize_idempotency_key(raw: Any) -> str:
     value = re.sub(r"[^A-Za-z0-9._:-]", "", str(raw or "").strip())
     return value[:ORDER_IDEMPOTENCY_KEY_MAX_LENGTH]
+
+
+def sanitize_external_order_reference(raw: Any) -> str:
+    value = re.sub(r"[\x00-\x1f\x7f]", "", str(raw or "").strip())
+    return value[:ORDER_EXTERNAL_REFERENCE_MAX_LENGTH]
+
+
+def normalize_order_channel(raw: Any) -> str:
+    value = str(raw or "").strip().lower().replace("_", "-")
+    aliases = {
+        "": ORDER_CHANNEL_WEB,
+        "public": ORDER_CHANNEL_WEB,
+        "public-web": ORDER_CHANNEL_WEB,
+        "storefront": ORDER_CHANNEL_WEB,
+        "instamart": ORDER_CHANNEL_WEB,
+        "cafe-24": ORDER_CHANNEL_CAFE24,
+        "cafe24": ORDER_CHANNEL_CAFE24,
+        "external-cafe24": ORDER_CHANNEL_CAFE24,
+        "admin": ORDER_CHANNEL_MANUAL,
+        "manual": ORDER_CHANNEL_MANUAL,
+    }
+    normalized = aliases.get(value, value)
+    if normalized not in ORDER_CHANNELS:
+        raise PanelError("지원하지 않는 주문 유입 경로입니다.")
+    return normalized
+
+
+def normalize_order_dispatch_status(raw: Any) -> str:
+    value = str(raw or "").strip().lower().replace("-", "_")
+    if value in {"", "none", "not_required", "not_required_yet", "unmapped"}:
+        return ORDER_DISPATCH_UNMAPPED
+    if value in {"ready", "pending", "queued"}:
+        return ORDER_DISPATCH_READY
+    if value in {"submitted", "success", "sent"}:
+        return ORDER_DISPATCH_SUBMITTED
+    if value in {"accepted"}:
+        return ORDER_DISPATCH_ACCEPTED
+    if value in {"in_progress", "processing", "progress", "running"}:
+        return ORDER_DISPATCH_IN_PROGRESS
+    if value in {"completed", "complete", "done"}:
+        return ORDER_DISPATCH_COMPLETED
+    if value in {"partial", "partially_completed"}:
+        return ORDER_DISPATCH_PARTIAL
+    if value in {"cancelled", "canceled", "cancel"}:
+        return ORDER_DISPATCH_CANCELLED
+    if value in {"failed", "fail", "error", "blocked"}:
+        return ORDER_DISPATCH_FAILED
+    return ORDER_DISPATCH_FAILED
+
+
+def order_channel_label(raw: Any) -> str:
+    try:
+        channel = normalize_order_channel(raw)
+    except PanelError:
+        channel = str(raw or "").strip() or ORDER_CHANNEL_WEB
+    return {
+        ORDER_CHANNEL_WEB: "자사몰",
+        ORDER_CHANNEL_CAFE24: "카페24",
+        ORDER_CHANNEL_MANUAL: "수동등록",
+    }.get(channel, channel)
+
+
+def normalize_cafe24_shop_no(raw: Any) -> int:
+    try:
+        value = int(raw or CAFE24_DEFAULT_SHOP_NO)
+    except (TypeError, ValueError):
+        value = CAFE24_DEFAULT_SHOP_NO
+    return max(value, 1)
+
+
+def normalize_cafe24_scopes(raw: Any) -> List[str]:
+    if isinstance(raw, list):
+        values = raw
+    else:
+        values = re.split(r"[\s,]+", str(raw or "").strip())
+    scopes = []
+    for value in values:
+        scope = str(value or "").strip()
+        if scope and scope not in scopes:
+            scopes.append(scope)
+    return scopes or list(CAFE24_DEFAULT_SCOPES)
+
+
+def cafe24_oauth_timestamp_from_response(payload: Dict[str, Any], absolute_key: str, seconds_key: str) -> str:
+    absolute_value = str(payload.get(absolute_key) or "").strip()
+    if absolute_value:
+        return absolute_value
+    try:
+        seconds = int(payload.get(seconds_key) or 0)
+    except (TypeError, ValueError):
+        seconds = 0
+    if seconds <= 0:
+        return ""
+    return (dt.datetime.now().astimezone() + dt.timedelta(seconds=seconds)).isoformat()
+
+
+def parse_iso_datetime(value: Any) -> Optional[dt.datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.datetime.now().astimezone().tzinfo)
+    return parsed
+
+
+def cafe24_refresh_token_expired(expires_at: Any) -> bool:
+    parsed = parse_iso_datetime(expires_at)
+    return bool(parsed and parsed <= dt.datetime.now().astimezone())
+
+
+def cafe24_refresh_token_expiring_soon(expires_at: Any) -> bool:
+    parsed = parse_iso_datetime(expires_at)
+    if not parsed:
+        return False
+    threshold = dt.datetime.now().astimezone() + dt.timedelta(days=CAFE24_REFRESH_TOKEN_EXPIRY_WARNING_DAYS)
+    return parsed <= threshold
+
+
+def cafe24_refresh_error_requires_reconnect(error_message: Any) -> bool:
+    message = str(error_message or "").lower()
+    return any(
+        token in message
+        for token in (
+            "invalid_grant",
+            "invalid refresh",
+            "expired",
+            "unauthorized",
+            "401",
+            "400",
+            "access_denied",
+            "invalid token",
+        )
+    )
+
+
+def normalize_cafe24_status(raw: Any) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return "received"
+    if value in CAFE24_ORDER_UNPAID_STATUSES:
+        return "received"
+    if value.startswith(CAFE24_ORDER_CANCELLED_PREFIXES):
+        return "cancelled"
+    if value in CAFE24_ORDER_ELIGIBLE_STATUSES:
+        return "validated"
+    return "received"
+
+
+def cafe24_status_is_supply_eligible(raw: Any) -> bool:
+    return str(raw or "").strip() in CAFE24_ORDER_ELIGIBLE_STATUSES
+
+
+def cafe24_status_is_cancelled(raw: Any) -> bool:
+    value = str(raw or "").strip()
+    return bool(value) and value.startswith(CAFE24_ORDER_CANCELLED_PREFIXES)
+
+
+def cafe24_default_poll_window(last_poll_at: str = "", overlap_minutes: int = CAFE24_ORDER_OVERLAP_MINUTES) -> Dict[str, str]:
+    now = dt.datetime.now().astimezone()
+    start = now - dt.timedelta(hours=6)
+    if last_poll_at:
+        try:
+            parsed = dt.datetime.fromisoformat(last_poll_at)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=now.tzinfo)
+            start = parsed - dt.timedelta(minutes=max(int(overlap_minutes or 0), 0))
+        except ValueError:
+            pass
+    return {
+        "start": start.strftime("%Y-%m-%d"),
+        "end": now.strftime("%Y-%m-%d"),
+    }
+
+
+def cafe24_payload_value(payload: Dict[str, Any], keys: Iterable[str]) -> str:
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def redact_external_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: Dict[str, Any] = {}
+        sensitive_tokens = ("token", "secret", "password", "authorization", "access_token", "refresh_token")
+        for key, item in value.items():
+            lower = str(key).lower()
+            if any(token in lower for token in sensitive_tokens):
+                redacted[key] = mask_secret(str(item), 4)
+            elif "email" in lower:
+                redacted[key] = mask_email(str(item))
+            elif "phone" in lower or "mobile" in lower or "tel" in lower:
+                redacted[key] = mask_phone(str(item))
+            else:
+                redacted[key] = redact_external_payload(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact_external_payload(item) for item in value]
+    return value
 
 
 def is_unique_constraint_error(exc: BaseException) -> bool:
@@ -2400,6 +2801,60 @@ class SupplierApiClient:
             )
         return self.call("services")
 
+    def _mkt24_v3_url(self, path: str) -> str:
+        parsed = urlparse(self.api_url)
+        if not parsed.scheme or not parsed.netloc:
+            raise SupplierApiError("MKT24 API URL 형식이 올바르지 않습니다.")
+        base_path = parsed.path.rstrip("/")
+        marker = "/v3"
+        if marker in base_path:
+            base_path = base_path[: base_path.index(marker) + len(marker)]
+        else:
+            base_path = "/v3"
+        return f"{parsed.scheme}://{parsed.netloc}{base_path}/{path.lstrip('/')}"
+
+    def mkt24_product_detail(self, product_uuid: str) -> Any:
+        return self._request_json(
+            method="GET",
+            url=self._mkt24_v3_url(f"/products/{quote(str(product_uuid), safe='')}"),
+            headers={
+                "Authorization": f"Bearer {self.bearer_token}",
+                "x-api-key": self.api_key,
+            },
+        )
+
+    def mkt24_estimate_sns(self, payload: Dict[str, Any]) -> Any:
+        return self._request_json(
+            method="POST",
+            url=self._mkt24_v3_url("/order/sns/estimate"),
+            headers={
+                "Authorization": f"Bearer {self.bearer_token}",
+                "x-api-key": self.api_key,
+            },
+            payload=payload,
+        )
+
+    def mkt24_order_sns(self, payload: Dict[str, Any]) -> Any:
+        return self._request_json(
+            method="POST",
+            url=self._mkt24_v3_url("/order/sns"),
+            headers={
+                "Authorization": f"Bearer {self.bearer_token}",
+                "x-api-key": self.api_key,
+            },
+            payload=payload,
+        )
+
+    def mkt24_order_status(self, order_uuid: str) -> Any:
+        return self._request_json(
+            method="GET",
+            url=self._mkt24_v3_url(f"/order/sns/{quote(str(order_uuid), safe='')}"),
+            headers={
+                "Authorization": f"Bearer {self.bearer_token}",
+                "x-api-key": self.api_key,
+            },
+        )
+
     def balance(self) -> Any:
         if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
             raise SupplierApiError("잔액 API를 지원하지 않는 공급사 타입입니다.")
@@ -2407,12 +2862,21 @@ class SupplierApiClient:
 
     def order(self, data: Dict[str, Any]) -> Any:
         if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
-            raise SupplierApiError("이 공급사 타입은 아직 자동 발주 API가 연결되지 않았습니다.")
+            if not self.api_key or not self.bearer_token:
+                raise SupplierApiError("MKT24 자동 발주에는 x-api-key와 Bearer Token이 필요합니다.")
+            payload = dict(data)
+            product_uuid = str(payload.pop("productUuid", "") or payload.pop("product_uuid", "") or payload.get("service") or "").strip()
+            if product_uuid:
+                payload["productUuid"] = product_uuid
+                payload.pop("service", None)
+            return self.mkt24_order_sns(payload)
         return self.call("add", data)
 
     def status(self, order_id: str) -> Any:
         if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
-            raise SupplierApiError("이 공급사 타입은 아직 상태 조회 API가 연결되지 않았습니다.")
+            if not self.api_key or not self.bearer_token:
+                raise SupplierApiError("MKT24 상태 조회에는 x-api-key와 Bearer Token이 필요합니다.")
+            return self.mkt24_order_status(order_id)
         return self.call("status", {"order": order_id})
 
     def multi_status(self, order_ids: List[str]) -> Any:
@@ -2435,6 +2899,186 @@ class SupplierApiClient:
             "balance": str(payload.get("balance", "")),
             "currency": str(payload.get("currency", "")),
         }
+
+
+class Cafe24ApiError(Exception):
+    pass
+
+
+class Cafe24ApiClient:
+    def __init__(self, mall_id: str, access_token: str, *, shop_no: int = CAFE24_DEFAULT_SHOP_NO) -> None:
+        self.mall_id = str(mall_id or "").strip()
+        self.access_token = str(access_token or "").strip()
+        self.shop_no = int(shop_no or CAFE24_DEFAULT_SHOP_NO)
+        if not self.mall_id:
+            raise Cafe24ApiError("Cafe24 mall_id가 필요합니다.")
+        if not self.access_token:
+            raise Cafe24ApiError("Cafe24 access token이 필요합니다.")
+        self.base_url = cafe24_api_base_url(self.mall_id)
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: Optional[Dict[str, Any]] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        normalized_path = "/" + path.lstrip("/")
+        url = f"{self.base_url}{normalized_path}"
+        params = dict(query or {})
+        params.setdefault("shop_no", self.shop_no)
+        if params:
+            url = f"{url}?{urlencode({key: value for key, value in params.items() if value not in (None, '')}, doseq=True)}"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": PREVIEW_HEADERS["User-Agent"],
+        }
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        raw = ""
+        for attempt in range(3):
+            request = Request(url, data=data, headers=headers, method=method.upper())
+            try:
+                with urlopen(request, timeout=15) as response:
+                    raw = response.read().decode("utf-8", errors="replace")
+                break
+            except HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
+                if exc.code in {429, 500, 502, 503, 504} and attempt < 2:
+                    retry_after = str(exc.headers.get("Retry-After") or "").strip() if exc.headers else ""
+                    try:
+                        delay = min(max(float(retry_after), 0.5), 3.0) if retry_after else 0.5 * (attempt + 1)
+                    except ValueError:
+                        delay = 0.5 * (attempt + 1)
+                    time.sleep(delay)
+                    continue
+                raise Cafe24ApiError(f"Cafe24 API 오류 {exc.code}: {body or exc.reason}") from exc
+            except (URLError, TimeoutError, ValueError) as exc:
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise Cafe24ApiError(str(exc)) from exc
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise Cafe24ApiError("Cafe24 API가 JSON이 아닌 응답을 반환했습니다.") from exc
+        if isinstance(parsed, dict) and parsed.get("error"):
+            error = parsed.get("error")
+            if isinstance(error, dict):
+                raise Cafe24ApiError(str(error.get("message") or error.get("description") or error))
+            raise Cafe24ApiError(str(error))
+        return parsed
+
+    @staticmethod
+    def exchange_authorization_code(mall_id: str, code: str, redirect_uri: str) -> Dict[str, Any]:
+        client_id = cafe24_client_id()
+        client_secret = cafe24_client_secret()
+        if not client_id or not client_secret:
+            raise Cafe24ApiError("SMM_PANEL_CAFE24_CLIENT_ID / SMM_PANEL_CAFE24_CLIENT_SECRET 설정이 필요합니다.")
+        if not str(code or "").strip():
+            raise Cafe24ApiError("Cafe24 인증 code가 없습니다.")
+        if not str(redirect_uri or "").strip():
+            raise Cafe24ApiError("Cafe24 redirect_uri가 없습니다.")
+        token_url = f"{cafe24_api_base_url(mall_id)}/oauth/token"
+        basic = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
+        data = urlencode(
+            {
+                "grant_type": "authorization_code",
+                "code": str(code).strip(),
+                "redirect_uri": str(redirect_uri).strip(),
+            }
+        ).encode("utf-8")
+        request = Request(
+            token_url,
+            data=data,
+            headers={
+                "Authorization": f"Basic {basic}",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=15) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
+            raise Cafe24ApiError(f"Cafe24 토큰 발급 실패 {exc.code}: {body or exc.reason}") from exc
+        except (URLError, TimeoutError, ValueError) as exc:
+            raise Cafe24ApiError(str(exc)) from exc
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise Cafe24ApiError("Cafe24 토큰 응답 형식이 올바르지 않습니다.") from exc
+        if not isinstance(parsed, dict) or not parsed.get("access_token"):
+            raise Cafe24ApiError("Cafe24 access token을 발급하지 못했습니다.")
+        return parsed
+
+    @staticmethod
+    def refresh_access_token(mall_id: str, refresh_token: str) -> Dict[str, Any]:
+        client_id = cafe24_client_id()
+        client_secret = cafe24_client_secret()
+        if not client_id or not client_secret:
+            raise Cafe24ApiError("SMM_PANEL_CAFE24_CLIENT_ID / SMM_PANEL_CAFE24_CLIENT_SECRET 설정이 필요합니다.")
+        token_url = f"{cafe24_api_base_url(mall_id)}/oauth/token"
+        basic = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
+        data = urlencode({"grant_type": "refresh_token", "refresh_token": refresh_token}).encode("utf-8")
+        request = Request(
+            token_url,
+            data=data,
+            headers={
+                "Authorization": f"Basic {basic}",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=15) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
+            raise Cafe24ApiError(f"Cafe24 토큰 갱신 실패 {exc.code}: {body or exc.reason}") from exc
+        except (URLError, TimeoutError, ValueError) as exc:
+            raise Cafe24ApiError(str(exc)) from exc
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise Cafe24ApiError("Cafe24 토큰 응답 형식이 올바르지 않습니다.") from exc
+        if not isinstance(parsed, dict) or not parsed.get("access_token"):
+            raise Cafe24ApiError("Cafe24 access token을 갱신하지 못했습니다.")
+        return parsed
+
+    def orders(self, *, start_date: str, end_date: str, statuses: Optional[List[str]] = None, limit: int = 100) -> Any:
+        query: Dict[str, Any] = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "limit": min(max(int(limit or 100), 1), 100),
+            "embed": "items,buyer,receivers",
+        }
+        if statuses:
+            query["order_status"] = ",".join(statuses)
+        return self._request("GET", "/admin/orders", query=query)
+
+    def order(self, order_id: str) -> Any:
+        return self._request(
+            "GET",
+            f"/admin/orders/{quote(str(order_id), safe='')}",
+            query={"embed": "items,buyer,receivers"},
+        )
+
+    def order_count(self, *, start_date: str, end_date: str, statuses: Optional[List[str]] = None) -> Any:
+        query: Dict[str, Any] = {"start_date": start_date, "end_date": end_date}
+        if statuses:
+            query["order_status"] = ",".join(statuses)
+        return self._request("GET", "/admin/orders/count", query=query)
+
+    def update_order(self, order_id: str, payload: Dict[str, Any]) -> Any:
+        return self._request("PUT", f"/admin/orders/{quote(str(order_id), safe='')}", payload=payload)
 
 
 def service_html(title: str, lead: str, points: List[str], steps: List[str], note: str) -> str:
@@ -4121,6 +4765,13 @@ class PanelStore:
         self._ensure_column(conn, "charge_orders", "bank_account_snapshot_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column(conn, "charge_orders", "confirmed_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "orders", "idempotency_key", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "orders", "order_channel", "TEXT NOT NULL DEFAULT 'web'")
+        self._ensure_column(conn, "orders", "external_order_id", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "orders", "external_order_item_id", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "orders", "dispatch_status", "TEXT NOT NULL DEFAULT 'unmapped'")
+        self._ensure_column(conn, "orders", "dispatch_attempts", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "orders", "supplier_last_error", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "orders", "external_payload_json", "TEXT NOT NULL DEFAULT '{}'")
         conn.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_user_idempotency_key
@@ -4128,7 +4779,34 @@ class PanelStore:
                 WHERE idempotency_key <> ''
             """
         )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_channel_external_reference
+                ON orders(order_channel, external_order_id, external_order_item_id)
+                WHERE external_order_id <> ''
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_orders_channel_status_created_at
+                ON orders(order_channel, status, created_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_orders_dispatch_status_created_at
+                ON orders(dispatch_status, created_at DESC)
+            """
+        )
         self._ensure_charge_support_tables(conn)
+        self._ensure_cafe24_support_tables(conn)
+        self._ensure_column(conn, "cafe24_integrations", "token_status", "TEXT NOT NULL DEFAULT 'connected'")
+        self._ensure_column(conn, "cafe24_integrations", "token_last_checked_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_integrations", "token_last_refreshed_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_integrations", "token_refresh_lock_until", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_integrations", "token_refresh_lock_owner", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_integrations", "reconnect_required_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_integrations", "reconnect_reason", "TEXT NOT NULL DEFAULT ''")
         self._ensure_bigint_columns(
             conn,
             {
@@ -4222,6 +4900,126 @@ class PanelStore:
             );
             CREATE INDEX IF NOT EXISTS idx_tax_invoice_requests_user_created_at
                 ON tax_invoice_requests(user_id, created_at DESC);
+            """
+        )
+
+    def _ensure_cafe24_support_tables(self, conn: DatabaseConnection) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS cafe24_oauth_states (
+                state TEXT PRIMARY KEY,
+                mall_id TEXT NOT NULL,
+                shop_no INTEGER NOT NULL DEFAULT 1,
+                scopes_json TEXT NOT NULL DEFAULT '[]',
+                redirect_uri TEXT NOT NULL DEFAULT '',
+                actor TEXT NOT NULL DEFAULT 'admin',
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_at TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_cafe24_oauth_states_expires_at
+                ON cafe24_oauth_states(expires_at);
+
+            CREATE TABLE IF NOT EXISTS cafe24_integrations (
+                id TEXT PRIMARY KEY,
+                mall_id TEXT NOT NULL,
+                shop_no INTEGER NOT NULL DEFAULT 1,
+                scopes_json TEXT NOT NULL DEFAULT '[]',
+                access_token TEXT NOT NULL DEFAULT '',
+                refresh_token TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL DEFAULT '',
+                refresh_token_expires_at TEXT NOT NULL DEFAULT '',
+                last_poll_at TEXT NOT NULL DEFAULT '',
+                poll_cursor TEXT NOT NULL DEFAULT '',
+                auto_submit INTEGER NOT NULL DEFAULT 1,
+                completion_policy TEXT NOT NULL DEFAULT 'memo_only',
+                token_status TEXT NOT NULL DEFAULT 'connected',
+                token_last_checked_at TEXT NOT NULL DEFAULT '',
+                token_last_refreshed_at TEXT NOT NULL DEFAULT '',
+                token_refresh_lock_until TEXT NOT NULL DEFAULT '',
+                token_refresh_lock_owner TEXT NOT NULL DEFAULT '',
+                reconnect_required_at TEXT NOT NULL DEFAULT '',
+                reconnect_reason TEXT NOT NULL DEFAULT '',
+                is_active INTEGER NOT NULL DEFAULT 1,
+                last_sync_status TEXT NOT NULL DEFAULT 'never',
+                last_sync_message TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(mall_id, shop_no)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cafe24_integrations_active
+                ON cafe24_integrations(is_active, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS cafe24_product_mappings (
+                id TEXT PRIMARY KEY,
+                mall_id TEXT NOT NULL,
+                shop_no INTEGER NOT NULL DEFAULT 1,
+                cafe24_product_no TEXT NOT NULL DEFAULT '',
+                cafe24_variant_code TEXT NOT NULL DEFAULT '',
+                cafe24_custom_product_code TEXT NOT NULL DEFAULT '',
+                internal_product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                supplier_id TEXT NOT NULL DEFAULT '',
+                supplier_product_uuid TEXT NOT NULL DEFAULT '',
+                supplier_product_code TEXT NOT NULL DEFAULT '',
+                field_mapping_json TEXT NOT NULL DEFAULT '{}',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(mall_id, shop_no, cafe24_product_no, cafe24_variant_code, cafe24_custom_product_code)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cafe24_product_mappings_product
+                ON cafe24_product_mappings(internal_product_id, enabled);
+
+            CREATE TABLE IF NOT EXISTS cafe24_order_items (
+                id TEXT PRIMARY KEY,
+                mall_id TEXT NOT NULL,
+                shop_no INTEGER NOT NULL DEFAULT 1,
+                cafe24_order_id TEXT NOT NULL,
+                cafe24_order_item_code TEXT NOT NULL DEFAULT '',
+                cafe24_product_no TEXT NOT NULL DEFAULT '',
+                cafe24_variant_code TEXT NOT NULL DEFAULT '',
+                cafe24_custom_product_code TEXT NOT NULL DEFAULT '',
+                buyer_name TEXT NOT NULL DEFAULT '',
+                buyer_email TEXT NOT NULL DEFAULT '',
+                buyer_phone TEXT NOT NULL DEFAULT '',
+                receiver_name TEXT NOT NULL DEFAULT '',
+                order_status_code TEXT NOT NULL DEFAULT '',
+                source_status TEXT NOT NULL DEFAULT '',
+                standard_status TEXT NOT NULL DEFAULT 'received',
+                internal_order_id TEXT NOT NULL DEFAULT '',
+                mapping_id TEXT NOT NULL DEFAULT '',
+                product_id TEXT NOT NULL DEFAULT '',
+                normalized_fields_json TEXT NOT NULL DEFAULT '{}',
+                supplier_payload_json TEXT NOT NULL DEFAULT '{}',
+                raw_payload_json TEXT NOT NULL DEFAULT '{}',
+                error_message TEXT NOT NULL DEFAULT '',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                supplier_order_id TEXT NOT NULL DEFAULT '',
+                supplier_order_uuid TEXT NOT NULL DEFAULT '',
+                last_submitted_at TEXT NOT NULL DEFAULT '',
+                last_synced_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(mall_id, shop_no, cafe24_order_id, cafe24_order_item_code)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_status_updated_at
+                ON cafe24_order_items(standard_status, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_internal_order
+                ON cafe24_order_items(internal_order_id);
+
+            CREATE TABLE IF NOT EXISTS cafe24_api_events (
+                id TEXT PRIMARY KEY,
+                mall_id TEXT NOT NULL,
+                shop_no INTEGER NOT NULL DEFAULT 1,
+                event_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                request_json TEXT NOT NULL DEFAULT '{}',
+                response_json TEXT NOT NULL DEFAULT '{}',
+                error_message TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_cafe24_api_events_created_at
+                ON cafe24_api_events(created_at DESC);
             """
         )
 
@@ -6496,6 +7294,9 @@ class PanelStore:
                         "totalPrice": row["total_price"],
                         "totalPriceLabel": money(row["total_price"]),
                         "status": row["status"],
+                        "orderChannel": row["order_channel"] or ORDER_CHANNEL_WEB,
+                        "orderChannelLabel": order_channel_label(row["order_channel"] or ORDER_CHANNEL_WEB),
+                        "dispatchStatus": row["dispatch_status"] or ORDER_DISPATCH_UNMAPPED,
                         "notes": {key: value for key, value in notes.items() if key != "adminMemo"},
                         "createdAt": row["created_at"],
                         "createdLabel": self._relative_date_label(row["created_at"]),
@@ -7950,6 +8751,13 @@ class PanelStore:
                     "totalPrice": row["total_price"],
                     "totalPriceLabel": money(row["total_price"]),
                     "status": row["status"],
+                    "orderChannel": row["order_channel"] or ORDER_CHANNEL_WEB,
+                    "orderChannelLabel": order_channel_label(row["order_channel"] or ORDER_CHANNEL_WEB),
+                    "externalOrderId": row["external_order_id"] or "",
+                    "externalOrderItemId": row["external_order_item_id"] or "",
+                    "dispatchStatus": row["dispatch_status"] or ORDER_DISPATCH_UNMAPPED,
+                    "dispatchAttempts": int(row["dispatch_attempts"] or 0),
+                    "supplierLastError": row["supplier_last_error"] or "",
                     "notes": parse_json(row["notes_json"], {}),
                     "supplierStatus": row["supplier_status"] or "",
                     "supplierOrderId": row["supplier_order_id"] or "",
@@ -7975,6 +8783,11 @@ class PanelStore:
                                 str(row["product_name_snapshot"] or ""),
                                 str(row["option_name_snapshot"] or ""),
                                 str(row["target_value"] or ""),
+                                str(row["order_channel"] or ""),
+                                str(row["external_order_id"] or ""),
+                                str(row["external_order_item_id"] or ""),
+                                str(row["dispatch_status"] or ""),
+                                str(row["supplier_last_error"] or ""),
                                 str((parse_json(row["notes_json"], {}) or {}).get("memo") or ""),
                                 str((parse_json(row["notes_json"], {}) or {}).get("adminMemo") or ""),
                                 str(row["supplier_name"] or ""),
@@ -8002,6 +8815,38 @@ class PanelStore:
                 """
             ).fetchall()
             admin_charge_orders = [self._admin_charge_order_payload(row) for row in admin_charge_rows]
+            cafe24_integration_rows = conn.execute(
+                "SELECT * FROM cafe24_integrations ORDER BY is_active DESC, mall_id, shop_no"
+            ).fetchall()
+            cafe24_mapping_rows = conn.execute(
+                """
+                SELECT
+                    cm.*,
+                    p.name AS internal_product_name,
+                    p.option_name AS internal_option_name,
+                    s.name AS supplier_name
+                FROM cafe24_product_mappings cm
+                JOIN products p ON p.id = cm.internal_product_id
+                LEFT JOIN suppliers s ON s.id = cm.supplier_id
+                ORDER BY cm.updated_at DESC
+                LIMIT 200
+                """
+            ).fetchall()
+            cafe24_order_rows = conn.execute(
+                """
+                SELECT
+                    coi.*,
+                    p.name AS internal_product_name,
+                    p.option_name AS internal_option_name
+                FROM cafe24_order_items coi
+                LEFT JOIN products p ON p.id = coi.product_id
+                ORDER BY coi.updated_at DESC
+                LIMIT 200
+                """
+            ).fetchall()
+            cafe24_integrations = [self._cafe24_integration_payload(row) for row in cafe24_integration_rows]
+            cafe24_product_mappings = [self._cafe24_mapping_payload(row) for row in cafe24_mapping_rows]
+            cafe24_order_items = [self._cafe24_order_item_payload(row) for row in cafe24_order_rows]
             notice_rows = conn.execute("SELECT * FROM notices ORDER BY pinned DESC, published_at DESC, id").fetchall()
             faq_rows = conn.execute("SELECT * FROM faqs ORDER BY sort_order, id").fetchall()
             audit_rows = conn.execute(
@@ -8033,6 +8878,9 @@ class PanelStore:
                 "internalProducts": internal_products,
                 "adminOrders": admin_orders,
                 "adminChargeOrders": admin_charge_orders,
+                "cafe24Integrations": cafe24_integrations,
+                "cafe24ProductMappings": cafe24_product_mappings,
+                "cafe24OrderItems": cafe24_order_items,
                 "notices": [self._notice_payload(row) for row in notice_rows],
                 "faqs": [self._faq_payload(row) for row in faq_rows],
                 "auditLogs": [self._admin_audit_payload(row) for row in audit_rows],
@@ -8048,10 +8896,1669 @@ class PanelStore:
                     "orderCount": len(admin_orders),
                     "chargeOrderCount": len(admin_charge_orders),
                     "pendingChargeCount": pending_charge_count,
+                    "cafe24IntegrationCount": len(cafe24_integrations),
+                    "cafe24ReconnectRequiredCount": sum(1 for item in cafe24_integrations if item["tokenStatus"] == CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED),
+                    "cafe24WaitingInputCount": sum(1 for item in cafe24_order_items if item["standardStatus"] == "waiting_input"),
+                    "cafe24FailedCount": sum(1 for item in cafe24_order_items if item["standardStatus"] == "failed"),
                     "visitorCount": int(analytics_overview.get("uniqueVisitors") or 0),
                     "salesTotal": int(analytics_overview.get("sales") or 0),
                 },
             }
+
+    def _cafe24_integration_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "mallId": row["mall_id"],
+            "shopNo": int(row["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+            "scopes": parse_json(row["scopes_json"], []),
+            "hasAccessToken": bool(row["access_token"]),
+            "hasRefreshToken": bool(row["refresh_token"]),
+            "accessTokenMasked": safe_mask_secret(row["access_token"]),
+            "refreshTokenMasked": safe_mask_secret(row["refresh_token"]),
+            "expiresAt": row["expires_at"] or "",
+            "refreshTokenExpiresAt": row["refresh_token_expires_at"] or "",
+            "lastPollAt": row["last_poll_at"] or "",
+            "pollCursor": row["poll_cursor"] or "",
+            "autoSubmit": bool(row["auto_submit"]),
+            "completionPolicy": row["completion_policy"] or "memo_only",
+            "tokenStatus": self._cafe24_token_status(row),
+            "tokenStatusLabel": self._cafe24_token_status_label(row),
+            "tokenStatusMessage": self._cafe24_token_status_message(row),
+            "tokenLastCheckedAt": row.get("token_last_checked_at") or "",
+            "tokenLastRefreshedAt": row.get("token_last_refreshed_at") or "",
+            "tokenRefreshLockUntil": row.get("token_refresh_lock_until") or "",
+            "reconnectRequiredAt": row.get("reconnect_required_at") or "",
+            "reconnectReason": row.get("reconnect_reason") or "",
+            "isActive": bool(row["is_active"]),
+            "lastSyncStatus": row["last_sync_status"] or "never",
+            "lastSyncMessage": row["last_sync_message"] or "",
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def _cafe24_token_status(self, row: Dict[str, Any]) -> str:
+        stored = str(row.get("token_status") or CAFE24_TOKEN_STATUS_CONNECTED).strip() or CAFE24_TOKEN_STATUS_CONNECTED
+        if stored == CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED:
+            return stored
+        if not row.get("refresh_token"):
+            return CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED
+        if cafe24_refresh_token_expired(row.get("refresh_token_expires_at")):
+            return CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED
+        if stored == CAFE24_TOKEN_STATUS_REFRESHING and parse_iso_datetime(row.get("token_refresh_lock_until")):
+            lock_until = parse_iso_datetime(row.get("token_refresh_lock_until"))
+            if lock_until and lock_until > dt.datetime.now().astimezone():
+                return stored
+        if cafe24_refresh_token_expiring_soon(row.get("refresh_token_expires_at")):
+            return CAFE24_TOKEN_STATUS_EXPIRING
+        return stored if stored in {CAFE24_TOKEN_STATUS_CONNECTED, CAFE24_TOKEN_STATUS_FAILED} else CAFE24_TOKEN_STATUS_CONNECTED
+
+    def _cafe24_token_status_label(self, row: Dict[str, Any]) -> str:
+        return {
+            CAFE24_TOKEN_STATUS_CONNECTED: "정상",
+            CAFE24_TOKEN_STATUS_EXPIRING: "재연결 권장",
+            CAFE24_TOKEN_STATUS_REFRESHING: "갱신 중",
+            CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED: "재연결 필요",
+            CAFE24_TOKEN_STATUS_FAILED: "확인 실패",
+        }.get(self._cafe24_token_status(row), "미확인")
+
+    def _cafe24_token_status_message(self, row: Dict[str, Any]) -> str:
+        status = self._cafe24_token_status(row)
+        if status == CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED:
+            return row.get("reconnect_reason") or "Refresh token이 없거나 만료되었습니다. OAuth 재연결이 필요합니다."
+        if status == CAFE24_TOKEN_STATUS_EXPIRING:
+            return "Refresh token 만료가 임박했습니다. 운영 중단을 막으려면 OAuth를 다시 연결하세요."
+        if status == CAFE24_TOKEN_STATUS_REFRESHING:
+            return "다른 요청에서 Cafe24 토큰을 갱신 중입니다."
+        if status == CAFE24_TOKEN_STATUS_FAILED:
+            return row.get("reconnect_reason") or row.get("last_sync_message") or "최근 토큰 확인에 실패했습니다."
+        return "주문 수집 전 access token 만료 여부를 확인하고 필요 시 자동 갱신합니다."
+
+    def _cafe24_mapping_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "mallId": row["mall_id"],
+            "shopNo": int(row["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+            "cafe24ProductNo": row["cafe24_product_no"] or "",
+            "cafe24VariantCode": row["cafe24_variant_code"] or "",
+            "cafe24CustomProductCode": row["cafe24_custom_product_code"] or "",
+            "internalProductId": row["internal_product_id"] or "",
+            "internalProductName": row.get("internal_product_name") or "",
+            "internalOptionName": row.get("internal_option_name") or "",
+            "supplierId": row["supplier_id"] or "",
+            "supplierName": row.get("supplier_name") or "",
+            "supplierProductUuid": row["supplier_product_uuid"] or "",
+            "supplierProductCode": row["supplier_product_code"] or "",
+            "fieldMapping": parse_json(row["field_mapping_json"], {}),
+            "fieldMappingJson": row["field_mapping_json"] or "{}",
+            "enabled": bool(row["enabled"]),
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def _cafe24_order_item_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        raw_payload = parse_json(row["raw_payload_json"], {})
+        return {
+            "id": row["id"],
+            "mallId": row["mall_id"],
+            "shopNo": int(row["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+            "orderId": row["cafe24_order_id"],
+            "orderItemCode": row["cafe24_order_item_code"],
+            "productNo": row["cafe24_product_no"],
+            "variantCode": row["cafe24_variant_code"],
+            "customProductCode": row["cafe24_custom_product_code"],
+            "buyerName": row["buyer_name"],
+            "buyerEmailMasked": mask_email(row["buyer_email"]),
+            "buyerPhoneMasked": mask_phone(row["buyer_phone"]),
+            "receiverName": row["receiver_name"],
+            "orderStatusCode": row["order_status_code"],
+            "sourceStatus": row["source_status"],
+            "standardStatus": row["standard_status"],
+            "internalOrderId": row["internal_order_id"],
+            "mappingId": row["mapping_id"],
+            "productId": row["product_id"],
+            "internalProductName": row.get("internal_product_name") or "",
+            "internalOptionName": row.get("internal_option_name") or "",
+            "normalizedFields": parse_json(row["normalized_fields_json"], {}),
+            "supplierPayload": parse_json(row["supplier_payload_json"], {}),
+            "rawPayloadPreview": redact_external_payload(raw_payload),
+            "errorMessage": row["error_message"] or "",
+            "retryCount": int(row["retry_count"] or 0),
+            "supplierOrderId": row["supplier_order_id"] or "",
+            "supplierOrderUuid": row["supplier_order_uuid"] or "",
+            "lastSubmittedAt": row["last_submitted_at"] or "",
+            "lastSyncedAt": row["last_synced_at"] or "",
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+            "searchText": " ".join(
+                filter(
+                    None,
+                    [
+                        row["mall_id"],
+                        str(row["shop_no"] or ""),
+                        row["cafe24_order_id"],
+                        row["cafe24_order_item_code"],
+                        row["cafe24_product_no"],
+                        row["cafe24_variant_code"],
+                        row["cafe24_custom_product_code"],
+                        row["buyer_name"],
+                        row.get("internal_product_name") or "",
+                        row["standard_status"],
+                        row["error_message"] or "",
+                    ],
+                )
+            ).lower(),
+        }
+
+    def _log_cafe24_event(
+        self,
+        conn: DatabaseConnection,
+        *,
+        mall_id: str,
+        shop_no: int,
+        event_type: str,
+        status: str,
+        request_payload: Any = None,
+        response_payload: Any = None,
+        error_message: str = "",
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO cafe24_api_events (
+                id, mall_id, shop_no, event_type, status, request_json, response_json, error_message, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"cafe24_evt_{uuid4().hex[:16]}",
+                mall_id,
+                int(shop_no or CAFE24_DEFAULT_SHOP_NO),
+                event_type,
+                status,
+                as_json(redact_external_payload(request_payload or {})),
+                as_json(redact_external_payload(response_payload or {})),
+                str(error_message or "")[:1000],
+                now_iso(),
+            ),
+        )
+
+    def create_cafe24_oauth_authorize_url(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        mall_id = re.sub(r"[^A-Za-z0-9_-]", "", str(payload.get("mallId") or "").strip())
+        shop_no = normalize_cafe24_shop_no(payload.get("shopNo"))
+        redirect_uri = str(payload.get("redirectUri") or cafe24_redirect_uri()).strip()
+        scopes = normalize_cafe24_scopes(payload.get("scopes"))
+        actor = self._admin_actor(payload)
+        if not mall_id:
+            raise PanelError("Cafe24 Mall ID를 입력해 주세요.")
+        if not redirect_uri:
+            raise PanelError("Cafe24 OAuth redirect URI를 확인할 수 없습니다.")
+        client_id = cafe24_client_id()
+        if not client_id or not cafe24_client_secret():
+            raise PanelError("SMM_PANEL_CAFE24_CLIENT_ID / SMM_PANEL_CAFE24_CLIENT_SECRET 환경변수가 필요합니다.", status=503)
+        state = secrets.token_urlsafe(32)
+        created_at = now_iso()
+        expires_at = (dt.datetime.now().astimezone() + dt.timedelta(seconds=CAFE24_OAUTH_STATE_TTL_SECONDS)).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM cafe24_oauth_states WHERE expires_at < ? OR used_at != ''",
+                (created_at,),
+            )
+            conn.execute(
+                """
+                INSERT INTO cafe24_oauth_states (
+                    state, mall_id, shop_no, scopes_json, redirect_uri, actor, created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (state, mall_id, shop_no, as_json(scopes), redirect_uri, actor, created_at, expires_at),
+            )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="cafe24.oauth_start",
+                entity_type="cafe24_integration",
+                entity_id=f"{mall_id}:{shop_no}",
+                message=f"Cafe24 OAuth 승인 시작: {mall_id} / {shop_no}",
+                metadata={"scopes": scopes, "redirectUri": redirect_uri},
+            )
+            conn.commit()
+        authorize_params = {
+            "response_type": "code",
+            "client_id": client_id,
+            "state": state,
+            "redirect_uri": redirect_uri,
+            "scope": ",".join(scopes),
+        }
+        authorize_url = f"{cafe24_api_base_url(mall_id)}/oauth/authorize?{urlencode(authorize_params)}"
+        return {
+            "authorizeUrl": authorize_url,
+            "state": state,
+            "expiresAt": expires_at,
+            "redirectUri": redirect_uri,
+            "scopes": scopes,
+        }
+
+    def complete_cafe24_oauth_callback(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        state = str(payload.get("state") or "").strip()
+        code = str(payload.get("code") or "").strip()
+        if not state or not code:
+            raise PanelError("Cafe24 OAuth state/code가 없습니다.", status=400)
+        with self._connect() as conn:
+            state_row = conn.execute("SELECT * FROM cafe24_oauth_states WHERE state = ?", (state,)).fetchone()
+        if state_row is None:
+            raise PanelError("Cafe24 OAuth 요청을 찾을 수 없습니다. 관리자에서 다시 연결을 시작해 주세요.", status=400)
+        if str(state_row["used_at"] or ""):
+            raise PanelError("이미 사용된 Cafe24 OAuth 요청입니다. 관리자에서 다시 연결을 시작해 주세요.", status=400)
+        try:
+            expires_at = dt.datetime.fromisoformat(str(state_row["expires_at"]))
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=dt.datetime.now().astimezone().tzinfo)
+        except ValueError:
+            expires_at = dt.datetime.now().astimezone() - dt.timedelta(seconds=1)
+        if expires_at < dt.datetime.now().astimezone():
+            raise PanelError("Cafe24 OAuth 승인 시간이 만료되었습니다. 관리자에서 다시 연결을 시작해 주세요.", status=400)
+
+        mall_id = str(state_row["mall_id"] or "").strip()
+        shop_no = normalize_cafe24_shop_no(state_row["shop_no"])
+        redirect_uri = str(state_row["redirect_uri"] or "").strip()
+        actor = str(state_row["actor"] or "admin")
+        token_payload = Cafe24ApiClient.exchange_authorization_code(mall_id, code, redirect_uri)
+        token_scopes = token_payload.get("scopes") or token_payload.get("scope") or parse_json(state_row["scopes_json"], list(CAFE24_DEFAULT_SCOPES))
+        expires_at_value = str(
+            token_payload.get("expires_at")
+            or token_payload.get("access_token_expires_at")
+            or cafe24_oauth_timestamp_from_response(token_payload, "expires_at", "expires_in")
+            or ""
+        ).strip()
+        refresh_expires_at_value = str(
+            token_payload.get("refresh_token_expires_at")
+            or cafe24_oauth_timestamp_from_response(token_payload, "refresh_token_expires_at", "refresh_token_expires_in")
+            or ""
+        ).strip()
+        result = self.save_cafe24_integration(
+            {
+                "mallId": mall_id,
+                "shopNo": shop_no,
+                "accessToken": token_payload.get("access_token"),
+                "refreshToken": token_payload.get("refresh_token"),
+                "expiresAt": expires_at_value,
+                "refreshTokenExpiresAt": refresh_expires_at_value,
+                "scopes": token_scopes,
+                "autoSubmit": True,
+                "isActive": True,
+                "_adminActor": actor,
+            }
+        )
+        with self._connect() as conn:
+            timestamp = now_iso()
+            conn.execute("UPDATE cafe24_oauth_states SET used_at = ? WHERE state = ?", (timestamp, state))
+            self._log_cafe24_event(
+                conn,
+                mall_id=mall_id,
+                shop_no=shop_no,
+                event_type="oauth_callback",
+                status="success",
+                request_payload={"state": state, "redirectUri": redirect_uri},
+                response_payload=token_payload,
+            )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="cafe24.oauth_complete",
+                entity_type="cafe24_integration",
+                entity_id=result["integration"]["id"],
+                message=f"Cafe24 OAuth 토큰 저장 완료: {mall_id} / {shop_no}",
+            )
+            conn.commit()
+        return result
+
+    def save_cafe24_integration(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        integration_id = str(payload.get("id") or "").strip()
+        mall_id = re.sub(r"[^A-Za-z0-9_-]", "", str(payload.get("mallId") or "").strip())
+        shop_no = normalize_cafe24_shop_no(payload.get("shopNo"))
+        access_token = str(payload.get("accessToken") or "").strip()
+        refresh_token = str(payload.get("refreshToken") or "").strip()
+        scopes = normalize_cafe24_scopes(payload.get("scopes"))
+        expires_at = str(payload.get("expiresAt") or "").strip()
+        refresh_expires_at = str(payload.get("refreshTokenExpiresAt") or "").strip()
+        auto_submit = 1 if payload.get("autoSubmit", True) else 0
+        completion_policy = str(payload.get("completionPolicy") or "memo_only").strip() or "memo_only"
+        is_active = 1 if payload.get("isActive", True) else 0
+        actor = self._admin_actor(payload)
+        if not mall_id:
+            raise PanelError("Cafe24 mall_id를 입력해 주세요.")
+        with self._connect() as conn:
+            existing = None
+            if integration_id:
+                existing = conn.execute("SELECT * FROM cafe24_integrations WHERE id = ?", (integration_id,)).fetchone()
+                if existing is None:
+                    raise PanelError("Cafe24 연동 정보를 찾을 수 없습니다.", status=404)
+            else:
+                existing = conn.execute(
+                    "SELECT * FROM cafe24_integrations WHERE mall_id = ? AND shop_no = ?",
+                    (mall_id, shop_no),
+                ).fetchone()
+            timestamp = now_iso()
+            stored_access_token = encrypt_secret_value(
+                access_token or (decrypt_secret_value(existing["access_token"]) if existing else ""),
+                require_key=_secret_encryption_required(),
+            )
+            stored_refresh_token = encrypt_secret_value(
+                refresh_token or (decrypt_secret_value(existing["refresh_token"]) if existing else ""),
+                require_key=_secret_encryption_required(),
+            )
+            tokens_updated = bool(access_token or refresh_token or not existing)
+            tokens_available = bool(stored_access_token and stored_refresh_token)
+            next_token_status = (
+                CAFE24_TOKEN_STATUS_CONNECTED
+                if tokens_available
+                else CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED
+            )
+            next_reconnect_required_at = "" if tokens_available else timestamp
+            next_reconnect_reason = "" if tokens_available else "Cafe24 OAuth 토큰을 연결해야 합니다."
+            if existing and not tokens_updated:
+                next_token_status = str(existing.get("token_status") or next_token_status)
+                next_reconnect_required_at = str(existing.get("reconnect_required_at") or "")
+                next_reconnect_reason = str(existing.get("reconnect_reason") or "")
+            token_last_refreshed_at = (
+                timestamp
+                if access_token or refresh_token
+                else (str(existing.get("token_last_refreshed_at") or "") if existing else "")
+            )
+            if existing:
+                integration_id = existing["id"]
+                conn.execute(
+                    """
+                    UPDATE cafe24_integrations
+                    SET mall_id = ?, shop_no = ?, scopes_json = ?, access_token = ?, refresh_token = ?,
+                        expires_at = ?, refresh_token_expires_at = ?, auto_submit = ?, completion_policy = ?,
+                        token_status = ?, token_last_checked_at = ?, token_last_refreshed_at = ?,
+                        token_refresh_lock_until = ?, token_refresh_lock_owner = ?,
+                        reconnect_required_at = ?, reconnect_reason = ?, is_active = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        mall_id,
+                        shop_no,
+                        as_json(scopes),
+                        stored_access_token,
+                        stored_refresh_token,
+                        expires_at or existing["expires_at"],
+                        refresh_expires_at or existing["refresh_token_expires_at"],
+                        auto_submit,
+                        completion_policy,
+                        next_token_status,
+                        timestamp,
+                        token_last_refreshed_at,
+                        "",
+                        "",
+                        next_reconnect_required_at,
+                        next_reconnect_reason,
+                        is_active,
+                        timestamp,
+                        integration_id,
+                    ),
+                )
+                action = "updated"
+            else:
+                integration_id = f"cafe24_{uuid4().hex[:14]}"
+                conn.execute(
+                    """
+                    INSERT INTO cafe24_integrations (
+                        id, mall_id, shop_no, scopes_json, access_token, refresh_token,
+                        expires_at, refresh_token_expires_at, auto_submit, completion_policy,
+                        token_status, token_last_checked_at, token_last_refreshed_at,
+                        token_refresh_lock_until, token_refresh_lock_owner,
+                        reconnect_required_at, reconnect_reason, is_active, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        integration_id,
+                        mall_id,
+                        shop_no,
+                        as_json(scopes),
+                        stored_access_token,
+                        stored_refresh_token,
+                        expires_at,
+                        refresh_expires_at,
+                        auto_submit,
+                        completion_policy,
+                        next_token_status,
+                        timestamp,
+                        token_last_refreshed_at,
+                        "",
+                        "",
+                        next_reconnect_required_at,
+                        next_reconnect_reason,
+                        is_active,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                action = "created"
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action=f"cafe24.integration_{action}",
+                entity_type="cafe24_integration",
+                entity_id=integration_id,
+                message=f"Cafe24 연동 {action}: {mall_id} / {shop_no}",
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM cafe24_integrations WHERE id = ?", (integration_id,)).fetchone()
+        return {"integration": self._cafe24_integration_payload(row)}
+
+    def save_cafe24_product_mapping(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        mapping_id = str(payload.get("id") or "").strip()
+        mall_id = re.sub(r"[^A-Za-z0-9_-]", "", str(payload.get("mallId") or "").strip())
+        shop_no = normalize_cafe24_shop_no(payload.get("shopNo"))
+        product_no = sanitize_external_order_reference(payload.get("cafe24ProductNo"))
+        variant_code = sanitize_external_order_reference(payload.get("cafe24VariantCode"))
+        custom_product_code = sanitize_external_order_reference(payload.get("cafe24CustomProductCode"))
+        internal_product_id = str(payload.get("internalProductId") or "").strip()
+        supplier_id = str(payload.get("supplierId") or "").strip()
+        supplier_product_uuid = sanitize_external_order_reference(payload.get("supplierProductUuid"))
+        supplier_product_code = sanitize_external_order_reference(payload.get("supplierProductCode"))
+        field_mapping_raw = payload.get("fieldMappingJson")
+        field_mapping = parse_json(str(field_mapping_raw or "{}"), {}) if isinstance(field_mapping_raw, str) else payload.get("fieldMapping") or {}
+        enabled = 1 if payload.get("enabled", True) else 0
+        actor = self._admin_actor(payload)
+        if not mall_id:
+            raise PanelError("Cafe24 mall_id를 입력해 주세요.")
+        if not any([product_no, variant_code, custom_product_code]):
+            raise PanelError("Cafe24 상품번호, 품목코드, 자체상품코드 중 하나 이상이 필요합니다.")
+        if not internal_product_id:
+            raise PanelError("연결할 내부 상품을 선택해 주세요.")
+        with self._connect() as conn:
+            product = conn.execute("SELECT id FROM products WHERE id = ?", (internal_product_id,)).fetchone()
+            if product is None:
+                raise PanelError("내부 상품을 찾을 수 없습니다.", status=404)
+            existing = conn.execute("SELECT * FROM cafe24_product_mappings WHERE id = ?", (mapping_id,)).fetchone() if mapping_id else None
+            if existing is None:
+                existing = conn.execute(
+                    """
+                    SELECT *
+                    FROM cafe24_product_mappings
+                    WHERE mall_id = ? AND shop_no = ? AND cafe24_product_no = ?
+                      AND cafe24_variant_code = ? AND cafe24_custom_product_code = ?
+                    """,
+                    (mall_id, shop_no, product_no, variant_code, custom_product_code),
+                ).fetchone()
+                if existing is not None:
+                    mapping_id = existing["id"]
+            timestamp = now_iso()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE cafe24_product_mappings
+                    SET mall_id = ?, shop_no = ?, cafe24_product_no = ?, cafe24_variant_code = ?,
+                        cafe24_custom_product_code = ?, internal_product_id = ?, supplier_id = ?,
+                        supplier_product_uuid = ?, supplier_product_code = ?, field_mapping_json = ?,
+                        enabled = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        mall_id,
+                        shop_no,
+                        product_no,
+                        variant_code,
+                        custom_product_code,
+                        internal_product_id,
+                        supplier_id,
+                        supplier_product_uuid,
+                        supplier_product_code,
+                        as_json(field_mapping),
+                        enabled,
+                        timestamp,
+                        mapping_id,
+                    ),
+                )
+            else:
+                mapping_id = f"cafe24_map_{uuid4().hex[:14]}"
+                conn.execute(
+                    """
+                    INSERT INTO cafe24_product_mappings (
+                        id, mall_id, shop_no, cafe24_product_no, cafe24_variant_code,
+                        cafe24_custom_product_code, internal_product_id, supplier_id,
+                        supplier_product_uuid, supplier_product_code, field_mapping_json,
+                        enabled, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        mapping_id,
+                        mall_id,
+                        shop_no,
+                        product_no,
+                        variant_code,
+                        custom_product_code,
+                        internal_product_id,
+                        supplier_id,
+                        supplier_product_uuid,
+                        supplier_product_code,
+                        as_json(field_mapping),
+                        enabled,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="cafe24.mapping_save",
+                entity_type="cafe24_mapping",
+                entity_id=mapping_id,
+                message=f"Cafe24 상품 매핑 저장: {mall_id}/{shop_no}",
+                metadata={"productNo": product_no, "variantCode": variant_code, "customProductCode": custom_product_code},
+            )
+            conn.commit()
+            row = conn.execute(
+                """
+                SELECT cm.*, p.name AS internal_product_name, p.option_name AS internal_option_name, s.name AS supplier_name
+                FROM cafe24_product_mappings cm
+                JOIN products p ON p.id = cm.internal_product_id
+                LEFT JOIN suppliers s ON s.id = cm.supplier_id
+                WHERE cm.id = ?
+                """,
+                (mapping_id,),
+            ).fetchone()
+        return {"mapping": self._cafe24_mapping_payload(row)}
+
+    def delete_cafe24_product_mapping(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        mapping_id = str(payload.get("mappingId") or payload.get("id") or "").strip()
+        actor = self._admin_actor(payload)
+        if not mapping_id:
+            raise PanelError("삭제할 Cafe24 매핑을 선택해 주세요.")
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM cafe24_product_mappings WHERE id = ?", (mapping_id,)).fetchone()
+            if row is None:
+                raise PanelError("Cafe24 매핑을 찾을 수 없습니다.", status=404)
+            conn.execute("UPDATE cafe24_product_mappings SET enabled = 0, updated_at = ? WHERE id = ?", (now_iso(), mapping_id))
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="cafe24.mapping_disable",
+                entity_type="cafe24_mapping",
+                entity_id=mapping_id,
+                message="Cafe24 상품 매핑 비활성화",
+            )
+            conn.commit()
+        return {"ok": True, "mappingId": mapping_id}
+
+    def _cafe24_integration_row(self, conn: DatabaseConnection, integration_id: str = "") -> Dict[str, Any]:
+        if integration_id:
+            row = conn.execute("SELECT * FROM cafe24_integrations WHERE id = ?", (integration_id,)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM cafe24_integrations WHERE is_active = 1 ORDER BY updated_at DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            raise PanelError("Cafe24 연동 정보를 찾을 수 없습니다.", status=404)
+        return row
+
+    def _cafe24_token_expiring(self, expires_at: str) -> bool:
+        if not expires_at:
+            return False
+        try:
+            expires = dt.datetime.fromisoformat(str(expires_at))
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=dt.datetime.now().astimezone().tzinfo)
+            return expires <= dt.datetime.now().astimezone() + dt.timedelta(minutes=3)
+        except ValueError:
+            return False
+
+    def _mark_cafe24_token_state(
+        self,
+        conn: DatabaseConnection,
+        integration_id: str,
+        *,
+        status: str,
+        message: str = "",
+        reconnect_required: bool = False,
+        clear_lock: bool = True,
+    ) -> None:
+        timestamp = now_iso()
+        reconnect_at = timestamp if reconnect_required else ""
+        lock_until = "" if clear_lock else None
+        lock_owner = "" if clear_lock else None
+        if clear_lock:
+            conn.execute(
+                """
+                UPDATE cafe24_integrations
+                SET token_status = ?, token_last_checked_at = ?, token_refresh_lock_until = ?,
+                    token_refresh_lock_owner = ?, reconnect_required_at = ?, reconnect_reason = ?,
+                    last_sync_status = CASE WHEN ? = 'failed' THEN 'failed' ELSE last_sync_status END,
+                    last_sync_message = CASE WHEN ? != '' THEN ? ELSE last_sync_message END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    timestamp,
+                    lock_until,
+                    lock_owner,
+                    reconnect_at,
+                    str(message or "")[:1000],
+                    status,
+                    str(message or ""),
+                    str(message or "")[:1000],
+                    timestamp,
+                    integration_id,
+                ),
+            )
+            return
+        conn.execute(
+            """
+            UPDATE cafe24_integrations
+            SET token_status = ?, token_last_checked_at = ?, reconnect_required_at = ?,
+                reconnect_reason = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, timestamp, reconnect_at, str(message or "")[:1000], timestamp, integration_id),
+        )
+
+    def _acquire_cafe24_refresh_lock(self, conn: DatabaseConnection, integration_id: str) -> str:
+        owner = f"refresh_{uuid4().hex[:16]}"
+        timestamp = now_iso()
+        lock_until = (dt.datetime.now().astimezone() + dt.timedelta(seconds=CAFE24_REFRESH_LOCK_SECONDS)).isoformat(timespec="seconds")
+        cursor = conn.execute(
+            """
+            UPDATE cafe24_integrations
+            SET token_status = ?, token_last_checked_at = ?, token_refresh_lock_owner = ?,
+                token_refresh_lock_until = ?, updated_at = ?
+            WHERE id = ?
+              AND (
+                token_refresh_lock_until = ''
+                OR token_refresh_lock_until < ?
+                OR token_refresh_lock_owner = ?
+              )
+            """,
+            (
+                CAFE24_TOKEN_STATUS_REFRESHING,
+                timestamp,
+                owner,
+                lock_until,
+                timestamp,
+                integration_id,
+                timestamp,
+                owner,
+            ),
+        )
+        return owner if cursor.rowcount == 1 else ""
+
+    def _cafe24_client_for_row(self, conn: DatabaseConnection, row: Dict[str, Any]) -> Cafe24ApiClient:
+        mall_id = str(row["mall_id"])
+        access_token = decrypt_secret_value(row["access_token"])
+        refresh_token = decrypt_secret_value(row["refresh_token"])
+        integration_id = str(row["id"])
+        if not access_token or not refresh_token:
+            message = "Cafe24 OAuth 토큰이 없습니다. 관리자에서 다시 연결해 주세요."
+            self._mark_cafe24_token_state(
+                conn,
+                integration_id,
+                status=CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED,
+                message=message,
+                reconnect_required=True,
+            )
+            conn.commit()
+            raise PanelError(message, status=409)
+        if cafe24_refresh_token_expired(row["refresh_token_expires_at"]):
+            message = "Cafe24 refresh token이 만료되었습니다. OAuth 재연결이 필요합니다."
+            self._mark_cafe24_token_state(
+                conn,
+                integration_id,
+                status=CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED,
+                message=message,
+                reconnect_required=True,
+            )
+            conn.commit()
+            raise PanelError(message, status=409)
+        if refresh_token and self._cafe24_token_expiring(str(row["expires_at"] or "")):
+            lock_owner = self._acquire_cafe24_refresh_lock(conn, integration_id)
+            if not lock_owner:
+                time.sleep(0.8)
+                latest = conn.execute("SELECT * FROM cafe24_integrations WHERE id = ?", (integration_id,)).fetchone()
+                if latest:
+                    latest_access_token = decrypt_secret_value(latest["access_token"])
+                    if latest_access_token and not self._cafe24_token_expiring(str(latest["expires_at"] or "")):
+                        return Cafe24ApiClient(
+                            mall_id,
+                            latest_access_token,
+                            shop_no=int(latest["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                        )
+                raise PanelError("Cafe24 토큰 갱신이 진행 중입니다. 잠시 후 다시 시도해 주세요.", status=409)
+            conn.commit()
+            try:
+                refreshed = Cafe24ApiClient.refresh_access_token(mall_id, refresh_token)
+            except Exception as exc:
+                message = str(exc)
+                next_status = (
+                    CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED
+                    if cafe24_refresh_error_requires_reconnect(message)
+                    else CAFE24_TOKEN_STATUS_FAILED
+                )
+                self._mark_cafe24_token_state(
+                    conn,
+                    integration_id,
+                    status=next_status,
+                    message=message,
+                    reconnect_required=next_status == CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED,
+                )
+                conn.commit()
+                raise PanelError(
+                    "Cafe24 토큰 갱신에 실패했습니다. OAuth 재연결이 필요합니다."
+                    if next_status == CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED
+                    else f"Cafe24 토큰 갱신에 실패했습니다: {message}",
+                    status=409 if next_status == CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED else 503,
+                ) from exc
+            access_token = str(refreshed.get("access_token") or "").strip()
+            refresh_token = str(refreshed.get("refresh_token") or refresh_token).strip()
+            scopes = normalize_cafe24_scopes(refreshed.get("scopes") or refreshed.get("scope") or parse_json(row["scopes_json"], []))
+            refreshed_expires_at = (
+                str(refreshed.get("expires_at") or refreshed.get("access_token_expires_at") or "").strip()
+                or cafe24_oauth_timestamp_from_response(refreshed, "expires_at", "expires_in")
+                or str(row["expires_at"] or "")
+            )
+            refreshed_refresh_expires_at = (
+                str(refreshed.get("refresh_token_expires_at") or "").strip()
+                or cafe24_oauth_timestamp_from_response(refreshed, "refresh_token_expires_at", "refresh_token_expires_in")
+                or str(row["refresh_token_expires_at"] or "")
+            )
+            conn.execute(
+                """
+                UPDATE cafe24_integrations
+                SET access_token = ?, refresh_token = ?, expires_at = ?, refresh_token_expires_at = ?,
+                    scopes_json = ?, token_status = ?, token_last_checked_at = ?,
+                    token_last_refreshed_at = ?, token_refresh_lock_until = ?,
+                    token_refresh_lock_owner = ?, reconnect_required_at = ?, reconnect_reason = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    encrypt_secret_value(access_token, require_key=_secret_encryption_required()),
+                    encrypt_secret_value(refresh_token, require_key=_secret_encryption_required()),
+                    refreshed_expires_at,
+                    refreshed_refresh_expires_at,
+                    as_json(scopes or []),
+                    CAFE24_TOKEN_STATUS_CONNECTED,
+                    now_iso(),
+                    now_iso(),
+                    "",
+                    "",
+                    "",
+                    "",
+                    now_iso(),
+                    row["id"],
+                ),
+            )
+            conn.commit()
+        elif cafe24_refresh_token_expiring_soon(row["refresh_token_expires_at"]):
+            self._mark_cafe24_token_state(
+                conn,
+                integration_id,
+                status=CAFE24_TOKEN_STATUS_EXPIRING,
+                message="Cafe24 refresh token 만료가 임박했습니다.",
+                clear_lock=False,
+            )
+        else:
+            self._mark_cafe24_token_state(
+                conn,
+                integration_id,
+                status=CAFE24_TOKEN_STATUS_CONNECTED,
+                message="",
+                clear_lock=False,
+            )
+        return Cafe24ApiClient(mall_id, access_token, shop_no=int(row["shop_no"] or CAFE24_DEFAULT_SHOP_NO))
+
+    def _cafe24_orders_from_payload(self, payload: Any) -> List[Dict[str, Any]]:
+        if isinstance(payload, dict):
+            for key in ("orders", "order"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return [item for item in value if isinstance(item, dict)]
+                if isinstance(value, dict):
+                    return [value]
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        return []
+
+    def _cafe24_order_items_from_order(self, order_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        for key in ("items", "order_items", "orderItems"):
+            value = order_payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                return [value]
+        return [order_payload]
+
+    def _cafe24_item_code(self, order_payload: Dict[str, Any], item_payload: Dict[str, Any], index: int) -> str:
+        code = cafe24_payload_value(
+            item_payload,
+            ("order_item_code", "order_item_id", "item_code", "variant_code", "product_code"),
+        )
+        if code:
+            return code
+        return f"{cafe24_payload_value(order_payload, ('order_id', 'order_no', 'id'))}_{index}"
+
+    def _cafe24_item_identity(self, order_payload: Dict[str, Any], item_payload: Dict[str, Any], index: int) -> Dict[str, str]:
+        return {
+            "orderId": cafe24_payload_value(order_payload, ("order_id", "order_no", "id")),
+            "orderItemCode": self._cafe24_item_code(order_payload, item_payload, index),
+            "productNo": cafe24_payload_value(item_payload, ("product_no", "product_id")),
+            "variantCode": cafe24_payload_value(item_payload, ("variant_code", "option_code", "variant_id")),
+            "customProductCode": cafe24_payload_value(
+                item_payload,
+                ("custom_product_code", "custom_product_code_display", "product_code", "item_code"),
+            ),
+            "statusCode": cafe24_payload_value(item_payload, ("order_status", "status", "order_status_code"))
+            or cafe24_payload_value(order_payload, ("order_status", "status", "order_status_code")),
+        }
+
+    def _cafe24_option_pairs(self, order_payload: Dict[str, Any], item_payload: Dict[str, Any]) -> Dict[str, str]:
+        pairs: Dict[str, str] = {}
+
+        def add_pair(label: Any, value: Any) -> None:
+            key = str(label or "").strip()
+            text = str(value or "").strip()
+            if key and text:
+                pairs[key] = text
+
+        def consume(value: Any, prefix: str = "") -> None:
+            if isinstance(value, dict):
+                label = value.get("name") or value.get("option_name") or value.get("label") or value.get("key")
+                text = value.get("value") or value.get("option_value") or value.get("text") or value.get("input_value")
+                if label or text:
+                    add_pair(label or prefix or "option", text)
+                for nested_key, nested_value in value.items():
+                    if isinstance(nested_value, (dict, list)):
+                        consume(nested_value, str(nested_key))
+            elif isinstance(value, list):
+                for item in value:
+                    consume(item, prefix)
+            elif isinstance(value, str):
+                for part in re.split(r"[\n\r,|/]+", value):
+                    cleaned = part.strip()
+                    if not cleaned:
+                        continue
+                    if ":" in cleaned:
+                        left, right = cleaned.split(":", 1)
+                        add_pair(left, right)
+                    elif "=" in cleaned:
+                        left, right = cleaned.split("=", 1)
+                        add_pair(left, right)
+                    else:
+                        add_pair(prefix or "option", cleaned)
+
+        for key in (
+            "options",
+            "option",
+            "option_value",
+            "option_value_default",
+            "option_text",
+            "additional_option_values",
+            "additional_options",
+            "input_options",
+            "custom_options",
+        ):
+            consume(item_payload.get(key), key)
+        consume(order_payload.get("memo"), "orderMemo")
+        return pairs
+
+    def _resolve_cafe24_mapping_source(
+        self,
+        source: Any,
+        *,
+        order_payload: Dict[str, Any],
+        item_payload: Dict[str, Any],
+        buyer: Dict[str, Any],
+        receiver: Dict[str, Any],
+        option_pairs: Dict[str, str],
+    ) -> str:
+        sources = source if isinstance(source, list) else [source]
+        for spec in sources:
+            text = str(spec or "").strip()
+            if not text:
+                continue
+            if text == "quantity":
+                return cafe24_payload_value(item_payload, ("quantity", "qty", "order_quantity"))
+            if text.startswith("item."):
+                value = cafe24_payload_value(item_payload, (text[5:],))
+            elif text.startswith("order."):
+                value = cafe24_payload_value(order_payload, (text[6:],))
+            elif text.startswith("buyer."):
+                value = cafe24_payload_value(buyer, (text[6:],))
+            elif text.startswith("receiver."):
+                value = cafe24_payload_value(receiver, (text[9:],))
+            elif text.startswith("option:"):
+                needle = text[7:].strip().lower()
+                value = next((value for label, value in option_pairs.items() if needle in label.lower()), "")
+            else:
+                value = option_pairs.get(text, "")
+            if value:
+                return str(value).strip()
+        return ""
+
+    def _match_cafe24_mapping(
+        self,
+        conn: DatabaseConnection,
+        mall_id: str,
+        shop_no: int,
+        identity: Dict[str, str],
+    ) -> Optional[Dict[str, Any]]:
+        rows = conn.execute(
+            """
+            SELECT cm.*, p.form_structure_json, p.name AS internal_product_name
+            FROM cafe24_product_mappings cm
+            JOIN products p ON p.id = cm.internal_product_id
+            WHERE cm.mall_id = ? AND cm.shop_no = ? AND cm.enabled = 1
+            """,
+            (mall_id, shop_no),
+        ).fetchall()
+        best: Optional[Dict[str, Any]] = None
+        best_score = -1
+        for row in rows:
+            score = 0
+            row_product_no = str(row["cafe24_product_no"] or "")
+            row_variant_code = str(row["cafe24_variant_code"] or "")
+            row_custom_code = str(row["cafe24_custom_product_code"] or "")
+            if row_product_no:
+                if row_product_no != identity["productNo"]:
+                    continue
+                score += 4
+            if row_variant_code:
+                if row_variant_code != identity["variantCode"]:
+                    continue
+                score += 3
+            if row_custom_code:
+                if row_custom_code != identity["customProductCode"]:
+                    continue
+                score += 2
+            if score > best_score:
+                best = row
+                best_score = score
+        return best
+
+    def _normalize_cafe24_item_fields(
+        self,
+        *,
+        product: Dict[str, Any],
+        mapping: Dict[str, Any],
+        order_payload: Dict[str, Any],
+        item_payload: Dict[str, Any],
+        buyer: Dict[str, Any],
+        receiver: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        form_structure = ensure_request_memo_form_structure(parse_json(product["form_structure_json"], {}), "추가 요청사항")
+        template = form_structure.get("template", {})
+        schema = form_structure.get("schema", {})
+        field_mapping = parse_json(mapping["field_mapping_json"], {})
+        option_pairs = self._cafe24_option_pairs(order_payload, item_payload)
+        option_blob = " ".join(option_pairs.values())
+        first_url_match = re.search(r"https?://[^\s,|]+", option_blob)
+        account_candidate = ""
+        for label, value in option_pairs.items():
+            lowered = label.lower()
+            if any(token in lowered for token in ("계정", "아이디", "id", "account", "username")):
+                account_candidate = value
+                break
+
+        fields: Dict[str, Any] = {}
+        for field_key in template.keys() | schema.keys():
+            mapped_value = self._resolve_cafe24_mapping_source(
+                field_mapping.get(field_key),
+                order_payload=order_payload,
+                item_payload=item_payload,
+                buyer=buyer,
+                receiver=receiver,
+                option_pairs=option_pairs,
+            )
+            if mapped_value:
+                fields[field_key] = mapped_value
+                continue
+            if field_key == "orderedCount":
+                fields[field_key] = cafe24_payload_value(item_payload, ("quantity", "qty", "order_quantity")) or "1"
+            elif field_key == "targetUrl" and first_url_match:
+                fields[field_key] = first_url_match.group(0)
+            elif field_key == "targetValue":
+                fields[field_key] = first_url_match.group(0) if first_url_match else account_candidate
+            elif field_key == "contactPhone":
+                fields[field_key] = cafe24_payload_value(receiver, ("cellphone", "phone", "mobile", "phone1")) or cafe24_payload_value(
+                    buyer,
+                    ("cellphone", "phone", "mobile", "phone1"),
+                )
+            elif field_key == "requestMemo":
+                fields[field_key] = cafe24_payload_value(order_payload, ("memo", "client_memo", "order_memo")) or option_pairs.get("orderMemo", "")
+
+        if "orderedCount" not in fields:
+            fields["orderedCount"] = cafe24_payload_value(item_payload, ("quantity", "qty", "order_quantity")) or "1"
+        return fields
+
+    def _ensure_cafe24_channel_user(self, conn: DatabaseConnection, mall_id: str, shop_no: int) -> str:
+        user_id = f"user_cafe24_{re.sub(r'[^A-Za-z0-9_]', '_', mall_id)}_{int(shop_no)}"
+        existing = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+        if existing is not None:
+            return user_id
+        timestamp = now_iso()
+        conn.execute(
+            """
+            INSERT INTO users (
+                id, name, email, phone, tier, role, avatar_label, balance, is_active,
+                account_status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                f"Cafe24 {mall_id}",
+                f"cafe24-{mall_id}-{shop_no}@external.instamart.local",
+                "",
+                "EXTERNAL",
+                "integration",
+                "C24",
+                0,
+                0,
+                "external_channel",
+                timestamp,
+                timestamp,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallets (user_id, available_balance, pending_balance, created_at, updated_at)
+            VALUES (?, 0, 0, ?, ?)
+            ON CONFLICT(user_id) DO NOTHING
+            """,
+            (user_id, timestamp, timestamp),
+        )
+        return user_id
+
+    def _active_supplier_mapping_for_product(
+        self,
+        conn: DatabaseConnection,
+        product_id: str,
+        cafe24_mapping: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        mapping = None
+        cafe24_mapping_dict = dict(cafe24_mapping or {})
+        preferred_supplier_id = str(cafe24_mapping_dict.get("supplier_id") or "").strip()
+        if preferred_supplier_id:
+            mapping = conn.execute(
+                """
+                SELECT
+                    psm.*, s.api_url, s.integration_type, s.api_key, s.bearer_token,
+                    s.name AS supplier_name, s.is_active AS supplier_is_active
+                FROM product_supplier_mappings psm
+                JOIN suppliers s ON s.id = psm.supplier_id
+                WHERE psm.product_id = ? AND psm.supplier_id = ? AND psm.is_active = 1
+                LIMIT 1
+                """,
+                (product_id, preferred_supplier_id),
+            ).fetchone()
+        if mapping is None:
+            mapping = conn.execute(
+                """
+                SELECT
+                    psm.*, s.api_url, s.integration_type, s.api_key, s.bearer_token,
+                    s.name AS supplier_name, s.is_active AS supplier_is_active
+                FROM product_supplier_mappings psm
+                JOIN suppliers s ON s.id = psm.supplier_id
+                WHERE psm.product_id = ? AND psm.is_primary = 1 AND psm.is_active = 1
+                LIMIT 1
+                """,
+                (product_id,),
+            ).fetchone()
+        if mapping is None and preferred_supplier_id and cafe24_mapping_dict:
+            supplier = conn.execute("SELECT * FROM suppliers WHERE id = ?", (preferred_supplier_id,)).fetchone()
+            if supplier is not None:
+                return {
+                    "id": "",
+                    "product_id": product_id,
+                    "supplier_id": supplier["id"],
+                    "supplier_service_id": str(
+                        cafe24_mapping_dict.get("supplier_product_uuid") or cafe24_mapping_dict.get("supplier_product_code") or ""
+                    ),
+                    "supplier_external_service_id": str(
+                        cafe24_mapping_dict.get("supplier_product_uuid") or cafe24_mapping_dict.get("supplier_product_code") or ""
+                    ),
+                    "api_url": supplier["api_url"],
+                    "integration_type": supplier["integration_type"],
+                    "api_key": supplier["api_key"],
+                    "bearer_token": supplier["bearer_token"],
+                    "supplier_name": supplier["name"],
+                    "supplier_is_active": supplier["is_active"],
+                }
+        return mapping
+
+    def _create_cafe24_internal_order(
+        self,
+        conn: DatabaseConnection,
+        *,
+        integration: Dict[str, Any],
+        order_item_id: str,
+        identity: Dict[str, str],
+        product: Dict[str, Any],
+        fields: Dict[str, Any],
+        raw_payload: Dict[str, Any],
+        supplier_mapping: Optional[Dict[str, Any]],
+    ) -> str:
+        existing = conn.execute(
+            "SELECT internal_order_id FROM cafe24_order_items WHERE id = ?",
+            (order_item_id,),
+        ).fetchone()
+        if existing is not None and str(existing["internal_order_id"] or "").strip():
+            return str(existing["internal_order_id"])
+        duplicate = conn.execute(
+            """
+            SELECT id
+            FROM orders
+            WHERE order_channel = ? AND external_order_id = ? AND external_order_item_id = ?
+            """,
+            (ORDER_CHANNEL_CAFE24, identity["orderId"], identity["orderItemCode"]),
+        ).fetchone()
+        if duplicate is not None:
+            return str(duplicate["id"])
+
+        user_id = self._ensure_cafe24_channel_user(conn, str(integration["mall_id"]), int(integration["shop_no"]))
+        timestamp = now_iso()
+        order_number = generate_public_order_number()
+        while conn.execute("SELECT 1 FROM orders WHERE order_number = ? LIMIT 1", (order_number,)).fetchone() is not None:
+            order_number = generate_public_order_number()
+        quantity = self._resolve_quantity(product, fields)
+        total_price = int(product["price"]) if product["price_strategy"] == "fixed" else int(product["price"]) * quantity
+        target_value = (
+            str(fields.get("targetValue") or "")
+            or str(fields.get("targetUrl") or "")
+            or str(fields.get("targetKeyword") or "")
+        ).strip()
+        notes = {
+            "memo": str(fields.get("requestMemo") or "").strip(),
+            "source": "cafe24",
+            "mallId": integration["mall_id"],
+            "shopNo": int(integration["shop_no"]),
+            "cafe24OrderId": identity["orderId"],
+            "cafe24OrderItemCode": identity["orderItemCode"],
+            "buyerName": cafe24_payload_value(raw_payload.get("buyer") or {}, ("name", "buyer_name")),
+        }
+        order_id = f"order_{uuid4().hex[:16]}"
+        conn.execute(
+            """
+            INSERT INTO orders (
+                id, order_number, user_id, platform_section_id, product_category_id, product_id,
+                product_name_snapshot, option_name_snapshot, target_value, contact_phone,
+                quantity, unit_price, total_price, status, order_channel, external_order_id,
+                external_order_item_id, dispatch_status, external_payload_json, notes_json,
+                idempotency_key, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                order_id,
+                order_number,
+                user_id,
+                product["platform_section_id"],
+                product["category_id"],
+                product["id"],
+                product["name"],
+                product["option_name"],
+                target_value,
+                str(fields.get("contactPhone") or "").strip(),
+                quantity,
+                int(product["price"]),
+                total_price,
+                "queued",
+                ORDER_CHANNEL_CAFE24,
+                identity["orderId"],
+                identity["orderItemCode"],
+                ORDER_DISPATCH_READY if supplier_mapping else ORDER_DISPATCH_UNMAPPED,
+                as_json(redact_external_payload(raw_payload)),
+                as_json(notes),
+                "",
+                timestamp,
+                timestamp,
+            ),
+        )
+        template = ensure_request_memo_form_structure(parse_json(product["form_structure_json"], {}), "추가 요청사항").get("template", {})
+        for field_index, (field_key, field_value) in enumerate(fields.items()):
+            if field_value in ("", None):
+                continue
+            field_label = self._field_label(template.get(field_key, {}), field_key)
+            conn.execute(
+                "INSERT INTO order_fields (id, order_id, field_key, field_label, field_value) VALUES (?, ?, ?, ?, ?)",
+                (f"{order_id}_field_{field_index}", order_id, field_key, field_label, str(field_value)),
+            )
+        conn.execute(
+            """
+            UPDATE cafe24_order_items
+            SET internal_order_id = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (order_id, timestamp, order_item_id),
+        )
+        return order_id
+
+    def _process_cafe24_item(
+        self,
+        conn: DatabaseConnection,
+        *,
+        integration: Dict[str, Any],
+        order_payload: Dict[str, Any],
+        item_payload: Dict[str, Any],
+        index: int,
+        submit_ready: bool,
+    ) -> Dict[str, Any]:
+        mall_id = str(integration["mall_id"])
+        shop_no = int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO)
+        identity = self._cafe24_item_identity(order_payload, item_payload, index)
+        if not identity["orderId"]:
+            raise PanelError("Cafe24 주문번호가 없는 주문 payload입니다.")
+        buyer = order_payload.get("buyer") if isinstance(order_payload.get("buyer"), dict) else {}
+        receivers = order_payload.get("receivers")
+        receiver = receivers[0] if isinstance(receivers, list) and receivers and isinstance(receivers[0], dict) else {}
+        source_status = identity["statusCode"]
+        status = normalize_cafe24_status(source_status)
+        error_message = ""
+        mapping_row = self._match_cafe24_mapping(conn, mall_id, shop_no, identity)
+        normalized_fields: Dict[str, Any] = {}
+        supplier_payload: Dict[str, Any] = {}
+        internal_order_id = ""
+        supplier_mapping: Optional[Dict[str, Any]] = None
+        product: Optional[Dict[str, Any]] = None
+
+        raw_payload = {
+            "order": order_payload,
+            "item": item_payload,
+            "buyer": buyer,
+            "receiver": receiver,
+        }
+        if cafe24_status_is_cancelled(source_status):
+            status = "cancelled"
+            error_message = "Cafe24 취소/반품 계열 상태입니다. 공급 전이면 자동 차단됩니다."
+        elif source_status in CAFE24_ORDER_UNPAID_STATUSES:
+            status = "received"
+            error_message = "결제 전 주문입니다. 공급하지 않습니다."
+        elif mapping_row is None:
+            status = "waiting_input"
+            error_message = "Cafe24 상품 매핑이 없습니다."
+        else:
+            product_row = conn.execute(
+                """
+                SELECT
+                    p.*,
+                    pc.id AS category_id,
+                    pc.name AS category_name,
+                    pg.platform_section_id,
+                    ps.slug AS platform_slug,
+                    ps.accent_color AS accent_color
+                FROM products p
+                JOIN product_categories pc ON pc.id = p.product_category_id
+                JOIN platform_groups pg ON pg.id = pc.platform_group_id
+                JOIN platform_sections ps ON ps.id = pg.platform_section_id
+                WHERE p.id = ? AND p.is_active = 1 AND pc.is_active = 1
+                """,
+                (mapping_row["internal_product_id"],),
+            ).fetchone()
+            if product_row is None:
+                status = "waiting_input"
+                error_message = "매핑된 내부 상품이 비활성 또는 삭제 상태입니다."
+            else:
+                product = dict(product_row)
+                normalized_fields = self._normalize_cafe24_item_fields(
+                    product=product,
+                    mapping=mapping_row,
+                    order_payload=order_payload,
+                    item_payload=item_payload,
+                    buyer=buyer,
+                    receiver=receiver,
+                )
+                try:
+                    form_structure = ensure_request_memo_form_structure(parse_json(product["form_structure_json"], {}), "추가 요청사항")
+                    self._validate_fields(normalized_fields, form_structure.get("schema", {}))
+                    self._validate_product_target(product, normalized_fields, require_preview=False)
+                    supplier_mapping = self._active_supplier_mapping_for_product(conn, product["id"], mapping_row)
+                    if supplier_mapping is None or not bool(supplier_mapping["supplier_is_active"]):
+                        status = "waiting_input"
+                        error_message = "내부 상품의 활성 공급사 매핑이 없습니다."
+                    else:
+                        supplier_payload = self._build_supplier_order_payload(product, normalized_fields, supplier_mapping)
+                        status = "ready_to_submit"
+                except PanelError as exc:
+                    status = "waiting_input"
+                    error_message = str(exc)
+
+        timestamp = now_iso()
+        row_id = f"cafe24_item_{uuid4().hex[:16]}"
+        conn.execute(
+            """
+            INSERT INTO cafe24_order_items (
+                id, mall_id, shop_no, cafe24_order_id, cafe24_order_item_code,
+                cafe24_product_no, cafe24_variant_code, cafe24_custom_product_code,
+                buyer_name, buyer_email, buyer_phone, receiver_name, order_status_code,
+                source_status, standard_status, mapping_id, product_id,
+                normalized_fields_json, supplier_payload_json, raw_payload_json,
+                error_message, last_synced_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(mall_id, shop_no, cafe24_order_id, cafe24_order_item_code)
+            DO UPDATE SET
+                cafe24_product_no = excluded.cafe24_product_no,
+                cafe24_variant_code = excluded.cafe24_variant_code,
+                cafe24_custom_product_code = excluded.cafe24_custom_product_code,
+                buyer_name = excluded.buyer_name,
+                buyer_email = excluded.buyer_email,
+                buyer_phone = excluded.buyer_phone,
+                receiver_name = excluded.receiver_name,
+                order_status_code = excluded.order_status_code,
+                source_status = excluded.source_status,
+                standard_status = CASE
+                    WHEN cafe24_order_items.standard_status IN ('supplier_submitted', 'supplier_progress', 'completed')
+                    THEN cafe24_order_items.standard_status
+                    ELSE excluded.standard_status
+                END,
+                mapping_id = excluded.mapping_id,
+                product_id = excluded.product_id,
+                normalized_fields_json = excluded.normalized_fields_json,
+                supplier_payload_json = excluded.supplier_payload_json,
+                raw_payload_json = excluded.raw_payload_json,
+                error_message = excluded.error_message,
+                last_synced_at = excluded.last_synced_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                row_id,
+                mall_id,
+                shop_no,
+                identity["orderId"],
+                identity["orderItemCode"],
+                identity["productNo"],
+                identity["variantCode"],
+                identity["customProductCode"],
+                cafe24_payload_value(buyer, ("name", "buyer_name")),
+                cafe24_payload_value(buyer, ("email", "buyer_email")),
+                cafe24_payload_value(buyer, ("cellphone", "phone", "mobile")),
+                cafe24_payload_value(receiver, ("name", "receiver_name")),
+                source_status,
+                source_status,
+                status,
+                mapping_row["id"] if mapping_row is not None else "",
+                product["id"] if product is not None else "",
+                as_json(normalized_fields),
+                as_json(supplier_payload),
+                as_json(raw_payload),
+                error_message,
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+        current = conn.execute(
+            """
+            SELECT *
+            FROM cafe24_order_items
+            WHERE mall_id = ? AND shop_no = ? AND cafe24_order_id = ? AND cafe24_order_item_code = ?
+            """,
+            (mall_id, shop_no, identity["orderId"], identity["orderItemCode"]),
+        ).fetchone()
+        current_status = str(current["standard_status"] or status)
+        if current_status == "ready_to_submit" and product is not None:
+            internal_order_id = self._create_cafe24_internal_order(
+                conn,
+                integration=integration,
+                order_item_id=current["id"],
+                identity=identity,
+                product=product,
+                fields=normalized_fields,
+                raw_payload=raw_payload,
+                supplier_mapping=supplier_mapping,
+            )
+        if submit_ready and internal_order_id and supplier_mapping is not None:
+            # Commit the normalized order before the external supplier request.
+            conn.commit()
+            dispatch = self._dispatch_supplier_order(internal_order_id, product, normalized_fields, supplier_mapping)
+            with self._connect() as dispatch_conn:
+                next_status = "supplier_submitted" if dispatch["status"] in {"submitted", "accepted"} else "failed"
+                dispatch_conn.execute(
+                    """
+                    UPDATE cafe24_order_items
+                    SET standard_status = ?, supplier_order_id = ?, supplier_order_uuid = ?,
+                        error_message = ?, last_submitted_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        next_status,
+                        dispatch.get("id") or "",
+                        dispatch.get("supplierExternalOrderId") or "",
+                        "" if next_status == "supplier_submitted" else "공급사 발주 실패",
+                        now_iso(),
+                        now_iso(),
+                        current["id"],
+                    ),
+                )
+                dispatch_conn.commit()
+            return {"id": current["id"], "status": next_status, "submitted": True}
+        return {"id": current["id"], "status": current_status, "submitted": False}
+
+    def poll_cafe24_orders(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        integration_id = str(payload.get("integrationId") or "").strip()
+        submit_ready = bool(payload.get("submitReady", True))
+        actor = self._admin_actor(payload)
+        processed = 0
+        waiting = 0
+        submitted = 0
+        failed = 0
+        errors: List[str] = []
+        with self._connect() as conn:
+            if integration_id:
+                integration_rows = [self._cafe24_integration_row(conn, integration_id)]
+            else:
+                integration_rows = conn.execute("SELECT * FROM cafe24_integrations WHERE is_active = 1 ORDER BY updated_at DESC").fetchall()
+            if not integration_rows:
+                raise PanelError("활성 Cafe24 연동 정보가 없습니다.")
+            for integration in integration_rows:
+                mall_id = str(integration["mall_id"])
+                shop_no = int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO)
+                window = cafe24_default_poll_window(integration["last_poll_at"], CAFE24_ORDER_OVERLAP_MINUTES)
+                try:
+                    client = self._cafe24_client_for_row(conn, integration)
+                    start_date = str(payload.get("startDate") or window["start"])
+                    end_date = str(payload.get("endDate") or window["end"])
+                    response = client.orders(
+                        start_date=start_date,
+                        end_date=end_date,
+                        statuses=sorted(CAFE24_ORDER_ELIGIBLE_STATUSES),
+                    )
+                    orders = self._cafe24_orders_from_payload(response)
+                    self._log_cafe24_event(
+                        conn,
+                        mall_id=mall_id,
+                        shop_no=shop_no,
+                        event_type="orders.poll",
+                        status="success",
+                        request_payload={"startDate": start_date, "endDate": end_date},
+                        response_payload={"count": len(orders)},
+                    )
+                    for order_payload in orders:
+                        for index, item_payload in enumerate(self._cafe24_order_items_from_order(order_payload)):
+                            result = self._process_cafe24_item(
+                                conn,
+                                integration=integration,
+                                order_payload=order_payload,
+                                item_payload=item_payload,
+                                index=index,
+                                submit_ready=submit_ready and bool(integration["auto_submit"]),
+                            )
+                            processed += 1
+                            if result["status"] == "waiting_input":
+                                waiting += 1
+                            elif result["status"] == "failed":
+                                failed += 1
+                            elif result.get("submitted"):
+                                submitted += 1
+                    conn.execute(
+                        """
+                        UPDATE cafe24_integrations
+                        SET last_poll_at = ?, last_sync_status = ?, last_sync_message = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            now_iso(),
+                            "success",
+                            f"{processed}개 품주 처리",
+                            now_iso(),
+                            integration["id"],
+                        ),
+                    )
+                    self._record_admin_audit(
+                        conn,
+                        actor=actor,
+                        action="cafe24.orders_poll",
+                        entity_type="cafe24_integration",
+                        entity_id=integration["id"],
+                        message=f"Cafe24 주문 수집: {mall_id}/{shop_no}",
+                        metadata={"processed": processed, "waiting": waiting, "submitted": submitted, "failed": failed},
+                    )
+                    conn.commit()
+                except Exception as exc:
+                    message = str(exc)
+                    errors.append(f"{mall_id}/{shop_no}: {message}")
+                    conn.execute(
+                        """
+                        UPDATE cafe24_integrations
+                        SET last_sync_status = ?, last_sync_message = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        ("failed", message[:1000], now_iso(), integration["id"]),
+                    )
+                    self._log_cafe24_event(
+                        conn,
+                        mall_id=mall_id,
+                        shop_no=shop_no,
+                        event_type="orders.poll",
+                        status="failed",
+                        error_message=message,
+                    )
+                    conn.commit()
+        return {
+            "processed": processed,
+            "waitingInput": waiting,
+            "submitted": submitted,
+            "failed": failed,
+            "errors": errors,
+        }
+
+    def retry_cafe24_order_item(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        item_id = str(payload.get("itemId") or payload.get("id") or "").strip()
+        actor = self._admin_actor(payload)
+        if not item_id:
+            raise PanelError("재처리할 Cafe24 주문 품주를 선택해 주세요.")
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
+            if row is None:
+                raise PanelError("Cafe24 주문 품주를 찾을 수 없습니다.", status=404)
+            integration = conn.execute(
+                "SELECT * FROM cafe24_integrations WHERE mall_id = ? AND shop_no = ?",
+                (row["mall_id"], row["shop_no"]),
+            ).fetchone()
+            if integration is None:
+                raise PanelError("Cafe24 연동 정보를 찾을 수 없습니다.", status=404)
+            raw_payload = parse_json(row["raw_payload_json"], {})
+            order_payload = raw_payload.get("order") if isinstance(raw_payload.get("order"), dict) else {}
+            item_payload = raw_payload.get("item") if isinstance(raw_payload.get("item"), dict) else {}
+            if not order_payload or not item_payload:
+                raise PanelError("원본 Cafe24 payload가 없어 재처리할 수 없습니다.")
+            conn.execute(
+                "UPDATE cafe24_order_items SET retry_count = COALESCE(retry_count, 0) + 1, updated_at = ? WHERE id = ?",
+                (now_iso(), item_id),
+            )
+            result = self._process_cafe24_item(
+                conn,
+                integration=integration,
+                order_payload=order_payload,
+                item_payload=item_payload,
+                index=0,
+                submit_ready=True,
+            )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="cafe24.order_item_retry",
+                entity_type="cafe24_order_item",
+                entity_id=item_id,
+                message="Cafe24 주문 품주 수동 재처리",
+                metadata=result,
+            )
+            conn.commit()
+        return {"result": result}
+
+    def resync_cafe24_order_item(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        item_id = str(payload.get("itemId") or payload.get("id") or "").strip()
+        actor = self._admin_actor(payload)
+        if not item_id:
+            raise PanelError("재동기화할 Cafe24 주문 품주를 선택해 주세요.")
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
+            if row is None:
+                raise PanelError("Cafe24 주문 품주를 찾을 수 없습니다.", status=404)
+            integration = conn.execute(
+                "SELECT * FROM cafe24_integrations WHERE mall_id = ? AND shop_no = ?",
+                (row["mall_id"], row["shop_no"]),
+            ).fetchone()
+            if integration is None:
+                raise PanelError("Cafe24 연동 정보를 찾을 수 없습니다.", status=404)
+            client = self._cafe24_client_for_row(conn, integration)
+            response = client.order(row["cafe24_order_id"])
+            orders = self._cafe24_orders_from_payload(response)
+            if not orders:
+                raise PanelError("Cafe24 주문 상세 응답이 비어 있습니다.")
+            result = None
+            for order_payload in orders:
+                for index, item_payload in enumerate(self._cafe24_order_items_from_order(order_payload)):
+                    identity = self._cafe24_item_identity(order_payload, item_payload, index)
+                    if identity["orderItemCode"] != row["cafe24_order_item_code"]:
+                        continue
+                    result = self._process_cafe24_item(
+                        conn,
+                        integration=integration,
+                        order_payload=order_payload,
+                        item_payload=item_payload,
+                        index=index,
+                        submit_ready=bool(integration["auto_submit"]),
+                    )
+                    break
+            if result is None:
+                raise PanelError("Cafe24 주문 상세에서 해당 품주를 찾지 못했습니다.")
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="cafe24.order_item_resync",
+                entity_type="cafe24_order_item",
+                entity_id=item_id,
+                message="Cafe24 주문 품주 재동기화",
+                metadata=result,
+            )
+            conn.commit()
+        return {"result": result}
+
+    def update_cafe24_order_item_status(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        item_id = str(payload.get("itemId") or payload.get("id") or "").strip()
+        status = str(payload.get("status") or "").strip()
+        memo = str(payload.get("memo") or "").strip()
+        actor = self._admin_actor(payload)
+        if not item_id:
+            raise PanelError("처리할 Cafe24 주문 품주를 선택해 주세요.")
+        if status not in CAFE24_STANDARD_STATUSES:
+            raise PanelError("지원하지 않는 Cafe24 주문 상태입니다.")
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
+            if row is None:
+                raise PanelError("Cafe24 주문 품주를 찾을 수 없습니다.", status=404)
+            conn.execute(
+                "UPDATE cafe24_order_items SET standard_status = ?, error_message = ?, updated_at = ? WHERE id = ?",
+                (status, memo, now_iso(), item_id),
+            )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="cafe24.order_item_status",
+                entity_type="cafe24_order_item",
+                entity_id=item_id,
+                message=f"Cafe24 주문 품주 상태 변경: {status}",
+                metadata={"memo": memo},
+            )
+            conn.commit()
+        return {"ok": True, "itemId": item_id, "status": status}
 
     def list_supplier_services(self, supplier_id: str, search: str = "") -> Dict[str, Any]:
         with self._connect() as conn:
@@ -9300,6 +11807,17 @@ class PanelStore:
                 "UPDATE supplier_orders SET status = ?, response_json = ?, updated_at = ? WHERE id = ?",
                 (next_supplier_status, as_json(response_json), timestamp, row["id"]),
             )
+            conn.execute(
+                "UPDATE orders SET dispatch_status = ?, supplier_last_error = ?, updated_at = ? WHERE id = ?",
+                (
+                    normalize_order_dispatch_status(next_supplier_status),
+                    str(status_payload.get("error") or status_payload.get("message") or "").strip()
+                    if isinstance(status_payload, dict) and next_supplier_status in {"failed", "cancelled"}
+                    else "",
+                    timestamp,
+                    order_id,
+                ),
+            )
             if next_supplier_status == "completed":
                 conn.execute("UPDATE orders SET status = ?, updated_at = ? WHERE id = ?", ("completed", timestamp, order_id))
             elif next_supplier_status in {"in_progress", "pending", "submitted", "partial"}:
@@ -10195,6 +12713,10 @@ class PanelStore:
             "ok": True,
             "orderId": order_row["id"],
             "orderNumber": order_row["order_number"],
+            "orderChannel": order_row.get("order_channel") or ORDER_CHANNEL_WEB,
+            "externalOrderId": order_row.get("external_order_id") or "",
+            "externalOrderItemId": order_row.get("external_order_item_id") or "",
+            "dispatchStatus": order_row.get("dispatch_status") or ORDER_DISPATCH_UNMAPPED,
             "totalPrice": int(order_row["total_price"]),
             "totalPriceLabel": money(int(order_row["total_price"])),
             "balanceAfter": wallet["available"],
@@ -10216,9 +12738,49 @@ class PanelStore:
                 return None
             return self._order_submission_payload(conn, dict(row), duplicate=True)
 
-    def create_order(self, payload: Dict[str, Any], user_id: str = "") -> Dict[str, Any]:
+    def _existing_order_by_external_reference(
+        self,
+        order_channel: str,
+        external_order_id: str,
+        external_order_item_id: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        if not external_order_id:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM orders
+                WHERE order_channel = ?
+                  AND external_order_id = ?
+                  AND external_order_item_id = ?
+                """,
+                (order_channel, external_order_id, external_order_item_id),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._order_submission_payload(conn, dict(row), duplicate=True)
+
+    def create_order(
+        self,
+        payload: Dict[str, Any],
+        user_id: str = "",
+        *,
+        order_channel: str = ORDER_CHANNEL_WEB,
+        external_order_id: str = "",
+        external_order_item_id: str = "",
+        external_payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         if not user_id:
             raise PanelError("로그인이 필요합니다.", status=401)
+        channel = normalize_order_channel(order_channel)
+        external_reference = sanitize_external_order_reference(external_order_id)
+        external_item_reference = sanitize_external_order_reference(external_order_item_id)
+        if channel == ORDER_CHANNEL_WEB:
+            external_reference = ""
+            external_item_reference = ""
+        elif not external_reference:
+            raise PanelError("외부 주문 식별자가 필요합니다.")
         product_id = str(payload.get("productId") or "").strip()
         fields = payload.get("fields") or {}
         if not product_id:
@@ -10229,6 +12791,9 @@ class PanelStore:
         existing_order = self._existing_order_by_idempotency(user_id, idempotency_key)
         if existing_order is not None:
             return existing_order
+        existing_external_order = self._existing_order_by_external_reference(channel, external_reference, external_item_reference)
+        if existing_external_order is not None:
+            return existing_external_order
 
         supplier_mapping: Optional[Dict[str, Any]] = None
         product_data: Optional[Dict[str, Any]] = None
@@ -10241,6 +12806,19 @@ class PanelStore:
                     ).fetchone()
                     if existing_row is not None:
                         return self._order_submission_payload(conn, dict(existing_row), duplicate=True)
+                if external_reference:
+                    existing_external_row = conn.execute(
+                        """
+                        SELECT *
+                        FROM orders
+                        WHERE order_channel = ?
+                          AND external_order_id = ?
+                          AND external_order_item_id = ?
+                        """,
+                        (channel, external_reference, external_item_reference),
+                    ).fetchone()
+                    if existing_external_row is not None:
+                        return self._order_submission_payload(conn, dict(existing_external_row), duplicate=True)
                 product = conn.execute(
                     """
                     SELECT
@@ -10302,6 +12880,7 @@ class PanelStore:
                 if mapping_row is not None and bool(mapping_row["supplier_is_active"]):
                     supplier_mapping = dict(mapping_row)
                 product_data = dict(product)
+                dispatch_status = ORDER_DISPATCH_READY if supplier_mapping else ORDER_DISPATCH_UNMAPPED
 
                 timestamp = now_iso()
                 order_number = generate_public_order_number()
@@ -10328,8 +12907,10 @@ class PanelStore:
                     INSERT INTO orders (
                         id, order_number, user_id, platform_section_id, product_category_id, product_id,
                         product_name_snapshot, option_name_snapshot, target_value, contact_phone,
-                        quantity, unit_price, total_price, status, notes_json, idempotency_key, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        quantity, unit_price, total_price, status, order_channel, external_order_id,
+                        external_order_item_id, dispatch_status, external_payload_json, notes_json,
+                        idempotency_key, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         order_id,
@@ -10346,6 +12927,11 @@ class PanelStore:
                         product["price"],
                         total_price,
                         "queued",
+                        channel,
+                        external_reference,
+                        external_item_reference,
+                        dispatch_status,
+                        as_json(external_payload or {}),
                         as_json(notes),
                         idempotency_key,
                         timestamp,
@@ -10399,6 +12985,14 @@ class PanelStore:
                 existing_order = self._existing_order_by_idempotency(user_id, idempotency_key)
                 if existing_order is not None:
                     return existing_order
+            if external_reference and is_unique_constraint_error(exc):
+                existing_external_order = self._existing_order_by_external_reference(
+                    channel,
+                    external_reference,
+                    external_item_reference,
+                )
+                if existing_external_order is not None:
+                    return existing_external_order
             raise
 
         supplier_dispatch = None
@@ -10409,6 +13003,10 @@ class PanelStore:
             "ok": True,
             "orderId": order_id,
             "orderNumber": order_number,
+            "orderChannel": channel,
+            "externalOrderId": external_reference,
+            "externalOrderItemId": external_item_reference,
+            "dispatchStatus": dispatch_status,
             "totalPrice": total_price,
             "totalPriceLabel": money(total_price),
             "balanceAfter": balance_after,
@@ -10416,6 +13014,7 @@ class PanelStore:
         }
         if supplier_dispatch is not None:
             response_payload["supplierDispatchStatus"] = supplier_dispatch["status"]
+            response_payload["dispatchStatus"] = supplier_dispatch["status"]
         return response_payload
 
     def _dispatch_supplier_order(
@@ -10425,12 +13024,34 @@ class PanelStore:
         fields: Dict[str, Any],
         mapping: Dict[str, Any],
     ) -> Dict[str, Any]:
+        with self._connect() as conn:
+            existing = conn.execute(
+                """
+                SELECT id, supplier_external_order_id, status
+                FROM supplier_orders
+                WHERE order_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (order_id,),
+            ).fetchone()
+            if existing is not None and (
+                str(existing["supplier_external_order_id"] or "").strip()
+                or str(existing["status"] or "") in {"submitted", "accepted", "in_progress", "completed"}
+            ):
+                return {
+                    "id": existing["id"],
+                    "status": normalize_order_dispatch_status(existing["status"]),
+                    "supplierExternalOrderId": existing["supplier_external_order_id"] or "",
+                    "duplicate": True,
+                }
         supplier_order_id = f"sord_{uuid4().hex[:12]}"
         timestamp = now_iso()
         request_payload = self._build_supplier_order_payload(product, fields, mapping)
         supplier_external_order_id = ""
         status = "pending"
         response_payload: Any = {}
+        supplier_last_error = ""
 
         try:
             api_key = decrypt_secret_value(mapping["api_key"])
@@ -10443,7 +13064,14 @@ class PanelStore:
             )
             response_payload = client.order(request_payload)
             if isinstance(response_payload, dict):
-                supplier_external_order_id = str(response_payload.get("order") or response_payload.get("id") or "").strip()
+                supplier_external_order_id = str(
+                    response_payload.get("order")
+                    or response_payload.get("id")
+                    or response_payload.get("orderUuid")
+                    or response_payload.get("order_uuid")
+                    or response_payload.get("uuid")
+                    or ""
+                ).strip()
                 if supplier_external_order_id:
                     status = "submitted"
                 elif response_payload:
@@ -10457,6 +13085,10 @@ class PanelStore:
         except Exception as exc:
             response_payload = {"error": str(exc)}
             status = "failed"
+            supplier_last_error = str(exc)
+        if not supplier_last_error and isinstance(response_payload, dict):
+            supplier_last_error = str(response_payload.get("error") or response_payload.get("message") or "").strip()
+        dispatch_status = normalize_order_dispatch_status(status)
 
         with self._connect() as conn:
             conn.execute(
@@ -10479,11 +13111,27 @@ class PanelStore:
                     timestamp,
                 ),
             )
+            conn.execute(
+                """
+                UPDATE orders
+                SET dispatch_status = ?,
+                    dispatch_attempts = COALESCE(dispatch_attempts, 0) + 1,
+                    supplier_last_error = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    dispatch_status,
+                    supplier_last_error if dispatch_status == ORDER_DISPATCH_FAILED else "",
+                    timestamp,
+                    order_id,
+                ),
+            )
             conn.commit()
 
         return {
             "id": supplier_order_id,
-            "status": status,
+            "status": dispatch_status,
             "supplierExternalOrderId": supplier_external_order_id,
         }
 
