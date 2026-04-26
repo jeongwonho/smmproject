@@ -847,7 +847,9 @@ class AppHandler(SimpleHTTPRequestHandler):
             if parsed.path.startswith("/api/admin/"):
                 self._require_admin_auth()
             if parsed.path == "/api/admin/bootstrap":
-                write_json(self, 200, {"ok": True, **self._server().store.admin_bootstrap()})
+                payload = self._server().store.admin_bootstrap()
+                payload["cafe24OAuthRedirectUri"] = self._cafe24_oauth_redirect_uri()
+                write_json(self, 200, {"ok": True, **payload})
                 return
             if parsed.path.startswith("/api/admin/customers/"):
                 customer_id = parsed.path.rsplit("/", 1)[-1]

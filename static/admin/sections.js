@@ -1704,6 +1704,7 @@ function renderCafe24AdminSection() {
   const integrations = state.adminBootstrap?.cafe24Integrations || [];
   const mappings = state.adminBootstrap?.cafe24ProductMappings || [];
   const orderItems = state.adminBootstrap?.cafe24OrderItems || [];
+  const cafe24OAuthRedirectUri = state.adminBootstrap?.cafe24OAuthRedirectUri || "";
   const products = getAdminProducts();
   const suppliers = getAdminSuppliers();
   const activeIntegration = integrations[0] || {};
@@ -1806,7 +1807,11 @@ function renderCafe24AdminSection() {
             <button class="admin-primary-button" type="submit">연동 저장</button>
             <button class="admin-secondary-button" type="button" data-admin-cafe24-poll="${escapeHtml(activeIntegration.id || "")}" ${activeIntegration.id ? "" : "disabled"}>주문 수집</button>
           </div>
-          <p class="admin-inline-note">OAuth 승인 URL은 현재 관리자 도메인을 콜백 주소로 사용합니다. Vercel 배포 환경에서는 Cafe24 앱의 Redirect URI와 일치해야 합니다.</p>
+          <p class="admin-inline-note">
+            Cafe24 Developers Redirect URL:
+            <code>${escapeHtml(cafe24OAuthRedirectUri || "서버에서 확인 불가")}</code>
+            <br />이 값과 Cafe24 앱 설정값이 1글자까지 동일해야 합니다. 끝 / 포함 여부도 맞춰 주세요.
+          </p>
           <p class="admin-inline-note">마지막 수집: ${escapeHtml(activeIntegration.lastPollAt || "없음")} · ${escapeHtml(activeIntegration.lastSyncMessage || activeIntegration.lastSyncStatus || "미확인")}</p>
         </form>
 
