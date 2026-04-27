@@ -3408,7 +3408,6 @@ class Cafe24ApiClient:
         query: Dict[str, Any] = {
             "limit": min(max(int(limit or 20), 1), 100),
             "offset": max(int(offset or 0), 0),
-            "embed": "options,variants",
         }
         normalized_product_no = str(product_no or "").strip()
         normalized_keyword = str(keyword or "").strip()
@@ -3422,11 +3421,7 @@ class Cafe24ApiClient:
         return self._request("GET", "/admin/products", query=query)
 
     def product(self, product_no: str) -> Any:
-        return self._request(
-            "GET",
-            f"/admin/products/{quote(str(product_no), safe='')}",
-            query={"embed": "options,variants"},
-        )
+        return self._request("GET", f"/admin/products/{quote(str(product_no), safe='')}")
 
     def product_options(self, product_no: str) -> Any:
         return self._request("GET", f"/admin/products/{quote(str(product_no), safe='')}/options")
@@ -10063,6 +10058,24 @@ class PanelStore:
             raise PanelError("Cafe24 연동 정보를 찾을 수 없습니다.", status=404)
         return row
 
+    def _require_cafe24_scope(self, row: Dict[str, Any], scope: str, action_label: str) -> None:
+        scopes = normalize_cafe24_scopes(parse_json(row["scopes_json"], []))
+        if scope not in scopes:
+            raise PanelError(
+                f"{action_label} 권한이 없습니다. Cafe24 OAuth를 {scope} 권한으로 다시 연결해 주세요.",
+                status=403,
+            )
+
+    def _cafe24_api_panel_error(self, action_label: str, exc: Exception) -> PanelError:
+        message = str(exc or "").strip() or "알 수 없는 Cafe24 API 오류"
+        safe_message = message[:500]
+        lowered = message.lower()
+        if any(keyword in lowered for keyword in ("401", "unauthorized", "invalid token", "access token")):
+            return PanelError(f"{action_label} 실패: Cafe24 OAuth 토큰을 다시 연결해 주세요.", status=409)
+        if any(keyword in lowered for keyword in ("403", "forbidden", "scope", "permission", "권한")):
+            return PanelError(f"{action_label} 실패: Cafe24 상품 읽기 권한을 확인해 주세요. mall.read_product 권한으로 다시 연결이 필요합니다.", status=403)
+        return PanelError(f"{action_label} 실패: {safe_message}", status=502)
+
     def _cafe24_token_expiring(self, expires_at: str) -> bool:
         if not expires_at:
             return False
@@ -10371,8 +10384,22 @@ class PanelStore:
             raise PanelError("조회 개수/페이지 값이 올바르지 않습니다.", status=400)
         with self._connect() as conn:
             integration = self._cafe24_integration_row(conn, integration_id)
+            self._require_cafe24_scope(integration, "mall.read_product", "Cafe24 상품 조회")
             client = self._cafe24_client_for_row(conn, integration)
-            response = client.products(keyword=keyword, product_no=product_no, limit=limit, offset=offset)
+            try:
+                response = client.products(keyword=keyword, product_no=product_no, limit=limit, offset=offset)
+            except Cafe24ApiError as exc:
+                self._log_cafe24_event(
+                    conn,
+                    mall_id=str(integration["mall_id"]),
+                    shop_no=int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                    event_type="products.lookup",
+                    status="failed",
+                    request_payload={"keyword": keyword, "productNo": product_no, "limit": limit, "offset": offset},
+                    error_message=str(exc),
+                )
+                conn.commit()
+                raise self._cafe24_api_panel_error("Cafe24 상품 조회", exc) from exc
             products = [self._cafe24_product_payload(product) for product in self._cafe24_products_from_payload(response)]
             self._log_cafe24_event(
                 conn,
@@ -10398,8 +10425,22 @@ class PanelStore:
         warnings: List[str] = []
         with self._connect() as conn:
             integration = self._cafe24_integration_row(conn, integration_id)
+            self._require_cafe24_scope(integration, "mall.read_product", "Cafe24 상품 상세 조회")
             client = self._cafe24_client_for_row(conn, integration)
-            product_response = client.product(product_no)
+            try:
+                product_response = client.product(product_no)
+            except Cafe24ApiError as exc:
+                self._log_cafe24_event(
+                    conn,
+                    mall_id=str(integration["mall_id"]),
+                    shop_no=int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                    event_type="products.detail",
+                    status="failed",
+                    request_payload={"productNo": product_no},
+                    error_message=str(exc),
+                )
+                conn.commit()
+                raise self._cafe24_api_panel_error("Cafe24 상품 상세 조회", exc) from exc
             product_rows = self._cafe24_products_from_payload(product_response)
             if not product_rows:
                 raise PanelError("Cafe24 상품을 찾지 못했습니다.", status=404)
