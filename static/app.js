@@ -38,6 +38,7 @@ import {
 } from "./admin/sections.js";
 import {
   configureCafe24AdminActions,
+  handleCafe24AdminChange,
   handleCafe24AdminClick,
   handleCafe24AdminSubmit,
 } from "./admin/cafe24.js";
@@ -108,6 +109,7 @@ const state = {
     adminSupplierMode: "edit",
     adminSelectedPlatformSectionId: "",
     adminSelectedSupplierId: "",
+    adminCafe24SelectedSupplierId: "",
     adminSelectedProductId: "",
     adminSelectedSupplierServiceId: "",
     adminServiceSearch: "",
@@ -2786,6 +2788,12 @@ async function renderRoute() {
         showLoading("공급사 서비스 목록을 불러오는 중...");
         await ensureAdminSupplierServices(selectedSupplierId);
       }
+      const selectedCafe24SupplierId = state.ui.adminCafe24SelectedSupplierId || (state.adminBootstrap?.suppliers || [])[0]?.id || "";
+      if (state.ui.adminActiveSection === "cafe24" && selectedCafe24SupplierId && !state.adminSupplierServices[selectedCafe24SupplierId]) {
+        showLoading("Cafe24 매핑용 공급사 서비스를 불러오는 중...");
+        await ensureAdminSupplierServices(selectedCafe24SupplierId);
+        state.ui.adminCafe24SelectedSupplierId = selectedCafe24SupplierId;
+      }
     }
     if (route.name === "detail") {
       if (!route.id) {
@@ -4264,6 +4272,9 @@ document.addEventListener("input", (event) => {
 
 document.addEventListener("change", async (event) => {
   const target = event.target;
+  if (await handleCafe24AdminChange(target)) {
+    return;
+  }
   if (target.matches("[data-charge-filter]")) {
     const field = target.getAttribute("data-charge-filter") || "";
     if (field === "status") state.ui.chargeStatusFilter = target.value || "all";

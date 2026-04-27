@@ -131,10 +131,22 @@ CAFE24_ORDER_OVERLAP_MINUTES = 20
 CAFE24_ORDER_ELIGIBLE_STATUSES = {"N10", "N20", "N21", "N22", "N30", "N40"}
 CAFE24_ORDER_UNPAID_STATUSES = {"N00"}
 CAFE24_ORDER_CANCELLED_PREFIXES = ("C", "R", "E")
+CAFE24_PAYMENT_PAID_STATUSES = {"paid", "payment_confirmed", "confirmed", "complete", "completed", "done", "y", "true", "t"}
+CAFE24_PAYMENT_PENDING_STATUSES = {"unpaid", "awaiting_payment", "pending", "ready", "waiting", "n", "false", "f"}
+CAFE24_PAYMENT_CANCELLED_STATUSES = {"canceled", "cancelled", "cancel", "refunded", "refund", "void"}
 CAFE24_STANDARD_STATUSES = {
     "received",
+    "payment_pending",
+    "payment_review_required",
     "validated",
     "waiting_input",
+    "mapping_error",
+    "field_extract_failed",
+    "missing_required_field",
+    "invalid_quantity",
+    "invalid_target",
+    "supplier_range_error",
+    "needs_manual_review",
     "ready_to_submit",
     "submitting",
     "supplier_submitted",
@@ -934,7 +946,7 @@ CREATE TABLE IF NOT EXISTS cafe24_integrations (
     refresh_token_expires_at TEXT NOT NULL DEFAULT '',
     last_poll_at TEXT NOT NULL DEFAULT '',
     poll_cursor TEXT NOT NULL DEFAULT '',
-    auto_submit INTEGER NOT NULL DEFAULT 1,
+    auto_submit INTEGER NOT NULL DEFAULT 0,
     completion_policy TEXT NOT NULL DEFAULT 'memo_only',
     token_status TEXT NOT NULL DEFAULT 'connected',
     token_last_checked_at TEXT NOT NULL DEFAULT '',
@@ -975,6 +987,30 @@ CREATE TABLE IF NOT EXISTS cafe24_product_mappings (
 CREATE INDEX IF NOT EXISTS idx_cafe24_product_mappings_product
     ON cafe24_product_mappings(internal_product_id, enabled);
 
+CREATE TABLE IF NOT EXISTS cafe24_supplier_mappings (
+    id TEXT PRIMARY KEY,
+    mall_id TEXT NOT NULL,
+    shop_no INTEGER NOT NULL DEFAULT 1,
+    cafe24_product_no TEXT NOT NULL DEFAULT '',
+    cafe24_variant_code TEXT NOT NULL DEFAULT '',
+    cafe24_custom_product_code TEXT NOT NULL DEFAULT '',
+    internal_product_id TEXT NOT NULL DEFAULT '',
+    supplier_id TEXT NOT NULL DEFAULT '',
+    supplier_service_id TEXT NOT NULL DEFAULT '',
+    supplier_external_service_id TEXT NOT NULL DEFAULT '',
+    supplier_product_uuid TEXT NOT NULL DEFAULT '',
+    supplier_product_code TEXT NOT NULL DEFAULT '',
+    field_mapping_json TEXT NOT NULL DEFAULT '{}',
+    auto_dispatch_enabled INTEGER NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(mall_id, shop_no, cafe24_product_no, cafe24_variant_code, cafe24_custom_product_code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cafe24_supplier_mappings_supplier
+    ON cafe24_supplier_mappings(supplier_id, supplier_service_id, enabled);
+
 CREATE TABLE IF NOT EXISTS cafe24_order_items (
     id TEXT PRIMARY KEY,
     mall_id TEXT NOT NULL,
@@ -989,11 +1025,16 @@ CREATE TABLE IF NOT EXISTS cafe24_order_items (
     buyer_phone TEXT NOT NULL DEFAULT '',
     receiver_name TEXT NOT NULL DEFAULT '',
     order_status_code TEXT NOT NULL DEFAULT '',
+    payment_status TEXT NOT NULL DEFAULT '',
+    payment_gate_status TEXT NOT NULL DEFAULT 'unverified',
     source_status TEXT NOT NULL DEFAULT '',
     standard_status TEXT NOT NULL DEFAULT 'received',
     internal_order_id TEXT NOT NULL DEFAULT '',
     mapping_id TEXT NOT NULL DEFAULT '',
     product_id TEXT NOT NULL DEFAULT '',
+    supplier_id TEXT NOT NULL DEFAULT '',
+    supplier_service_id TEXT NOT NULL DEFAULT '',
+    supplier_external_service_id TEXT NOT NULL DEFAULT '',
     normalized_fields_json TEXT NOT NULL DEFAULT '{}',
     supplier_payload_json TEXT NOT NULL DEFAULT '{}',
     raw_payload_json TEXT NOT NULL DEFAULT '{}',
@@ -1001,6 +1042,7 @@ CREATE TABLE IF NOT EXISTS cafe24_order_items (
     retry_count INTEGER NOT NULL DEFAULT 0,
     supplier_order_id TEXT NOT NULL DEFAULT '',
     supplier_order_uuid TEXT NOT NULL DEFAULT '',
+    supplier_response_json TEXT NOT NULL DEFAULT '{}',
     last_submitted_at TEXT NOT NULL DEFAULT '',
     last_synced_at TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
@@ -1101,7 +1143,7 @@ CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_entity
     ON admin_audit_logs(entity_type, entity_id, created_at DESC);
 """
 
-RUNTIME_SCHEMA_VERSION = "2026-04-26-04"
+RUNTIME_SCHEMA_VERSION = "2026-04-27-02"
 
 
 class PanelError(Exception):
@@ -1916,6 +1958,55 @@ def normalize_cafe24_status(raw: Any) -> str:
     if value in CAFE24_ORDER_ELIGIBLE_STATUSES:
         return "validated"
     return "received"
+
+
+def normalize_cafe24_payment_status(raw: Any) -> str:
+    if isinstance(raw, bool):
+        return "paid" if raw else "unpaid"
+    value = str(raw or "").strip().lower()
+    if value in CAFE24_PAYMENT_PAID_STATUSES:
+        return "paid"
+    if value in CAFE24_PAYMENT_CANCELLED_STATUSES:
+        return "canceled"
+    if value in CAFE24_PAYMENT_PENDING_STATUSES:
+        return "unpaid"
+    return value
+
+
+def cafe24_payment_status_from_payload(order_payload: Dict[str, Any], item_payload: Dict[str, Any]) -> str:
+    for payload in (item_payload, order_payload):
+        if not isinstance(payload, dict):
+            continue
+        direct = cafe24_payload_value(
+            payload,
+            ("payment_status", "paymentStatus", "payment_state", "paymentState", "paid_status", "paidStatus"),
+        )
+        if direct:
+            return normalize_cafe24_payment_status(direct)
+        paid_value = payload.get("paid")
+        if isinstance(paid_value, bool):
+            return normalize_cafe24_payment_status(paid_value)
+        payment = payload.get("payment")
+        if isinstance(payment, dict):
+            nested = cafe24_payload_value(payment, ("status", "payment_status", "state", "paid_status"))
+            if nested:
+                return normalize_cafe24_payment_status(nested)
+            nested_paid = payment.get("paid")
+            if isinstance(nested_paid, bool):
+                return normalize_cafe24_payment_status(nested_paid)
+    return ""
+
+
+def cafe24_payment_gate_status(order_status: Any, payment_status: Any) -> str:
+    order_value = str(order_status or "").strip()
+    normalized_payment = normalize_cafe24_payment_status(payment_status)
+    if cafe24_status_is_cancelled(order_value) or normalized_payment == "canceled":
+        return "cancelled"
+    if order_value in CAFE24_ORDER_UNPAID_STATUSES or normalized_payment == "unpaid":
+        return "payment_pending"
+    if order_value in CAFE24_ORDER_ELIGIBLE_STATUSES and normalized_payment == "paid":
+        return "payment_confirmed"
+    return "payment_review_required"
 
 
 def cafe24_status_is_supply_eligible(raw: Any) -> bool:
@@ -4837,6 +4928,14 @@ class PanelStore:
         self._ensure_column(conn, "cafe24_integrations", "token_refresh_lock_owner", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_integrations", "reconnect_required_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_integrations", "reconnect_reason", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_order_items", "payment_status", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_order_items", "payment_gate_status", "TEXT NOT NULL DEFAULT 'unverified'")
+        self._ensure_column(conn, "cafe24_order_items", "supplier_id", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_order_items", "supplier_service_id", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_order_items", "supplier_external_service_id", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_order_items", "supplier_response_json", "TEXT NOT NULL DEFAULT '{}'")
+        conn.execute("UPDATE cafe24_integrations SET auto_submit = 0 WHERE auto_submit != 0")
+        self._migrate_cafe24_supplier_mappings(conn)
         self._ensure_bigint_columns(
             conn,
             {
@@ -4857,6 +4956,83 @@ class PanelStore:
         conn.execute("UPDATE users SET role = 'admin', is_active = 1, account_status = 'active' WHERE id = ?", (DEMO_USER_ID,))
         conn.execute("UPDATE users SET role = COALESCE(NULLIF(role, ''), 'customer') WHERE id != ?", (DEMO_USER_ID,))
         self._migrate_supplier_secrets(conn)
+
+    def _migrate_cafe24_supplier_mappings(self, conn: DatabaseConnection) -> None:
+        legacy_rows = conn.execute(
+            """
+            SELECT
+                cm.*,
+                psm.supplier_id AS fallback_supplier_id,
+                psm.supplier_service_id AS fallback_supplier_service_id,
+                psm.supplier_external_service_id AS fallback_supplier_external_service_id
+            FROM cafe24_product_mappings cm
+            LEFT JOIN product_supplier_mappings psm
+                ON psm.product_id = cm.internal_product_id
+               AND psm.is_active = 1
+               AND (
+                    cm.supplier_id = ''
+                    OR cm.supplier_id = psm.supplier_id
+               )
+            """
+        ).fetchall()
+        timestamp = now_iso()
+        for row in legacy_rows:
+            product_no = str(row["cafe24_product_no"] or "")
+            variant_code = str(row["cafe24_variant_code"] or "")
+            custom_code = str(row["cafe24_custom_product_code"] or "")
+            if not any([product_no, variant_code, custom_code]):
+                continue
+            supplier_id = str(row["supplier_id"] or row["fallback_supplier_id"] or "").strip()
+            supplier_service_id = str(row["fallback_supplier_service_id"] or "").strip()
+            supplier_external_service_id = str(
+                row["supplier_product_uuid"]
+                or row["supplier_product_code"]
+                or row["fallback_supplier_external_service_id"]
+                or ""
+            ).strip()
+            if not supplier_id and not supplier_external_service_id:
+                continue
+            existing = conn.execute(
+                """
+                SELECT id
+                FROM cafe24_supplier_mappings
+                WHERE mall_id = ? AND shop_no = ? AND cafe24_product_no = ?
+                  AND cafe24_variant_code = ? AND cafe24_custom_product_code = ?
+                """,
+                (row["mall_id"], row["shop_no"], product_no, variant_code, custom_code),
+            ).fetchone()
+            if existing is not None:
+                continue
+            conn.execute(
+                """
+                INSERT INTO cafe24_supplier_mappings (
+                    id, mall_id, shop_no, cafe24_product_no, cafe24_variant_code,
+                    cafe24_custom_product_code, internal_product_id, supplier_id,
+                    supplier_service_id, supplier_external_service_id,
+                    supplier_product_uuid, supplier_product_code, field_mapping_json,
+                    auto_dispatch_enabled, enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"cafe24_smap_{uuid4().hex[:14]}",
+                    row["mall_id"],
+                    row["shop_no"],
+                    product_no,
+                    variant_code,
+                    custom_code,
+                    row["internal_product_id"] or "",
+                    supplier_id,
+                    supplier_service_id,
+                    supplier_external_service_id,
+                    row["supplier_product_uuid"] or "",
+                    row["supplier_product_code"] or "",
+                    row["field_mapping_json"] or "{}",
+                    0,
+                    row["enabled"],
+                    timestamp,
+                    timestamp,
+                ),
+            )
 
     def _migrate_supplier_secrets(self, conn: DatabaseConnection) -> None:
         if not secret_encryption_available():
@@ -4961,7 +5137,7 @@ class PanelStore:
                 refresh_token_expires_at TEXT NOT NULL DEFAULT '',
                 last_poll_at TEXT NOT NULL DEFAULT '',
                 poll_cursor TEXT NOT NULL DEFAULT '',
-                auto_submit INTEGER NOT NULL DEFAULT 1,
+                auto_submit INTEGER NOT NULL DEFAULT 0,
                 completion_policy TEXT NOT NULL DEFAULT 'memo_only',
                 token_status TEXT NOT NULL DEFAULT 'connected',
                 token_last_checked_at TEXT NOT NULL DEFAULT '',
@@ -5000,6 +5176,29 @@ class PanelStore:
             CREATE INDEX IF NOT EXISTS idx_cafe24_product_mappings_product
                 ON cafe24_product_mappings(internal_product_id, enabled);
 
+            CREATE TABLE IF NOT EXISTS cafe24_supplier_mappings (
+                id TEXT PRIMARY KEY,
+                mall_id TEXT NOT NULL,
+                shop_no INTEGER NOT NULL DEFAULT 1,
+                cafe24_product_no TEXT NOT NULL DEFAULT '',
+                cafe24_variant_code TEXT NOT NULL DEFAULT '',
+                cafe24_custom_product_code TEXT NOT NULL DEFAULT '',
+                internal_product_id TEXT NOT NULL DEFAULT '',
+                supplier_id TEXT NOT NULL DEFAULT '',
+                supplier_service_id TEXT NOT NULL DEFAULT '',
+                supplier_external_service_id TEXT NOT NULL DEFAULT '',
+                supplier_product_uuid TEXT NOT NULL DEFAULT '',
+                supplier_product_code TEXT NOT NULL DEFAULT '',
+                field_mapping_json TEXT NOT NULL DEFAULT '{}',
+                auto_dispatch_enabled INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(mall_id, shop_no, cafe24_product_no, cafe24_variant_code, cafe24_custom_product_code)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cafe24_supplier_mappings_supplier
+                ON cafe24_supplier_mappings(supplier_id, supplier_service_id, enabled);
+
             CREATE TABLE IF NOT EXISTS cafe24_order_items (
                 id TEXT PRIMARY KEY,
                 mall_id TEXT NOT NULL,
@@ -5014,11 +5213,16 @@ class PanelStore:
                 buyer_phone TEXT NOT NULL DEFAULT '',
                 receiver_name TEXT NOT NULL DEFAULT '',
                 order_status_code TEXT NOT NULL DEFAULT '',
+                payment_status TEXT NOT NULL DEFAULT '',
+                payment_gate_status TEXT NOT NULL DEFAULT 'unverified',
                 source_status TEXT NOT NULL DEFAULT '',
                 standard_status TEXT NOT NULL DEFAULT 'received',
                 internal_order_id TEXT NOT NULL DEFAULT '',
                 mapping_id TEXT NOT NULL DEFAULT '',
                 product_id TEXT NOT NULL DEFAULT '',
+                supplier_id TEXT NOT NULL DEFAULT '',
+                supplier_service_id TEXT NOT NULL DEFAULT '',
+                supplier_external_service_id TEXT NOT NULL DEFAULT '',
                 normalized_fields_json TEXT NOT NULL DEFAULT '{}',
                 supplier_payload_json TEXT NOT NULL DEFAULT '{}',
                 raw_payload_json TEXT NOT NULL DEFAULT '{}',
@@ -5026,6 +5230,7 @@ class PanelStore:
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 supplier_order_id TEXT NOT NULL DEFAULT '',
                 supplier_order_uuid TEXT NOT NULL DEFAULT '',
+                supplier_response_json TEXT NOT NULL DEFAULT '{}',
                 last_submitted_at TEXT NOT NULL DEFAULT '',
                 last_synced_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
@@ -8854,10 +9059,13 @@ class PanelStore:
                     cm.*,
                     p.name AS internal_product_name,
                     p.option_name AS internal_option_name,
-                    s.name AS supplier_name
-                FROM cafe24_product_mappings cm
-                JOIN products p ON p.id = cm.internal_product_id
+                    s.name AS supplier_name,
+                    ss.name AS supplier_service_name,
+                    ss.external_service_id AS supplier_service_external_id
+                FROM cafe24_supplier_mappings cm
+                LEFT JOIN products p ON p.id = cm.internal_product_id
                 LEFT JOIN suppliers s ON s.id = cm.supplier_id
+                LEFT JOIN supplier_services ss ON ss.id = cm.supplier_service_id
                 ORDER BY cm.updated_at DESC
                 LIMIT 200
                 """
@@ -9016,10 +9224,15 @@ class PanelStore:
             "internalOptionName": row.get("internal_option_name") or "",
             "supplierId": row["supplier_id"] or "",
             "supplierName": row.get("supplier_name") or "",
+            "supplierServiceId": row.get("supplier_service_id") or "",
+            "supplierServiceName": row.get("supplier_service_name") or "",
+            "supplierServiceExternalId": row.get("supplier_service_external_id") or row.get("supplier_external_service_id") or "",
+            "supplierExternalServiceId": row.get("supplier_external_service_id") or "",
             "supplierProductUuid": row["supplier_product_uuid"] or "",
             "supplierProductCode": row["supplier_product_code"] or "",
             "fieldMapping": parse_json(row["field_mapping_json"], {}),
             "fieldMappingJson": row["field_mapping_json"] or "{}",
+            "autoDispatchEnabled": bool(row.get("auto_dispatch_enabled") or False),
             "enabled": bool(row["enabled"]),
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
@@ -9041,15 +9254,21 @@ class PanelStore:
             "buyerPhoneMasked": mask_phone(row["buyer_phone"]),
             "receiverName": row["receiver_name"],
             "orderStatusCode": row["order_status_code"],
+            "paymentStatus": row.get("payment_status") or "",
+            "paymentGateStatus": row.get("payment_gate_status") or "",
             "sourceStatus": row["source_status"],
             "standardStatus": row["standard_status"],
             "internalOrderId": row["internal_order_id"],
             "mappingId": row["mapping_id"],
             "productId": row["product_id"],
+            "supplierId": row.get("supplier_id") or "",
+            "supplierServiceId": row.get("supplier_service_id") or "",
+            "supplierExternalServiceId": row.get("supplier_external_service_id") or "",
             "internalProductName": row.get("internal_product_name") or "",
             "internalOptionName": row.get("internal_option_name") or "",
             "normalizedFields": parse_json(row["normalized_fields_json"], {}),
             "supplierPayload": parse_json(row["supplier_payload_json"], {}),
+            "supplierResponse": parse_json(row.get("supplier_response_json") or "{}", {}),
             "rawPayloadPreview": redact_external_payload(raw_payload),
             "errorMessage": row["error_message"] or "",
             "retryCount": int(row["retry_count"] or 0),
@@ -9073,6 +9292,8 @@ class PanelStore:
                         row["buyer_name"],
                         row.get("internal_product_name") or "",
                         row["standard_status"],
+                        row.get("payment_status") or "",
+                        row.get("payment_gate_status") or "",
                         row["error_message"] or "",
                     ],
                 )
@@ -9211,7 +9432,7 @@ class PanelStore:
                 "expiresAt": expires_at_value,
                 "refreshTokenExpiresAt": refresh_expires_at_value,
                 "scopes": token_scopes,
-                "autoSubmit": True,
+                "autoSubmit": False,
                 "isActive": True,
                 "_adminActor": actor,
             }
@@ -9248,7 +9469,7 @@ class PanelStore:
         scopes = normalize_cafe24_scopes(payload.get("scopes"))
         expires_at = str(payload.get("expiresAt") or "").strip()
         refresh_expires_at = str(payload.get("refreshTokenExpiresAt") or "").strip()
-        auto_submit = 1 if payload.get("autoSubmit", True) else 0
+        auto_submit = 1 if payload.get("autoSubmit", False) else 0
         completion_policy = str(payload.get("completionPolicy") or "memo_only").strip() or "memo_only"
         is_active = 1 if payload.get("isActive", True) else 0
         actor = self._admin_actor(payload)
@@ -9384,28 +9605,49 @@ class PanelStore:
         custom_product_code = sanitize_external_order_reference(payload.get("cafe24CustomProductCode"))
         internal_product_id = str(payload.get("internalProductId") or "").strip()
         supplier_id = str(payload.get("supplierId") or "").strip()
+        supplier_service_id = str(payload.get("supplierServiceId") or "").strip()
         supplier_product_uuid = sanitize_external_order_reference(payload.get("supplierProductUuid"))
         supplier_product_code = sanitize_external_order_reference(payload.get("supplierProductCode"))
         field_mapping_raw = payload.get("fieldMappingJson")
         field_mapping = parse_json(str(field_mapping_raw or "{}"), {}) if isinstance(field_mapping_raw, str) else payload.get("fieldMapping") or {}
+        auto_dispatch_enabled = 1 if payload.get("autoDispatchEnabled", False) else 0
         enabled = 1 if payload.get("enabled", True) else 0
         actor = self._admin_actor(payload)
         if not mall_id:
             raise PanelError("Cafe24 mall_id를 입력해 주세요.")
         if not any([product_no, variant_code, custom_product_code]):
             raise PanelError("Cafe24 상품번호, 품목코드, 자체상품코드 중 하나 이상이 필요합니다.")
-        if not internal_product_id:
-            raise PanelError("연결할 내부 상품을 선택해 주세요.")
+        if not supplier_id:
+            raise PanelError("Cafe24 상품에 연결할 공급사를 선택해 주세요.")
+        if not supplier_service_id and not supplier_product_uuid and not supplier_product_code:
+            raise PanelError("공급사 서비스를 선택하거나 공급사 상품 코드를 입력해 주세요.")
         with self._connect() as conn:
-            product = conn.execute("SELECT id FROM products WHERE id = ?", (internal_product_id,)).fetchone()
-            if product is None:
-                raise PanelError("내부 상품을 찾을 수 없습니다.", status=404)
-            existing = conn.execute("SELECT * FROM cafe24_product_mappings WHERE id = ?", (mapping_id,)).fetchone() if mapping_id else None
+            if internal_product_id:
+                product = conn.execute("SELECT id FROM products WHERE id = ?", (internal_product_id,)).fetchone()
+                if product is None:
+                    raise PanelError("내부 상품을 찾을 수 없습니다.", status=404)
+            supplier = conn.execute("SELECT id, is_active FROM suppliers WHERE id = ?", (supplier_id,)).fetchone()
+            if supplier is None:
+                raise PanelError("공급사를 찾을 수 없습니다.", status=404)
+            if not bool(supplier["is_active"]):
+                raise PanelError("비활성 공급사는 Cafe24 매핑에 사용할 수 없습니다.")
+            supplier_service = None
+            supplier_external_service_id = supplier_product_uuid or supplier_product_code
+            if supplier_service_id:
+                supplier_service = conn.execute(
+                    "SELECT id, external_service_id FROM supplier_services WHERE id = ? AND supplier_id = ?",
+                    (supplier_service_id, supplier_id),
+                ).fetchone()
+                if supplier_service is None:
+                    raise PanelError("선택한 공급사 서비스를 찾을 수 없습니다.", status=404)
+                supplier_external_service_id = str(supplier_service["external_service_id"] or "")
+                supplier_product_uuid = supplier_product_uuid or supplier_external_service_id
+            existing = conn.execute("SELECT * FROM cafe24_supplier_mappings WHERE id = ?", (mapping_id,)).fetchone() if mapping_id else None
             if existing is None:
                 existing = conn.execute(
                     """
                     SELECT *
-                    FROM cafe24_product_mappings
+                    FROM cafe24_supplier_mappings
                     WHERE mall_id = ? AND shop_no = ? AND cafe24_product_no = ?
                       AND cafe24_variant_code = ? AND cafe24_custom_product_code = ?
                     """,
@@ -9417,10 +9659,11 @@ class PanelStore:
             if existing:
                 conn.execute(
                     """
-                    UPDATE cafe24_product_mappings
+                    UPDATE cafe24_supplier_mappings
                     SET mall_id = ?, shop_no = ?, cafe24_product_no = ?, cafe24_variant_code = ?,
                         cafe24_custom_product_code = ?, internal_product_id = ?, supplier_id = ?,
-                        supplier_product_uuid = ?, supplier_product_code = ?, field_mapping_json = ?,
+                        supplier_service_id = ?, supplier_external_service_id = ?, supplier_product_uuid = ?,
+                        supplier_product_code = ?, field_mapping_json = ?, auto_dispatch_enabled = ?,
                         enabled = ?, updated_at = ?
                     WHERE id = ?
                     """,
@@ -9432,24 +9675,28 @@ class PanelStore:
                         custom_product_code,
                         internal_product_id,
                         supplier_id,
+                        supplier_service_id,
+                        supplier_external_service_id,
                         supplier_product_uuid,
                         supplier_product_code,
                         as_json(field_mapping),
+                        auto_dispatch_enabled,
                         enabled,
                         timestamp,
                         mapping_id,
                     ),
                 )
             else:
-                mapping_id = f"cafe24_map_{uuid4().hex[:14]}"
+                mapping_id = f"cafe24_smap_{uuid4().hex[:14]}"
                 conn.execute(
                     """
-                    INSERT INTO cafe24_product_mappings (
+                    INSERT INTO cafe24_supplier_mappings (
                         id, mall_id, shop_no, cafe24_product_no, cafe24_variant_code,
                         cafe24_custom_product_code, internal_product_id, supplier_id,
-                        supplier_product_uuid, supplier_product_code, field_mapping_json,
+                        supplier_service_id, supplier_external_service_id, supplier_product_uuid,
+                        supplier_product_code, field_mapping_json, auto_dispatch_enabled,
                         enabled, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         mapping_id,
@@ -9460,9 +9707,12 @@ class PanelStore:
                         custom_product_code,
                         internal_product_id,
                         supplier_id,
+                        supplier_service_id,
+                        supplier_external_service_id,
                         supplier_product_uuid,
                         supplier_product_code,
                         as_json(field_mapping),
+                        auto_dispatch_enabled,
                         enabled,
                         timestamp,
                         timestamp,
@@ -9472,18 +9722,31 @@ class PanelStore:
                 conn,
                 actor=actor,
                 action="cafe24.mapping_save",
-                entity_type="cafe24_mapping",
+                entity_type="cafe24_supplier_mapping",
                 entity_id=mapping_id,
-                message=f"Cafe24 상품 매핑 저장: {mall_id}/{shop_no}",
-                metadata={"productNo": product_no, "variantCode": variant_code, "customProductCode": custom_product_code},
+                message=f"Cafe24 공급사 매핑 저장: {mall_id}/{shop_no}",
+                metadata={
+                    "productNo": product_no,
+                    "variantCode": variant_code,
+                    "customProductCode": custom_product_code,
+                    "supplierId": supplier_id,
+                    "supplierServiceId": supplier_service_id,
+                },
             )
             conn.commit()
             row = conn.execute(
                 """
-                SELECT cm.*, p.name AS internal_product_name, p.option_name AS internal_option_name, s.name AS supplier_name
-                FROM cafe24_product_mappings cm
-                JOIN products p ON p.id = cm.internal_product_id
+                SELECT
+                    cm.*,
+                    p.name AS internal_product_name,
+                    p.option_name AS internal_option_name,
+                    s.name AS supplier_name,
+                    ss.name AS supplier_service_name,
+                    ss.external_service_id AS supplier_service_external_id
+                FROM cafe24_supplier_mappings cm
+                LEFT JOIN products p ON p.id = cm.internal_product_id
                 LEFT JOIN suppliers s ON s.id = cm.supplier_id
+                LEFT JOIN supplier_services ss ON ss.id = cm.supplier_service_id
                 WHERE cm.id = ?
                 """,
                 (mapping_id,),
@@ -9496,15 +9759,15 @@ class PanelStore:
         if not mapping_id:
             raise PanelError("삭제할 Cafe24 매핑을 선택해 주세요.")
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM cafe24_product_mappings WHERE id = ?", (mapping_id,)).fetchone()
+            row = conn.execute("SELECT * FROM cafe24_supplier_mappings WHERE id = ?", (mapping_id,)).fetchone()
             if row is None:
                 raise PanelError("Cafe24 매핑을 찾을 수 없습니다.", status=404)
-            conn.execute("UPDATE cafe24_product_mappings SET enabled = 0, updated_at = ? WHERE id = ?", (now_iso(), mapping_id))
+            conn.execute("UPDATE cafe24_supplier_mappings SET enabled = 0, updated_at = ? WHERE id = ?", (now_iso(), mapping_id))
             self._record_admin_audit(
                 conn,
                 actor=actor,
                 action="cafe24.mapping_disable",
-                entity_type="cafe24_mapping",
+                entity_type="cafe24_supplier_mapping",
                 entity_id=mapping_id,
                 message="Cafe24 상품 매핑 비활성화",
             )
@@ -10030,9 +10293,25 @@ class PanelStore:
     ) -> Optional[Dict[str, Any]]:
         rows = conn.execute(
             """
-            SELECT cm.*, p.form_structure_json, p.name AS internal_product_name
-            FROM cafe24_product_mappings cm
-            JOIN products p ON p.id = cm.internal_product_id
+            SELECT
+                cm.*,
+                p.form_structure_json,
+                p.name AS internal_product_name,
+                s.name AS supplier_name,
+                s.api_url,
+                s.integration_type,
+                s.api_key,
+                s.bearer_token,
+                s.is_active AS supplier_is_active,
+                ss.name AS supplier_service_name,
+                ss.external_service_id AS supplier_service_external_id,
+                ss.raw_json AS supplier_service_raw_json,
+                ss.min_amount AS supplier_min_amount,
+                ss.max_amount AS supplier_max_amount
+            FROM cafe24_supplier_mappings cm
+            LEFT JOIN products p ON p.id = cm.internal_product_id
+            JOIN suppliers s ON s.id = cm.supplier_id
+            LEFT JOIN supplier_services ss ON ss.id = cm.supplier_service_id
             WHERE cm.mall_id = ? AND cm.shop_no = ? AND cm.enabled = 1
             """,
             (mall_id, shop_no),
@@ -10115,6 +10394,142 @@ class PanelStore:
         if "orderedCount" not in fields:
             fields["orderedCount"] = cafe24_payload_value(item_payload, ("quantity", "qty", "order_quantity")) or "1"
         return fields
+
+    def _supplier_mapping_from_cafe24_mapping(
+        self,
+        mapping: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        supplier_id = str(mapping.get("supplier_id") or "").strip()
+        if not supplier_id:
+            return None
+        supplier_external_service_id = str(
+            mapping.get("supplier_service_external_id")
+            or mapping.get("supplier_external_service_id")
+            or mapping.get("supplier_product_uuid")
+            or mapping.get("supplier_product_code")
+            or ""
+        ).strip()
+        if not supplier_external_service_id:
+            return None
+        return {
+            "id": str(mapping.get("id") or ""),
+            "product_id": str(mapping.get("internal_product_id") or ""),
+            "supplier_id": supplier_id,
+            "supplier_service_id": str(mapping.get("supplier_service_id") or supplier_external_service_id),
+            "supplier_external_service_id": supplier_external_service_id,
+            "api_url": str(mapping.get("api_url") or ""),
+            "integration_type": str(mapping.get("integration_type") or SUPPLIER_INTEGRATION_CLASSIC),
+            "api_key": mapping.get("api_key") or "",
+            "bearer_token": mapping.get("bearer_token") or "",
+            "supplier_name": str(mapping.get("supplier_name") or ""),
+            "supplier_service_name": str(mapping.get("supplier_service_name") or ""),
+            "supplier_is_active": mapping.get("supplier_is_active"),
+            "supplier_service_raw_json": mapping.get("supplier_service_raw_json") or "{}",
+        }
+
+    def _normalize_cafe24_direct_item_fields(
+        self,
+        *,
+        mapping: Dict[str, Any],
+        order_payload: Dict[str, Any],
+        item_payload: Dict[str, Any],
+        buyer: Dict[str, Any],
+        receiver: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        field_mapping = parse_json(mapping.get("field_mapping_json"), {})
+        option_pairs = self._cafe24_option_pairs(order_payload, item_payload)
+        option_blob = " ".join(option_pairs.values())
+        first_url_match = re.search(r"https?://[^\s,|]+", option_blob)
+        account_candidate = ""
+        for label, value in option_pairs.items():
+            lowered = label.lower()
+            if any(token in lowered for token in ("계정", "아이디", "id", "account", "username", "링크", "url")):
+                account_candidate = value
+                break
+
+        field_keys = set(field_mapping.keys()) | {
+            "targetUrl",
+            "targetValue",
+            "orderedCount",
+            "contactPhone",
+            "requestMemo",
+            "comments",
+            "runs",
+            "interval",
+            "min",
+            "max",
+            "posts",
+            "oldPosts",
+            "delay",
+            "expiry",
+        }
+        fields: Dict[str, Any] = {}
+        for field_key in field_keys:
+            mapped_value = self._resolve_cafe24_mapping_source(
+                field_mapping.get(field_key),
+                order_payload=order_payload,
+                item_payload=item_payload,
+                buyer=buyer,
+                receiver=receiver,
+                option_pairs=option_pairs,
+            )
+            if mapped_value:
+                fields[field_key] = mapped_value
+                continue
+            if field_key == "orderedCount":
+                fields[field_key] = cafe24_payload_value(item_payload, ("quantity", "qty", "order_quantity")) or "1"
+            elif field_key == "targetUrl" and first_url_match:
+                fields[field_key] = first_url_match.group(0)
+            elif field_key == "targetValue":
+                fields[field_key] = first_url_match.group(0) if first_url_match else account_candidate
+            elif field_key == "contactPhone":
+                fields[field_key] = cafe24_payload_value(receiver, ("cellphone", "phone", "mobile", "phone1")) or cafe24_payload_value(
+                    buyer,
+                    ("cellphone", "phone", "mobile", "phone1"),
+                )
+            elif field_key == "requestMemo":
+                fields[field_key] = cafe24_payload_value(order_payload, ("memo", "client_memo", "order_memo")) or option_pairs.get("orderMemo", "")
+
+        return {key: value for key, value in fields.items() if value not in ("", None)}
+
+    def _validate_cafe24_direct_fields(self, fields: Dict[str, Any], mapping: Dict[str, Any]) -> None:
+        raw_quantity = fields.get("orderedCount")
+        if raw_quantity in (None, ""):
+            raise PanelError("수량을 확인할 수 없습니다.")
+        try:
+            quantity = int(str(raw_quantity).replace(",", "").strip())
+        except (TypeError, ValueError):
+            raise PanelError("수량은 숫자로 입력되어야 합니다.")
+        if quantity <= 0:
+            raise PanelError("수량은 1 이상이어야 합니다.")
+        min_amount = int(mapping.get("supplier_min_amount") or 0)
+        max_amount = int(mapping.get("supplier_max_amount") or 0)
+        if min_amount and quantity < min_amount:
+            raise PanelError(f"공급사 최소 수량({min_amount})보다 작습니다.")
+        if max_amount and quantity > max_amount:
+            raise PanelError(f"공급사 최대 수량({max_amount})보다 큽니다.")
+
+        target_url = str(fields.get("targetUrl") or "").strip()
+        target_value = str(fields.get("targetValue") or "").strip()
+        comments = str(fields.get("comments") or "").strip()
+        if not target_url and not target_value and not comments:
+            raise PanelError("공급사 발주에 필요한 링크 또는 계정 입력값이 없습니다.")
+        if target_url and looks_like_url(target_url) and not normalize_url(target_url):
+            raise PanelError("대상 URL 형식이 올바르지 않습니다.")
+        if target_value and looks_like_url(target_value) and not normalize_url(target_value):
+            raise PanelError("대상 URL 형식이 올바르지 않습니다.")
+
+    def _cafe24_processing_error_status(self, exc: Exception) -> str:
+        message = str(exc)
+        if "수량" in message and "범위" not in message and "최소" not in message and "최대" not in message:
+            return "invalid_quantity"
+        if "최소" in message or "최대" in message or "범위" in message:
+            return "supplier_range_error"
+        if "URL" in message or "링크" in message or "계정" in message:
+            return "invalid_target"
+        if "필수" in message or "필요한" in message:
+            return "missing_required_field"
+        return "needs_manual_review"
 
     def _ensure_cafe24_channel_user(self, conn: DatabaseConnection, mall_id: str, shop_no: int) -> str:
         user_id = f"user_cafe24_{re.sub(r'[^A-Za-z0-9_]', '_', mall_id)}_{int(shop_no)}"
@@ -10326,6 +10741,7 @@ class PanelStore:
         item_payload: Dict[str, Any],
         index: int,
         submit_ready: bool,
+        require_mapping_auto_dispatch: bool = False,
     ) -> Dict[str, Any]:
         mall_id = str(integration["mall_id"])
         shop_no = int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO)
@@ -10336,14 +10752,20 @@ class PanelStore:
         receivers = order_payload.get("receivers")
         receiver = receivers[0] if isinstance(receivers, list) and receivers and isinstance(receivers[0], dict) else {}
         source_status = identity["statusCode"]
+        payment_status = cafe24_payment_status_from_payload(order_payload, item_payload)
+        payment_gate_status = cafe24_payment_gate_status(source_status, payment_status)
         status = normalize_cafe24_status(source_status)
         error_message = ""
         mapping_row = self._match_cafe24_mapping(conn, mall_id, shop_no, identity)
+        mapping = dict(mapping_row) if mapping_row is not None else None
         normalized_fields: Dict[str, Any] = {}
         supplier_payload: Dict[str, Any] = {}
         internal_order_id = ""
         supplier_mapping: Optional[Dict[str, Any]] = None
         product: Optional[Dict[str, Any]] = None
+        supplier_id = ""
+        supplier_service_id = ""
+        supplier_external_service_id = ""
 
         raw_payload = {
             "order": order_payload,
@@ -10351,59 +10773,97 @@ class PanelStore:
             "buyer": buyer,
             "receiver": receiver,
         }
-        if cafe24_status_is_cancelled(source_status):
+        if payment_gate_status == "cancelled":
             status = "cancelled"
             error_message = "Cafe24 취소/반품 계열 상태입니다. 공급 전이면 자동 차단됩니다."
-        elif source_status in CAFE24_ORDER_UNPAID_STATUSES:
-            status = "received"
-            error_message = "결제 전 주문입니다. 공급하지 않습니다."
-        elif mapping_row is None:
+        elif payment_gate_status == "payment_pending":
+            status = "payment_pending"
+            error_message = "결제 완료 전 주문입니다. 공급하지 않습니다."
+        elif payment_gate_status != "payment_confirmed":
+            status = "payment_review_required"
+            error_message = "Cafe24 결제 완료 상태가 확인되지 않아 검수가 필요합니다."
+        elif mapping is None:
             status = "waiting_input"
             error_message = "Cafe24 상품 매핑이 없습니다."
         else:
-            product_row = conn.execute(
-                """
-                SELECT
-                    p.*,
-                    pc.id AS category_id,
-                    pc.name AS category_name,
-                    pg.platform_section_id,
-                    ps.slug AS platform_slug,
-                    ps.accent_color AS accent_color
-                FROM products p
-                JOIN product_categories pc ON pc.id = p.product_category_id
-                JOIN platform_groups pg ON pg.id = pc.platform_group_id
-                JOIN platform_sections ps ON ps.id = pg.platform_section_id
-                WHERE p.id = ? AND p.is_active = 1 AND pc.is_active = 1
-                """,
-                (mapping_row["internal_product_id"],),
-            ).fetchone()
-            if product_row is None:
-                status = "waiting_input"
-                error_message = "매핑된 내부 상품이 비활성 또는 삭제 상태입니다."
-            else:
-                product = dict(product_row)
-                normalized_fields = self._normalize_cafe24_item_fields(
-                    product=product,
-                    mapping=mapping_row,
-                    order_payload=order_payload,
-                    item_payload=item_payload,
-                    buyer=buyer,
-                    receiver=receiver,
-                )
-                try:
-                    form_structure = ensure_request_memo_form_structure(parse_json(product["form_structure_json"], {}), "추가 요청사항")
-                    self._validate_fields(normalized_fields, form_structure.get("schema", {}))
-                    self._validate_product_target(product, normalized_fields, require_preview=False)
-                    supplier_mapping = self._active_supplier_mapping_for_product(conn, product["id"], mapping_row)
-                    if supplier_mapping is None or not bool(supplier_mapping["supplier_is_active"]):
-                        status = "waiting_input"
-                        error_message = "내부 상품의 활성 공급사 매핑이 없습니다."
-                    else:
+            supplier_mapping = self._supplier_mapping_from_cafe24_mapping(mapping)
+            supplier_id = str(mapping.get("supplier_id") or "")
+            supplier_service_id = str(mapping.get("supplier_service_id") or "")
+            supplier_external_service_id = str(
+                mapping.get("supplier_service_external_id")
+                or mapping.get("supplier_external_service_id")
+                or mapping.get("supplier_product_uuid")
+                or mapping.get("supplier_product_code")
+                or ""
+            )
+            if supplier_mapping is None:
+                status = "mapping_error"
+                error_message = "Cafe24 상품에 연결된 공급사 서비스가 없습니다."
+            elif not bool(mapping.get("supplier_is_active")):
+                status = "mapping_error"
+                error_message = "Cafe24 상품에 연결된 공급사가 비활성 상태입니다."
+            elif mapping.get("internal_product_id"):
+                product_row = conn.execute(
+                    """
+                    SELECT
+                        p.*,
+                        pc.id AS category_id,
+                        pc.name AS category_name,
+                        pg.platform_section_id,
+                        ps.slug AS platform_slug,
+                        ps.accent_color AS accent_color
+                    FROM products p
+                    JOIN product_categories pc ON pc.id = p.product_category_id
+                    JOIN platform_groups pg ON pg.id = pc.platform_group_id
+                    JOIN platform_sections ps ON ps.id = pg.platform_section_id
+                    WHERE p.id = ? AND p.is_active = 1 AND pc.is_active = 1
+                    """,
+                    (mapping["internal_product_id"],),
+                ).fetchone()
+                if product_row is None:
+                    status = "mapping_error"
+                    error_message = "매핑된 내부 상품 참조가 비활성 또는 삭제 상태입니다."
+                else:
+                    product = dict(product_row)
+                    normalized_fields = self._normalize_cafe24_item_fields(
+                        product=product,
+                        mapping=mapping,
+                        order_payload=order_payload,
+                        item_payload=item_payload,
+                        buyer=buyer,
+                        receiver=receiver,
+                    )
+                    try:
+                        form_structure = ensure_request_memo_form_structure(parse_json(product["form_structure_json"], {}), "추가 요청사항")
+                        self._validate_fields(normalized_fields, form_structure.get("schema", {}))
+                        self._validate_product_target(product, normalized_fields, require_preview=False)
                         supplier_payload = self._build_supplier_order_payload(product, normalized_fields, supplier_mapping)
                         status = "ready_to_submit"
+                    except PanelError as exc:
+                        status = self._cafe24_processing_error_status(exc)
+                        error_message = str(exc)
+            else:
+                try:
+                    normalized_fields = self._normalize_cafe24_direct_item_fields(
+                        mapping=mapping,
+                        order_payload=order_payload,
+                        item_payload=item_payload,
+                        buyer=buyer,
+                        receiver=receiver,
+                    )
+                    self._validate_cafe24_direct_fields(normalized_fields, mapping)
+                    supplier_payload = self._build_supplier_order_payload(
+                        {
+                            "product_code": "",
+                            "platform_slug": "",
+                            "price_strategy": "unit",
+                        },
+                        normalized_fields,
+                        supplier_mapping,
+                    )
+                    status = "ready_to_submit"
                 except PanelError as exc:
-                    status = "waiting_input"
+                    status = self._cafe24_processing_error_status(exc)
                     error_message = str(exc)
 
         timestamp = now_iso()
@@ -10414,10 +10874,11 @@ class PanelStore:
                 id, mall_id, shop_no, cafe24_order_id, cafe24_order_item_code,
                 cafe24_product_no, cafe24_variant_code, cafe24_custom_product_code,
                 buyer_name, buyer_email, buyer_phone, receiver_name, order_status_code,
-                source_status, standard_status, mapping_id, product_id,
+                payment_status, payment_gate_status, source_status, standard_status,
+                mapping_id, product_id, supplier_id, supplier_service_id, supplier_external_service_id,
                 normalized_fields_json, supplier_payload_json, raw_payload_json,
                 error_message, last_synced_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(mall_id, shop_no, cafe24_order_id, cafe24_order_item_code)
             DO UPDATE SET
                 cafe24_product_no = excluded.cafe24_product_no,
@@ -10428,6 +10889,8 @@ class PanelStore:
                 buyer_phone = excluded.buyer_phone,
                 receiver_name = excluded.receiver_name,
                 order_status_code = excluded.order_status_code,
+                payment_status = excluded.payment_status,
+                payment_gate_status = excluded.payment_gate_status,
                 source_status = excluded.source_status,
                 standard_status = CASE
                     WHEN cafe24_order_items.standard_status IN ('supplier_submitted', 'supplier_progress', 'completed')
@@ -10436,6 +10899,9 @@ class PanelStore:
                 END,
                 mapping_id = excluded.mapping_id,
                 product_id = excluded.product_id,
+                supplier_id = excluded.supplier_id,
+                supplier_service_id = excluded.supplier_service_id,
+                supplier_external_service_id = excluded.supplier_external_service_id,
                 normalized_fields_json = excluded.normalized_fields_json,
                 supplier_payload_json = excluded.supplier_payload_json,
                 raw_payload_json = excluded.raw_payload_json,
@@ -10457,10 +10923,15 @@ class PanelStore:
                 cafe24_payload_value(buyer, ("cellphone", "phone", "mobile")),
                 cafe24_payload_value(receiver, ("name", "receiver_name")),
                 source_status,
+                payment_status,
+                payment_gate_status,
                 source_status,
                 status,
-                mapping_row["id"] if mapping_row is not None else "",
+                mapping["id"] if mapping is not None else "",
                 product["id"] if product is not None else "",
+                supplier_id,
+                supplier_service_id,
+                supplier_external_service_id,
                 as_json(normalized_fields),
                 as_json(supplier_payload),
                 as_json(raw_payload),
@@ -10490,7 +10961,12 @@ class PanelStore:
                 raw_payload=raw_payload,
                 supplier_mapping=supplier_mapping,
             )
-        if submit_ready and internal_order_id and supplier_mapping is not None:
+        dispatch_allowed = bool(
+            submit_ready
+            and mapping
+            and (not require_mapping_auto_dispatch or mapping.get("auto_dispatch_enabled"))
+        )
+        if dispatch_allowed and internal_order_id and product is not None and supplier_mapping is not None:
             # Commit the normalized order before the external supplier request.
             conn.commit()
             dispatch = self._dispatch_supplier_order(internal_order_id, product, normalized_fields, supplier_mapping)
@@ -10519,10 +10995,11 @@ class PanelStore:
 
     def poll_cafe24_orders(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         integration_id = str(payload.get("integrationId") or "").strip()
-        submit_ready = bool(payload.get("submitReady", True))
+        submit_ready = bool(payload.get("submitReady", False))
         actor = self._admin_actor(payload)
         processed = 0
         waiting = 0
+        blocked = 0
         submitted = 0
         failed = 0
         errors: List[str] = []
@@ -10565,10 +11042,13 @@ class PanelStore:
                                 item_payload=item_payload,
                                 index=index,
                                 submit_ready=submit_ready and bool(integration["auto_submit"]),
+                                require_mapping_auto_dispatch=True,
                             )
                             processed += 1
-                            if result["status"] == "waiting_input":
+                            if result["status"] in {"waiting_input", "mapping_error", "field_extract_failed", "missing_required_field", "invalid_quantity", "invalid_target", "supplier_range_error", "needs_manual_review"}:
                                 waiting += 1
+                            elif result["status"] in {"payment_pending", "payment_review_required", "cancelled"}:
+                                blocked += 1
                             elif result["status"] == "failed":
                                 failed += 1
                             elif result.get("submitted"):
@@ -10582,7 +11062,7 @@ class PanelStore:
                         (
                             now_iso(),
                             "success",
-                            f"{processed}개 품주 처리",
+                            f"{processed}개 품주 처리 · {blocked}개 결제/취소 게이트 차단",
                             now_iso(),
                             integration["id"],
                         ),
@@ -10594,7 +11074,7 @@ class PanelStore:
                         entity_type="cafe24_integration",
                         entity_id=integration["id"],
                         message=f"Cafe24 주문 수집: {mall_id}/{shop_no}",
-                        metadata={"processed": processed, "waiting": waiting, "submitted": submitted, "failed": failed},
+                        metadata={"processed": processed, "waiting": waiting, "blocked": blocked, "submitted": submitted, "failed": failed},
                     )
                     conn.commit()
                 except Exception as exc:
@@ -10620,6 +11100,7 @@ class PanelStore:
         return {
             "processed": processed,
             "waitingInput": waiting,
+            "blocked": blocked,
             "submitted": submitted,
             "failed": failed,
             "errors": errors,
@@ -10656,6 +11137,7 @@ class PanelStore:
                 item_payload=item_payload,
                 index=0,
                 submit_ready=True,
+                require_mapping_auto_dispatch=False,
             )
             self._record_admin_audit(
                 conn,
@@ -10668,6 +11150,162 @@ class PanelStore:
             )
             conn.commit()
         return {"result": result}
+
+    def dispatch_cafe24_order_item(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        item_id = str(payload.get("itemId") or payload.get("id") or "").strip()
+        actor = self._admin_actor(payload)
+        if not item_id:
+            raise PanelError("발주할 Cafe24 주문 품주를 선택해 주세요.")
+
+        dispatch_id = f"cafe24_sord_{uuid4().hex[:12]}"
+        timestamp = now_iso()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    coi.*,
+                    s.name AS supplier_name,
+                    s.api_url,
+                    s.integration_type,
+                    s.api_key,
+                    s.bearer_token,
+                    s.is_active AS supplier_is_active
+                FROM cafe24_order_items coi
+                LEFT JOIN suppliers s ON s.id = coi.supplier_id
+                WHERE coi.id = ?
+                """,
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                raise PanelError("Cafe24 주문 품주를 찾을 수 없습니다.", status=404)
+            if str(row["supplier_order_uuid"] or "").strip() or str(row["standard_status"] or "") in {
+                "supplier_submitted",
+                "supplier_progress",
+                "completed",
+            }:
+                return {
+                    "id": row["id"],
+                    "status": row["standard_status"],
+                    "submitted": False,
+                    "duplicate": True,
+                    "supplierOrderUuid": row["supplier_order_uuid"] or "",
+                }
+            if str(row["payment_gate_status"] or "") != "payment_confirmed":
+                raise PanelError("Cafe24 결제완료가 확인되지 않아 발주할 수 없습니다.")
+            if str(row["standard_status"] or "") not in {"ready_to_submit", "failed"}:
+                raise PanelError("발주 가능한 상태가 아닙니다. 먼저 재검증을 실행해 주세요.")
+            if not bool(row.get("supplier_is_active")):
+                raise PanelError("연결된 공급사가 비활성 상태입니다.")
+            request_payload = parse_json(row["supplier_payload_json"], {})
+            if not isinstance(request_payload, dict) or not request_payload:
+                raise PanelError("공급사 발주 payload가 없습니다. 먼저 재검증을 실행해 주세요.")
+            if not str(row["supplier_id"] or "").strip() or not str(row["supplier_external_service_id"] or "").strip():
+                raise PanelError("공급사 서비스 매핑이 없습니다.")
+            cursor = conn.execute(
+                """
+                UPDATE cafe24_order_items
+                SET standard_status = ?, supplier_order_id = ?, error_message = ?,
+                    retry_count = COALESCE(retry_count, 0) + 1, updated_at = ?
+                WHERE id = ?
+                  AND supplier_order_uuid = ''
+                  AND standard_status IN ('ready_to_submit', 'failed')
+                """,
+                ("submitting", dispatch_id, "", timestamp, item_id),
+            )
+            if cursor.rowcount != 1:
+                raise PanelError("다른 요청에서 이미 발주 처리 중입니다.")
+            conn.commit()
+
+        response_payload: Any = {}
+        supplier_external_order_id = ""
+        next_status = "failed"
+        error_message = ""
+        try:
+            api_key = decrypt_secret_value(row["api_key"])
+            bearer_token = decrypt_secret_value(row.get("bearer_token") or "")
+            client = SupplierApiClient(
+                str(row["api_url"]),
+                api_key,
+                integration_type=str(row.get("integration_type") or SUPPLIER_INTEGRATION_CLASSIC),
+                bearer_token=bearer_token,
+            )
+            response_payload = client.order(request_payload)
+            if isinstance(response_payload, dict):
+                supplier_external_order_id = str(
+                    response_payload.get("order")
+                    or response_payload.get("id")
+                    or response_payload.get("orderUuid")
+                    or response_payload.get("order_uuid")
+                    or response_payload.get("uuid")
+                    or ""
+                ).strip()
+                if supplier_external_order_id:
+                    next_status = "supplier_submitted"
+                elif response_payload:
+                    next_status = "needs_manual_review"
+                    error_message = "공급사 응답에 주문 ID가 없어 중복 여부 확인이 필요합니다."
+                else:
+                    error_message = "공급사 응답이 비어 있습니다."
+            elif response_payload not in (None, False, "", []):
+                next_status = "needs_manual_review"
+                error_message = "공급사 주문 ID를 확인할 수 없어 수동 확인이 필요합니다."
+            else:
+                error_message = "공급사 응답이 비어 있습니다."
+        except Exception as exc:
+            response_payload = {"error": str(exc)}
+            error_message = str(exc)
+            next_status = "failed"
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE cafe24_order_items
+                SET standard_status = ?, supplier_order_uuid = ?, supplier_response_json = ?,
+                    error_message = ?, last_submitted_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    next_status,
+                    supplier_external_order_id,
+                    as_json(redact_external_payload(response_payload)),
+                    error_message,
+                    now_iso(),
+                    now_iso(),
+                    item_id,
+                ),
+            )
+            self._log_cafe24_event(
+                conn,
+                mall_id=str(row["mall_id"]),
+                shop_no=int(row["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                event_type="supplier.dispatch",
+                status="success" if next_status == "supplier_submitted" else "failed",
+                request_payload=redact_external_payload(request_payload),
+                response_payload=redact_external_payload(response_payload),
+                error_message=error_message,
+            )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="cafe24.order_item_dispatch",
+                entity_type="cafe24_order_item",
+                entity_id=item_id,
+                message=f"Cafe24 주문 품주 공급사 발주: {next_status}",
+                metadata={
+                    "supplierOrderId": dispatch_id,
+                    "supplierOrderUuid": supplier_external_order_id,
+                    "status": next_status,
+                },
+            )
+            conn.commit()
+        return {
+            "id": item_id,
+            "status": next_status,
+            "submitted": next_status == "supplier_submitted",
+            "supplierOrderId": dispatch_id,
+            "supplierOrderUuid": supplier_external_order_id,
+            "errorMessage": error_message,
+        }
 
     def resync_cafe24_order_item(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         item_id = str(payload.get("itemId") or payload.get("id") or "").strip()
@@ -10702,6 +11340,7 @@ class PanelStore:
                         item_payload=item_payload,
                         index=index,
                         submit_ready=bool(integration["auto_submit"]),
+                        require_mapping_auto_dispatch=True,
                     )
                     break
             if result is None:

@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import os
 import sqlite3
 import tempfile
@@ -79,8 +80,8 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
                 "shopNo": 1,
                 "cafe24ProductNo": "1001",
                 "cafe24VariantCode": "P00000AA000A",
-                "internalProductId": "prd_branding_standard_30",
                 "supplierId": "supplier_test",
+                "supplierServiceId": "supplier_service_test",
                 "fieldMapping": {
                     "targetValue": "option:계정",
                     "contactPhone": "receiver.cellphone",
@@ -156,6 +157,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         return {
             "order_id": "20260426-000001",
             "order_status": "N20",
+            "payment_status": "paid",
             "memo": "오전 처리 희망",
             "buyer": {
                 "name": "홍길동",
@@ -198,7 +200,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         )
         self.conn.commit()
 
-    def test_cafe24_item_creates_internal_order_without_wallet_debit(self):
+    def test_cafe24_item_normalizes_to_supplier_payload_without_internal_product(self):
         order_payload = self._order_payload()
         result = self.store._process_cafe24_item(
             self.conn,
@@ -211,13 +213,66 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.conn.commit()
 
         self.assertEqual(result["status"], "ready_to_submit")
-        order = self.conn.execute("SELECT * FROM orders WHERE order_channel = 'cafe24'").fetchone()
-        self.assertIsNotNone(order)
-        self.assertEqual(order["external_order_id"], "20260426-000001")
-        self.assertEqual(order["external_order_item_id"], "20260426-000001-01")
-        self.assertEqual(order["target_value"], "instamart_official")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders WHERE order_channel = 'cafe24'").fetchone()[0], 0)
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.assertEqual(item["payment_status"], "paid")
+        self.assertEqual(item["payment_gate_status"], "payment_confirmed")
+        self.assertEqual(item["supplier_id"], "supplier_test")
+        self.assertEqual(item["supplier_service_id"], "supplier_service_test")
+        supplier_payload = json.loads(item["supplier_payload_json"])
+        self.assertEqual(supplier_payload["service"], "svc-1001")
+        self.assertEqual(supplier_payload["username"], "instamart_official")
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM balance_transactions").fetchone()[0], 0)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM wallet_ledger").fetchone()[0], 0)
+
+    def test_ready_cafe24_item_can_be_manually_dispatched_once(self):
+        order_payload = self._order_payload()
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+        item_id = self.conn.execute("SELECT id FROM cafe24_order_items").fetchone()["id"]
+
+        with patch("smm_panel.core.SupplierApiClient.order", return_value={"order": "SUP-1001"}) as order_call:
+            result = self.store.dispatch_cafe24_order_item({"itemId": item_id, "_adminActor": "qa"})
+            duplicate = self.store.dispatch_cafe24_order_item({"itemId": item_id, "_adminActor": "qa"})
+
+        self.assertEqual(result["status"], "supplier_submitted")
+        self.assertEqual(result["supplierOrderUuid"], "SUP-1001")
+        self.assertTrue(duplicate["duplicate"])
+        order_call.assert_called_once()
+        supplier_payload = order_call.call_args.args[0]
+        self.assertEqual(supplier_payload["service"], "svc-1001")
+        item = self.conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
+        self.assertEqual(item["standard_status"], "supplier_submitted")
+        self.assertEqual(item["supplier_order_uuid"], "SUP-1001")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders WHERE order_channel = 'cafe24'").fetchone()[0], 0)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM wallet_ledger").fetchone()[0], 0)
+
+    def test_payment_pending_cafe24_item_cannot_be_dispatched(self):
+        order_payload = self._order_payload()
+        order_payload["payment_status"] = "unpaid"
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+        item_id = self.conn.execute("SELECT id FROM cafe24_order_items").fetchone()["id"]
+
+        with patch("smm_panel.core.SupplierApiClient.order") as order_call:
+            with self.assertRaises(PanelError):
+                self.store.dispatch_cafe24_order_item({"itemId": item_id, "_adminActor": "qa"})
+
+        order_call.assert_not_called()
 
     def test_duplicate_cafe24_item_is_idempotent(self):
         order_payload = self._order_payload()
@@ -233,7 +288,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.conn.commit()
 
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM cafe24_order_items").fetchone()[0], 1)
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders WHERE order_channel = 'cafe24'").fetchone()[0], 1)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders WHERE order_channel = 'cafe24'").fetchone()[0], 0)
 
     def test_unmapped_cafe24_item_waits_for_operator_input(self):
         order_payload = self._order_payload()
@@ -250,6 +305,49 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "waiting_input")
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders WHERE order_channel = 'cafe24'").fetchone()[0], 0)
+
+    def test_unpaid_cafe24_item_is_blocked_before_mapping_or_dispatch(self):
+        order_payload = self._order_payload()
+        order_payload["payment_status"] = "unpaid"
+        result = self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=True,
+        )
+        self.conn.commit()
+
+        self.assertEqual(result["status"], "payment_pending")
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.assertEqual(item["payment_gate_status"], "payment_pending")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders WHERE order_channel = 'cafe24'").fetchone()[0], 0)
+
+    def test_missing_payment_status_requires_manual_review(self):
+        order_payload = self._order_payload()
+        order_payload.pop("payment_status", None)
+        result = self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=True,
+        )
+        self.conn.commit()
+
+        self.assertEqual(result["status"], "payment_review_required")
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.assertEqual(item["payment_gate_status"], "payment_review_required")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders WHERE order_channel = 'cafe24'").fetchone()[0], 0)
+
+    def test_cafe24_mapping_can_be_saved_without_internal_product(self):
+        row = self.conn.execute("SELECT * FROM cafe24_supplier_mappings WHERE mall_id = ?", ("instamart",)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["internal_product_id"], "")
+        self.assertEqual(row["supplier_id"], "supplier_test")
+        self.assertEqual(row["supplier_service_id"], "supplier_service_test")
 
     def test_cafe24_oauth_start_persists_state(self):
         with patch.dict(
