@@ -1830,6 +1830,8 @@ function renderCafe24AdminSection() {
   const products = getAdminProducts();
   const suppliers = getAdminSuppliers();
   const activeIntegration = integrations[0] || {};
+  const selectedCafe24SupplierId = state.ui.adminCafe24SelectedSupplierId || suppliers[0]?.id || "";
+  const cafe24SupplierServices = selectedCafe24SupplierId ? state.adminSupplierServices[selectedCafe24SupplierId]?.services || [] : [];
   const waitingCount = orderItems.filter((item) => item.standardStatus === "waiting_input").length;
   const failedCount = orderItems.filter((item) => item.standardStatus === "failed").length;
   const submittedCount = orderItems.filter((item) => ["supplier_submitted", "supplier_progress", "completed"].includes(item.standardStatus)).length;
@@ -1852,7 +1854,7 @@ function renderCafe24AdminSection() {
       ${renderAdminInsightStrip(
         [
           { label: "연동몰", value: `${integrations.length}개`, description: "등록된 Cafe24 mall/shop" },
-          { label: "상품 매핑", value: `${mappings.length}개`, description: "Cafe24 상품 → 내부 상품" },
+          { label: "상품 매핑", value: `${mappings.length}개`, description: "Cafe24 상품 → 공급사 서비스" },
           { label: "확인 필요", value: `${waitingCount}건`, description: "필수값/매핑 보완 필요" },
           { label: "토큰 상태", value: activeIntegration.tokenStatusLabel || "미연결", description: activeIntegration.reconnectRequiredAt ? "OAuth 재연결 필요" : "수집 전 자동 점검" },
         ],
@@ -1921,7 +1923,7 @@ function renderCafe24AdminSection() {
             </label>
           </div>
           <div class="admin-two-column">
-            <label class="admin-toggle"><input type="checkbox" name="autoSubmit" ${activeIntegration.autoSubmit !== false ? "checked" : ""} /><span>매핑 완료 주문 자동 공급</span></label>
+            <label class="admin-toggle"><input type="checkbox" name="autoSubmit" ${activeIntegration.autoSubmit ? "checked" : ""} /><span>자동 발주 허용(기본 OFF)</span></label>
             <label class="admin-toggle"><input type="checkbox" name="isActive" ${activeIntegration.isActive !== false ? "checked" : ""} /><span>연동 활성화</span></label>
           </div>
           <div class="admin-action-row">
@@ -1941,8 +1943,8 @@ function renderCafe24AdminSection() {
 
         <form class="admin-panel admin-form" data-admin-cafe24-mapping-form>
           <div class="section-head section-head--compact">
-            <h3>3) 상품 매핑</h3>
-            <p>상품명 매칭 대신 product_no, variant_code, custom_product_code 기준으로 연결합니다.</p>
+            <h3>3) 공급사 매핑</h3>
+            <p>Cafe24 상품/옵션 키를 기존 공급사 서비스에 직접 연결합니다. 내부 상품 참조는 선택값입니다.</p>
           </div>
           <div class="admin-three-column">
             <label class="form-field">
@@ -1960,33 +1962,43 @@ function renderCafe24AdminSection() {
           </div>
           <div class="admin-two-column">
             <label class="form-field">
-              <span class="field-label">내부 상품</span>
+              <span class="field-label">내부 상품 참조(선택)</span>
               <div class="field-shell">
                 <select class="field-select" name="internalProductId">
+                  <option value="">내부 상품 없이 공급사 서비스 직접 연결</option>
                   ${products.map((product) => `<option value="${escapeHtml(product.id)}">${escapeHtml(product.name)} · ${escapeHtml(product.optionName || "")}</option>`).join("")}
                 </select>
               </div>
             </label>
             <label class="form-field">
-              <span class="field-label">공급사 우선 선택</span>
+              <span class="field-label">공급사</span>
               <div class="field-shell">
-                <select class="field-select" name="supplierId">
-                  <option value="">내부 상품 기본 매핑 사용</option>
-                  ${suppliers.map((supplier) => `<option value="${escapeHtml(supplier.id)}">${escapeHtml(supplier.name)}</option>`).join("")}
+                <select class="field-select" name="supplierId" data-admin-cafe24-supplier-select>
+                  ${suppliers.map((supplier) => `<option value="${escapeHtml(supplier.id)}" ${supplier.id === selectedCafe24SupplierId ? "selected" : ""}>${escapeHtml(supplier.name)}</option>`).join("")}
                 </select>
               </div>
             </label>
           </div>
+          <label class="form-field">
+            <span class="field-label">공급사 서비스</span>
+            <div class="field-shell">
+              <select class="field-select" name="supplierServiceId" data-admin-cafe24-service-select>
+                <option value="">공급사 선택 후 서비스 목록을 불러오세요</option>
+                ${cafe24SupplierServices.map((service) => `<option value="${escapeHtml(service.id)}">${escapeHtml(service.name)} · ${escapeHtml(service.externalServiceId || "")} · ${escapeHtml(service.minAmount || "-")}~${escapeHtml(service.maxAmount || "-")}</option>`).join("")}
+              </select>
+            </div>
+          </label>
           <div class="admin-two-column">
             <label class="form-field">
-              <span class="field-label">공급사 상품 UUID</span>
+              <span class="field-label">공급사 상품 UUID(보조)</span>
               <div class="field-shell"><input class="field-input" name="supplierProductUuid" placeholder="예: productUuid" /></div>
             </label>
             <label class="form-field">
-              <span class="field-label">공급사 상품 코드</span>
+              <span class="field-label">공급사 상품 코드(보조)</span>
               <div class="field-shell"><input class="field-input" name="supplierProductCode" placeholder="예: service code" /></div>
             </label>
           </div>
+          <label class="admin-toggle"><input type="checkbox" name="autoDispatchEnabled" /><span>이 매핑은 자동 발주 허용(결제완료·검증통과 시에만)</span></label>
           <label class="form-field">
             <span class="field-label">필드 매핑 JSON</span>
             <div class="field-shell">
@@ -2006,13 +2018,13 @@ function renderCafe24AdminSection() {
         </div>
         <div class="admin-table-wrap">
           <table class="admin-table">
-            <thead><tr><th>Cafe24 키</th><th>내부 상품</th><th>공급사</th><th>상태</th><th>작업</th></tr></thead>
+            <thead><tr><th>Cafe24 키</th><th>내부 참조</th><th>공급사 서비스</th><th>상태</th><th>작업</th></tr></thead>
             <tbody>
               ${mappings.length ? mappings.map((mapping) => `
                 <tr>
                   <td>${escapeHtml([mapping.cafe24ProductNo, mapping.cafe24VariantCode, mapping.cafe24CustomProductCode].filter(Boolean).join(" / ") || "-")}</td>
-                  <td>${escapeHtml(mapping.internalProductName || mapping.internalProductId)} ${mapping.internalOptionName ? `· ${escapeHtml(mapping.internalOptionName)}` : ""}</td>
-                  <td>${escapeHtml(mapping.supplierName || mapping.supplierId || "내부 기본 매핑")} ${mapping.supplierProductUuid || mapping.supplierProductCode ? `· ${escapeHtml(mapping.supplierProductUuid || mapping.supplierProductCode)}` : ""}</td>
+                  <td>${escapeHtml(mapping.internalProductName || "선택 안 함")} ${mapping.internalOptionName ? `· ${escapeHtml(mapping.internalOptionName)}` : ""}</td>
+                  <td>${escapeHtml(mapping.supplierName || mapping.supplierId || "-")} ${mapping.supplierServiceName || mapping.supplierExternalServiceId ? `· ${escapeHtml(mapping.supplierServiceName || mapping.supplierExternalServiceId)}` : ""}</td>
                   <td><span class="admin-badge ${mapping.enabled ? "is-success" : "is-neutral"}">${mapping.enabled ? "활성" : "비활성"}</span></td>
                   <td><button class="admin-secondary-button" type="button" data-admin-cafe24-delete-mapping="${escapeHtml(mapping.id)}">비활성화</button></td>
                 </tr>
@@ -2025,10 +2037,14 @@ function renderCafe24AdminSection() {
       <div class="admin-panel">
         <div class="section-head section-head--compact">
           <h3>수집 주문 품주</h3>
-          <p>결제 전 주문은 공급하지 않고, 필수 입력값이 부족하면 waiting_input으로 유지합니다.</p>
+          <p>결제완료가 확인되지 않은 품주는 자동/수동 발주 모두 차단하고, 필수값 부족은 검수 상태로 유지합니다.</p>
         </div>
         <div class="admin-order-list">
-          ${orderItems.length ? orderItems.map((item) => `
+          ${orderItems.length ? orderItems.map((item) => {
+            const canDispatchCafe24Item = item.standardStatus === "ready_to_submit"
+              && item.paymentGateStatus === "payment_confirmed"
+              && !item.supplierOrderUuid;
+            return `
             <article class="admin-order-card ${item.standardStatus === "failed" ? "is-risk" : ""}">
               <div class="admin-order-card__top">
                 <div>
@@ -2044,17 +2060,21 @@ function renderCafe24AdminSection() {
               <div class="admin-order-card__fact-grid">
                 <article><span>상품번호</span><strong>${escapeHtml(item.productNo || "-")}</strong></article>
                 <article><span>품목코드</span><strong>${escapeHtml(item.variantCode || "-")}</strong></article>
+                <article><span>결제 게이트</span><strong>${escapeHtml(item.paymentGateStatus || "-")}</strong></article>
+                <article><span>결제상태</span><strong>${escapeHtml(item.paymentStatus || "-")}</strong></article>
+                <article><span>공급사</span><strong>${escapeHtml(item.supplierExternalServiceId || "-")}</strong></article>
                 <article><span>구매자</span><strong>${escapeHtml(item.buyerName || "-")}</strong></article>
                 <article><span>재시도</span><strong>${escapeHtml(String(item.retryCount || 0))}회</strong></article>
               </div>
               ${item.errorMessage ? `<p class="admin-inline-note">${escapeHtml(item.errorMessage)}</p>` : ""}
               <details class="admin-disclosure">
                 <summary>정규화/공급 payload 보기</summary>
-                <pre>${escapeHtml(JSON.stringify({ fields: item.normalizedFields, supplierPayload: item.supplierPayload, raw: item.rawPayloadPreview }, null, 2))}</pre>
+                <pre>${escapeHtml(JSON.stringify({ fields: item.normalizedFields, supplierPayload: item.supplierPayload, supplierResponse: item.supplierResponse, raw: item.rawPayloadPreview }, null, 2))}</pre>
               </details>
               <div class="admin-action-row">
                 <button class="admin-secondary-button" type="button" data-admin-cafe24-resync-item="${escapeHtml(item.id)}">재동기화</button>
                 <button class="admin-secondary-button" type="button" data-admin-cafe24-retry-item="${escapeHtml(item.id)}">수동 재시도</button>
+                <button class="admin-primary-button" type="button" data-admin-cafe24-dispatch-item="${escapeHtml(item.id)}" ${canDispatchCafe24Item ? "" : "disabled"}>공급사 발주</button>
               </div>
               <form class="admin-order-form" data-admin-cafe24-item-status-form>
                 <input type="hidden" name="itemId" value="${escapeHtml(item.id)}" />
@@ -2063,7 +2083,7 @@ function renderCafe24AdminSection() {
                     <span class="field-label">상태</span>
                     <div class="field-shell">
                       <select class="field-select" name="status">
-                        ${["received", "validated", "waiting_input", "ready_to_submit", "supplier_submitted", "supplier_progress", "completed", "failed", "cancelled"].map((status) => `<option value="${status}" ${item.standardStatus === status ? "selected" : ""}>${status}</option>`).join("")}
+                        ${["received", "payment_pending", "payment_review_required", "waiting_input", "mapping_error", "missing_required_field", "invalid_quantity", "invalid_target", "supplier_range_error", "needs_manual_review", "ready_to_submit", "submitting", "supplier_submitted", "supplier_progress", "completed", "failed", "cancelled"].map((status) => `<option value="${status}" ${item.standardStatus === status ? "selected" : ""}>${status}</option>`).join("")}
                       </select>
                     </div>
                   </label>
@@ -2077,7 +2097,8 @@ function renderCafe24AdminSection() {
                 </div>
               </form>
             </article>
-          `).join("") : `<div class="admin-empty-card"><strong>수집된 Cafe24 주문이 없습니다.</strong><p>연동 정보를 저장한 뒤 주문 수집을 실행해 주세요.</p></div>`}
+          `;
+          }).join("") : `<div class="admin-empty-card"><strong>수집된 Cafe24 주문이 없습니다.</strong><p>연동 정보를 저장한 뒤 주문 수집을 실행해 주세요.</p></div>`}
         </div>
       </div>
     </section>

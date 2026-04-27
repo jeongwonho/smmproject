@@ -20,6 +20,16 @@ function refreshAdminData(...args) { return callRuntime("refreshAdminData", ...a
 function renderRoute(...args) { return callRuntime("renderRoute", ...args); }
 function showToast(...args) { return callRuntime("showToast", ...args); }
 
+function escapeOptionText(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[char]));
+}
+
 function applyCafe24ProductToMapping(button) {
   const mappingForm = document.querySelector("[data-admin-cafe24-mapping-form]");
   if (!mappingForm) return false;
@@ -29,6 +39,41 @@ function applyCafe24ProductToMapping(button) {
   if (productNoInput) productNoInput.value = button.getAttribute("data-admin-cafe24-use-product") || "";
   if (variantCodeInput) variantCodeInput.value = button.getAttribute("data-admin-cafe24-variant-code") || "";
   if (customProductCodeInput) customProductCodeInput.value = button.getAttribute("data-admin-cafe24-custom-product-code") || "";
+  return true;
+}
+
+async function loadCafe24SupplierServices(supplierId) {
+  if (!supplierId) return null;
+  if (!state.adminSupplierServices) {
+    state.adminSupplierServices = {};
+  }
+  if (!state.adminSupplierServices[supplierId]) {
+    state.adminSupplierServices[supplierId] = await apiGet(`/api/admin/suppliers/${encodeURIComponent(supplierId)}/services`);
+  }
+  return state.adminSupplierServices[supplierId];
+}
+
+export async function handleCafe24AdminChange(target) {
+  if (!(target instanceof Element)) return false;
+  if (!target.matches("[data-admin-cafe24-supplier-select]")) return false;
+  const supplierId = target.value || "";
+  state.ui = state.ui || {};
+  state.ui.adminCafe24SelectedSupplierId = supplierId;
+  try {
+    const data = await loadCafe24SupplierServices(supplierId);
+    const serviceSelect = document.querySelector("[data-admin-cafe24-service-select]");
+    if (serviceSelect && data?.services) {
+      serviceSelect.innerHTML = [
+        `<option value="">공급사 서비스를 선택하세요</option>`,
+        ...data.services.map((service) => (
+          `<option value="${escapeOptionText(service.id)}">${escapeOptionText(service.name)} · ${escapeOptionText(service.externalServiceId || "")} · ${escapeOptionText(service.minAmount || "-")}~${escapeOptionText(service.maxAmount || "-")}</option>`
+        )),
+      ].join("");
+    }
+    showToast("공급사 서비스 목록을 불러왔습니다.");
+  } catch (error) {
+    showToast(error.message || "공급사 서비스 목록을 불러오지 못했습니다.", "error");
+  }
   return true;
 }
 
@@ -89,12 +134,12 @@ export async function handleCafe24AdminClick(closest) {
     try {
       const result = await apiPost("/api/admin/cafe24/poll", {
         integrationId: integrationId || formData.get("id"),
-        submitReady: true,
+        submitReady: false,
         startDate: formData.get("pollStartDate"),
         endDate: formData.get("pollEndDate"),
       });
       await refreshAdminData({ preserveDraft: true });
-      showToast(`Cafe24 수집 완료: ${result.processed || 0}개 처리, ${result.submitted || 0}개 전송`);
+      showToast(`Cafe24 수집 완료: ${result.processed || 0}개 처리, ${result.blocked || 0}개 차단`);
       renderRoute();
     } catch (error) {
       showToast(error.message || "Cafe24 주문 수집에 실패했습니다.", "error");
@@ -126,6 +171,20 @@ export async function handleCafe24AdminClick(closest) {
       renderRoute();
     } catch (error) {
       showToast(error.message || "Cafe24 품주 재처리에 실패했습니다.", "error");
+    }
+    return true;
+  }
+
+  const cafe24DispatchButton = closest("[data-admin-cafe24-dispatch-item]");
+  if (cafe24DispatchButton) {
+    const itemId = cafe24DispatchButton.getAttribute("data-admin-cafe24-dispatch-item") || "";
+    try {
+      const result = await apiPost("/api/admin/cafe24/order-items/dispatch", { itemId });
+      await refreshAdminData({ preserveDraft: true });
+      showToast(`Cafe24 공급사 발주: ${result.status || "처리됨"}`);
+      renderRoute();
+    } catch (error) {
+      showToast(error.message || "Cafe24 공급사 발주에 실패했습니다.", "error");
     }
     return true;
   }
@@ -215,9 +274,11 @@ export async function handleCafe24AdminSubmit(form, event) {
         cafe24CustomProductCode: formData.get("cafe24CustomProductCode"),
         internalProductId: formData.get("internalProductId"),
         supplierId: formData.get("supplierId"),
+        supplierServiceId: formData.get("supplierServiceId"),
         supplierProductUuid: formData.get("supplierProductUuid"),
         supplierProductCode: formData.get("supplierProductCode"),
         fieldMappingJson: formData.get("fieldMappingJson"),
+        autoDispatchEnabled: Boolean(formData.get("autoDispatchEnabled")),
         enabled: true,
       });
       await refreshAdminData({ preserveDraft: true });
