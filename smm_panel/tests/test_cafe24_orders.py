@@ -8,7 +8,7 @@ from unittest.mock import patch
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from smm_panel.core import PanelError, PanelStore, now_iso
+from smm_panel.core import Cafe24ApiError, PanelError, PanelStore, now_iso
 
 
 class FakeCafe24ProductClient:
@@ -54,6 +54,11 @@ class FakeCafe24ProductClient:
                 }
             ]
         }
+
+
+class FailingCafe24ProductClient:
+    def products(self, *, keyword="", product_no="", limit=20, offset=0):
+        raise Cafe24ApiError("Cafe24 API 오류 403: scope permission denied")
 
 
 class Cafe24OrderIntegrationTest(unittest.TestCase):
@@ -470,6 +475,27 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(product["productNo"], "1001")
         self.assertEqual(product["customProductCode"], "IG-FOLLOWER")
         self.assertEqual(product["variants"][0]["variantCode"], "P00000AA000A")
+
+    def test_cafe24_product_lookup_requires_product_scope(self):
+        self.conn.execute(
+            "UPDATE cafe24_integrations SET scopes_json = ? WHERE id = ?",
+            (json.dumps(["mall.read_order", "mall.write_order"], ensure_ascii=False), self.integration["id"]),
+        )
+        self.conn.commit()
+
+        with self.assertRaises(PanelError) as context:
+            self.store.list_cafe24_products({"integrationId": self.integration["id"], "q": "인스타"})
+
+        self.assertEqual(context.exception.status, 403)
+        self.assertIn("mall.read_product", str(context.exception))
+
+    def test_cafe24_product_lookup_exposes_api_error_without_generic_500(self):
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=FailingCafe24ProductClient()):
+            with self.assertRaises(PanelError) as context:
+                self.store.list_cafe24_products({"integrationId": self.integration["id"], "q": "인스타"})
+
+        self.assertEqual(context.exception.status, 403)
+        self.assertIn("상품 읽기 권한", str(context.exception))
 
     def test_cafe24_product_detail_includes_options_and_variants_for_mapping(self):
         with patch.object(self.store, "_cafe24_client_for_row", return_value=FakeCafe24ProductClient()):
