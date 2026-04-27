@@ -1488,15 +1488,15 @@ def receipt_type_label(receipt_type: str) -> str:
 
 def default_home_popup_record() -> Dict[str, Any]:
     return {
-        "id": "popup_home_youtube_rank",
-        "name": "홈 유튜브 상위노출 팝업",
-        "badgeText": "검색 노출 개선 집중",
-        "title": "유튜브 상위노출\n서비스 출시!",
-        "description": "신규 런칭 기념으로 빠르게 확인할 수 있는 홈 프로모션 팝업입니다.",
+        "id": "popup_home_service_notice",
+        "name": "홈 서비스 안내 팝업",
+        "badgeText": "신규 서비스 안내",
+        "title": "서비스 안내를 확인해 주세요",
+        "description": "상품별 제공 범위와 정책을 확인한 뒤 주문해 주세요.",
         "imageUrl": "",
-        "route": "/products/cat_youtube_views",
+        "route": "/help",
         "theme": "coral",
-        "isActive": True,
+        "isActive": False,
     }
 
 
@@ -2321,6 +2321,8 @@ def normalize_image_asset_source(raw: Any, label: str = "이미지") -> str:
         return candidate
     normalized = normalize_url(candidate)
     if normalized:
+        if urlparse(normalized).scheme.lower() != "https":
+            raise PanelError(f"{label}는 https 주소만 사용할 수 있습니다.")
         return normalized
     raise PanelError(f"{label} 주소 형식이 올바르지 않습니다.")
 
@@ -2478,6 +2480,8 @@ def safe_preview_image_url(source_url: str, candidate_url: str, title: str, acce
     try:
         validate_preview_target(resolved)
     except ValueError:
+        return placeholder_thumbnail(title, accent_color)
+    if urlparse(resolved).scheme.lower() != "https":
         return placeholder_thumbnail(title, accent_color)
     return resolved
 

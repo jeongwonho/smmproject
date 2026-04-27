@@ -978,7 +978,7 @@ function renderPopupAdminSection() {
               <label class="form-field">
                 <span class="field-label">뱃지 문구</span>
                 <div class="field-shell">
-                  <input class="field-input" type="text" name="badgeText" value="${escapeHtml(draft.badgeText)}" placeholder="예: 검색 노출 개선 집중" data-admin-popup-field="badgeText" />
+                  <input class="field-input" type="text" name="badgeText" value="${escapeHtml(draft.badgeText)}" placeholder="예: 신규 서비스 안내" data-admin-popup-field="badgeText" />
                 </div>
               </label>
               <label class="form-field">
