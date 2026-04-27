@@ -55,6 +55,15 @@ async function loadCafe24SupplierServices(supplierId) {
 
 export async function handleCafe24AdminChange(target) {
   if (!(target instanceof Element)) return false;
+  if (target.matches("[data-admin-cafe24-filter]")) {
+    state.ui = state.ui || {};
+    const key = target.getAttribute("data-admin-cafe24-filter") || "";
+    if (key === "payment") state.ui.adminCafe24PaymentFilter = target.value || "all";
+    if (key === "mapping") state.ui.adminCafe24MappingFilter = target.value || "all";
+    if (key === "search") state.ui.adminCafe24Search = target.value || "";
+    renderRoute();
+    return true;
+  }
   if (!target.matches("[data-admin-cafe24-supplier-select]")) return false;
   const supplierId = target.value || "";
   state.ui = state.ui || {};
@@ -78,6 +87,14 @@ export async function handleCafe24AdminChange(target) {
 }
 
 export async function handleCafe24AdminClick(closest) {
+  const cafe24TabButton = closest("[data-admin-cafe24-tab]");
+  if (cafe24TabButton) {
+    state.ui = state.ui || {};
+    state.ui.adminCafe24Tab = cafe24TabButton.getAttribute("data-admin-cafe24-tab") || "queue";
+    renderRoute();
+    return true;
+  }
+
   const cafe24OauthStartButton = closest("[data-admin-cafe24-oauth-start]");
   if (cafe24OauthStartButton) {
     const form = cafe24OauthStartButton.closest("[data-admin-cafe24-integration-form]");
@@ -137,6 +154,7 @@ export async function handleCafe24AdminClick(closest) {
         submitReady: false,
         startDate: formData.get("pollStartDate"),
         endDate: formData.get("pollEndDate"),
+        includeAllStatuses: Boolean(formData.get("pollIncludeAllStatuses")),
       });
       await refreshAdminData({ preserveDraft: true });
       showToast(`Cafe24 수집 완료: ${result.processed || 0}개 처리, ${result.blocked || 0}개 차단`);

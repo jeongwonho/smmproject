@@ -907,6 +907,28 @@ CREATE TABLE IF NOT EXISTS product_supplier_mappings (
     UNIQUE(product_id, supplier_id, supplier_service_id)
 );
 
+CREATE TABLE IF NOT EXISTS mkt24_product_settings (
+    id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'mkt24',
+    supplier_id TEXT NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+    supplier_service_id TEXT NOT NULL DEFAULT '',
+    product_uuid TEXT NOT NULL,
+    product_type_name TEXT NOT NULL DEFAULT '',
+    full_name TEXT NOT NULL DEFAULT '',
+    menu_name TEXT NOT NULL DEFAULT '',
+    detail_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    field_config_json TEXT NOT NULL DEFAULT '{}',
+    option_config_json TEXT NOT NULL DEFAULT '{}',
+    is_active INTEGER NOT NULL DEFAULT 1,
+    last_synced_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(supplier_id, product_uuid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mkt24_product_settings_supplier_service
+    ON mkt24_product_settings(supplier_id, supplier_service_id, is_active);
+
 CREATE TABLE IF NOT EXISTS supplier_orders (
     id TEXT PRIMARY KEY,
     order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
@@ -1027,6 +1049,11 @@ CREATE TABLE IF NOT EXISTS cafe24_order_items (
     order_status_code TEXT NOT NULL DEFAULT '',
     payment_status TEXT NOT NULL DEFAULT '',
     payment_gate_status TEXT NOT NULL DEFAULT 'unverified',
+    payment_method TEXT NOT NULL DEFAULT '',
+    payment_amount INTEGER NOT NULL DEFAULT 0,
+    payment_paid_at TEXT NOT NULL DEFAULT '',
+    payment_reference TEXT NOT NULL DEFAULT '',
+    payment_snapshot_json TEXT NOT NULL DEFAULT '{}',
     source_status TEXT NOT NULL DEFAULT '',
     standard_status TEXT NOT NULL DEFAULT 'received',
     internal_order_id TEXT NOT NULL DEFAULT '',
@@ -1997,6 +2024,115 @@ def cafe24_payment_status_from_payload(order_payload: Dict[str, Any], item_paylo
     return ""
 
 
+def cafe24_payment_amount_value(value: Any) -> int:
+    if value in (None, ""):
+        return 0
+    try:
+        return int(float(str(value).replace(",", "").strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def cafe24_payment_snapshot_from_payload(order_payload: Dict[str, Any], item_payload: Dict[str, Any]) -> Dict[str, Any]:
+    candidates: List[Dict[str, Any]] = []
+    for payload in (item_payload, order_payload):
+        if not isinstance(payload, dict):
+            continue
+        candidates.append(payload)
+        for nested_key in ("payment", "payment_info", "paymentInfo", "payment_detail", "paymentDetail"):
+            nested = payload.get(nested_key)
+            if isinstance(nested, dict):
+                candidates.append(nested)
+            elif isinstance(nested, list):
+                candidates.extend(item for item in nested if isinstance(item, dict))
+    method = ""
+    amount = 0
+    paid_at = ""
+    reference = ""
+    for candidate in candidates:
+        if not method:
+            method = str(
+                cafe24_payload_value(
+                    candidate,
+                    (
+                        "payment_method",
+                        "paymentMethod",
+                        "payment_method_name",
+                        "paymentMethodName",
+                        "pay_method",
+                        "payMethod",
+                        "paymethod",
+                        "payment_gateway",
+                        "paymentGateway",
+                    ),
+                )
+                or ""
+            ).strip()
+        if not amount:
+            amount = cafe24_payment_amount_value(
+                cafe24_payload_value(
+                    candidate,
+                    (
+                        "payment_amount",
+                        "paymentAmount",
+                        "paid_amount",
+                        "paidAmount",
+                        "actual_payment_amount",
+                        "actualPaymentAmount",
+                        "order_price_amount",
+                        "orderPriceAmount",
+                        "total_amount",
+                        "totalAmount",
+                        "amount",
+                    ),
+                )
+            )
+        if not paid_at:
+            paid_at = str(
+                cafe24_payload_value(
+                    candidate,
+                    (
+                        "paid_at",
+                        "paidAt",
+                        "payment_date",
+                        "paymentDate",
+                        "payment_complete_date",
+                        "paymentCompleteDate",
+                        "payment_confirmed_at",
+                        "paymentConfirmedAt",
+                        "paid_date",
+                        "paidDate",
+                    ),
+                )
+                or ""
+            ).strip()
+        if not reference:
+            reference = str(
+                cafe24_payload_value(
+                    candidate,
+                    (
+                        "pg_tid",
+                        "pgTid",
+                        "transaction_id",
+                        "transactionId",
+                        "payment_id",
+                        "paymentId",
+                        "approval_no",
+                        "approvalNo",
+                        "receipt_id",
+                        "receiptId",
+                    ),
+                )
+                or ""
+            ).strip()
+    return {
+        "method": method,
+        "amount": amount,
+        "paidAt": paid_at,
+        "reference": reference,
+    }
+
+
 def cafe24_payment_gate_status(order_status: Any, payment_status: Any) -> str:
     order_value = str(order_status or "").strip()
     normalized_payment = normalize_cafe24_payment_status(payment_status)
@@ -2572,6 +2708,87 @@ def supplier_service_record(integration_type: str, item: Dict[str, Any]) -> Opti
     }
 
 
+def mkt24_detail_data(payload: Any) -> Dict[str, Any]:
+    data = payload.get("data") if isinstance(payload, dict) else payload
+    return data if isinstance(data, dict) else {}
+
+
+def mkt24_template_label(entry: Dict[str, Any], fallback: str) -> str:
+    options = entry.get("templateOptions", {}) if isinstance(entry, dict) else {}
+    if isinstance(options, dict):
+        if options.get("label"):
+            return str(options.get("label"))
+        label_props = options.get("labelProps")
+        if isinstance(label_props, dict) and label_props.get("label"):
+            return str(label_props.get("label"))
+        form_props = options.get("formProps")
+        if isinstance(form_props, dict) and form_props.get("label"):
+            return str(form_props.get("label"))
+    return fallback
+
+
+def default_mkt24_field_config(detail: Dict[str, Any], existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    existing = existing if isinstance(existing, dict) else {}
+    form_structure = detail.get("formStructure") if isinstance(detail.get("formStructure"), dict) else {}
+    template = form_structure.get("template") if isinstance(form_structure.get("template"), dict) else {}
+    schema = form_structure.get("schema") if isinstance(form_structure.get("schema"), dict) else {}
+    config: Dict[str, Any] = {}
+    for field_key, template_entry in template.items():
+        if not isinstance(template_entry, dict):
+            continue
+        prior = existing.get(field_key) if isinstance(existing.get(field_key), dict) else {}
+        rules = schema.get(field_key) if isinstance(schema.get(field_key), list) else []
+        field_config = {
+            "enabled": bool(prior.get("enabled", True)),
+            "required": bool(prior.get("required", "STRING_REQUIRED" in rules or field_key == "orderedCount")),
+            "defaultValue": prior.get("defaultValue", ""),
+            "inputMode": str(prior.get("inputMode") or "user_input"),
+            "label": mkt24_template_label(template_entry, str(field_key)),
+            "variant": str(template_entry.get("variant") or "input"),
+            "templateOptions": template_entry.get("templateOptions") if isinstance(template_entry.get("templateOptions"), dict) else {},
+            "rules": rules,
+        }
+        if field_key == "orderedCount":
+            field_config.update(
+                {
+                    "min": int(prior.get("min") or detail.get("minAmount") or 1),
+                    "max": int(prior.get("max") or detail.get("maxAmount") or detail.get("minAmount") or 1),
+                    "step": int(prior.get("step") or detail.get("stepAmount") or 1),
+                }
+            )
+        config[str(field_key)] = field_config
+    return config
+
+
+def default_mkt24_option_config(detail: Dict[str, Any], existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    existing = existing if isinstance(existing, dict) else {}
+    supports = bool(detail.get("supportsOrderOptions"))
+    defaults = existing.get("defaults") if isinstance(existing.get("defaults"), dict) else {}
+    return {
+        "enabled": bool(existing.get("enabled", supports)),
+        "supportsOrderOptions": supports,
+        "defaults": defaults,
+    }
+
+
+def validate_mkt24_option_config(option_config: Dict[str, Any], *, supports_order_options: bool) -> Dict[str, Any]:
+    if not isinstance(option_config, dict):
+        raise PanelError("MKT24 optionInfo 설정 형식이 올바르지 않습니다.")
+    defaults = option_config.get("defaults")
+    if defaults in (None, ""):
+        defaults = {}
+    if not isinstance(defaults, dict):
+        raise PanelError("optionInfo 기본값은 JSON 객체여야 합니다.")
+    enabled = bool(option_config.get("enabled", supports_order_options))
+    if enabled and not supports_order_options:
+        enabled = False
+    return {
+        "enabled": enabled,
+        "supportsOrderOptions": bool(supports_order_options),
+        "defaults": defaults,
+    }
+
+
 def supplier_target_placeholder(platform_key: str, target_kind: str) -> str:
     platform = str(platform_key or "").strip().lower()
     if target_kind == "account":
@@ -2908,6 +3125,18 @@ class SupplierApiClient:
         return self._request_json(
             method="GET",
             url=self._mkt24_v3_url(f"/products/{quote(str(product_uuid), safe='')}"),
+            headers={
+                "Authorization": f"Bearer {self.bearer_token}",
+                "x-api-key": self.api_key,
+            },
+        )
+
+    def mkt24_sns_lookup(self, *, product_uuid: str, sns_value: str) -> Any:
+        return self._request_json(
+            method="GET",
+            url=self._mkt24_v3_url(
+                f"/sns?snsValue={quote(str(sns_value), safe='')}&productUuid={quote(str(product_uuid), safe='')}"
+            ),
             headers={
                 "Authorization": f"Bearer {self.bearer_token}",
                 "x-api-key": self.api_key,
@@ -4921,6 +5150,7 @@ class PanelStore:
         )
         self._ensure_charge_support_tables(conn)
         self._ensure_cafe24_support_tables(conn)
+        self._ensure_mkt24_product_settings_table(conn)
         self._ensure_column(conn, "cafe24_integrations", "token_status", "TEXT NOT NULL DEFAULT 'connected'")
         self._ensure_column(conn, "cafe24_integrations", "token_last_checked_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_integrations", "token_last_refreshed_at", "TEXT NOT NULL DEFAULT ''")
@@ -4930,6 +5160,11 @@ class PanelStore:
         self._ensure_column(conn, "cafe24_integrations", "reconnect_reason", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "payment_status", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "payment_gate_status", "TEXT NOT NULL DEFAULT 'unverified'")
+        self._ensure_column(conn, "cafe24_order_items", "payment_method", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_order_items", "payment_amount", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "cafe24_order_items", "payment_paid_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_order_items", "payment_reference", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_order_items", "payment_snapshot_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column(conn, "cafe24_order_items", "supplier_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "supplier_service_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "supplier_external_service_id", "TEXT NOT NULL DEFAULT ''")
@@ -4956,6 +5191,32 @@ class PanelStore:
         conn.execute("UPDATE users SET role = 'admin', is_active = 1, account_status = 'active' WHERE id = ?", (DEMO_USER_ID,))
         conn.execute("UPDATE users SET role = COALESCE(NULLIF(role, ''), 'customer') WHERE id != ?", (DEMO_USER_ID,))
         self._migrate_supplier_secrets(conn)
+
+    def _ensure_mkt24_product_settings_table(self, conn: DatabaseConnection) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS mkt24_product_settings (
+                id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL DEFAULT 'mkt24',
+                supplier_id TEXT NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+                supplier_service_id TEXT NOT NULL DEFAULT '',
+                product_uuid TEXT NOT NULL,
+                product_type_name TEXT NOT NULL DEFAULT '',
+                full_name TEXT NOT NULL DEFAULT '',
+                menu_name TEXT NOT NULL DEFAULT '',
+                detail_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                field_config_json TEXT NOT NULL DEFAULT '{}',
+                option_config_json TEXT NOT NULL DEFAULT '{}',
+                is_active INTEGER NOT NULL DEFAULT 1,
+                last_synced_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(supplier_id, product_uuid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_mkt24_product_settings_supplier_service
+                ON mkt24_product_settings(supplier_id, supplier_service_id, is_active);
+            """
+        )
 
     def _migrate_cafe24_supplier_mappings(self, conn: DatabaseConnection) -> None:
         legacy_rows = conn.execute(
@@ -5215,6 +5476,11 @@ class PanelStore:
                 order_status_code TEXT NOT NULL DEFAULT '',
                 payment_status TEXT NOT NULL DEFAULT '',
                 payment_gate_status TEXT NOT NULL DEFAULT 'unverified',
+                payment_method TEXT NOT NULL DEFAULT '',
+                payment_amount INTEGER NOT NULL DEFAULT 0,
+                payment_paid_at TEXT NOT NULL DEFAULT '',
+                payment_reference TEXT NOT NULL DEFAULT '',
+                payment_snapshot_json TEXT NOT NULL DEFAULT '{}',
                 source_status TEXT NOT NULL DEFAULT '',
                 standard_status TEXT NOT NULL DEFAULT 'received',
                 internal_order_id TEXT NOT NULL DEFAULT '',
@@ -9256,6 +9522,12 @@ class PanelStore:
             "orderStatusCode": row["order_status_code"],
             "paymentStatus": row.get("payment_status") or "",
             "paymentGateStatus": row.get("payment_gate_status") or "",
+            "paymentMethod": row.get("payment_method") or "",
+            "paymentAmount": int(row.get("payment_amount") or 0),
+            "paymentAmountLabel": money(int(row.get("payment_amount") or 0)),
+            "paymentPaidAt": row.get("payment_paid_at") or "",
+            "paymentReference": row.get("payment_reference") or "",
+            "paymentSnapshot": parse_json(row.get("payment_snapshot_json") or "{}", {}),
             "sourceStatus": row["source_status"],
             "standardStatus": row["standard_status"],
             "internalOrderId": row["internal_order_id"],
@@ -9294,6 +9566,8 @@ class PanelStore:
                         row["standard_status"],
                         row.get("payment_status") or "",
                         row.get("payment_gate_status") or "",
+                        row.get("payment_method") or "",
+                        row.get("payment_reference") or "",
                         row["error_message"] or "",
                     ],
                 )
@@ -10754,6 +11028,7 @@ class PanelStore:
         source_status = identity["statusCode"]
         payment_status = cafe24_payment_status_from_payload(order_payload, item_payload)
         payment_gate_status = cafe24_payment_gate_status(source_status, payment_status)
+        payment_snapshot = cafe24_payment_snapshot_from_payload(order_payload, item_payload)
         status = normalize_cafe24_status(source_status)
         error_message = ""
         mapping_row = self._match_cafe24_mapping(conn, mall_id, shop_no, identity)
@@ -10874,11 +11149,12 @@ class PanelStore:
                 id, mall_id, shop_no, cafe24_order_id, cafe24_order_item_code,
                 cafe24_product_no, cafe24_variant_code, cafe24_custom_product_code,
                 buyer_name, buyer_email, buyer_phone, receiver_name, order_status_code,
-                payment_status, payment_gate_status, source_status, standard_status,
+                payment_status, payment_gate_status, payment_method, payment_amount,
+                payment_paid_at, payment_reference, payment_snapshot_json, source_status, standard_status,
                 mapping_id, product_id, supplier_id, supplier_service_id, supplier_external_service_id,
                 normalized_fields_json, supplier_payload_json, raw_payload_json,
                 error_message, last_synced_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(mall_id, shop_no, cafe24_order_id, cafe24_order_item_code)
             DO UPDATE SET
                 cafe24_product_no = excluded.cafe24_product_no,
@@ -10891,6 +11167,11 @@ class PanelStore:
                 order_status_code = excluded.order_status_code,
                 payment_status = excluded.payment_status,
                 payment_gate_status = excluded.payment_gate_status,
+                payment_method = excluded.payment_method,
+                payment_amount = excluded.payment_amount,
+                payment_paid_at = excluded.payment_paid_at,
+                payment_reference = excluded.payment_reference,
+                payment_snapshot_json = excluded.payment_snapshot_json,
                 source_status = excluded.source_status,
                 standard_status = CASE
                     WHEN cafe24_order_items.standard_status IN ('supplier_submitted', 'supplier_progress', 'completed')
@@ -10925,6 +11206,11 @@ class PanelStore:
                 source_status,
                 payment_status,
                 payment_gate_status,
+                payment_snapshot["method"],
+                int(payment_snapshot["amount"] or 0),
+                payment_snapshot["paidAt"],
+                payment_snapshot["reference"],
+                as_json(payment_snapshot),
                 source_status,
                 status,
                 mapping["id"] if mapping is not None else "",
@@ -10996,6 +11282,7 @@ class PanelStore:
     def poll_cafe24_orders(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         integration_id = str(payload.get("integrationId") or "").strip()
         submit_ready = bool(payload.get("submitReady", False))
+        include_all_statuses = bool(payload.get("includeAllStatuses", False))
         actor = self._admin_actor(payload)
         processed = 0
         waiting = 0
@@ -11021,7 +11308,7 @@ class PanelStore:
                     response = client.orders(
                         start_date=start_date,
                         end_date=end_date,
-                        statuses=sorted(CAFE24_ORDER_ELIGIBLE_STATUSES),
+                        statuses=None if include_all_statuses else sorted(CAFE24_ORDER_ELIGIBLE_STATUSES),
                     )
                     orders = self._cafe24_orders_from_payload(response)
                     self._log_cafe24_event(
@@ -11030,7 +11317,7 @@ class PanelStore:
                         shop_no=shop_no,
                         event_type="orders.poll",
                         status="success",
-                        request_payload={"startDate": start_date, "endDate": end_date},
+                        request_payload={"startDate": start_date, "endDate": end_date, "includeAllStatuses": include_all_statuses},
                         response_payload={"count": len(orders)},
                     )
                     for order_payload in orders:
@@ -11447,6 +11734,277 @@ class PanelStore:
             ),
         }
         return payload
+
+    def get_mkt24_product_setting(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        supplier_id = str(payload.get("supplierId") or "").strip()
+        product_uuid = str(payload.get("productUuid") or "").strip()
+        refresh = bool(payload.get("refresh", False))
+        if not supplier_id or not product_uuid:
+            raise PanelError("MKT24 공급사와 상품을 선택해 주세요.")
+
+        with self._connect() as conn:
+            row = self._mkt24_product_setting_row(conn, supplier_id, product_uuid)
+            if row is not None and not refresh:
+                return {"setting": self._mkt24_product_setting_payload(row)}
+
+        return self.sync_mkt24_product_detail(
+            {
+                "supplierId": supplier_id,
+                "productUuid": product_uuid,
+                "_adminActor": payload.get("_adminActor") or "admin",
+            }
+        )
+
+    def sync_mkt24_product_detail(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        supplier_id = str(payload.get("supplierId") or "").strip()
+        product_uuid = str(payload.get("productUuid") or "").strip()
+        actor = self._admin_actor(payload)
+        if not supplier_id or not product_uuid:
+            raise PanelError("MKT24 공급사와 상품을 선택해 주세요.")
+
+        supplier = self._supplier_by_id(supplier_id, include_api_key=True)
+        if normalize_supplier_integration_type(supplier["integrationType"]) != SUPPLIER_INTEGRATION_MKT24:
+            raise PanelError("MKT24 공급사에서만 상품 상세를 조회할 수 있습니다.")
+
+        client = SupplierApiClient(
+            supplier["apiUrl"],
+            supplier["apiKey"],
+            integration_type=supplier["integrationType"],
+            bearer_token=supplier.get("bearerToken") or "",
+        )
+        detail_payload = client.mkt24_product_detail(product_uuid)
+        detail = mkt24_detail_data(detail_payload)
+        if not detail:
+            raise PanelError("MKT24 상품 상세 응답 형식이 올바르지 않습니다.")
+
+        timestamp = now_iso()
+        detail_product_uuid = str(detail.get("productUuid") or product_uuid).strip()
+        with self._connect() as conn:
+            service = conn.execute(
+                """
+                SELECT id, external_service_id, name, type
+                FROM supplier_services
+                WHERE supplier_id = ? AND external_service_id = ?
+                LIMIT 1
+                """,
+                (supplier_id, detail_product_uuid),
+            ).fetchone()
+            row = self._mkt24_product_setting_row(conn, supplier_id, detail_product_uuid)
+            existing_field_config = parse_json(row["field_config_json"], {}) if row is not None else {}
+            existing_option_config = parse_json(row["option_config_json"], {}) if row is not None else {}
+            field_config = default_mkt24_field_config(detail, existing_field_config)
+            option_config = default_mkt24_option_config(detail, existing_option_config)
+            option_config = validate_mkt24_option_config(
+                option_config,
+                supports_order_options=bool(detail.get("supportsOrderOptions")),
+            )
+            values = (
+                "mkt24",
+                supplier_id,
+                service["id"] if service is not None else "",
+                detail_product_uuid,
+                str(detail.get("productTypeName") or (service["type"] if service else "") or ""),
+                str(detail.get("fullName") or detail.get("productName") or (service["name"] if service else "") or ""),
+                str(detail.get("menuName") or detail.get("productName") or ""),
+                as_json(detail),
+                as_json(field_config),
+                as_json(option_config),
+                1 if row is None else int(row["is_active"]),
+                timestamp,
+                timestamp,
+            )
+            if row is None:
+                setting_id = f"mkt24_set_{uuid4().hex[:14]}"
+                conn.execute(
+                    """
+                    INSERT INTO mkt24_product_settings (
+                        id, provider, supplier_id, supplier_service_id, product_uuid,
+                        product_type_name, full_name, menu_name, detail_snapshot_json,
+                        field_config_json, option_config_json, is_active, last_synced_at,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (setting_id, *values, timestamp),
+                )
+            else:
+                setting_id = row["id"]
+                conn.execute(
+                    """
+                    UPDATE mkt24_product_settings
+                    SET provider = ?, supplier_id = ?, supplier_service_id = ?, product_uuid = ?,
+                        product_type_name = ?, full_name = ?, menu_name = ?, detail_snapshot_json = ?,
+                        field_config_json = ?, option_config_json = ?, is_active = ?,
+                        last_synced_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (*values, setting_id),
+                )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="mkt24.product_detail_sync",
+                entity_type="mkt24_product_setting",
+                entity_id=setting_id,
+                message=f"MKT24 상품 상세 동기화: {detail_product_uuid}",
+                metadata={"supplierId": supplier_id, "productUuid": detail_product_uuid},
+            )
+            conn.commit()
+            refreshed = self._mkt24_product_setting_row(conn, supplier_id, detail_product_uuid)
+        return {"setting": self._mkt24_product_setting_payload(refreshed)}
+
+    def save_mkt24_product_setting(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        supplier_id = str(payload.get("supplierId") or "").strip()
+        product_uuid = str(payload.get("productUuid") or "").strip()
+        supplier_service_id = str(payload.get("supplierServiceId") or "").strip()
+        is_active = bool(payload.get("isActive", True))
+        field_config = payload.get("fieldConfig") if isinstance(payload.get("fieldConfig"), dict) else {}
+        option_config = payload.get("optionConfig") if isinstance(payload.get("optionConfig"), dict) else {}
+        actor = self._admin_actor(payload)
+        if not supplier_id or not product_uuid:
+            raise PanelError("저장할 MKT24 상품 설정을 선택해 주세요.")
+
+        timestamp = now_iso()
+        with self._connect() as conn:
+            supplier = conn.execute(
+                "SELECT id, integration_type FROM suppliers WHERE id = ?",
+                (supplier_id,),
+            ).fetchone()
+            if supplier is None or normalize_supplier_integration_type(supplier["integration_type"]) != SUPPLIER_INTEGRATION_MKT24:
+                raise PanelError("MKT24 공급사를 선택해 주세요.")
+            service = conn.execute(
+                """
+                SELECT id, external_service_id
+                FROM supplier_services
+                WHERE supplier_id = ? AND id = ?
+                LIMIT 1
+                """,
+                (supplier_id, supplier_service_id),
+            ).fetchone()
+            if service is None:
+                raise PanelError("MKT24 공급사 서비스를 선택해 주세요.")
+            if str(service["external_service_id"]) != product_uuid:
+                raise PanelError("선택한 서비스와 MKT24 상품 UUID가 일치하지 않습니다.")
+
+            row = self._mkt24_product_setting_row(conn, supplier_id, product_uuid)
+            if row is None:
+                raise PanelError("먼저 MKT24 상품 상세를 불러와 주세요.")
+            detail = parse_json(row["detail_snapshot_json"], {})
+            if not isinstance(detail, dict) or not detail:
+                raise PanelError("MKT24 상품 상세 snapshot이 없습니다. 다시 불러온 뒤 저장해 주세요.")
+
+            normalized_field_config = self._normalize_mkt24_field_config(detail, field_config)
+            normalized_option_config = validate_mkt24_option_config(
+                option_config,
+                supports_order_options=bool(detail.get("supportsOrderOptions")),
+            )
+            self._build_mkt24_order_payload_from_setting(
+                detail,
+                normalized_field_config,
+                normalized_option_config,
+                {},
+                for_preview=True,
+            )
+            conn.execute(
+                """
+                UPDATE mkt24_product_settings
+                SET supplier_service_id = ?, field_config_json = ?, option_config_json = ?,
+                    is_active = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    supplier_service_id,
+                    as_json(normalized_field_config),
+                    as_json(normalized_option_config),
+                    bool_to_int(is_active),
+                    timestamp,
+                    row["id"],
+                ),
+            )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="mkt24.product_setting_update",
+                entity_type="mkt24_product_setting",
+                entity_id=row["id"],
+                message=f"MKT24 주문 옵션 설정 저장: {product_uuid}",
+                metadata={"supplierId": supplier_id, "supplierServiceId": supplier_service_id, "isActive": is_active},
+            )
+            conn.commit()
+            saved = self._mkt24_product_setting_row(conn, supplier_id, product_uuid)
+        return {"setting": self._mkt24_product_setting_payload(saved)}
+
+    def _mkt24_product_setting_row(
+        self,
+        conn: DatabaseConnection,
+        supplier_id: str,
+        product_uuid: str,
+    ) -> Optional[Dict[str, Any]]:
+        return conn.execute(
+            """
+            SELECT *
+            FROM mkt24_product_settings
+            WHERE supplier_id = ? AND product_uuid = ?
+            LIMIT 1
+            """,
+            (supplier_id, product_uuid),
+        ).fetchone()
+
+    def _mkt24_product_setting_payload(self, row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if row is None:
+            return {}
+        detail = parse_json(row["detail_snapshot_json"], {})
+        field_config = parse_json(row["field_config_json"], {})
+        option_config = parse_json(row["option_config_json"], {})
+        preview: Dict[str, Any] = {}
+        preview_error = ""
+        try:
+            preview = self._build_mkt24_order_payload_from_setting(
+                detail if isinstance(detail, dict) else {},
+                field_config if isinstance(field_config, dict) else {},
+                option_config if isinstance(option_config, dict) else {},
+                {},
+                for_preview=True,
+            )
+        except Exception as exc:
+            preview_error = str(exc)
+        return {
+            "id": row["id"],
+            "provider": row["provider"],
+            "supplierId": row["supplier_id"],
+            "supplierServiceId": row["supplier_service_id"],
+            "productUuid": row["product_uuid"],
+            "productTypeName": row["product_type_name"],
+            "fullName": row["full_name"],
+            "menuName": row["menu_name"],
+            "detailSnapshot": detail if isinstance(detail, dict) else {},
+            "fieldConfig": field_config if isinstance(field_config, dict) else {},
+            "optionConfig": option_config if isinstance(option_config, dict) else {},
+            "isActive": bool(row["is_active"]),
+            "lastSyncedAt": row["last_synced_at"],
+            "updatedAt": row["updated_at"],
+            "payloadPreview": preview,
+            "payloadPreviewError": preview_error,
+        }
+
+    def _normalize_mkt24_field_config(self, detail: Dict[str, Any], field_config: Dict[str, Any]) -> Dict[str, Any]:
+        defaults = default_mkt24_field_config(detail, field_config)
+        normalized: Dict[str, Any] = {}
+        for field_key, config in defaults.items():
+            incoming = field_config.get(field_key) if isinstance(field_config.get(field_key), dict) else {}
+            merged = {**config, **incoming}
+            merged["enabled"] = bool(merged.get("enabled", True))
+            merged["required"] = bool(merged.get("required", False))
+            merged["inputMode"] = str(merged.get("inputMode") or "user_input")
+            if merged["inputMode"] not in {"user_input", "admin_default"}:
+                merged["inputMode"] = "user_input"
+            if field_key == "orderedCount":
+                merged["min"] = int(float(merged.get("min") or detail.get("minAmount") or 1))
+                merged["max"] = int(float(merged.get("max") or detail.get("maxAmount") or merged["min"]))
+                merged["step"] = max(int(float(merged.get("step") or detail.get("stepAmount") or 1)), 1)
+                if merged["min"] > merged["max"]:
+                    raise PanelError("MKT24 수량 최소값은 최대값보다 클 수 없습니다.")
+            normalized[field_key] = merged
+        return normalized
 
     def _admin_actor(self, payload: Optional[Dict[str, Any]] = None) -> str:
         actor = str((payload or {}).get("_adminActor") or "").strip()
@@ -13888,6 +14446,13 @@ class PanelStore:
                 integration_type=str(mapping.get("integration_type") or SUPPLIER_INTEGRATION_CLASSIC),
                 bearer_token=bearer_token,
             )
+            if client.integration_type == SUPPLIER_INTEGRATION_MKT24:
+                for check in self._mkt24_load_input_checks(mapping, request_payload):
+                    client.mkt24_sns_lookup(
+                        product_uuid=check["productUuid"],
+                        sns_value=check["snsValue"],
+                    )
+                client.mkt24_estimate_sns(request_payload)
             response_payload = client.order(request_payload)
             if isinstance(response_payload, dict):
                 supplier_external_order_id = str(
@@ -13967,6 +14532,9 @@ class PanelStore:
         fields: Dict[str, Any],
         mapping: Dict[str, Any],
     ) -> Dict[str, Any]:
+        if normalize_supplier_integration_type(str(mapping.get("integration_type") or "")) == SUPPLIER_INTEGRATION_MKT24:
+            return self._build_mkt24_supplier_order_payload(product, fields, mapping)
+
         payload: Dict[str, Any] = {
             "service": str(mapping["supplier_external_service_id"]),
         }
@@ -14026,6 +14594,166 @@ class PanelStore:
             payload["comments"] = request_memo
 
         return payload
+
+    def _build_mkt24_supplier_order_payload(
+        self,
+        product: Dict[str, Any],
+        fields: Dict[str, Any],
+        mapping: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        product_uuid = str(mapping.get("supplier_external_service_id") or mapping.get("productUuid") or "").strip()
+        if not product_uuid:
+            raise PanelError("MKT24 상품 UUID가 없습니다.")
+
+        setting = self._mkt24_setting_for_mapping(mapping)
+        if setting:
+            detail = setting["detail"]
+            field_config = setting["fieldConfig"]
+            option_config = setting["optionConfig"]
+        else:
+            detail = {
+                "productUuid": product_uuid,
+                "fullName": product.get("name") or "",
+                "productName": product.get("name") or "",
+                "productTypeName": product.get("product_code") or "",
+                "supportsOrderOptions": False,
+                "formStructure": {
+                    "schema": {"snsValue": ["STRING_REQUIRED"], "orderedCount": ["MIN_MAX"]},
+                    "template": {
+                        "snsValue": {"variant": "load_input", "templateOptions": {"type": "account", "label": "계정/URL"}},
+                        "orderedCount": {"variant": "input", "templateOptions": {"labelProps": {"label": "수량"}}},
+                    },
+                },
+            }
+            field_config = default_mkt24_field_config(detail)
+            option_config = default_mkt24_option_config(detail)
+        return self._build_mkt24_order_payload_from_setting(detail, field_config, option_config, fields)
+
+    def _mkt24_setting_for_mapping(self, mapping: Dict[str, Any]) -> Dict[str, Any]:
+        supplier_id = str(mapping.get("supplier_id") or mapping.get("supplierId") or "").strip()
+        product_uuid = str(mapping.get("supplier_external_service_id") or mapping.get("productUuid") or "").strip()
+        if not supplier_id or not product_uuid:
+            return {}
+        with self._connect() as conn:
+            row = self._mkt24_product_setting_row(conn, supplier_id, product_uuid)
+        if row is None or not bool(row["is_active"]):
+            return {}
+        detail = parse_json(row["detail_snapshot_json"], {})
+        field_config = parse_json(row["field_config_json"], {})
+        option_config = parse_json(row["option_config_json"], {})
+        return {
+            "detail": detail if isinstance(detail, dict) else {},
+            "fieldConfig": field_config if isinstance(field_config, dict) else {},
+            "optionConfig": option_config if isinstance(option_config, dict) else {},
+        }
+
+    def _resolve_mkt24_field_value(self, field_key: str, config: Dict[str, Any], user_fields: Dict[str, Any], *, for_preview: bool) -> Any:
+        value = None
+        if str(config.get("inputMode") or "user_input") == "user_input":
+            value = user_fields.get(field_key)
+            if value in (None, "") and field_key == "snsValue":
+                value = user_fields.get("snsValue") or user_fields.get("targetValue") or user_fields.get("targetUrl") or user_fields.get("targetKeyword")
+            if value in (None, "") and field_key == "orderedCount":
+                value = user_fields.get("orderedCount")
+        if value in (None, ""):
+            value = config.get("defaultValue")
+        if value in (None, "") and for_preview:
+            if field_key == "snsValue":
+                return "sample_account"
+            if field_key == "orderedCount":
+                return config.get("min") or 1
+            return f"sample_{field_key}"
+        return value
+
+    def _build_mkt24_order_payload_from_setting(
+        self,
+        detail: Dict[str, Any],
+        field_config: Dict[str, Any],
+        option_config: Dict[str, Any],
+        user_fields: Dict[str, Any],
+        *,
+        for_preview: bool = False,
+    ) -> Dict[str, Any]:
+        if not isinstance(detail, dict):
+            raise PanelError("MKT24 상품 상세 정보가 없습니다.")
+        product_uuid = str(detail.get("productUuid") or "").strip()
+        if not product_uuid:
+            raise PanelError("MKT24 상품 UUID가 없습니다.")
+        normalized_fields = self._normalize_mkt24_field_config(detail, field_config)
+        normalized_options = validate_mkt24_option_config(
+            option_config if isinstance(option_config, dict) else {},
+            supports_order_options=bool(detail.get("supportsOrderOptions")),
+        )
+
+        order_info: Dict[str, Any] = {}
+        ordered_count = None
+        for field_key, config in normalized_fields.items():
+            if not bool(config.get("enabled", True)):
+                continue
+            value = self._resolve_mkt24_field_value(field_key, config, user_fields, for_preview=for_preview)
+            if bool(config.get("required")) and value in (None, ""):
+                raise PanelError(f"MKT24 필수 입력값이 비어 있습니다: {config.get('label') or field_key}")
+            if value in (None, ""):
+                continue
+            if field_key == "orderedCount":
+                try:
+                    ordered_count = int(value)
+                except (TypeError, ValueError):
+                    raise PanelError("MKT24 주문 수량은 숫자로 입력해 주세요.")
+                min_amount = int(config.get("min") or detail.get("minAmount") or 1)
+                max_amount = int(config.get("max") or detail.get("maxAmount") or min_amount)
+                step_amount = max(int(config.get("step") or detail.get("stepAmount") or 1), 1)
+                if ordered_count < min_amount or ordered_count > max_amount:
+                    raise PanelError(f"MKT24 주문 수량은 {min_amount}~{max_amount} 범위여야 합니다.")
+                if step_amount > 1 and (ordered_count - min_amount) % step_amount != 0:
+                    raise PanelError(f"MKT24 주문 수량은 {step_amount} 단위로 입력해 주세요.")
+                order_info[field_key] = ordered_count
+                continue
+            order_info[field_key] = value
+
+        if ordered_count is None and "orderedCount" not in normalized_fields:
+            fallback_count = user_fields.get("orderedCount")
+            if fallback_count not in (None, ""):
+                try:
+                    ordered_count = int(fallback_count)
+                    order_info["orderedCount"] = ordered_count
+                except (TypeError, ValueError):
+                    raise PanelError("MKT24 주문 수량은 숫자로 입력해 주세요.")
+
+        value_payload: Dict[str, Any] = {
+            "orderInfo": order_info,
+            "fullName": str(detail.get("fullName") or detail.get("productName") or detail.get("menuName") or ""),
+            "productTypeName": str(detail.get("productTypeName") or ""),
+            "isAuto": bool(detail.get("isAuto", False)),
+        }
+        if ordered_count is not None:
+            value_payload["orderedCount"] = ordered_count
+            order_info.setdefault("orderedCountRange", [0, 0])
+        if normalized_options["enabled"] and normalized_options["defaults"]:
+            value_payload["optionInfo"] = normalized_options["defaults"]
+
+        return {
+            "productUuid": product_uuid,
+            "value": value_payload,
+        }
+
+    def _mkt24_load_input_checks(self, mapping: Dict[str, Any], payload: Dict[str, Any]) -> List[Dict[str, str]]:
+        setting = self._mkt24_setting_for_mapping(mapping)
+        field_config = setting.get("fieldConfig") if setting else {}
+        if not isinstance(field_config, dict):
+            return []
+        product_uuid = str(payload.get("productUuid") or "").strip()
+        order_info = payload.get("value", {}).get("orderInfo", {}) if isinstance(payload.get("value"), dict) else {}
+        checks: List[Dict[str, str]] = []
+        for field_key, config in field_config.items():
+            if not isinstance(config, dict) or not bool(config.get("enabled", True)):
+                continue
+            if str(config.get("variant") or "") != "load_input":
+                continue
+            value = str(order_info.get(field_key) or "").strip()
+            if value:
+                checks.append({"fieldKey": str(field_key), "productUuid": product_uuid, "snsValue": value})
+        return checks
 
     def _validate_fields(self, fields: Dict[str, Any], rules: Dict[str, List[str]]) -> None:
         for key, field_rules in rules.items():

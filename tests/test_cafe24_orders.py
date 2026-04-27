@@ -158,6 +158,12 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
             "order_id": "20260426-000001",
             "order_status": "N20",
             "payment_status": "paid",
+            "payment": {
+                "payment_method": "card",
+                "paid_amount": "15000",
+                "payment_date": "2026-04-27T10:11:00+09:00",
+                "pg_tid": "TID-123",
+            },
             "memo": "오전 처리 희망",
             "buyer": {
                 "name": "홍길동",
@@ -217,6 +223,10 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
         self.assertEqual(item["payment_status"], "paid")
         self.assertEqual(item["payment_gate_status"], "payment_confirmed")
+        self.assertEqual(item["payment_method"], "card")
+        self.assertEqual(item["payment_amount"], 15000)
+        self.assertEqual(item["payment_paid_at"], "2026-04-27T10:11:00+09:00")
+        self.assertEqual(item["payment_reference"], "TID-123")
         self.assertEqual(item["supplier_id"], "supplier_test")
         self.assertEqual(item["supplier_service_id"], "supplier_service_test")
         supplier_payload = json.loads(item["supplier_payload_json"])

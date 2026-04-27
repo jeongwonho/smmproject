@@ -69,6 +69,7 @@ const state = {
   adminSession: null,
   adminCsrfToken: "",
   adminSupplierServices: {},
+  adminMkt24ProductSettings: {},
   adminCafe24ProductLookup: { products: [], detail: null, query: {}, warnings: [] },
   adminCustomerDetails: {},
   adminSiteSettingsDraft: null,
@@ -110,6 +111,10 @@ const state = {
     adminSelectedPlatformSectionId: "",
     adminSelectedSupplierId: "",
     adminCafe24SelectedSupplierId: "",
+    adminCafe24Tab: "queue",
+    adminCafe24PaymentFilter: "all",
+    adminCafe24MappingFilter: "all",
+    adminCafe24Search: "",
     adminSelectedProductId: "",
     adminSelectedSupplierServiceId: "",
     adminServiceSearch: "",
@@ -740,7 +745,7 @@ function supplierConnectionGuide(integrationType) {
     return {
       status: "서비스 목록 조회가 성공하면 연결된 것으로 처리됩니다.",
       balance: "이 연동 방식은 잔액 API가 문서화되지 않아 서비스 수만 확인합니다.",
-      dispatch: "현재는 서비스 동기화까지만 지원하고, 자동 발주는 주문 API 문서가 들어오면 연결합니다.",
+      dispatch: "상품 상세 주문 필드와 optionInfo 기본값을 저장하면 MKT24 주문 API로 발주합니다.",
     };
   }
   return {
@@ -1472,6 +1477,7 @@ function syncAdminSelections({ preserveDraft = true } = {}) {
 function resetAdminState({ preserveSession = false } = {}) {
   state.adminBootstrap = null;
   state.adminSupplierServices = {};
+  state.adminMkt24ProductSettings = {};
   state.adminCafe24ProductLookup = { products: [], detail: null, query: {}, warnings: [] };
   state.adminCustomerDetails = {};
   state.adminSiteSettingsDraft = null;
@@ -1491,6 +1497,11 @@ function resetAdminState({ preserveSession = false } = {}) {
   state.ui.adminCustomerSearch = "";
   state.ui.adminSupplierMode = "edit";
   state.ui.adminSelectedSupplierId = "";
+  state.ui.adminCafe24SelectedSupplierId = "";
+  state.ui.adminCafe24Tab = "queue";
+  state.ui.adminCafe24PaymentFilter = "all";
+  state.ui.adminCafe24MappingFilter = "all";
+  state.ui.adminCafe24Search = "";
   state.ui.adminSelectedProductId = "";
   state.ui.adminSelectedSupplierServiceId = "";
   state.ui.adminServiceSearch = "";
@@ -1546,6 +1557,81 @@ async function ensureAdminSupplierServices(supplierId, { force = false } = {}) {
   }
   syncAdminSelections({ preserveDraft: true });
   return state.adminSupplierServices[supplierId];
+}
+
+function mkt24ProductSettingKey(supplierId, productUuid) {
+  return `${supplierId || ""}:${productUuid || ""}`;
+}
+
+function getAdminMkt24ProductSetting(supplierId, productUuid) {
+  return state.adminMkt24ProductSettings[mkt24ProductSettingKey(supplierId, productUuid)] || null;
+}
+
+async function ensureAdminMkt24ProductSetting(supplierId, productUuid, { force = false } = {}) {
+  if (!supplierId || !productUuid) return null;
+  const key = mkt24ProductSettingKey(supplierId, productUuid);
+  if (force || !state.adminMkt24ProductSettings[key]) {
+    const query = force ? "?refresh=1" : "";
+    const data = await apiGet(
+      `/api/admin/suppliers/${encodeURIComponent(supplierId)}/mkt24-product-settings/${encodeURIComponent(productUuid)}${query}`
+    );
+    state.adminMkt24ProductSettings[key] = data.setting || {};
+  }
+  return state.adminMkt24ProductSettings[key];
+}
+
+async function ensureSelectedMkt24ProductSetting({ force = false } = {}) {
+  const supplier = getSelectedAdminSupplier();
+  const service = getSelectedAdminSupplierService();
+  if (supplier?.integrationType !== "mkt24" || !service?.externalServiceId) return null;
+  return ensureAdminMkt24ProductSetting(supplier.id, service.externalServiceId, { force });
+}
+
+function collectMkt24ProductSettingPayload(form) {
+  const selectedSupplier = getSelectedAdminSupplier();
+  const selectedService = getSelectedAdminSupplierService();
+  if (!selectedSupplier || !selectedService) {
+    throw new Error("MKT24 공급사와 서비스를 먼저 선택해 주세요.");
+  }
+  const fieldConfig = {};
+  form.querySelectorAll("[data-mkt24-field-row]").forEach((row) => {
+    const key = row.getAttribute("data-mkt24-field-row") || "";
+    if (!key) return;
+    const field = (suffix) => Array.from(row.querySelectorAll("[name]")).find((item) => item.name === `field_${key}_${suffix}`);
+    const defaultValue = field("defaultValue")?.value || "";
+    const config = {
+      enabled: Boolean(field("enabled")?.checked),
+      required: Boolean(field("required")?.checked),
+      inputMode: field("inputMode")?.value || "user_input",
+      defaultValue,
+    };
+    const minInput = field("min");
+    const maxInput = field("max");
+    const stepInput = field("step");
+    if (minInput) config.min = minInput.value;
+    if (maxInput) config.max = maxInput.value;
+    if (stepInput) config.step = stepInput.value;
+    fieldConfig[key] = config;
+  });
+
+  const optionDefaultsRaw = form.querySelector('[name="optionDefaultsJson"]')?.value || "{}";
+  let optionDefaults = {};
+  try {
+    optionDefaults = optionDefaultsRaw.trim() ? JSON.parse(optionDefaultsRaw) : {};
+  } catch (error) {
+    throw new Error("optionInfo JSON 형식이 올바르지 않습니다.");
+  }
+  return {
+    supplierId: selectedSupplier.id,
+    supplierServiceId: selectedService.id,
+    productUuid: selectedService.externalServiceId,
+    isActive: Boolean(form.querySelector('[name="isActive"]')?.checked),
+    fieldConfig,
+    optionConfig: {
+      enabled: Boolean(form.querySelector('[name="optionEnabled"]')?.checked),
+      defaults: optionDefaults,
+    },
+  };
 }
 
 async function ensureAdminCustomerDetail(customerId, { force = false } = {}) {
@@ -2673,6 +2759,7 @@ configureAdminSections({
   getSelectedAdminNotice,
   getSelectedAdminFaq,
   getSelectedAdminSupplierService,
+  getAdminMkt24ProductSetting,
   getManageProducts,
   currentViewer,
   blankSiteSettingsDraft,
@@ -3616,6 +3703,23 @@ document.addEventListener("click", async (event) => {
   const serviceButton = closest("[data-admin-service-select]");
   if (serviceButton) {
     state.ui.adminSelectedSupplierServiceId = serviceButton.getAttribute("data-admin-service-select") || "";
+    try {
+      await ensureSelectedMkt24ProductSetting();
+    } catch (error) {
+      showToast(error.message || "MKT24 상품 상세를 불러오지 못했습니다.", "error");
+    }
+    renderRoute();
+    return;
+  }
+
+  const refreshMkt24SettingButton = closest("[data-admin-mkt24-detail-refresh]");
+  if (refreshMkt24SettingButton) {
+    try {
+      await ensureSelectedMkt24ProductSetting({ force: true });
+      showToast("MKT24 상품 상세를 다시 불러왔습니다.");
+    } catch (error) {
+      showToast(error.message || "MKT24 상품 상세를 다시 불러오지 못했습니다.", "error");
+    }
     renderRoute();
     return;
   }
@@ -4298,6 +4402,12 @@ document.addEventListener("change", async (event) => {
   }
   if (target.matches("[data-admin-service-select-box]")) {
     state.ui.adminSelectedSupplierServiceId = target.value || "";
+    ensureSelectedMkt24ProductSetting()
+      .catch((error) => showToast(error.message || "MKT24 상품 상세를 불러오지 못했습니다.", "error"))
+      .finally(() => renderRoute());
+    return;
+  }
+  if (target.matches("[data-admin-mkt24-setting-field]")) {
     renderRoute();
     return;
   }
@@ -4947,6 +5057,20 @@ document.addEventListener("submit", async (event) => {
       renderRoute();
     } catch (error) {
       showToast(error.message || "공급사 저장에 실패했습니다.", "error");
+    }
+    return;
+  }
+
+  if (form.matches("[data-admin-mkt24-setting-form]")) {
+    event.preventDefault();
+    try {
+      const payload = collectMkt24ProductSettingPayload(form);
+      const result = await apiPost("/api/admin/mkt24-product-settings", payload);
+      state.adminMkt24ProductSettings[mkt24ProductSettingKey(payload.supplierId, payload.productUuid)] = result.setting || {};
+      showToast("MKT24 주문 옵션 설정을 저장했습니다.");
+      renderRoute();
+    } catch (error) {
+      showToast(error.message || "MKT24 주문 옵션 설정 저장에 실패했습니다.", "error");
     }
     return;
   }
