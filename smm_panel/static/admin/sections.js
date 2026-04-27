@@ -61,6 +61,7 @@ function getSelectedManageProduct(...args) { return callRuntime("getSelectedMana
 function getSelectedAdminNotice(...args) { return callRuntime("getSelectedAdminNotice", ...args); }
 function getSelectedAdminFaq(...args) { return callRuntime("getSelectedAdminFaq", ...args); }
 function getSelectedAdminSupplierService(...args) { return callRuntime("getSelectedAdminSupplierService", ...args); }
+function getAdminMkt24ProductSetting(...args) { return callRuntime("getAdminMkt24ProductSetting", ...args); }
 function getManageProducts(...args) { return callRuntime("getManageProducts", ...args); }
 function currentViewer(...args) { return callRuntime("currentViewer", ...args); }
 function blankSiteSettingsDraft(...args) { return callRuntime("blankSiteSettingsDraft", ...args); }
@@ -236,6 +237,124 @@ function renderCafe24ProductLookupPanel(activeIntegration = {}) {
           `
           : ""
       }
+    </div>
+  `;
+}
+
+function cafe24OrderItemProductLabel(item = {}) {
+  return item.internalProductName
+    || item.rawPayloadPreview?.item?.product_name
+    || item.rawPayloadPreview?.item?.productName
+    || item.rawPayloadPreview?.item?.product_name_default
+    || "매핑 대기";
+}
+
+function renderCafe24PaymentAuditPanel(orderItems = []) {
+  const paymentFilter = state.ui.adminCafe24PaymentFilter || "all";
+  const mappingFilter = state.ui.adminCafe24MappingFilter || "all";
+  const search = String(state.ui.adminCafe24Search || "").trim().toLowerCase();
+  const filteredItems = orderItems.filter((item) => {
+    if (paymentFilter !== "all" && item.paymentGateStatus !== paymentFilter) return false;
+    const isMapped = Boolean(item.mappingId || item.supplierServiceId || item.internalProductName);
+    if (mappingFilter === "mapped" && !isMapped) return false;
+    if (mappingFilter === "unmapped" && isMapped) return false;
+    if (search && !String(item.searchText || "").includes(search)) return false;
+    return true;
+  });
+  const paidUnmappedCount = orderItems.filter((item) => item.paymentGateStatus === "payment_confirmed" && !item.mappingId).length;
+  const paidCount = orderItems.filter((item) => item.paymentGateStatus === "payment_confirmed").length;
+  const pendingCount = orderItems.filter((item) => item.paymentGateStatus === "payment_pending").length;
+  return `
+    <div class="admin-panel">
+      <div class="section-head section-head--compact">
+        <h3>결제/미매핑 주문 조회</h3>
+        <p>수집된 Cafe24 품주를 결제 상태와 매핑 상태 기준으로 확인합니다. 결제완료지만 매핑이 없는 건을 우선 처리하세요.</p>
+      </div>
+
+      ${renderAdminInsightStrip(
+        [
+          { label: "결제완료", value: `${paidCount}건`, description: "공급 후보가 될 수 있는 품주" },
+          { label: "결제완료 미매핑", value: `${paidUnmappedCount}건`, description: "매핑 후 재검증 필요", tone: paidUnmappedCount ? "warning" : "success" },
+          { label: "결제대기/미확정", value: `${pendingCount}건`, description: "발주 차단 상태" },
+          { label: "조회 결과", value: `${filteredItems.length}건`, description: "현재 필터 기준" },
+        ],
+        "admin-insight-grid--compact"
+      )}
+
+      <div class="admin-toolbar">
+        <div class="search-shell">
+          <input class="search-input" type="text" value="${escapeHtml(state.ui.adminCafe24Search || "")}" placeholder="주문번호, 품목코드, 상품번호, 구매자, 결제수단 검색" data-admin-cafe24-filter="search" />
+        </div>
+        <select class="field-select" data-admin-cafe24-filter="payment">
+          <option value="all" ${paymentFilter === "all" ? "selected" : ""}>전체 결제상태</option>
+          <option value="payment_confirmed" ${paymentFilter === "payment_confirmed" ? "selected" : ""}>결제완료</option>
+          <option value="payment_pending" ${paymentFilter === "payment_pending" ? "selected" : ""}>결제대기</option>
+          <option value="payment_review_required" ${paymentFilter === "payment_review_required" ? "selected" : ""}>검수 필요</option>
+          <option value="cancelled" ${paymentFilter === "cancelled" ? "selected" : ""}>취소/환불</option>
+        </select>
+        <select class="field-select" data-admin-cafe24-filter="mapping">
+          <option value="all" ${mappingFilter === "all" ? "selected" : ""}>전체 매핑상태</option>
+          <option value="unmapped" ${mappingFilter === "unmapped" ? "selected" : ""}>미매핑</option>
+          <option value="mapped" ${mappingFilter === "mapped" ? "selected" : ""}>매핑됨</option>
+        </select>
+      </div>
+
+      <div class="admin-table-wrap">
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>주문/품주</th>
+              <th>상품</th>
+              <th>결제</th>
+              <th>금액/승인</th>
+              <th>매핑</th>
+              <th>처리</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${
+              filteredItems.length
+                ? filteredItems.map((item) => {
+                    const mapped = Boolean(item.mappingId || item.supplierServiceId || item.internalProductName);
+                    const canDispatchCafe24Item = item.standardStatus === "ready_to_submit"
+                      && item.paymentGateStatus === "payment_confirmed"
+                      && !item.supplierOrderUuid;
+                    return `
+                      <tr>
+                        <td>
+                          <strong>${escapeHtml(item.orderId)}</strong>
+                          <p class="admin-inline-note">${escapeHtml(item.orderItemCode || "-")}</p>
+                        </td>
+                        <td>
+                          <strong>${escapeHtml(cafe24OrderItemProductLabel(item))}</strong>
+                          <p class="admin-inline-note">${escapeHtml(item.productNo || "-")} / ${escapeHtml(item.variantCode || "-")}</p>
+                        </td>
+                        <td>
+                          <span class="admin-badge ${item.paymentGateStatus === "payment_confirmed" ? "is-success" : item.paymentGateStatus === "payment_pending" ? "is-warning" : "is-neutral"}">${escapeHtml(item.paymentGateStatus || "-")}</span>
+                          <p class="admin-inline-note">${escapeHtml(item.paymentStatus || "-")} · ${escapeHtml(item.paymentMethod || "수단 미확인")}</p>
+                        </td>
+                        <td>
+                          <strong>${escapeHtml(item.paymentAmountLabel || formatMoney(item.paymentAmount || 0))}</strong>
+                          <p class="admin-inline-note">${escapeHtml(item.paymentPaidAt || "결제일 미확인")} ${item.paymentReference ? `· ${escapeHtml(item.paymentReference)}` : ""}</p>
+                        </td>
+                        <td>
+                          <span class="admin-badge ${mapped ? "is-success" : "is-warning"}">${mapped ? "매핑됨" : "미매핑"}</span>
+                          <p class="admin-inline-note">${escapeHtml(item.supplierExternalServiceId || item.errorMessage || "-")}</p>
+                        </td>
+                        <td>
+                          <div class="admin-action-row">
+                            <button class="admin-secondary-button" type="button" data-admin-cafe24-resync-item="${escapeHtml(item.id)}">재동기화</button>
+                            <button class="admin-primary-button" type="button" data-admin-cafe24-dispatch-item="${escapeHtml(item.id)}" ${canDispatchCafe24Item ? "" : "disabled"}>발주</button>
+                          </div>
+                        </td>
+                      </tr>
+                    `;
+                  }).join("")
+                : `<tr><td colspan="6">조건에 맞는 Cafe24 결제/주문 품주가 없습니다. 기간을 넓혀 주문 수집을 다시 실행해 주세요.</td></tr>`
+            }
+          </tbody>
+        </table>
+      </div>
     </div>
   `;
 }
@@ -1835,6 +1954,8 @@ function renderCafe24AdminSection() {
   const waitingCount = orderItems.filter((item) => item.standardStatus === "waiting_input").length;
   const failedCount = orderItems.filter((item) => item.standardStatus === "failed").length;
   const submittedCount = orderItems.filter((item) => ["supplier_submitted", "supplier_progress", "completed"].includes(item.standardStatus)).length;
+  const paidUnmappedCount = orderItems.filter((item) => item.paymentGateStatus === "payment_confirmed" && !item.mappingId).length;
+  const activeCafe24Tab = state.ui.adminCafe24Tab || "queue";
   const tokenStatus = activeIntegration.tokenStatus || "reconnect_required";
   const tokenBadgeClass = {
     connected: "is-success",
@@ -1856,6 +1977,7 @@ function renderCafe24AdminSection() {
           { label: "연동몰", value: `${integrations.length}개`, description: "등록된 Cafe24 mall/shop" },
           { label: "상품 매핑", value: `${mappings.length}개`, description: "Cafe24 상품 → 공급사 서비스" },
           { label: "확인 필요", value: `${waitingCount}건`, description: "필수값/매핑 보완 필요" },
+          { label: "결제완료 미매핑", value: `${paidUnmappedCount}건`, description: "결제는 됐지만 공급 연결이 없는 품주" },
           { label: "토큰 상태", value: activeIntegration.tokenStatusLabel || "미연결", description: activeIntegration.reconnectRequiredAt ? "OAuth 재연결 필요" : "수집 전 자동 점검" },
         ],
         "admin-insight-grid--compact"
@@ -1926,6 +2048,10 @@ function renderCafe24AdminSection() {
             <label class="admin-toggle"><input type="checkbox" name="autoSubmit" ${activeIntegration.autoSubmit ? "checked" : ""} /><span>자동 발주 허용(기본 OFF)</span></label>
             <label class="admin-toggle"><input type="checkbox" name="isActive" ${activeIntegration.isActive !== false ? "checked" : ""} /><span>연동 활성화</span></label>
           </div>
+          <label class="admin-toggle">
+            <input type="checkbox" name="pollIncludeAllStatuses" />
+            <span>수집 시 전체 주문상태 포함(결제/미매핑 대조용)</span>
+          </label>
           <div class="admin-action-row">
             <button class="admin-primary-button" type="button" data-admin-cafe24-oauth-start>OAuth 연결 시작</button>
             <button class="admin-primary-button" type="submit">연동 저장</button>
@@ -2010,6 +2136,19 @@ function renderCafe24AdminSection() {
           <button class="admin-primary-button" type="submit" ${activeIntegration.mallId ? "" : "disabled"}>매핑 저장</button>
         </form>
       </div>
+
+      <nav class="admin-analytics-subnav">
+        <button class="admin-analytics-subnav__item ${activeCafe24Tab === "queue" ? "is-active" : ""}" type="button" data-admin-cafe24-tab="queue">
+          <strong>주문 처리</strong>
+          <small>매핑/발주 큐</small>
+        </button>
+        <button class="admin-analytics-subnav__item ${activeCafe24Tab === "payments" ? "is-active" : ""}" type="button" data-admin-cafe24-tab="payments">
+          <strong>결제/미매핑</strong>
+          <small>결제완료 품주 확인</small>
+        </button>
+      </nav>
+
+      ${activeCafe24Tab === "payments" ? renderCafe24PaymentAuditPanel(orderItems) : ""}
 
       <div class="admin-panel">
         <div class="section-head section-head--compact">
@@ -3278,6 +3417,158 @@ function renderAnalyticsAdminSection() {
   `;
 }
 
+function renderMkt24ProductSettingPanel(selectedSupplier, selectedService) {
+  if (selectedSupplier?.integrationType !== "mkt24" || !selectedService?.externalServiceId) return "";
+  const setting = getAdminMkt24ProductSetting(selectedSupplier.id, selectedService.externalServiceId);
+  if (!setting) {
+    return `
+      <div class="admin-card admin-subcard">
+        <div class="admin-subcard__head">
+          <strong>MKT24 주문 옵션 설정</strong>
+          <span class="admin-badge is-warning">상세 필요</span>
+        </div>
+        <p class="admin-inline-note">선택한 MKT24 상품의 formStructure와 optionInfo 설정을 불러와야 주문 payload를 구성할 수 있습니다.</p>
+        <div class="admin-action-row">
+          <button class="admin-secondary-button" type="button" data-admin-mkt24-detail-refresh>상품 상세 불러오기</button>
+        </div>
+      </div>
+    `;
+  }
+
+  const detail = setting.detailSnapshot || {};
+  const fieldConfig = setting.fieldConfig || {};
+  const optionConfig = setting.optionConfig || {};
+  const fieldEntries = Object.entries(fieldConfig);
+  const optionDefaultsText = JSON.stringify(optionConfig.defaults || {}, null, 2);
+  const previewText = setting.payloadPreviewError
+    ? setting.payloadPreviewError
+    : JSON.stringify(setting.payloadPreview || {}, null, 2);
+  const minMaxText = `${detail.minAmount ?? selectedService.minAmount ?? 0}~${detail.maxAmount ?? selectedService.maxAmount ?? 0}`;
+  return `
+    <div class="admin-card admin-subcard">
+      <div class="admin-subcard__head">
+        <strong>MKT24 주문 옵션 설정</strong>
+        <span class="admin-badge ${setting.isActive ? "is-success" : "is-neutral"}">${setting.isActive ? "활성" : "비활성"}</span>
+      </div>
+      <p class="admin-inline-note">
+        상품 UUID ${escapeHtml(setting.productUuid)} · ${escapeHtml(setting.productTypeName || detail.productTypeName || "상품 유형 없음")} · 수량 ${escapeHtml(String(minMaxText))}
+      </p>
+      <form class="admin-form" data-admin-mkt24-setting-form>
+        <label class="admin-toggle">
+          <input type="checkbox" name="isActive" ${setting.isActive ? "checked" : ""} data-admin-mkt24-setting-field />
+          <span>이 MKT24 상품 설정으로 주문 발주 허용</span>
+        </label>
+
+        <div class="admin-mapping-preview">
+          <article class="admin-mini-card">
+            <span>상품명</span>
+            <strong>${escapeHtml(setting.fullName || detail.fullName || selectedService.name || "")}</strong>
+          </article>
+          <article class="admin-mini-card">
+            <span>동기화</span>
+            <strong>${escapeHtml(setting.lastSyncedAt || "기록 없음")}</strong>
+          </article>
+        </div>
+
+        <div class="admin-stack">
+          <strong>사용자 입력 필드</strong>
+          ${
+            fieldEntries.length
+              ? fieldEntries
+                  .map(([fieldKey, config]) => renderMkt24FieldConfigRow(fieldKey, config))
+                  .join("")
+              : `<div class="admin-empty-card"><strong>formStructure가 없습니다.</strong><p>구조가 없는 상품은 관리자 기본값 기반으로만 payload를 만들 수 있습니다.</p></div>`
+          }
+        </div>
+
+        <div class="admin-stack">
+          <div class="admin-subcard__head">
+            <strong>optionInfo 기본값</strong>
+            <span class="admin-badge ${detail.supportsOrderOptions ? "is-success" : "is-neutral"}">${detail.supportsOrderOptions ? "지원" : "미지원"}</span>
+          </div>
+          <label class="admin-toggle">
+            <input type="checkbox" name="optionEnabled" ${optionConfig.enabled ? "checked" : ""} ${detail.supportsOrderOptions ? "" : "disabled"} data-admin-mkt24-setting-field />
+            <span>주문 payload에 optionInfo 포함</span>
+          </label>
+          <label class="form-field">
+            <span class="field-label">optionInfo defaults JSON</span>
+            <textarea class="field-textarea" name="optionDefaultsJson" rows="7" spellcheck="false" data-admin-mkt24-setting-field>${escapeHtml(optionDefaultsText)}</textarea>
+          </label>
+        </div>
+
+        <div class="admin-stack">
+          <strong>주문 payload preview</strong>
+          <textarea class="field-textarea" rows="10" readonly>${escapeHtml(previewText)}</textarea>
+        </div>
+
+        <div class="admin-action-row">
+          <button class="admin-primary-button" type="submit">MKT24 옵션 설정 저장</button>
+          <button class="admin-secondary-button" type="button" data-admin-mkt24-detail-refresh>상품 상세 다시 불러오기</button>
+        </div>
+      </form>
+    </div>
+  `;
+}
+
+function renderMkt24FieldConfigRow(fieldKey, config = {}) {
+  const isQuantity = fieldKey === "orderedCount";
+  const label = config.label || fieldKey;
+  return `
+    <div class="admin-card admin-subcard" data-mkt24-field-row="${escapeHtml(fieldKey)}">
+      <div class="admin-subcard__head">
+        <strong>${escapeHtml(label)}</strong>
+        <span class="admin-badge is-neutral">${escapeHtml(config.variant || "input")}</span>
+      </div>
+      <p class="admin-inline-note">${escapeHtml(fieldKey)} · ${(config.rules || []).map((rule) => escapeHtml(rule)).join(", ") || "검증 규칙 없음"}</p>
+      <div class="admin-mapping-preview">
+        <label class="admin-toggle">
+          <input type="checkbox" name="field_${escapeHtml(fieldKey)}_enabled" ${config.enabled !== false ? "checked" : ""} data-admin-mkt24-setting-field />
+          <span>사용</span>
+        </label>
+        <label class="admin-toggle">
+          <input type="checkbox" name="field_${escapeHtml(fieldKey)}_required" ${config.required ? "checked" : ""} data-admin-mkt24-setting-field />
+          <span>필수</span>
+        </label>
+        <label class="form-field">
+          <span class="field-label">입력 방식</span>
+          <div class="field-shell">
+            <select class="field-select" name="field_${escapeHtml(fieldKey)}_inputMode" data-admin-mkt24-setting-field>
+              <option value="user_input" ${config.inputMode !== "admin_default" ? "selected" : ""}>고객 입력 우선</option>
+              <option value="admin_default" ${config.inputMode === "admin_default" ? "selected" : ""}>관리자 기본값 고정</option>
+            </select>
+          </div>
+        </label>
+        <label class="form-field">
+          <span class="field-label">기본값</span>
+          <div class="field-shell">
+            <input class="field-input" type="text" name="field_${escapeHtml(fieldKey)}_defaultValue" value="${escapeHtml(config.defaultValue ?? "")}" data-admin-mkt24-setting-field />
+          </div>
+        </label>
+      </div>
+      ${
+        isQuantity
+          ? `
+            <div class="admin-mapping-preview">
+              <label class="form-field">
+                <span class="field-label">최소</span>
+                <input class="field-input" type="number" name="field_${escapeHtml(fieldKey)}_min" value="${escapeHtml(String(config.min ?? ""))}" data-admin-mkt24-setting-field />
+              </label>
+              <label class="form-field">
+                <span class="field-label">최대</span>
+                <input class="field-input" type="number" name="field_${escapeHtml(fieldKey)}_max" value="${escapeHtml(String(config.max ?? ""))}" data-admin-mkt24-setting-field />
+              </label>
+              <label class="form-field">
+                <span class="field-label">단위</span>
+                <input class="field-input" type="number" name="field_${escapeHtml(fieldKey)}_step" value="${escapeHtml(String(config.step ?? 1))}" data-admin-mkt24-setting-field />
+              </label>
+            </div>
+          `
+          : ""
+      }
+    </div>
+  `;
+}
+
 function renderSupplierAdminSection({
   suppliers,
   draft,
@@ -3545,6 +3836,7 @@ function renderSupplierAdminSection({
                       <p>${escapeHtml(selectedService.category || "분류 없음")} · Rate ${escapeHtml(selectedService.rateLabel)} · ${escapeHtml(String(selectedService.minAmount || 0))} ~ ${escapeHtml(String(selectedService.maxAmount || 0))} · ${selectedService.refill ? "리필 가능" : "리필 없음"}</p>
                     </div>
                     ${renderSupplierRequestGuide(selectedService, { applyLabel: selectedProduct ? "선택한 상품 제작 폼에 추천 적용" : "새 상품 제작 폼에 추천 적용" })}
+                    ${renderMkt24ProductSettingPanel(selectedSupplier, selectedService)}
                   `
                   : `<div class="admin-empty-card"><strong>선택된 서비스가 없습니다.</strong><p>왼쪽 목록에서 공급사 서비스를 고르면 호출 예시와 추천 양식이 이곳에 표시됩니다.</p></div>`
               }

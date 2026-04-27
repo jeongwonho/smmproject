@@ -17,7 +17,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
-from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse
+from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse
 
 from core import APP_ROOT, DEFAULT_SITE_NAME, PanelError, PanelStore
 
@@ -912,6 +912,26 @@ class AppHandler(SimpleHTTPRequestHandler):
                 search = parse_qs(parsed.query).get("q", [""])[0]
                 write_json(self, 200, {"ok": True, **self._server().store.list_supplier_services(supplier_id, search)})
                 return
+            if parsed.path.startswith("/api/admin/suppliers/") and "/mkt24-product-settings/" in parsed.path:
+                parts = parsed.path.split("/")
+                supplier_id = parts[4] if len(parts) > 4 else ""
+                product_uuid = unquote(parts[-1]) if parts else ""
+                query = parse_qs(parsed.query)
+                write_json(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        **self._server().store.get_mkt24_product_setting(
+                            {
+                                "supplierId": supplier_id,
+                                "productUuid": product_uuid,
+                                "refresh": query.get("refresh", ["0"])[0] in {"1", "true", "yes"},
+                            }
+                        ),
+                    },
+                )
+                return
             if parsed.path.startswith("/api/product-categories/"):
                 category_id = parsed.path.rsplit("/", 1)[-1]
                 write_json(
@@ -1263,6 +1283,12 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             if parsed.path == "/api/admin/suppliers":
                 write_json(self, 200, {"ok": True, **self._server().store.save_supplier(payload)})
+                return
+            if parsed.path == "/api/admin/mkt24-product-settings":
+                write_json(self, 200, {"ok": True, **self._server().store.save_mkt24_product_setting(payload)})
+                return
+            if parsed.path == "/api/admin/mkt24-product-settings/sync":
+                write_json(self, 200, {"ok": True, **self._server().store.sync_mkt24_product_detail(payload)})
                 return
             if parsed.path == "/api/admin/cafe24/oauth/start":
                 payload["redirectUri"] = payload.get("redirectUri") or self._cafe24_oauth_redirect_uri()
