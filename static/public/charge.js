@@ -106,6 +106,9 @@ export function renderChargePage(runtime, renderFrame) {
             <span class="charge-flow-note__item">결제/입금 요청</span>
             <span class="charge-flow-note__item">확인 후 보유금액 반영</span>
           </div>
+          <p class="charge-inline-note">
+            충전한 보유금액은 인스타마트 상품 주문에만 사용됩니다. SNS 계정 비밀번호는 요구하지 않습니다.
+          </p>
           <div class="charge-subtabs" role="tablist" aria-label="충전 탭">
             <button class="charge-subtab ${state.ui.chargeTab === "create" ? "is-active" : ""}" type="button" data-charge-tab="create">충전하기</button>
             <button class="charge-subtab ${state.ui.chargeTab === "history" ? "is-active" : ""}" type="button" data-charge-tab="history">이용내역</button>
@@ -356,6 +359,7 @@ export function renderChargePage(runtime, renderFrame) {
 
                     <div class="charge-notice-box">
                       <strong>충전 유의사항</strong>
+                      <p>충전 전 결제수단, 입금 상태, 환불 기준을 확인해 주세요. 보유금액은 상품 주문 결제에만 사용됩니다.</p>
                       <ul>
                         ${(chargeConfig.policyHighlights || [])
                           .map((item) => `<li>${escapeHtml(item)}</li>`)

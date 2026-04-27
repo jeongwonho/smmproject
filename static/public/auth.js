@@ -54,6 +54,7 @@ function loginFormMarkup({ authConfig, escapeHtml }) {
       <div class="auth-shell__copy">
         <h1>로그인하고 바로 이용하세요</h1>
         <p>충전, 주문, 내역은 로그인 후 이용할 수 있어요.</p>
+        <p class="auth-inline-note">인스타마트 계정으로 로그인합니다. SNS 계정 비밀번호는 입력하지 않습니다.</p>
       </div>
       <form class="auth-form" data-public-login-form>
         <label class="form-field">
@@ -131,6 +132,7 @@ function signupEmailStepMarkup(signupState, escapeHtml) {
       </label>
       <button class="full-width-cta auth-form__submit" type="submit">인증코드 받기</button>
       <p class="auth-inline-note">입력한 이메일로 인증코드를 보내드립니다.</p>
+      <p class="auth-inline-note">인스타마트 로그인용 계정만 생성하며, SNS 계정 비밀번호는 수집하지 않습니다.</p>
     </form>
   `;
 }

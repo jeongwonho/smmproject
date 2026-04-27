@@ -625,7 +625,7 @@ function popupPreviewPayload(popup) {
   return {
     id: popup?.id || "preview",
     badgeText: popup?.badgeText || "",
-    title: popup?.title || "유튜브 상위노출\n서비스 출시!",
+    title: popup?.title || "서비스 안내를 확인해 주세요",
     description: popup?.description || "",
     imageUrl: popup?.imageUrl || "",
     route: popup?.route || "/",

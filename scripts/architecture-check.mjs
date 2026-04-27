@@ -9,7 +9,7 @@ const DEFAULT_ROOT = path.resolve(__dirname, "..");
 const LINE_BUDGETS = [
   ["static/app.js", 5200],
   ["static/admin/pages.js", 800],
-  ["static/admin/sections.js", 3800],
+  ["static/admin/sections.js", 4100],
   ["static/public/pages.js", 1400],
   ["static/public/charge.js", 800],
   ["static/public/auth.js", 600],

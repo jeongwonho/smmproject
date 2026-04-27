@@ -32,7 +32,7 @@ PUBLIC_SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 MAX_JSON_BODY_BYTES = 10 * 1024 * 1024
 ADMIN_LOGIN_WINDOW_SECONDS = 15 * 60
 ADMIN_LOGIN_MAX_ATTEMPTS = 5
-ROBOTS_TXT = "User-agent: *\nDisallow: /admin\nDisallow: /api/admin\n"
+ROBOTS_TXT = "User-agent: *\nDisallow: /admin\nDisallow: /admin/\nDisallow: /api/\nAllow: /\n"
 INDEX_TEMPLATE_PATH = STATIC_ROOT / "index.html"
 VERCEL_REWRITE_PATH_QUERY_KEY = "__path"
 
@@ -647,7 +647,7 @@ class AppHandler(SimpleHTTPRequestHandler):
             connect_sources.append(api_origin)
         return (
             "default-src 'self'; "
-            "img-src 'self' data: https: http:; "
+            "img-src 'self' data: https:; "
             "style-src 'self' 'unsafe-inline'; "
             "script-src 'self'; "
             f"connect-src {' '.join(connect_sources)}; "
