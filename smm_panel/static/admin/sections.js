@@ -359,6 +359,34 @@ function renderCafe24PaymentAuditPanel(orderItems = []) {
   `;
 }
 
+function renderCafe24CollectionResult(result = null) {
+  if (!result) return "";
+  const summary = result.summary || {};
+  const windows = Array.isArray(summary.requestWindows) ? summary.requestWindows : [];
+  const requestLabel = windows.length
+    ? windows.map((item) => {
+      const statusLabel = Array.isArray(item.orderStatuses) ? item.orderStatuses.join(", ") : item.orderStatuses || "all";
+      const range = item.startDate && item.endDate ? `${item.startDate} ~ ${item.endDate}` : item.orderId || "-";
+      return `${item.mallId || "-"} / shop ${item.shopNo || "-"} · ${range} · status ${statusLabel}`;
+    }).join(" | ")
+    : "-";
+  const errors = Array.isArray(result.errors) ? result.errors.filter(Boolean) : [];
+  return `
+    <div class="admin-empty-card">
+      <strong>최근 Cafe24 수집 결과</strong>
+      <p class="admin-inline-note">요청: ${escapeHtml(requestLabel)}</p>
+      <div class="admin-mini-metrics">
+        <article><span>Cafe24 응답 주문</span><strong>${escapeHtml(String(summary.responseOrderCount ?? 0))}</strong></article>
+        <article><span>저장 품주</span><strong>${escapeHtml(String(summary.storedOrderItemCount ?? result.processed ?? 0))}</strong></article>
+        <article><span>결제/취소 차단</span><strong>${escapeHtml(String(summary.paymentBlockedCount ?? result.blocked ?? 0))}</strong></article>
+        <article><span>검수 필요</span><strong>${escapeHtml(String(summary.reviewRequiredCount ?? result.waitingInput ?? 0))}</strong></article>
+        <article><span>발주 대기</span><strong>${escapeHtml(String(summary.submitReadyCount ?? 0))}</strong></article>
+      </div>
+      ${errors.length ? `<p class="admin-inline-note is-danger">${escapeHtml(errors.join(" / "))}</p>` : ""}
+    </div>
+  `;
+}
+
 function renderMultilineText(value) {
   return escapeHtml(value || "").replace(/\n/g, "<br />");
 }
@@ -1956,6 +1984,7 @@ function renderCafe24AdminSection() {
   const submittedCount = orderItems.filter((item) => ["supplier_submitted", "supplier_progress", "completed"].includes(item.standardStatus)).length;
   const paidUnmappedCount = orderItems.filter((item) => item.paymentGateStatus === "payment_confirmed" && !item.mappingId).length;
   const activeCafe24Tab = state.ui.adminCafe24Tab || "queue";
+  const lastCollectionResult = state.adminCafe24LastPollResult || null;
   const tokenStatus = activeIntegration.tokenStatus || "reconnect_required";
   const tokenBadgeClass = {
     connected: "is-success",
@@ -2050,12 +2079,17 @@ function renderCafe24AdminSection() {
           </div>
           <label class="admin-toggle">
             <input type="checkbox" name="pollIncludeAllStatuses" />
-            <span>수집 시 전체 주문상태 포함(결제/미매핑 대조용)</span>
+            <span>상태 필터 없이 최대 범위 수집(권장)</span>
+          </label>
+          <label class="form-field">
+            <span class="field-label">주문번호 직접 재수집</span>
+            <div class="field-shell"><input class="field-input" name="resyncOrderId" placeholder="예: 20260506-000001" /></div>
           </label>
           <div class="admin-action-row">
             <button class="admin-primary-button" type="button" data-admin-cafe24-oauth-start>OAuth 연결 시작</button>
             <button class="admin-primary-button" type="submit">연동 저장</button>
             <button class="admin-secondary-button" type="button" data-admin-cafe24-poll="${escapeHtml(activeIntegration.id || "")}" ${activeIntegration.id ? "" : "disabled"}>주문 수집</button>
+            <button class="admin-secondary-button" type="button" data-admin-cafe24-resync-by-id="${escapeHtml(activeIntegration.id || "")}" ${activeIntegration.id ? "" : "disabled"}>주문번호 재수집</button>
           </div>
           <p class="admin-inline-note">
             Cafe24 Developers Redirect URL:
@@ -2063,6 +2097,7 @@ function renderCafe24AdminSection() {
             <br />이 값과 Cafe24 앱 설정값이 1글자까지 동일해야 합니다. 끝 / 포함 여부도 맞춰 주세요.
           </p>
           <p class="admin-inline-note">마지막 수집: ${escapeHtml(activeIntegration.lastPollAt || "없음")} · ${escapeHtml(activeIntegration.lastSyncMessage || activeIntegration.lastSyncStatus || "미확인")}</p>
+          ${renderCafe24CollectionResult(lastCollectionResult)}
         </form>
 
         ${renderCafe24ProductLookupPanel(activeIntegration)}

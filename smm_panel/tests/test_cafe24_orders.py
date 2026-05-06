@@ -61,6 +61,29 @@ class FailingCafe24ProductClient:
         raise Cafe24ApiError("Cafe24 API 오류 403: scope permission denied")
 
 
+class FakeCafe24OrderClient:
+    def __init__(self, order_payload):
+        self.order_payload = order_payload
+        self.orders_calls = []
+        self.order_calls = []
+
+    def orders(self, *, start_date, end_date, statuses=None, order_id="", limit=100):
+        self.orders_calls.append(
+            {
+                "start_date": start_date,
+                "end_date": end_date,
+                "statuses": statuses,
+                "order_id": order_id,
+                "limit": limit,
+            }
+        )
+        return {"orders": [self.order_payload]}
+
+    def order(self, order_id):
+        self.order_calls.append(order_id)
+        return {"order": self.order_payload}
+
+
 class Cafe24OrderIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.db_path = Path(tempfile.gettempdir()) / "instamart_cafe24_orders_test.db"
@@ -339,7 +362,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(item["payment_gate_status"], "payment_pending")
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders WHERE order_channel = 'cafe24'").fetchone()[0], 0)
 
-    def test_missing_payment_status_requires_manual_review(self):
+    def test_missing_payment_status_uses_order_status_payment_confirmation(self):
         order_payload = self._order_payload()
         order_payload.pop("payment_status", None)
         result = self.store._process_cafe24_item(
@@ -352,10 +375,103 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         )
         self.conn.commit()
 
-        self.assertEqual(result["status"], "payment_review_required")
+        self.assertEqual(result["status"], "ready_to_submit")
         item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
-        self.assertEqual(item["payment_gate_status"], "payment_review_required")
+        self.assertEqual(item["payment_status"], "paid")
+        self.assertEqual(item["payment_status_source"], "order_status")
+        self.assertEqual(item["payment_gate_status"], "payment_confirmed")
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders WHERE order_channel = 'cafe24'").fetchone()[0], 0)
+
+    def test_n50_order_is_collected_and_marked_payment_confirmed(self):
+        order_payload = self._order_payload()
+        order_payload["order_status"] = "N50"
+        order_payload.pop("payment_status", None)
+        fake_client = FakeCafe24OrderClient(order_payload)
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client):
+            result = self.store.poll_cafe24_orders({"integrationId": self.integration["id"]})
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["summary"]["responseOrderCount"], 1)
+        self.assertEqual(fake_client.orders_calls[0]["statuses"], None)
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.assertEqual(item["order_status_code"], "N50")
+        self.assertEqual(item["payment_status"], "paid")
+        self.assertEqual(item["payment_status_source"], "order_status")
+        self.assertEqual(item["payment_gate_status"], "payment_confirmed")
+
+    def test_n00_order_is_saved_but_blocked_from_dispatch(self):
+        order_payload = self._order_payload()
+        order_payload["order_status"] = "N00"
+        order_payload.pop("payment_status", None)
+        result = self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=True,
+        )
+        self.conn.commit()
+
+        self.assertEqual(result["status"], "payment_pending")
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.assertEqual(item["payment_status_source"], "missing")
+        self.assertEqual(item["payment_gate_status"], "payment_pending")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM cafe24_order_items").fetchone()[0], 1)
+
+    def test_cancelled_order_is_saved_but_blocked_from_dispatch(self):
+        order_payload = self._order_payload()
+        order_payload["order_status"] = "C10"
+        order_payload.pop("payment_status", None)
+        result = self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=True,
+        )
+        self.conn.commit()
+
+        self.assertEqual(result["status"], "cancelled")
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.assertEqual(item["payment_gate_status"], "cancelled")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM cafe24_order_items").fetchone()[0], 1)
+
+    def test_manual_poll_uses_today_window_even_when_last_poll_is_recent(self):
+        recent = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        self.conn.execute(
+            "UPDATE cafe24_integrations SET last_poll_at = ? WHERE id = ?",
+            (recent, self.integration["id"]),
+        )
+        self.conn.commit()
+        fake_client = FakeCafe24OrderClient(self._order_payload())
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client):
+            self.store.poll_cafe24_orders({"integrationId": self.integration["id"]})
+
+        self.assertEqual(len(fake_client.orders_calls), 1)
+        call = fake_client.orders_calls[0]
+        expected_date = dt.datetime.now().astimezone().strftime("%Y-%m-%d")
+        self.assertEqual(call["start_date"], f"{expected_date} 00:00:00")
+        self.assertRegex(call["end_date"], rf"^{expected_date} \d{{2}}:\d{{2}}:\d{{2}}$")
+        self.assertIsNone(call["statuses"])
+
+    def test_order_id_resync_is_idempotent(self):
+        fake_client = FakeCafe24OrderClient(self._order_payload())
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client):
+            first = self.store.resync_cafe24_order_by_id(
+                {"integrationId": self.integration["id"], "orderId": "20260426-000001"}
+            )
+            second = self.store.resync_cafe24_order_by_id(
+                {"integrationId": self.integration["id"], "orderId": "20260426-000001"}
+            )
+
+        self.assertEqual(first["processed"], 1)
+        self.assertEqual(second["processed"], 1)
+        self.assertEqual(fake_client.order_calls, ["20260426-000001", "20260426-000001"])
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM cafe24_order_items").fetchone()[0], 1)
 
     def test_cafe24_mapping_can_be_saved_without_internal_product(self):
         row = self.conn.execute("SELECT * FROM cafe24_supplier_mappings WHERE mall_id = ?", ("instamart",)).fetchone()

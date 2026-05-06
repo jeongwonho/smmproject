@@ -156,11 +156,38 @@ export async function handleCafe24AdminClick(closest) {
         endDate: formData.get("pollEndDate"),
         includeAllStatuses: Boolean(formData.get("pollIncludeAllStatuses")),
       });
+      state.adminCafe24LastPollResult = result;
       await refreshAdminData({ preserveDraft: true });
       showToast(`Cafe24 수집 완료: ${result.processed || 0}개 처리, ${result.blocked || 0}개 차단`);
       renderRoute();
     } catch (error) {
       showToast(error.message || "Cafe24 주문 수집에 실패했습니다.", "error");
+    }
+    return true;
+  }
+
+  const cafe24ResyncByIdButton = closest("[data-admin-cafe24-resync-by-id]");
+  if (cafe24ResyncByIdButton) {
+    const integrationId = cafe24ResyncByIdButton.getAttribute("data-admin-cafe24-resync-by-id") || "";
+    const form = document.querySelector("[data-admin-cafe24-integration-form]");
+    const formData = form ? new FormData(form) : new FormData();
+    const orderId = String(formData.get("resyncOrderId") || "").trim();
+    if (!orderId) {
+      showToast("재수집할 Cafe24 주문번호를 입력해 주세요.", "error");
+      return true;
+    }
+    try {
+      const result = await apiPost("/api/admin/cafe24/orders/resync-by-id", {
+        integrationId: integrationId || formData.get("id"),
+        orderId,
+        submitReady: false,
+      });
+      state.adminCafe24LastPollResult = result;
+      await refreshAdminData({ preserveDraft: true });
+      showToast(`Cafe24 주문번호 재수집 완료: ${result.processed || 0}개 품주 저장`);
+      renderRoute();
+    } catch (error) {
+      showToast(error.message || "Cafe24 주문번호 재수집에 실패했습니다.", "error");
     }
     return true;
   }

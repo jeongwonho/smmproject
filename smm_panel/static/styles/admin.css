@@ -388,6 +388,33 @@ body[data-route-surface="admin"] .admin-module-header__row {
   background: linear-gradient(180deg, rgba(254, 242, 242, 0.98) 0%, rgba(255, 247, 247, 0.98) 100%);
 }
 
+.admin-mini-metrics {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.admin-mini-metrics article {
+  padding: 10px 12px;
+  border: 1px solid rgba(221, 228, 246, 0.96);
+  border-radius: 12px;
+  background: rgba(248, 250, 255, 0.9);
+}
+
+.admin-mini-metrics span {
+  display: block;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+}
+
+.admin-mini-metrics strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 0.96rem;
+  letter-spacing: -0.02em;
+}
+
 .admin-supplier-explorer {
   display: grid;
   grid-template-columns: minmax(380px, 0.94fr) minmax(0, 1.06fr);

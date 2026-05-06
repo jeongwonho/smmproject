@@ -736,12 +736,19 @@ label {
 
 .export-box {
   margin-top: 8px;
+  gap: 10px;
 }
 
 .download-link {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+}
+
+.export-box .primary-button,
+.export-box .secondary-button,
+.export-box .download-link {
+  width: 100%;
 }
 
 .route-settings {

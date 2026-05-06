@@ -211,6 +211,10 @@ class AppHandler(SimpleHTTPRequestHandler):
                 project_id = parsed.path.split("/")[3]
                 write_json(self, 200, {"ok": True, "export": server.store.export_project(project_id)})
                 return
+            if re.fullmatch(r"/api/projects/[^/]+/export/obsidian", parsed.path or ""):
+                project_id = parsed.path.split("/")[3]
+                write_json(self, 200, {"ok": True, "obsidian": server.store.export_project_to_obsidian(project_id)})
+                return
             if re.fullmatch(r"/api/variants/[^/]+", parsed.path or ""):
                 variant_id = parsed.path.rsplit("/", 1)[-1]
                 write_json(self, 200, {"ok": True, "variant": server.store.update_variant(variant_id, payload)})

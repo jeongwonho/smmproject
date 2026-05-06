@@ -62,7 +62,9 @@ const els = {
   addCommentButton: document.querySelector("#add-comment-button"),
   commentList: document.querySelector("#comment-list"),
   exportProjectButton: document.querySelector("#export-project-button"),
+  exportObsidianButton: document.querySelector("#export-obsidian-button"),
   exportLink: document.querySelector("#export-link"),
+  obsidianLink: document.querySelector("#obsidian-link"),
   jobStatusBox: document.querySelector("#job-status-box"),
   settingsForm: document.querySelector("#settings-form"),
   googleKeyState: document.querySelector("#google-key-state"),
@@ -84,6 +86,8 @@ const els = {
   settingBudgetDefault: document.querySelector("#setting-budget-default"),
   settingDailyLimit: document.querySelector("#setting-daily-limit"),
   settingAllowFinal: document.querySelector("#setting-allow-final"),
+  settingObsidianVault: document.querySelector("#setting-obsidian-vault"),
+  settingObsidianFolder: document.querySelector("#setting-obsidian-folder"),
   settingDraftProvider: document.querySelector("#setting-draft-provider"),
   settingDraftModel: document.querySelector("#setting-draft-model"),
   settingDraftCost: document.querySelector("#setting-draft-cost"),
@@ -274,6 +278,10 @@ function bindEvents() {
 
   els.exportProjectButton.addEventListener("click", () => {
     handleExport().catch(handleError);
+  });
+
+  els.exportObsidianButton.addEventListener("click", () => {
+    handleObsidianExport().catch(handleError);
   });
 
   els.settingsForm.addEventListener("submit", (event) => {
@@ -487,6 +495,8 @@ function fillSettingsForm(settings) {
   els.settingBudgetDefault.value = settings.projectBudgetDefault;
   els.settingDailyLimit.value = settings.dailyGenerationLimit;
   els.settingAllowFinal.checked = Boolean(settings.allowFinalOnlyForSelected);
+  els.settingObsidianVault.value = settings.obsidian?.vaultPath || "";
+  els.settingObsidianFolder.value = settings.obsidian?.ideaFolder || "MVP Ideas";
   fillRouteForm("draft", settings.routes.draft);
   fillRouteForm("final", settings.routes.final);
   fillRouteForm("photo", settings.routes.photo);
@@ -1313,11 +1323,30 @@ async function handleExport() {
   setNotice("내보내기 패키지를 생성했습니다.");
 }
 
+async function handleObsidianExport() {
+  if (!state.currentProject) {
+    throw new Error("옵시디언으로 보낼 프로젝트가 없습니다.");
+  }
+  setNotice("Obsidian MVP 아이디어 노트를 생성하는 중입니다...", "info");
+  const response = await api(`/api/projects/${state.currentProject.id}/export/obsidian`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  els.obsidianLink.href = response.obsidian.openUrl;
+  els.obsidianLink.textContent = `옵시디언에서 열기 (${response.obsidian.notePath})`;
+  els.obsidianLink.classList.remove("is-hidden");
+  setNotice("Obsidian MVP 아이디어 노트를 생성했습니다.");
+}
+
 async function saveSettings() {
   const payload = {
     projectBudgetDefault: Number(els.settingBudgetDefault.value || 30),
     dailyGenerationLimit: Number(els.settingDailyLimit.value || 60),
     allowFinalOnlyForSelected: els.settingAllowFinal.checked,
+    obsidian: {
+      vaultPath: els.settingObsidianVault.value.trim(),
+      ideaFolder: els.settingObsidianFolder.value.trim() || "MVP Ideas",
+    },
     routes: {
       draft: collectRouteForm("draft"),
       final: collectRouteForm("final"),

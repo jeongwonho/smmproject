@@ -17,7 +17,7 @@ import time
 from html import escape as html_escape
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
@@ -128,7 +128,7 @@ CAFE24_TOKEN_STATUS_REFRESHING = "refreshing"
 CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED = "reconnect_required"
 CAFE24_TOKEN_STATUS_FAILED = "failed"
 CAFE24_ORDER_OVERLAP_MINUTES = 20
-CAFE24_ORDER_ELIGIBLE_STATUSES = {"N10", "N20", "N21", "N22", "N30", "N40"}
+CAFE24_ORDER_ELIGIBLE_STATUSES = {"N10", "N20", "N21", "N22", "N30", "N40", "N50"}
 CAFE24_ORDER_UNPAID_STATUSES = {"N00"}
 CAFE24_ORDER_CANCELLED_PREFIXES = ("C", "R", "E")
 CAFE24_PAYMENT_PAID_STATUSES = {"paid", "payment_confirmed", "confirmed", "complete", "completed", "done", "y", "true", "t"}
@@ -1048,6 +1048,7 @@ CREATE TABLE IF NOT EXISTS cafe24_order_items (
     receiver_name TEXT NOT NULL DEFAULT '',
     order_status_code TEXT NOT NULL DEFAULT '',
     payment_status TEXT NOT NULL DEFAULT '',
+    payment_status_source TEXT NOT NULL DEFAULT '',
     payment_gate_status TEXT NOT NULL DEFAULT 'unverified',
     payment_method TEXT NOT NULL DEFAULT '',
     payment_amount INTEGER NOT NULL DEFAULT 0,
@@ -2145,6 +2146,15 @@ def cafe24_payment_gate_status(order_status: Any, payment_status: Any) -> str:
     return "payment_review_required"
 
 
+def cafe24_payment_status_with_source(order_payload: Dict[str, Any], item_payload: Dict[str, Any], order_status: Any) -> Tuple[str, str]:
+    payment_status = cafe24_payment_status_from_payload(order_payload, item_payload)
+    if payment_status:
+        return payment_status, "payload"
+    if cafe24_status_is_supply_eligible(order_status):
+        return "paid", "order_status"
+    return "", "missing"
+
+
 def cafe24_status_is_supply_eligible(raw: Any) -> bool:
     return str(raw or "").strip() in CAFE24_ORDER_ELIGIBLE_STATUSES
 
@@ -2154,21 +2164,62 @@ def cafe24_status_is_cancelled(raw: Any) -> bool:
     return bool(value) and value.startswith(CAFE24_ORDER_CANCELLED_PREFIXES)
 
 
-def cafe24_default_poll_window(last_poll_at: str = "", overlap_minutes: int = CAFE24_ORDER_OVERLAP_MINUTES) -> Dict[str, str]:
+def cafe24_poll_datetime_window(
+    *,
+    start_raw: str = "",
+    end_raw: str = "",
+    last_poll_at: str = "",
+    use_cursor: bool = False,
+    overlap_minutes: int = CAFE24_ORDER_OVERLAP_MINUTES,
+) -> Dict[str, str]:
     now = dt.datetime.now().astimezone()
-    start = now - dt.timedelta(hours=6)
-    if last_poll_at:
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def parse_bound(value: str, *, is_end: bool) -> Optional[dt.datetime]:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        normalized = raw.replace("T", " ")
+        try:
+            if len(normalized) <= 10:
+                parsed_date = dt.date.fromisoformat(normalized[:10])
+                parsed = dt.datetime.combine(
+                    parsed_date,
+                    dt.time(23, 59, 59) if is_end else dt.time(0, 0, 0),
+                    tzinfo=now.tzinfo,
+                )
+            else:
+                parsed = dt.datetime.fromisoformat(normalized)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=now.tzinfo)
+            return parsed.astimezone(now.tzinfo)
+        except ValueError as exc:
+            raise PanelError("Cafe24 주문 조회 기간 형식이 올바르지 않습니다. YYYY-MM-DD 또는 YYYY-MM-DD HH:mm:ss 형식을 사용해 주세요.", status=400) from exc
+
+    start = parse_bound(start_raw, is_end=False)
+    end = parse_bound(end_raw, is_end=True)
+    if start is None:
+        start = today_start
+    if use_cursor and last_poll_at:
         try:
             parsed = dt.datetime.fromisoformat(last_poll_at)
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=now.tzinfo)
-            start = parsed - dt.timedelta(minutes=max(int(overlap_minutes or 0), 0))
+            start = parsed.astimezone(now.tzinfo) - dt.timedelta(minutes=max(int(overlap_minutes or 0), 0))
         except ValueError:
             pass
+    if end is None:
+        end = now
+    if start > end:
+        raise PanelError("Cafe24 주문 수집 시작일은 종료일보다 늦을 수 없습니다.", status=400)
     return {
-        "start": start.strftime("%Y-%m-%d"),
-        "end": now.strftime("%Y-%m-%d"),
+        "start": start.strftime("%Y-%m-%d %H:%M:%S"),
+        "end": end.strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+
+def cafe24_default_poll_window(last_poll_at: str = "", overlap_minutes: int = CAFE24_ORDER_OVERLAP_MINUTES) -> Dict[str, str]:
+    return cafe24_poll_datetime_window(last_poll_at=last_poll_at, use_cursor=False, overlap_minutes=overlap_minutes)
 
 
 def cafe24_payload_value(payload: Dict[str, Any], keys: Iterable[str]) -> str:
@@ -3377,7 +3428,15 @@ class Cafe24ApiClient:
             raise Cafe24ApiError("Cafe24 access token을 갱신하지 못했습니다.")
         return parsed
 
-    def orders(self, *, start_date: str, end_date: str, statuses: Optional[List[str]] = None, limit: int = 100) -> Any:
+    def orders(
+        self,
+        *,
+        start_date: str,
+        end_date: str,
+        statuses: Optional[List[str]] = None,
+        order_id: str = "",
+        limit: int = 100,
+    ) -> Any:
         query: Dict[str, Any] = {
             "start_date": start_date,
             "end_date": end_date,
@@ -3386,6 +3445,9 @@ class Cafe24ApiClient:
         }
         if statuses:
             query["order_status"] = ",".join(statuses)
+        normalized_order_id = str(order_id or "").strip()
+        if normalized_order_id:
+            query["order_id"] = normalized_order_id
         return self._request("GET", "/admin/orders", query=query)
 
     def order(self, order_id: str) -> Any:
@@ -5158,6 +5220,7 @@ class PanelStore:
         self._ensure_column(conn, "cafe24_integrations", "reconnect_required_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_integrations", "reconnect_reason", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "payment_status", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_order_items", "payment_status_source", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "payment_gate_status", "TEXT NOT NULL DEFAULT 'unverified'")
         self._ensure_column(conn, "cafe24_order_items", "payment_method", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "payment_amount", "INTEGER NOT NULL DEFAULT 0")
@@ -5474,6 +5537,7 @@ class PanelStore:
                 receiver_name TEXT NOT NULL DEFAULT '',
                 order_status_code TEXT NOT NULL DEFAULT '',
                 payment_status TEXT NOT NULL DEFAULT '',
+                payment_status_source TEXT NOT NULL DEFAULT '',
                 payment_gate_status TEXT NOT NULL DEFAULT 'unverified',
                 payment_method TEXT NOT NULL DEFAULT '',
                 payment_amount INTEGER NOT NULL DEFAULT 0,
@@ -9520,6 +9584,7 @@ class PanelStore:
             "receiverName": row["receiver_name"],
             "orderStatusCode": row["order_status_code"],
             "paymentStatus": row.get("payment_status") or "",
+            "paymentStatusSource": row.get("payment_status_source") or "",
             "paymentGateStatus": row.get("payment_gate_status") or "",
             "paymentMethod": row.get("payment_method") or "",
             "paymentAmount": int(row.get("payment_amount") or 0),
@@ -11071,7 +11136,7 @@ class PanelStore:
         receivers = order_payload.get("receivers")
         receiver = receivers[0] if isinstance(receivers, list) and receivers and isinstance(receivers[0], dict) else {}
         source_status = identity["statusCode"]
-        payment_status = cafe24_payment_status_from_payload(order_payload, item_payload)
+        payment_status, payment_status_source = cafe24_payment_status_with_source(order_payload, item_payload, source_status)
         payment_gate_status = cafe24_payment_gate_status(source_status, payment_status)
         payment_snapshot = cafe24_payment_snapshot_from_payload(order_payload, item_payload)
         status = normalize_cafe24_status(source_status)
@@ -11194,12 +11259,12 @@ class PanelStore:
                 id, mall_id, shop_no, cafe24_order_id, cafe24_order_item_code,
                 cafe24_product_no, cafe24_variant_code, cafe24_custom_product_code,
                 buyer_name, buyer_email, buyer_phone, receiver_name, order_status_code,
-                payment_status, payment_gate_status, payment_method, payment_amount,
+                payment_status, payment_status_source, payment_gate_status, payment_method, payment_amount,
                 payment_paid_at, payment_reference, payment_snapshot_json, source_status, standard_status,
                 mapping_id, product_id, supplier_id, supplier_service_id, supplier_external_service_id,
                 normalized_fields_json, supplier_payload_json, raw_payload_json,
                 error_message, last_synced_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(mall_id, shop_no, cafe24_order_id, cafe24_order_item_code)
             DO UPDATE SET
                 cafe24_product_no = excluded.cafe24_product_no,
@@ -11211,6 +11276,7 @@ class PanelStore:
                 receiver_name = excluded.receiver_name,
                 order_status_code = excluded.order_status_code,
                 payment_status = excluded.payment_status,
+                payment_status_source = excluded.payment_status_source,
                 payment_gate_status = excluded.payment_gate_status,
                 payment_method = excluded.payment_method,
                 payment_amount = excluded.payment_amount,
@@ -11250,6 +11316,7 @@ class PanelStore:
                 cafe24_payload_value(receiver, ("name", "receiver_name")),
                 source_status,
                 payment_status,
+                payment_status_source,
                 payment_gate_status,
                 payment_snapshot["method"],
                 int(payment_snapshot["amount"] or 0),
@@ -11335,6 +11402,8 @@ class PanelStore:
         submitted = 0
         failed = 0
         errors: List[str] = []
+        response_order_count = 0
+        requested_windows: List[Dict[str, Any]] = []
         with self._connect() as conn:
             if integration_id:
                 integration_rows = [self._cafe24_integration_row(conn, integration_id)]
@@ -11345,25 +11414,46 @@ class PanelStore:
             for integration in integration_rows:
                 mall_id = str(integration["mall_id"])
                 shop_no = int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO)
-                window = cafe24_default_poll_window(integration["last_poll_at"], CAFE24_ORDER_OVERLAP_MINUTES)
+                window = cafe24_poll_datetime_window(
+                    start_raw=str(payload.get("startDate") or ""),
+                    end_raw=str(payload.get("endDate") or ""),
+                    last_poll_at=str(integration["last_poll_at"] or ""),
+                    use_cursor=bool(payload.get("useCursor", False)),
+                    overlap_minutes=CAFE24_ORDER_OVERLAP_MINUTES,
+                )
+                requested_statuses = payload.get("statuses")
+                if isinstance(requested_statuses, str):
+                    status_filter = [status.strip() for status in requested_statuses.split(",") if status.strip()]
+                elif isinstance(requested_statuses, list):
+                    status_filter = [str(status).strip() for status in requested_statuses if str(status).strip()]
+                else:
+                    status_filter = None
+                start_date = window["start"]
+                end_date = window["end"]
+                request_payload = {
+                    "startDate": start_date,
+                    "endDate": end_date,
+                    "orderStatuses": status_filter or "all",
+                    "includeAllStatuses": include_all_statuses,
+                }
+                requested_windows.append({"mallId": mall_id, "shopNo": shop_no, **request_payload})
                 try:
                     client = self._cafe24_client_for_row(conn, integration)
-                    start_date = str(payload.get("startDate") or window["start"])
-                    end_date = str(payload.get("endDate") or window["end"])
                     response = client.orders(
                         start_date=start_date,
                         end_date=end_date,
-                        statuses=None if include_all_statuses else sorted(CAFE24_ORDER_ELIGIBLE_STATUSES),
+                        statuses=status_filter,
                     )
                     orders = self._cafe24_orders_from_payload(response)
+                    response_order_count += len(orders)
                     self._log_cafe24_event(
                         conn,
                         mall_id=mall_id,
                         shop_no=shop_no,
                         event_type="orders.poll",
                         status="success",
-                        request_payload={"startDate": start_date, "endDate": end_date, "includeAllStatuses": include_all_statuses},
-                        response_payload={"count": len(orders)},
+                        request_payload=request_payload,
+                        response_payload={"orderCount": len(orders)},
                     )
                     for order_payload in orders:
                         for index, item_payload in enumerate(self._cafe24_order_items_from_order(order_payload)):
@@ -11394,7 +11484,7 @@ class PanelStore:
                         (
                             now_iso(),
                             "success",
-                            f"{processed}개 품주 처리 · {blocked}개 결제/취소 게이트 차단",
+                            f"요청 {start_date}~{end_date} · Cafe24 {len(orders)}건 · 품주 {processed}개 저장",
                             now_iso(),
                             integration["id"],
                         ),
@@ -11426,9 +11516,21 @@ class PanelStore:
                         shop_no=shop_no,
                         event_type="orders.poll",
                         status="failed",
+                        request_payload=request_payload,
+                        response_payload={"orderCount": 0},
                         error_message=message,
                     )
                     conn.commit()
+        summary = {
+            "requestWindows": requested_windows,
+            "responseOrderCount": response_order_count,
+            "storedOrderItemCount": processed,
+            "paymentBlockedCount": blocked,
+            "reviewRequiredCount": waiting,
+            "submitReadyCount": max(processed - waiting - blocked - failed, 0),
+            "submittedCount": submitted,
+            "failedCount": failed,
+        }
         return {
             "processed": processed,
             "waitingInput": waiting,
@@ -11436,6 +11538,124 @@ class PanelStore:
             "submitted": submitted,
             "failed": failed,
             "errors": errors,
+            "summary": summary,
+        }
+
+    def resync_cafe24_order_by_id(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        integration_id = str(payload.get("integrationId") or "").strip()
+        order_id = str(payload.get("orderId") or payload.get("cafe24OrderId") or "").strip()
+        submit_ready = bool(payload.get("submitReady", False))
+        actor = self._admin_actor(payload)
+        if not order_id:
+            raise PanelError("재수집할 Cafe24 주문번호를 입력해 주세요.", status=400)
+        processed = 0
+        waiting = 0
+        blocked = 0
+        submitted = 0
+        failed = 0
+        errors: List[str] = []
+        response_order_count = 0
+        with self._connect() as conn:
+            integration = self._cafe24_integration_row(conn, integration_id)
+            mall_id = str(integration["mall_id"])
+            shop_no = int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO)
+            request_payload = {"orderId": order_id, "embed": "items,buyer,receivers"}
+            try:
+                client = self._cafe24_client_for_row(conn, integration)
+                response = client.order(order_id)
+                orders = self._cafe24_orders_from_payload(response)
+                response_order_count = len(orders)
+                self._log_cafe24_event(
+                    conn,
+                    mall_id=mall_id,
+                    shop_no=shop_no,
+                    event_type="orders.resync_by_id",
+                    status="success",
+                    request_payload=request_payload,
+                    response_payload={"orderCount": len(orders)},
+                )
+                for order_payload in orders:
+                    for index, item_payload in enumerate(self._cafe24_order_items_from_order(order_payload)):
+                        result = self._process_cafe24_item(
+                            conn,
+                            integration=integration,
+                            order_payload=order_payload,
+                            item_payload=item_payload,
+                            index=index,
+                            submit_ready=submit_ready and bool(integration["auto_submit"]),
+                            require_mapping_auto_dispatch=True,
+                        )
+                        processed += 1
+                        if result["status"] in {"waiting_input", "mapping_error", "field_extract_failed", "missing_required_field", "invalid_quantity", "invalid_target", "supplier_range_error", "needs_manual_review"}:
+                            waiting += 1
+                        elif result["status"] in {"payment_pending", "payment_review_required", "cancelled"}:
+                            blocked += 1
+                        elif result["status"] == "failed":
+                            failed += 1
+                        elif result.get("submitted"):
+                            submitted += 1
+                conn.execute(
+                    """
+                    UPDATE cafe24_integrations
+                    SET last_sync_status = ?, last_sync_message = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "success",
+                        f"주문번호 {order_id} 재수집 · Cafe24 {len(orders)}건 · 품주 {processed}개 저장",
+                        now_iso(),
+                        integration["id"],
+                    ),
+                )
+                self._record_admin_audit(
+                    conn,
+                    actor=actor,
+                    action="cafe24.orders_resync_by_id",
+                    entity_type="cafe24_integration",
+                    entity_id=integration["id"],
+                    message=f"Cafe24 주문번호 직접 재수집: {order_id}",
+                    metadata={"orderId": order_id, "processed": processed, "waiting": waiting, "blocked": blocked, "submitted": submitted, "failed": failed},
+                )
+                conn.commit()
+            except Exception as exc:
+                message = str(exc)
+                errors.append(f"{mall_id}/{shop_no}: {message}")
+                conn.execute(
+                    """
+                    UPDATE cafe24_integrations
+                    SET last_sync_status = ?, last_sync_message = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    ("failed", message[:1000], now_iso(), integration["id"]),
+                )
+                self._log_cafe24_event(
+                    conn,
+                    mall_id=mall_id,
+                    shop_no=shop_no,
+                    event_type="orders.resync_by_id",
+                    status="failed",
+                    request_payload=request_payload,
+                    response_payload={"orderCount": 0},
+                    error_message=message,
+                )
+                conn.commit()
+        return {
+            "processed": processed,
+            "waitingInput": waiting,
+            "blocked": blocked,
+            "submitted": submitted,
+            "failed": failed,
+            "errors": errors,
+            "summary": {
+                "requestWindows": [{"mallId": mall_id, "shopNo": shop_no, **request_payload}],
+                "responseOrderCount": response_order_count,
+                "storedOrderItemCount": processed,
+                "paymentBlockedCount": blocked,
+                "reviewRequiredCount": waiting,
+                "submitReadyCount": max(processed - waiting - blocked - failed, 0),
+                "submittedCount": submitted,
+                "failedCount": failed,
+            },
         }
 
     def retry_cafe24_order_item(self, payload: Dict[str, Any]) -> Dict[str, Any]:

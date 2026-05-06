@@ -15,6 +15,7 @@ import sqlite3
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import zipfile
@@ -30,6 +31,7 @@ ASSET_DIR = RUNTIME_DIR / "assets"
 EXPORT_DIR = RUNTIME_DIR / "exports"
 DB_PATH = RUNTIME_DIR / "brand_grid_studio.db"
 SETTINGS_PATH = RUNTIME_DIR / "settings.json"
+DEFAULT_OBSIDIAN_VAULT_PATH = Path.home() / "Documents" / "Obsidian Vault"
 
 DEFAULT_PORT = 8010
 PRIVATE_CIDRS = [
@@ -152,6 +154,10 @@ DEFAULT_SETTINGS = {
     "dailyGenerationLimit": 60,
     "internalOnly": True,
     "allowFinalOnlyForSelected": True,
+    "obsidian": {
+        "vaultPath": str(DEFAULT_OBSIDIAN_VAULT_PATH),
+        "ideaFolder": "MVP Ideas",
+    },
     "routes": {
         "draft": {"label": "Draft", "provider": "mock", "model": "mock-draft", "unitCost": 0.06},
         "final": {"label": "Final", "provider": "mock", "model": "mock-final", "unitCost": 0.24},
@@ -547,6 +553,11 @@ def merge_settings(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, A
                 for sub_key in ["label", "provider", "model", "unitCost"]:
                     if sub_key in route_value:
                         merged["routes"][route_name][sub_key] = route_value[sub_key]
+        elif key == "obsidian" and isinstance(value, dict):
+            merged.setdefault("obsidian", {})
+            for sub_key in ["vaultPath", "ideaFolder"]:
+                if sub_key in value:
+                    merged["obsidian"][sub_key] = value[sub_key]
         elif key in {"projectBudgetDefault", "dailyGenerationLimit", "internalOnly", "allowFinalOnlyForSelected"}:
             merged[key] = value
     return merged
@@ -652,6 +663,193 @@ def write_bytes(path: Path, raw: bytes) -> None:
 def write_text(path: Path, value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(value, encoding="utf-8")
+
+
+def yaml_string(value: Any) -> str:
+    return json.dumps(clean_text(value), ensure_ascii=False)
+
+
+def markdown_list(items: Iterable[Any], *, empty: str = "- 미정") -> str:
+    cleaned = [clean_text(item) for item in items if clean_text(item)]
+    if not cleaned:
+        return empty
+    return "\n".join(f"- {item}" for item in cleaned)
+
+
+def markdown_tasks(items: Iterable[Any], *, empty_label: str = "첫 검증 작업 정의") -> str:
+    cleaned = [clean_text(item) for item in items if clean_text(item)]
+    if not cleaned:
+        cleaned = [empty_label]
+    return "\n".join(f"- [ ] {item}" for item in cleaned)
+
+
+def obsidian_open_uri(path: Path) -> str:
+    return "obsidian://open?path=" + urllib.parse.quote(str(path), safe="")
+
+
+def obsidian_folder_parts(value: Any) -> Tuple[str, ...]:
+    raw = clean_text(value or "MVP Ideas")
+    parts = []
+    for part in re.split(r"[\\/]+", raw):
+        cleaned = clean_text(part)
+        if cleaned and cleaned not in {".", ".."}:
+            parts.append(cleaned)
+    return tuple(parts or ["MVP Ideas"])
+
+
+def unique_file_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    for index in range(2, 1000):
+        candidate = path.with_name(f"{stem}-{index}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise StudioError("고유한 Obsidian 노트 파일명을 만들 수 없습니다.")
+
+
+def build_mvp_idea_note(project: Dict[str, Any]) -> str:
+    brief = project.get("brief", {})
+    brand_pack = project.get("brandPack", {})
+    grid_plan = project.get("gridPlan", {})
+    review = project.get("review", {})
+    selected_variants = [
+        item for item in project.get("variants", []) if item.get("selected") or item.get("scopeType") == "one"
+    ]
+    comments = project.get("comments", [])[:8]
+    slots = grid_plan.get("slots", [])[:12]
+    checklist = review.get("checklist", [])
+    now = datetime.now().replace(microsecond=0).isoformat()
+    title = clean_text(project.get("projectName") or brief.get("projectName") or "MVP Idea")
+
+    assumptions = []
+    target_audience = clean_text(brief.get("targetAudience"))
+    service_summary = clean_text(brief.get("serviceSummary"))
+    if target_audience:
+        assumptions.append(f"{target_audience}가 이 문제를 실제로 겪는다.")
+    if service_summary:
+        assumptions.append(f"{service_summary}만으로 초기 가치를 설명할 수 있다.")
+    assumptions.append("수동 운영으로 먼저 검증한 뒤 자동화 범위를 줄인다.")
+
+    slot_lines = [
+        f"{slot.get('index', '-')}. {clean_text(slot.get('role'))}: {clean_text(slot.get('tone'))}"
+        for slot in slots
+        if clean_text(slot.get("role"))
+    ]
+    variant_lines = [
+        f"{clean_text(item.get('role'))} · {clean_text(item.get('status'))} · {clean_text(item.get('route'))}"
+        for item in selected_variants[:12]
+        if clean_text(item.get("role"))
+    ]
+    comment_lines = [
+        f"{clean_text(item.get('author'))}: {clean_text(item.get('body'))}"
+        for item in comments
+        if clean_text(item.get("body"))
+    ]
+    checklist_lines = [
+        f"{clean_text(item.get('label'))} {'완료' if item.get('done') else '대기'}"
+        for item in checklist
+        if clean_text(item.get("label"))
+    ]
+
+    return f"""---
+type: mvp-idea
+source: brand-grid-studio
+project_id: {yaml_string(project.get("id"))}
+status: {yaml_string(project.get("status"))}
+client: {yaml_string(project.get("client"))}
+brand: {yaml_string(project.get("brandName"))}
+industry: {yaml_string(project.get("industry"))}
+created: {yaml_string(now)}
+tags:
+  - mvp
+  - idea
+  - brand-grid-studio
+---
+
+# {title}
+
+> Brand Grid Studio에서 생성한 MVP 아이디어 노트입니다. 아이디어 검증과 v0 범위 확정에 맞춰 편집하세요.
+
+## 한 줄 아이디어
+{clean_text(brief.get("goal") or brief.get("serviceSummary") or "어떤 문제를 누구에게 어떻게 해결할지 한 문장으로 적기")}
+
+## 문제와 대상
+- 문제: {clean_text(brief.get("goal") or "아직 정의되지 않음")}
+- 대상: {clean_text(brief.get("targetAudience") or "아직 정의되지 않음")}
+- 브랜드/서비스: {clean_text(brief.get("brandName") or project.get("brandName") or title)}
+- 업종: {clean_text(project.get("industry") or "미입력")}
+
+## MVP 핵심 가치
+{clean_text(brief.get("serviceSummary") or brand_pack.get("overview") or "초기 사용자가 바로 체감할 핵심 가치를 적기")}
+
+## MVP v0 범위
+- [ ] 사용자가 가장 먼저 해야 하는 핵심 행동 1개 정의
+- [ ] 수동으로 처리해도 되는 운영 영역 분리
+- [ ] 첫 화면 또는 첫 산출물만 제작
+- [ ] 성공 기준 1개와 실패 기준 1개 설정
+
+## 검증 가설
+{markdown_tasks(assumptions, empty_label="가장 위험한 가설 1개 정의")}
+
+## 실험 체크리스트
+- [ ] 5명 이하의 실제 사용자에게 문제 인터뷰
+- [ ] 랜딩/프로토타입/수동 컨시어지 중 가장 싼 방식으로 테스트
+- [ ] 사용자가 돈, 시간, 연락처 중 하나를 실제로 내는지 확인
+- [ ] 검증 결과를 기준으로 만들 기능과 버릴 기능 분리
+
+## 브랜드/콘텐츠 단서
+- 톤: {clean_text(brand_pack.get("masterTone") or "미정")}
+- 키워드: {", ".join(brand_pack.get("toneKeywords", [])[:8]) or "미정"}
+- 팔레트: {", ".join(brand_pack.get("palette", [])[:6]) or "미정"}
+- 필수 키워드: {", ".join(brief.get("requiredKeywords", [])[:8]) or "미정"}
+- 금지 키워드: {", ".join(brief.get("bannedKeywords", [])[:8]) or "미정"}
+
+## 그리드/기획 메모
+{markdown_list(slot_lines)}
+
+## 선택된 시안
+{markdown_list(variant_lines, empty="- 아직 선택된 시안 없음")}
+
+## 리뷰 메모
+{markdown_list(comment_lines, empty="- 아직 리뷰 메모 없음")}
+
+## 내부 체크리스트 상태
+{markdown_list(checklist_lines, empty="- 체크리스트 없음")}
+
+## 참고 링크
+- 홈페이지: {clean_text(brief.get("homepageUrl") or "미입력")}
+- 인스타그램: {clean_text(brief.get("instagramUrl") or "미입력")}
+
+## 다음 액션
+- [ ] 이 노트에서 문제/대상/핵심 가치를 한 문장으로 좁히기
+- [ ] v0에서 만들지 않을 기능 목록 작성
+- [ ] 첫 검증 실험 일정 잡기
+"""
+
+
+def update_mvp_dashboard(dashboard_path: Path, note_path: Path, title: str) -> None:
+    if dashboard_path.exists():
+        content = dashboard_path.read_text(encoding="utf-8")
+    else:
+        content = """# MVP Ideas Dashboard
+
+Brand Grid Studio에서 보낸 MVP 아이디어 노트의 인덱스입니다.
+
+## 운영 규칙
+- 문제, 대상, 핵심 가치를 먼저 좁힙니다.
+- v0는 검증에 필요한 최소 범위만 남깁니다.
+- 실험 결과가 없는 기능은 백로그로 보냅니다.
+
+## Ideas
+"""
+    entry = f"- [[{note_path.stem}|{title}]] - {datetime.now().strftime('%Y-%m-%d')}"
+    if entry not in content:
+        if not content.endswith("\n"):
+            content += "\n"
+        content += entry + "\n"
+    write_text(dashboard_path, content)
 
 
 def route_settings(settings: Dict[str, Any], route: str) -> Dict[str, Any]:
@@ -1685,6 +1883,39 @@ class StudioStore:
             "folderUrl": "/" + str(export_root.relative_to(PROJECT_ROOT)).replace(os.sep, "/"),
             "zipUrl": "/" + str(zip_path.relative_to(PROJECT_ROOT)).replace(os.sep, "/"),
             "selectedCount": len(selected_variants),
+        }
+
+    def export_project_to_obsidian(self, project_id: str) -> Dict[str, Any]:
+        project = self.get_project(project_id)
+        settings = self.get_settings().get("obsidian", {})
+        vault_raw = clean_text(settings.get("vaultPath") or "")
+        if not vault_raw:
+            raise StudioError("Obsidian vault 경로가 설정되어 있지 않습니다.")
+
+        vault_path = Path(os.path.expanduser(vault_raw)).resolve()
+        if not vault_path.exists():
+            raise StudioError(f"Obsidian vault 경로를 찾을 수 없습니다: {vault_path}")
+        if not (vault_path / ".obsidian").exists():
+            raise StudioError(f"Obsidian vault가 아닌 폴더입니다: {vault_path}")
+
+        target_dir = vault_path.joinpath(*obsidian_folder_parts(settings.get("ideaFolder"))).resolve()
+        if target_dir != vault_path and vault_path not in target_dir.parents:
+            raise StudioError("Obsidian 노트 저장 폴더가 vault 밖으로 벗어났습니다.")
+
+        date_prefix = datetime.now().strftime("%Y-%m-%d")
+        title = clean_text(project.get("projectName") or project.get("brandName") or "MVP Idea")
+        note_path = unique_file_path(target_dir / f"{date_prefix}-{slugify(title)}-mvp-idea.md")
+        write_text(note_path, build_mvp_idea_note(project))
+
+        dashboard_path = target_dir / "_MVP Ideas Dashboard.md"
+        update_mvp_dashboard(dashboard_path, note_path, title)
+
+        return {
+            "vaultPath": str(vault_path),
+            "folderPath": str(target_dir),
+            "notePath": str(note_path),
+            "dashboardPath": str(dashboard_path),
+            "openUrl": obsidian_open_uri(note_path),
         }
 
 
