@@ -1306,6 +1306,9 @@ class AppHandler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/admin/cafe24/poll":
                 write_json(self, 200, {"ok": True, **self._server().store.poll_cafe24_orders(payload)})
                 return
+            if parsed.path == "/api/admin/cafe24/orders/resync-by-id":
+                write_json(self, 200, {"ok": True, **self._server().store.resync_cafe24_order_by_id(payload)})
+                return
             if parsed.path == "/api/admin/cafe24/order-items/retry":
                 write_json(self, 200, {"ok": True, **self._server().store.retry_cafe24_order_item(payload)})
                 return
