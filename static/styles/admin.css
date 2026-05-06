@@ -415,6 +415,63 @@ body[data-route-surface="admin"] .admin-module-header__row {
   letter-spacing: -0.02em;
 }
 
+.cafe24-ops-board {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin: 18px 0;
+}
+
+.cafe24-ops-board article {
+  padding: 16px;
+  border: 1px solid rgba(221, 228, 246, 0.96);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: var(--shadow-sm);
+}
+
+.cafe24-ops-board article.is-risk {
+  border-color: rgba(239, 68, 68, 0.24);
+  background: linear-gradient(180deg, rgba(255, 247, 247, 0.98) 0%, rgba(254, 242, 242, 0.98) 100%);
+}
+
+.cafe24-ops-board article.is-hot {
+  border-color: rgba(185, 107, 198, 0.35);
+  background: linear-gradient(180deg, rgba(250, 245, 255, 0.98) 0%, rgba(245, 238, 255, 0.98) 100%);
+}
+
+.cafe24-ops-board span,
+.cafe24-ops-board small {
+  display: block;
+  color: var(--text-muted);
+  font-size: 0.76rem;
+}
+
+.cafe24-ops-board strong {
+  display: block;
+  margin: 8px 0 5px;
+  font-size: 1.26rem;
+  letter-spacing: -0.03em;
+}
+
+.cafe24-quick-controls {
+  margin-bottom: 16px;
+}
+
+.cafe24-control-grid {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.8fr) minmax(120px, 0.5fr) minmax(280px, 1.4fr);
+  gap: 12px;
+}
+
+.cafe24-advanced-controls {
+  margin: 10px 0 4px;
+}
+
+.cafe24-order-list {
+  margin-top: 12px;
+}
+
 .admin-supplier-explorer {
   display: grid;
   grid-template-columns: minmax(380px, 0.94fr) minmax(0, 1.06fr);
