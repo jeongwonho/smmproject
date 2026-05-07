@@ -5339,66 +5339,68 @@ class PanelStore:
         self._ensure_column(conn, "cafe24_order_items", "supplier_service_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "supplier_external_service_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "supplier_response_json", "TEXT NOT NULL DEFAULT '{}'")
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_cafe24_oauth_states_expires_at
-                ON cafe24_oauth_states(expires_at)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_cafe24_integrations_active
-                ON cafe24_integrations(is_active, updated_at DESC)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_cafe24_product_mappings_product
-                ON cafe24_product_mappings(internal_product_id, enabled)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_cafe24_supplier_mappings_supplier
-                ON cafe24_supplier_mappings(supplier_id, supplier_service_id, enabled)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_status_updated_at
-                ON cafe24_order_items(standard_status, updated_at DESC)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_order_date
-                ON cafe24_order_items(mall_id, shop_no, cafe24_order_date DESC)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_internal_order
-                ON cafe24_order_items(internal_order_id)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_cafe24_api_events_created_at
-                ON cafe24_api_events(created_at DESC)
-            """
-        )
+        if not is_production_runtime():
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_cafe24_oauth_states_expires_at
+                    ON cafe24_oauth_states(expires_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_cafe24_integrations_active
+                    ON cafe24_integrations(is_active, updated_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_cafe24_product_mappings_product
+                    ON cafe24_product_mappings(internal_product_id, enabled)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_cafe24_supplier_mappings_supplier
+                    ON cafe24_supplier_mappings(supplier_id, supplier_service_id, enabled)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_status_updated_at
+                    ON cafe24_order_items(standard_status, updated_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_order_date
+                    ON cafe24_order_items(mall_id, shop_no, cafe24_order_date DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_internal_order
+                    ON cafe24_order_items(internal_order_id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_cafe24_api_events_created_at
+                    ON cafe24_api_events(created_at DESC)
+                """
+            )
         conn.execute("UPDATE cafe24_integrations SET auto_submit = 0 WHERE auto_submit != 0")
         self._migrate_cafe24_supplier_mappings(conn)
-        self._ensure_bigint_columns(
-            conn,
-            {
-                "wallets": ["available_balance", "pending_balance"],
-                "charge_orders": ["amount", "vat_amount", "total_amount"],
-                "wallet_ledger": ["amount", "balance_after"],
-                "payment_records": ["amount"],
-                "balance_transactions": ["amount", "balance_after"],
-            },
-        )
+        if not is_production_runtime():
+            self._ensure_bigint_columns(
+                conn,
+                {
+                    "wallets": ["available_balance", "pending_balance"],
+                    "charge_orders": ["amount", "vat_amount", "total_amount"],
+                    "wallet_ledger": ["amount", "balance_after"],
+                    "payment_records": ["amount"],
+                    "balance_transactions": ["amount", "balance_after"],
+                },
+            )
         conn.execute("UPDATE users SET email = lower(trim(email)) WHERE email != lower(trim(email))")
         conn.execute("UPDATE support_links SET route = '/help#faq' WHERE id = 'support_faq'")
         conn.execute("UPDATE support_links SET route = '/help#notice' WHERE id = 'support_notice'")
