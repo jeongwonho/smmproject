@@ -5162,7 +5162,12 @@ class PanelStore:
 
     def _initialize(self) -> None:
         with self._connect() as conn:
-            conn.executescript(SCHEMA_SQL)
+            previous_schema_version = self._runtime_metadata_value_if_available(conn, "schema_version")
+            # Existing production databases may not yet have columns referenced by newer
+            # CREATE INDEX statements in SCHEMA_SQL. For those DBs, run additive
+            # migrations first instead of replaying the full schema script.
+            if not previous_schema_version:
+                conn.executescript(SCHEMA_SQL)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS runtime_metadata (
@@ -5310,6 +5315,8 @@ class PanelStore:
         self._ensure_column(conn, "cafe24_product_mappings", "supplier_product_code", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_product_mappings", "field_mapping_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column(conn, "cafe24_product_mappings", "enabled", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column(conn, "cafe24_supplier_mappings", "supplier_service_id", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_supplier_mappings", "enabled", "INTEGER NOT NULL DEFAULT 1")
         self._ensure_column(conn, "cafe24_integrations", "token_status", "TEXT NOT NULL DEFAULT 'connected'")
         self._ensure_column(conn, "cafe24_integrations", "token_last_checked_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_integrations", "token_last_refreshed_at", "TEXT NOT NULL DEFAULT ''")
@@ -5326,14 +5333,58 @@ class PanelStore:
         self._ensure_column(conn, "cafe24_order_items", "payment_paid_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "payment_reference", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "payment_snapshot_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column(conn, "cafe24_order_items", "standard_status", "TEXT NOT NULL DEFAULT 'received'")
+        self._ensure_column(conn, "cafe24_order_items", "internal_order_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "supplier_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "supplier_service_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "supplier_external_service_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "supplier_response_json", "TEXT NOT NULL DEFAULT '{}'")
         conn.execute(
             """
+            CREATE INDEX IF NOT EXISTS idx_cafe24_oauth_states_expires_at
+                ON cafe24_oauth_states(expires_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cafe24_integrations_active
+                ON cafe24_integrations(is_active, updated_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cafe24_product_mappings_product
+                ON cafe24_product_mappings(internal_product_id, enabled)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cafe24_supplier_mappings_supplier
+                ON cafe24_supplier_mappings(supplier_id, supplier_service_id, enabled)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_status_updated_at
+                ON cafe24_order_items(standard_status, updated_at DESC)
+            """
+        )
+        conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_order_date
                 ON cafe24_order_items(mall_id, shop_no, cafe24_order_date DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_internal_order
+                ON cafe24_order_items(internal_order_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cafe24_api_events_created_at
+                ON cafe24_api_events(created_at DESC)
             """
         )
         conn.execute("UPDATE cafe24_integrations SET auto_submit = 0 WHERE auto_submit != 0")
@@ -5380,8 +5431,13 @@ class PanelStore:
                 updated_at TEXT NOT NULL,
                 UNIQUE(supplier_id, product_uuid)
             );
+            """
+        )
+        self._ensure_column(conn, "mkt24_product_settings", "supplier_service_id", "TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_mkt24_product_settings_supplier_service
-                ON mkt24_product_settings(supplier_id, supplier_service_id, is_active);
+                ON mkt24_product_settings(supplier_id, supplier_service_id, is_active)
             """
         )
 
@@ -5551,9 +5607,6 @@ class PanelStore:
                 expires_at TEXT NOT NULL,
                 used_at TEXT NOT NULL DEFAULT ''
             );
-            CREATE INDEX IF NOT EXISTS idx_cafe24_oauth_states_expires_at
-                ON cafe24_oauth_states(expires_at);
-
             CREATE TABLE IF NOT EXISTS cafe24_integrations (
                 id TEXT PRIMARY KEY,
                 mall_id TEXT NOT NULL,
@@ -5581,9 +5634,6 @@ class PanelStore:
                 updated_at TEXT NOT NULL,
                 UNIQUE(mall_id, shop_no)
             );
-            CREATE INDEX IF NOT EXISTS idx_cafe24_integrations_active
-                ON cafe24_integrations(is_active, updated_at DESC);
-
             CREATE TABLE IF NOT EXISTS cafe24_product_mappings (
                 id TEXT PRIMARY KEY,
                 mall_id TEXT NOT NULL,
@@ -5601,9 +5651,6 @@ class PanelStore:
                 updated_at TEXT NOT NULL,
                 UNIQUE(mall_id, shop_no, cafe24_product_no, cafe24_variant_code, cafe24_custom_product_code)
             );
-            CREATE INDEX IF NOT EXISTS idx_cafe24_product_mappings_product
-                ON cafe24_product_mappings(internal_product_id, enabled);
-
             CREATE TABLE IF NOT EXISTS cafe24_supplier_mappings (
                 id TEXT PRIMARY KEY,
                 mall_id TEXT NOT NULL,
@@ -5624,9 +5671,6 @@ class PanelStore:
                 updated_at TEXT NOT NULL,
                 UNIQUE(mall_id, shop_no, cafe24_product_no, cafe24_variant_code, cafe24_custom_product_code)
             );
-            CREATE INDEX IF NOT EXISTS idx_cafe24_supplier_mappings_supplier
-                ON cafe24_supplier_mappings(supplier_id, supplier_service_id, enabled);
-
             CREATE TABLE IF NOT EXISTS cafe24_order_items (
                 id TEXT PRIMARY KEY,
                 mall_id TEXT NOT NULL,
@@ -5672,13 +5716,6 @@ class PanelStore:
                 updated_at TEXT NOT NULL,
                 UNIQUE(mall_id, shop_no, cafe24_order_id, cafe24_order_item_code)
             );
-            CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_status_updated_at
-                ON cafe24_order_items(standard_status, updated_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_order_date
-                ON cafe24_order_items(mall_id, shop_no, cafe24_order_date DESC);
-            CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_internal_order
-                ON cafe24_order_items(internal_order_id);
-
             CREATE TABLE IF NOT EXISTS cafe24_api_events (
                 id TEXT PRIMARY KEY,
                 mall_id TEXT NOT NULL,
@@ -5690,8 +5727,6 @@ class PanelStore:
                 error_message TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_cafe24_api_events_created_at
-                ON cafe24_api_events(created_at DESC);
             """
         )
 
