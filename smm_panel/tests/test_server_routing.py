@@ -8,6 +8,7 @@ if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
 from server import AppHandler
+from core import derive_order_idempotency_key
 
 
 class VercelRewriteRoutingTest(unittest.TestCase):
@@ -23,6 +24,31 @@ class VercelRewriteRoutingTest(unittest.TestCase):
         path = AppHandler._incoming_request_path(None, "/api/index.py?__path=/api/products&q=instagram")
 
         self.assertEqual(path, "/api/products?q=instagram")
+
+
+class OrderIdempotencyTest(unittest.TestCase):
+    def test_derived_order_idempotency_key_is_stable_with_sorted_fields(self):
+        first = derive_order_idempotency_key(
+            "user_1",
+            "product_1",
+            {"targetValue": "  instamart  ", "orderedCount": 100},
+            now_seconds=120,
+        )
+        second = derive_order_idempotency_key(
+            "user_1",
+            "product_1",
+            {"orderedCount": "100", "targetValue": "instamart"},
+            now_seconds=121,
+        )
+
+        self.assertEqual(first, second)
+        self.assertTrue(first.startswith("auto:"))
+
+    def test_derived_order_idempotency_key_rotates_by_time_window(self):
+        first = derive_order_idempotency_key("user_1", "product_1", {"targetValue": "instamart"}, now_seconds=119)
+        second = derive_order_idempotency_key("user_1", "product_1", {"targetValue": "instamart"}, now_seconds=120)
+
+        self.assertNotEqual(first, second)
 
 
 if __name__ == "__main__":

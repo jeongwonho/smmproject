@@ -12,7 +12,16 @@
   <body data-route-surface="public">
     <div class="app-backdrop" aria-hidden="true"></div>
     <div class="device-shell" data-route-surface="public">
-      <div id="app" class="app-root"></div>
+      <div id="app" class="app-root">
+        <div class="loading-screen" data-initial-loading>
+          <div class="loading-card loading-card--brand">
+            <div class="loading-logo-skeleton" aria-hidden="true">
+              <img src="/static/assets/instamart-logo-light-bg.png" alt="" />
+            </div>
+            <p>인스타마트를 불러오는 중...</p>
+          </div>
+        </div>
+      </div>
     </div>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script type="module" src="/static/app.js"></script>

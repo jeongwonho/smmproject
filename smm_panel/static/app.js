@@ -1870,11 +1870,13 @@ function getRoute() {
   return parseRoute(window.location.pathname, normalizeAdminSectionId);
 }
 
-function showLoading(message = "패널을 불러오는 중...") {
+function showLoading(message = "인스타마트를 불러오는 중...") {
   app.innerHTML = `
     <div class="loading-screen">
-      <div class="loading-card">
-        <div class="loading-spinner"></div>
+      <div class="loading-card loading-card--brand">
+        <div class="loading-logo-skeleton" aria-hidden="true">
+          <img src="${escapeHtml(DEFAULT_LIGHT_BRAND_LOGO_URL)}" alt="" />
+        </div>
         <p>${escapeHtml(message)}</p>
       </div>
     </div>
