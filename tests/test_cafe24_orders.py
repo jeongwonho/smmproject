@@ -68,12 +68,24 @@ class FakeCafe24OrderClient:
         self.orders_calls = []
         self.order_calls = []
 
-    def orders(self, *, start_date, end_date, statuses=None, order_id="", limit=100, offset=0, date_type="order_date"):
+    def orders(
+        self,
+        *,
+        start_date,
+        end_date,
+        statuses=None,
+        payment_statuses=None,
+        order_id="",
+        limit=100,
+        offset=0,
+        date_type="order_date",
+    ):
         self.orders_calls.append(
             {
                 "start_date": start_date,
                 "end_date": end_date,
                 "statuses": statuses,
+                "payment_statuses": payment_statuses,
                 "order_id": order_id,
                 "limit": limit,
                 "offset": offset,
@@ -81,6 +93,9 @@ class FakeCafe24OrderClient:
             }
         )
         if self.order_pages is not None:
+            typed_key = (date_type, offset)
+            if typed_key in self.order_pages:
+                return {"orders": self.order_pages.get(typed_key, [])}
             return {"orders": self.order_pages.get(offset, [])}
         return {"orders": [self.order_payload]}
 
@@ -510,6 +525,39 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(call["limit"], 1000)
         self.assertEqual(call["offset"], 0)
         self.assertEqual(call["date_type"], "order_date")
+
+    def test_poll_falls_back_to_paid_date_when_order_date_returns_zero(self):
+        fake_client = FakeCafe24OrderClient(self._order_payload())
+        fake_client.order_pages = {
+            ("order_date", 0): [],
+            ("pay_date", 0): [self._order_payload()],
+        }
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client):
+            result = self.store.poll_cafe24_orders({"integrationId": self.integration["id"]})
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["summary"]["responseOrderCount"], 1)
+        self.assertEqual(len(fake_client.orders_calls), 2)
+        self.assertEqual(fake_client.orders_calls[0]["date_type"], "order_date")
+        self.assertIsNone(fake_client.orders_calls[0]["payment_statuses"])
+        self.assertEqual(fake_client.orders_calls[1]["date_type"], "pay_date")
+        self.assertEqual(fake_client.orders_calls[1]["payment_statuses"], ["P", "A", "T"])
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM cafe24_order_items").fetchone()[0], 1)
+
+    def test_poll_fetches_order_detail_when_list_response_has_no_items(self):
+        list_order = self._order_payload()
+        list_order.pop("items")
+        fake_client = FakeCafe24OrderClient(self._order_payload())
+        fake_client.order_pages = {("order_date", 0): [list_order]}
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client):
+            result = self.store.poll_cafe24_orders({"integrationId": self.integration["id"]})
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(fake_client.order_calls, ["20260426-000001"])
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.assertEqual(item["cafe24_order_item_code"], "20260426-000001-01")
 
     def test_cafe24_order_items_list_defaults_to_five_per_page_for_month_window(self):
         for index in range(6):
