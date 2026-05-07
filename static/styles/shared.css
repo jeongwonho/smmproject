@@ -2053,6 +2053,47 @@ select {
   text-align: center;
 }
 
+.loading-card--brand {
+  min-width: 180px;
+  background: rgba(255, 255, 255, 0.76);
+  border: 1px solid rgba(185, 107, 198, 0.16);
+  box-shadow: 0 24px 70px rgba(82, 43, 111, 0.12);
+}
+
+.loading-logo-skeleton {
+  position: relative;
+  width: 64px;
+  height: 64px;
+  margin: 0 auto 14px;
+  border-radius: 22px;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(135deg, rgba(185, 107, 198, 0.12), rgba(255, 255, 255, 0.92));
+}
+
+.loading-logo-skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-110%);
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.8), transparent);
+  animation: loading-logo-shimmer 1.2s ease-in-out infinite;
+}
+
+.loading-logo-skeleton img {
+  width: 44px;
+  height: 44px;
+  object-fit: contain;
+  filter: saturate(0.95);
+}
+
+.loading-card--brand p {
+  margin: 0;
+  font-weight: 800;
+  color: #65718d;
+}
+
 .loading-spinner {
   width: 32px;
   height: 32px;
@@ -2061,6 +2102,12 @@ select {
   border: 3px solid rgba(76, 118, 255, 0.18);
   border-top-color: var(--accent);
   animation: spin 0.9s linear infinite;
+}
+
+@keyframes loading-logo-shimmer {
+  100% {
+    transform: translateX(110%);
+  }
 }
 
 .bottom-nav {

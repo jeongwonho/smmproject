@@ -10,6 +10,7 @@ import json
 import math
 import os
 import secrets
+import threading
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -165,9 +166,28 @@ class RequestRateLimiter:
             "auth": (18, 60),
         }
         self.events: Dict[str, list[float]] = {}
+        self.lock = threading.Lock()
+        self.max_keys = 2000
 
     def _key(self, bucket: str, client_key: str) -> str:
         return f"{bucket}:{client_key}"
+
+    def _trim_storage_if_needed(self) -> None:
+        if len(self.events) <= self.max_keys:
+            return
+        now = time.time()
+        for storage_key in list(self.events.keys()):
+            bucket = storage_key.split(":", 1)[0]
+            window_seconds = self.rules.get(bucket, (0, 60))[1]
+            recent = [attempt for attempt in self.events.get(storage_key, []) if attempt > now - window_seconds]
+            if recent:
+                self.events[storage_key] = recent
+            else:
+                self.events.pop(storage_key, None)
+            if len(self.events) <= self.max_keys:
+                return
+        for storage_key in sorted(self.events, key=lambda key: min(self.events.get(key, [0])))[: max(0, len(self.events) - self.max_keys)]:
+            self.events.pop(storage_key, None)
 
     def _recent(self, bucket: str, client_key: str) -> list[float]:
         limit, window_seconds = self.rules[bucket]
@@ -200,10 +220,42 @@ class RequestRateLimiter:
         self.events[storage_key] = attempts
 
     def enforce(self, bucket: str, client_key: str, message: str) -> None:
-        retry_after = self.retry_after(bucket, client_key)
-        if retry_after:
-            raise PanelError(message.format(retry_after=retry_after), status=429)
-        self.record(bucket, client_key)
+        with self.lock:
+            self._trim_storage_if_needed()
+            retry_after = self.retry_after(bucket, client_key)
+            if retry_after:
+                raise PanelError(message.format(retry_after=retry_after), status=429)
+            self.record(bucket, client_key)
+
+
+class TTLResponseCache:
+    def __init__(self, max_items: int = 128) -> None:
+        self.max_items = max_items
+        self.items: Dict[str, tuple[float, bytes]] = {}
+        self.lock = threading.Lock()
+
+    def _prune(self, now: float) -> None:
+        for key, (expires_at, _) in list(self.items.items()):
+            if expires_at <= now:
+                self.items.pop(key, None)
+        if len(self.items) <= self.max_items:
+            return
+        for key in sorted(self.items, key=lambda item_key: self.items[item_key][0])[: len(self.items) - self.max_items]:
+            self.items.pop(key, None)
+
+    def get_or_set(self, key: str, ttl_seconds: int, factory: Any) -> Dict[str, Any]:
+        now = time.time()
+        with self.lock:
+            self._prune(now)
+            cached = self.items.get(key)
+            if cached is not None and cached[0] > now:
+                return json.loads(cached[1].decode("utf-8"))
+        payload = factory()
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        with self.lock:
+            self.items[key] = (now + max(1, ttl_seconds), raw)
+            self._prune(now)
+        return json.loads(raw.decode("utf-8"))
 
 
 class SignedSessionStore:
@@ -488,6 +540,7 @@ class PanelHTTPServer(ThreadingHTTPServer):
         user_sessions: UserSessionStore,
         config: AppConfig,
         rate_limiter: RequestRateLimiter,
+        public_cache: TTLResponseCache,
     ) -> None:
         super().__init__(server_address, handler_cls)
         self.store = store
@@ -495,6 +548,7 @@ class PanelHTTPServer(ThreadingHTTPServer):
         self.user_sessions = user_sessions
         self.config = config
         self.rate_limiter = rate_limiter
+        self.public_cache = public_cache
 
 
 @dataclass(frozen=True)
@@ -504,6 +558,7 @@ class RuntimeContext:
     user_sessions: UserSessionStore
     config: AppConfig
     rate_limiter: RequestRateLimiter
+    public_cache: TTLResponseCache
 
 
 _RUNTIME_CONTEXT: RuntimeContext | None = None
@@ -521,6 +576,7 @@ def build_runtime_context() -> RuntimeContext:
         user_sessions=UserSessionStore(session_secret),
         config=AppConfig.from_env(),
         rate_limiter=RequestRateLimiter(),
+        public_cache=TTLResponseCache(),
     )
 
 
@@ -780,6 +836,9 @@ class AppHandler(SimpleHTTPRequestHandler):
         client_key = self._client_identity()
         self._server().rate_limiter.enforce(bucket, client_key, message)
 
+    def _public_cached_payload(self, cache_key: str, ttl_seconds: int, factory: Any) -> Dict[str, Any]:
+        return self._server().public_cache.get_or_set(cache_key, ttl_seconds, factory)
+
     def do_GET(self) -> None:
         request_path = self._incoming_request_path(self.path)
         parsed = urlparse(request_path)
@@ -799,7 +858,12 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             if parsed.path == "/api/public-shell":
                 session = self._public_session()
-                payload = self._server().store.public_shell(str((session or {}).get("user", {}).get("id") or ""))
+                user_id = str((session or {}).get("user", {}).get("id") or "")
+                payload = (
+                    self._server().store.public_shell(user_id)
+                    if user_id
+                    else self._public_cached_payload("public-shell:v1", 15, lambda: self._server().store.public_shell(""))
+                )
                 payload["viewer"] = self._public_session_payload()
                 write_json(
                     self,
@@ -810,7 +874,12 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             if parsed.path == "/api/bootstrap":
                 session = self._public_session()
-                payload = self._server().store.bootstrap(str((session or {}).get("user", {}).get("id") or ""))
+                user_id = str((session or {}).get("user", {}).get("id") or "")
+                payload = (
+                    self._server().store.bootstrap(user_id)
+                    if user_id
+                    else self._public_cached_payload("bootstrap:v1", 15, lambda: self._server().store.bootstrap(""))
+                )
                 payload["viewer"] = self._public_session_payload()
                 write_json(
                     self,
@@ -1419,7 +1488,16 @@ def main() -> None:
     user_sessions = runtime.user_sessions
     rate_limiter = runtime.rate_limiter
     handler = partial(AppHandler, directory=str(STATIC_ROOT))
-    httpd = PanelHTTPServer((args.host, args.port), handler, store, admin_sessions, user_sessions, config, rate_limiter)
+    httpd = PanelHTTPServer(
+        (args.host, args.port),
+        handler,
+        store,
+        admin_sessions,
+        user_sessions,
+        config,
+        rate_limiter,
+        runtime.public_cache,
+    )
     print(f"{DEFAULT_SITE_NAME} panel running at http://{args.host}:{args.port}")
     print(f"Storage backend: {store.backend}")
     if not admin_sessions.is_configured:

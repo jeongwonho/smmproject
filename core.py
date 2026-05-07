@@ -91,6 +91,7 @@ PUBLIC_PASSWORD_MIN_LENGTH = 10
 PUBLIC_PASSWORD_RECOMMENDED_LENGTH = 12
 PUBLIC_PASSWORD_VERY_STRONG_LENGTH = 14
 ORDER_IDEMPOTENCY_KEY_MAX_LENGTH = 120
+ORDER_AUTO_IDEMPOTENCY_WINDOW_SECONDS = 2 * 60
 ORDER_EXTERNAL_REFERENCE_MAX_LENGTH = 160
 ORDER_CHANNEL_WEB = "web"
 ORDER_CHANNEL_CAFE24 = "cafe24"
@@ -1836,6 +1837,36 @@ def generate_public_order_number() -> str:
 def sanitize_idempotency_key(raw: Any) -> str:
     value = re.sub(r"[^A-Za-z0-9._:-]", "", str(raw or "").strip())
     return value[:ORDER_IDEMPOTENCY_KEY_MAX_LENGTH]
+
+
+def _canonical_order_field_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _canonical_order_field_value(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_canonical_order_field_value(item) for item in value]
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def derive_order_idempotency_key(
+    user_id: str,
+    product_id: str,
+    fields: Dict[str, Any],
+    *,
+    now_seconds: Optional[int] = None,
+) -> str:
+    bucket = int((now_seconds if now_seconds is not None else time.time()) // ORDER_AUTO_IDEMPOTENCY_WINDOW_SECONDS)
+    fingerprint_payload = {
+        "bucket": bucket,
+        "userId": str(user_id or "").strip(),
+        "productId": str(product_id or "").strip(),
+        "fields": _canonical_order_field_value(fields),
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:32]
+    return sanitize_idempotency_key(f"auto:{bucket}:{fingerprint}")
 
 
 def sanitize_external_order_reference(raw: Any) -> str:
@@ -14437,6 +14468,8 @@ class PanelStore:
         if not isinstance(fields, dict):
             raise PanelError("주문 폼 정보가 올바르지 않습니다.")
         idempotency_key = sanitize_idempotency_key(payload.get("idempotencyKey"))
+        if not idempotency_key and channel == ORDER_CHANNEL_WEB:
+            idempotency_key = derive_order_idempotency_key(user_id, product_id, fields)
         existing_order = self._existing_order_by_idempotency(user_id, idempotency_key)
         if existing_order is not None:
             return existing_order
