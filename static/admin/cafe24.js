@@ -17,6 +17,7 @@ function callRuntime(name, ...args) {
 function apiGet(...args) { return callRuntime("apiGet", ...args); }
 function apiPost(...args) { return callRuntime("apiPost", ...args); }
 function refreshAdminData(...args) { return callRuntime("refreshAdminData", ...args); }
+function refreshCafe24OrderItems(...args) { return callRuntime("refreshCafe24OrderItems", ...args); }
 function renderRoute(...args) { return callRuntime("renderRoute", ...args); }
 function showToast(...args) { return callRuntime("showToast", ...args); }
 
@@ -53,6 +54,31 @@ async function loadCafe24SupplierServices(supplierId) {
   return state.adminSupplierServices[supplierId];
 }
 
+export function cafe24OrderItemsQueryKey() {
+  const params = new URLSearchParams();
+  const integrationId = (state.adminBootstrap?.cafe24Integrations || [])[0]?.id || "";
+  if (integrationId) params.set("integrationId", integrationId);
+  [["page", state.ui.adminCafe24OrderPage || 1], ["pageSize", 5], ["payment", state.ui.adminCafe24PaymentFilter || "all"], ["mapping", state.ui.adminCafe24MappingFilter || "all"], ["status", state.ui.adminCafe24StatusFilter || "all"]]
+    .forEach(([key, value]) => params.set(key, String(value)));
+  const search = String(state.ui.adminCafe24Search || "").trim();
+  if (search) params.set("q", search);
+  return params.toString();
+}
+
+export async function refreshCafe24OrderItems({ force = false } = {}) {
+  if (!state.adminBootstrap?.cafe24Integrations?.length) {
+    state.adminCafe24OrderList = { items: [], summary: {}, pagination: { page: 1, pageSize: 5, total: 0, totalPages: 1 } };
+    state.adminCafe24OrderListKey = "";
+    return state.adminCafe24OrderList;
+  }
+  const key = cafe24OrderItemsQueryKey();
+  if (!force && state.adminCafe24OrderList && state.adminCafe24OrderListKey === key) return state.adminCafe24OrderList;
+  const data = await apiGet(`/api/admin/cafe24/order-items?${key}`);
+  state.adminCafe24OrderList = data;
+  state.adminCafe24OrderListKey = key;
+  return data;
+}
+
 export async function handleCafe24AdminChange(target) {
   if (!(target instanceof Element)) return false;
   if (target.matches("[data-admin-cafe24-filter]")) {
@@ -60,7 +86,10 @@ export async function handleCafe24AdminChange(target) {
     const key = target.getAttribute("data-admin-cafe24-filter") || "";
     if (key === "payment") state.ui.adminCafe24PaymentFilter = target.value || "all";
     if (key === "mapping") state.ui.adminCafe24MappingFilter = target.value || "all";
+    if (key === "status") state.ui.adminCafe24StatusFilter = target.value || "all";
     if (key === "search") state.ui.adminCafe24Search = target.value || "";
+    state.ui.adminCafe24OrderPage = 1;
+    await refreshCafe24OrderItems({ force: true });
     renderRoute();
     return true;
   }
@@ -91,6 +120,18 @@ export async function handleCafe24AdminClick(closest) {
   if (cafe24TabButton) {
     state.ui = state.ui || {};
     state.ui.adminCafe24Tab = cafe24TabButton.getAttribute("data-admin-cafe24-tab") || "queue";
+    if (state.ui.adminCafe24Tab === "queue" || state.ui.adminCafe24Tab === "monitor") {
+      await refreshCafe24OrderItems({ force: true });
+    }
+    renderRoute();
+    return true;
+  }
+
+  const cafe24PageButton = closest("[data-admin-cafe24-page]");
+  if (cafe24PageButton) {
+    const page = Number(cafe24PageButton.getAttribute("data-admin-cafe24-page") || "1");
+    state.ui.adminCafe24OrderPage = Number.isFinite(page) && page > 0 ? page : 1;
+    await refreshCafe24OrderItems({ force: true });
     renderRoute();
     return true;
   }
@@ -154,10 +195,11 @@ export async function handleCafe24AdminClick(closest) {
         submitReady: false,
         startDate: formData.get("pollStartDate"),
         endDate: formData.get("pollEndDate"),
-        includeAllStatuses: Boolean(formData.get("pollIncludeAllStatuses")),
       });
       state.adminCafe24LastPollResult = result;
       await refreshAdminData({ preserveDraft: true });
+      state.ui.adminCafe24OrderPage = 1;
+      await refreshCafe24OrderItems({ force: true });
       showToast(`Cafe24 수집 완료: ${result.processed || 0}개 처리, ${result.blocked || 0}개 차단`);
       renderRoute();
     } catch (error) {
@@ -184,6 +226,8 @@ export async function handleCafe24AdminClick(closest) {
       });
       state.adminCafe24LastPollResult = result;
       await refreshAdminData({ preserveDraft: true });
+      state.ui.adminCafe24OrderPage = 1;
+      await refreshCafe24OrderItems({ force: true });
       showToast(`Cafe24 주문번호 재수집 완료: ${result.processed || 0}개 품주 저장`);
       renderRoute();
     } catch (error) {
@@ -198,6 +242,7 @@ export async function handleCafe24AdminClick(closest) {
     try {
       await apiPost("/api/admin/cafe24/mappings/delete", { mappingId });
       await refreshAdminData({ preserveDraft: true });
+      await refreshCafe24OrderItems({ force: true });
       showToast("Cafe24 상품 매핑을 비활성화했습니다.");
       renderRoute();
     } catch (error) {
@@ -212,6 +257,7 @@ export async function handleCafe24AdminClick(closest) {
     try {
       const result = await apiPost("/api/admin/cafe24/order-items/retry", { itemId });
       await refreshAdminData({ preserveDraft: true });
+      await refreshCafe24OrderItems({ force: true });
       showToast(`Cafe24 품주 재처리: ${result.result?.status || "처리됨"}`);
       renderRoute();
     } catch (error) {
@@ -226,6 +272,7 @@ export async function handleCafe24AdminClick(closest) {
     try {
       const result = await apiPost("/api/admin/cafe24/order-items/dispatch", { itemId });
       await refreshAdminData({ preserveDraft: true });
+      await refreshCafe24OrderItems({ force: true });
       showToast(`Cafe24 공급사 발주: ${result.status || "처리됨"}`);
       renderRoute();
     } catch (error) {
@@ -240,6 +287,7 @@ export async function handleCafe24AdminClick(closest) {
     try {
       const result = await apiPost("/api/admin/cafe24/order-items/resync", { itemId });
       await refreshAdminData({ preserveDraft: true });
+      await refreshCafe24OrderItems({ force: true });
       showToast(`Cafe24 품주 재동기화: ${result.result?.status || "확인됨"}`);
       renderRoute();
     } catch (error) {
@@ -299,6 +347,7 @@ export async function handleCafe24AdminSubmit(form, event) {
         isActive: Boolean(formData.get("isActive")),
       });
       await refreshAdminData({ preserveDraft: true });
+      await refreshCafe24OrderItems({ force: true });
       showToast(`${result.integration.mallId} Cafe24 연동을 저장했습니다.`);
       renderRoute();
     } catch (error) {
@@ -327,6 +376,7 @@ export async function handleCafe24AdminSubmit(form, event) {
         enabled: true,
       });
       await refreshAdminData({ preserveDraft: true });
+      await refreshCafe24OrderItems({ force: true });
       showToast(`${result.mapping.internalProductName || "Cafe24"} 매핑을 저장했습니다.`);
       form.reset();
       renderRoute();
@@ -346,6 +396,7 @@ export async function handleCafe24AdminSubmit(form, event) {
         memo: formData.get("memo"),
       });
       await refreshAdminData({ preserveDraft: true });
+      await refreshCafe24OrderItems({ force: true });
       showToast("Cafe24 품주 상태를 저장했습니다.");
       renderRoute();
     } catch (error) {

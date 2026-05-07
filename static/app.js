@@ -11,11 +11,7 @@ import {
   renderLegalPage,
   renderFrame,
 } from "./public/pages.js";
-import {
-  configureAdminPages,
-  renderAdminAuth,
-  renderAdmin,
-} from "./admin/pages.js";
+import { configureAdminPages, renderAdminAuth, renderAdmin } from "./admin/pages.js";
 import {
   configureAdminSections,
   formatAnalyticsTooltipValue,
@@ -36,12 +32,7 @@ import {
   updateAdminPlatformSectionPreview,
   updateAdminSiteSettingsPreview,
 } from "./admin/sections.js";
-import {
-  configureCafe24AdminActions,
-  handleCafe24AdminChange,
-  handleCafe24AdminClick,
-  handleCafe24AdminSubmit,
-} from "./admin/cafe24.js";
+import { configureCafe24AdminActions, cafe24OrderItemsQueryKey, handleCafe24AdminChange, handleCafe24AdminClick, handleCafe24AdminSubmit, refreshCafe24OrderItems } from "./admin/cafe24.js";
 import { parseRoute } from "./shared/routes.js";
 import { createRuntimeConfig } from "./shared/runtime.js";
 import { blankPublicAuthState, blankSignupState, evaluatePublicPasswordStrength } from "./public/auth-state.js";
@@ -1546,6 +1537,9 @@ async function refreshAdminData({ preserveDraft = true } = {}) {
     }
   });
   syncAdminSelections({ preserveDraft });
+  if ((data.cafe24Integrations || []).length) {
+    await refreshCafe24OrderItems({ force: true });
+  }
   return data;
 }
 
@@ -2834,6 +2828,7 @@ configureCafe24AdminActions({
   apiGet,
   apiPost,
   refreshAdminData,
+  refreshCafe24OrderItems,
   renderRoute,
   showToast,
 });
@@ -2882,6 +2877,13 @@ async function renderRoute() {
         showLoading("Cafe24 매핑용 공급사 서비스를 불러오는 중...");
         await ensureAdminSupplierServices(selectedCafe24SupplierId);
         state.ui.adminCafe24SelectedSupplierId = selectedCafe24SupplierId;
+      }
+      if (state.ui.adminActiveSection === "cafe24") {
+        const nextCafe24OrderListKey = cafe24OrderItemsQueryKey();
+        if (!state.adminCafe24OrderList || state.adminCafe24OrderListKey !== nextCafe24OrderListKey) {
+          showLoading("Cafe24 주문 1개월 목록을 불러오는 중...");
+          await refreshCafe24OrderItems();
+        }
       }
     }
     if (route.name === "detail") {

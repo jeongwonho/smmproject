@@ -927,6 +927,29 @@ class AppHandler(SimpleHTTPRequestHandler):
                 payload["cafe24OAuthRedirectUri"] = self._cafe24_oauth_redirect_uri()
                 write_json(self, 200, {"ok": True, **payload})
                 return
+            if parsed.path == "/api/admin/cafe24/order-items":
+                query = parse_qs(parsed.query)
+                write_json(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        **self._server().store.list_cafe24_order_items(
+                            {
+                                "integrationId": query.get("integrationId", [""])[0],
+                                "from": query.get("from", [""])[0],
+                                "to": query.get("to", [""])[0],
+                                "page": query.get("page", ["1"])[0],
+                                "pageSize": query.get("pageSize", ["5"])[0],
+                                "payment": query.get("payment", ["all"])[0],
+                                "mapping": query.get("mapping", ["all"])[0],
+                                "status": query.get("status", ["all"])[0],
+                                "search": query.get("q", query.get("search", [""]))[0],
+                            }
+                        ),
+                    },
+                )
+                return
             if parsed.path.startswith("/api/admin/customers/"):
                 customer_id = parsed.path.rsplit("/", 1)[-1]
                 write_json(self, 200, {"ok": True, **self._server().store.get_customer_detail(customer_id)})

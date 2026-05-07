@@ -64,10 +64,11 @@ class FailingCafe24ProductClient:
 class FakeCafe24OrderClient:
     def __init__(self, order_payload):
         self.order_payload = order_payload
+        self.order_pages = None
         self.orders_calls = []
         self.order_calls = []
 
-    def orders(self, *, start_date, end_date, statuses=None, order_id="", limit=100):
+    def orders(self, *, start_date, end_date, statuses=None, order_id="", limit=100, offset=0, date_type="order_date"):
         self.orders_calls.append(
             {
                 "start_date": start_date,
@@ -75,8 +76,12 @@ class FakeCafe24OrderClient:
                 "statuses": statuses,
                 "order_id": order_id,
                 "limit": limit,
+                "offset": offset,
+                "date_type": date_type,
             }
         )
+        if self.order_pages is not None:
+            return {"orders": self.order_pages.get(offset, [])}
         return {"orders": [self.order_payload]}
 
     def order(self, order_id):
@@ -400,6 +405,50 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(item["payment_status_source"], "order_status")
         self.assertEqual(item["payment_gate_status"], "payment_confirmed")
 
+    def test_poll_collects_all_offset_pages(self):
+        first_page = []
+        for index in range(1000):
+            payload = json.loads(json.dumps(self._order_payload()))
+            payload["order_id"] = f"20260427-{index:06d}"
+            payload["items"][0]["order_item_code"] = f"20260427-{index:06d}-01"
+            first_page.append(payload)
+        second_payload = json.loads(json.dumps(self._order_payload()))
+        second_payload["order_id"] = "20260428-999999"
+        second_payload["items"][0]["order_item_code"] = "20260428-999999-01"
+        fake_client = FakeCafe24OrderClient(self._order_payload())
+        fake_client.order_pages = {0: first_page, 1000: [second_payload]}
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client):
+            result = self.store.poll_cafe24_orders({"integrationId": self.integration["id"]})
+
+        self.assertEqual(len(fake_client.orders_calls), 2)
+        self.assertEqual(fake_client.orders_calls[0]["offset"], 0)
+        self.assertEqual(fake_client.orders_calls[1]["offset"], 1000)
+        self.assertEqual(result["summary"]["responseOrderCount"], 1001)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM cafe24_order_items").fetchone()[0], 1001)
+
+    def test_cafe24_payment_status_codes_pat_are_paid(self):
+        for status in ("P", "A", "T"):
+            self.conn.execute("DELETE FROM cafe24_order_items")
+            self.conn.commit()
+            order_payload = self._order_payload()
+            order_payload["payment_status"] = status
+            result = self.store._process_cafe24_item(
+                self.conn,
+                integration=self._integration_row(),
+                order_payload=order_payload,
+                item_payload=order_payload["items"][0],
+                index=0,
+                submit_ready=False,
+            )
+            self.conn.commit()
+
+            self.assertEqual(result["status"], "ready_to_submit")
+            item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+            self.assertEqual(item["payment_status"], "paid")
+            self.assertEqual(item["payment_status_source"], "payload")
+            self.assertEqual(item["payment_gate_status"], "payment_confirmed")
+
     def test_n00_order_is_saved_but_blocked_from_dispatch(self):
         order_payload = self._order_payload()
         order_payload["order_status"] = "N00"
@@ -439,7 +488,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(item["payment_gate_status"], "cancelled")
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM cafe24_order_items").fetchone()[0], 1)
 
-    def test_manual_poll_uses_today_window_even_when_last_poll_is_recent(self):
+    def test_manual_poll_uses_month_window_even_when_last_poll_is_recent(self):
         recent = dt.datetime.now().astimezone().isoformat(timespec="seconds")
         self.conn.execute(
             "UPDATE cafe24_integrations SET last_poll_at = ? WHERE id = ?",
@@ -453,10 +502,41 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
 
         self.assertEqual(len(fake_client.orders_calls), 1)
         call = fake_client.orders_calls[0]
-        expected_date = dt.datetime.now().astimezone().strftime("%Y-%m-%d")
-        self.assertEqual(call["start_date"], f"{expected_date} 00:00:00")
-        self.assertRegex(call["end_date"], rf"^{expected_date} \d{{2}}:\d{{2}}:\d{{2}}$")
+        expected_start = (dt.datetime.now().astimezone() - dt.timedelta(days=30)).strftime("%Y-%m-%d")
+        expected_end = dt.datetime.now().astimezone().strftime("%Y-%m-%d")
+        self.assertEqual(call["start_date"], f"{expected_start} 00:00:00")
+        self.assertRegex(call["end_date"], rf"^{expected_end} \d{{2}}:\d{{2}}:\d{{2}}$")
         self.assertIsNone(call["statuses"])
+        self.assertEqual(call["limit"], 1000)
+        self.assertEqual(call["offset"], 0)
+        self.assertEqual(call["date_type"], "order_date")
+
+    def test_cafe24_order_items_list_defaults_to_five_per_page_for_month_window(self):
+        for index in range(6):
+            payload = json.loads(json.dumps(self._order_payload()))
+            payload["order_id"] = f"20260429-{index:06d}"
+            payload["items"][0]["order_item_code"] = f"20260429-{index:06d}-01"
+            payload["buyer"]["name"] = f"구매자{index}"
+            self.store._process_cafe24_item(
+                self.conn,
+                integration=self._integration_row(),
+                order_payload=payload,
+                item_payload=payload["items"][0],
+                index=0,
+                submit_ready=False,
+            )
+        self.conn.commit()
+
+        first_page = self.store.list_cafe24_order_items({"page": "1"})
+        second_page = self.store.list_cafe24_order_items({"page": "2"})
+        searched = self.store.list_cafe24_order_items({"q": "20260429-000005"})
+
+        self.assertEqual(first_page["pagination"]["pageSize"], 5)
+        self.assertEqual(first_page["pagination"]["total"], 6)
+        self.assertEqual(first_page["pagination"]["totalPages"], 2)
+        self.assertEqual(len(first_page["items"]), 5)
+        self.assertEqual(len(second_page["items"]), 1)
+        self.assertEqual(searched["pagination"]["total"], 1)
 
     def test_order_id_resync_is_idempotent(self):
         fake_client = FakeCafe24OrderClient(self._order_payload())
