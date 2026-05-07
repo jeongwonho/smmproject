@@ -129,10 +129,13 @@ CAFE24_TOKEN_STATUS_REFRESHING = "refreshing"
 CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED = "reconnect_required"
 CAFE24_TOKEN_STATUS_FAILED = "failed"
 CAFE24_ORDER_OVERLAP_MINUTES = 20
+CAFE24_ORDER_DEFAULT_LOOKBACK_DAYS = 30
+CAFE24_ORDER_PAGE_LIMIT = 1000
+CAFE24_ORDER_MAX_PAGES = 30
 CAFE24_ORDER_ELIGIBLE_STATUSES = {"N10", "N20", "N21", "N22", "N30", "N40", "N50"}
 CAFE24_ORDER_UNPAID_STATUSES = {"N00"}
 CAFE24_ORDER_CANCELLED_PREFIXES = ("C", "R", "E")
-CAFE24_PAYMENT_PAID_STATUSES = {"paid", "payment_confirmed", "confirmed", "complete", "completed", "done", "y", "true", "t"}
+CAFE24_PAYMENT_PAID_STATUSES = {"paid", "payment_confirmed", "confirmed", "complete", "completed", "done", "y", "true", "p", "a", "t"}
 CAFE24_PAYMENT_PENDING_STATUSES = {"unpaid", "awaiting_payment", "pending", "ready", "waiting", "n", "false", "f"}
 CAFE24_PAYMENT_CANCELLED_STATUSES = {"canceled", "cancelled", "cancel", "refunded", "refund", "void"}
 CAFE24_STANDARD_STATUSES = {
@@ -1043,6 +1046,7 @@ CREATE TABLE IF NOT EXISTS cafe24_order_items (
     cafe24_product_no TEXT NOT NULL DEFAULT '',
     cafe24_variant_code TEXT NOT NULL DEFAULT '',
     cafe24_custom_product_code TEXT NOT NULL DEFAULT '',
+    cafe24_order_date TEXT NOT NULL DEFAULT '',
     buyer_name TEXT NOT NULL DEFAULT '',
     buyer_email TEXT NOT NULL DEFAULT '',
     buyer_phone TEXT NOT NULL DEFAULT '',
@@ -1081,6 +1085,9 @@ CREATE TABLE IF NOT EXISTS cafe24_order_items (
 
 CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_status_updated_at
     ON cafe24_order_items(standard_status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_order_date
+    ON cafe24_order_items(mall_id, shop_no, cafe24_order_date DESC);
 
 CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_internal_order
     ON cafe24_order_items(internal_order_id);
@@ -2165,6 +2172,52 @@ def cafe24_payment_snapshot_from_payload(order_payload: Dict[str, Any], item_pay
     }
 
 
+def cafe24_normalize_datetime_text(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    normalized = raw.replace("T", " ")
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(normalized)
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone()
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
+            return f"{raw} 00:00:00"
+        if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", normalized):
+            return normalized[:19]
+    return raw[:19]
+
+
+def cafe24_order_date_from_payload(order_payload: Dict[str, Any], item_payload: Dict[str, Any]) -> str:
+    candidates: List[Dict[str, Any]] = []
+    for payload in (item_payload, order_payload):
+        if isinstance(payload, dict):
+            candidates.append(payload)
+    keys = (
+        "order_date",
+        "orderDate",
+        "ordered_date",
+        "orderedDate",
+        "created_date",
+        "createdDate",
+        "created_at",
+        "createdAt",
+        "order_datetime",
+        "orderDatetime",
+        "date",
+    )
+    for candidate in candidates:
+        value = cafe24_payload_value(candidate, keys)
+        if value:
+            return cafe24_normalize_datetime_text(value)
+    payment_snapshot = cafe24_payment_snapshot_from_payload(order_payload, item_payload)
+    return cafe24_normalize_datetime_text(payment_snapshot.get("paidAt"))
+
+
 def cafe24_payment_gate_status(order_status: Any, payment_status: Any) -> str:
     order_value = str(order_status or "").strip()
     normalized_payment = normalize_cafe24_payment_status(payment_status)
@@ -2204,7 +2257,12 @@ def cafe24_poll_datetime_window(
     overlap_minutes: int = CAFE24_ORDER_OVERLAP_MINUTES,
 ) -> Dict[str, str]:
     now = dt.datetime.now().astimezone()
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    default_start = (now - dt.timedelta(days=CAFE24_ORDER_DEFAULT_LOOKBACK_DAYS)).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
 
     def parse_bound(value: str, *, is_end: bool) -> Optional[dt.datetime]:
         raw = str(value or "").strip()
@@ -2230,7 +2288,7 @@ def cafe24_poll_datetime_window(
     start = parse_bound(start_raw, is_end=False)
     end = parse_bound(end_raw, is_end=True)
     if start is None:
-        start = today_start
+        start = default_start
     if use_cursor and last_poll_at:
         try:
             parsed = dt.datetime.fromisoformat(last_poll_at)
@@ -3466,12 +3524,16 @@ class Cafe24ApiClient:
         end_date: str,
         statuses: Optional[List[str]] = None,
         order_id: str = "",
-        limit: int = 100,
+        limit: int = CAFE24_ORDER_PAGE_LIMIT,
+        offset: int = 0,
+        date_type: str = "order_date",
     ) -> Any:
         query: Dict[str, Any] = {
             "start_date": start_date,
             "end_date": end_date,
-            "limit": min(max(int(limit or 100), 1), 100),
+            "date_type": str(date_type or "order_date").strip() or "order_date",
+            "limit": min(max(int(limit or CAFE24_ORDER_PAGE_LIMIT), 1), CAFE24_ORDER_PAGE_LIMIT),
+            "offset": max(int(offset or 0), 0),
             "embed": "items,buyer,receivers",
         }
         if statuses:
@@ -5250,6 +5312,7 @@ class PanelStore:
         self._ensure_column(conn, "cafe24_integrations", "token_refresh_lock_owner", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_integrations", "reconnect_required_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_integrations", "reconnect_reason", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_order_items", "cafe24_order_date", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "payment_status", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "payment_status_source", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "payment_gate_status", "TEXT NOT NULL DEFAULT 'unverified'")
@@ -5262,6 +5325,12 @@ class PanelStore:
         self._ensure_column(conn, "cafe24_order_items", "supplier_service_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "supplier_external_service_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "supplier_response_json", "TEXT NOT NULL DEFAULT '{}'")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_order_date
+                ON cafe24_order_items(mall_id, shop_no, cafe24_order_date DESC)
+            """
+        )
         conn.execute("UPDATE cafe24_integrations SET auto_submit = 0 WHERE auto_submit != 0")
         self._migrate_cafe24_supplier_mappings(conn)
         self._ensure_bigint_columns(
@@ -5562,6 +5631,7 @@ class PanelStore:
                 cafe24_product_no TEXT NOT NULL DEFAULT '',
                 cafe24_variant_code TEXT NOT NULL DEFAULT '',
                 cafe24_custom_product_code TEXT NOT NULL DEFAULT '',
+                cafe24_order_date TEXT NOT NULL DEFAULT '',
                 buyer_name TEXT NOT NULL DEFAULT '',
                 buyer_email TEXT NOT NULL DEFAULT '',
                 buyer_phone TEXT NOT NULL DEFAULT '',
@@ -5599,6 +5669,8 @@ class PanelStore:
             );
             CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_status_updated_at
                 ON cafe24_order_items(standard_status, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_order_date
+                ON cafe24_order_items(mall_id, shop_no, cafe24_order_date DESC);
             CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_internal_order
                 ON cafe24_order_items(internal_order_id);
 
@@ -9609,6 +9681,7 @@ class PanelStore:
             "productNo": row["cafe24_product_no"],
             "variantCode": row["cafe24_variant_code"],
             "customProductCode": row["cafe24_custom_product_code"],
+            "orderDate": row.get("cafe24_order_date") or "",
             "buyerName": row["buyer_name"],
             "buyerEmailMasked": mask_email(row["buyer_email"]),
             "buyerPhoneMasked": mask_phone(row["buyer_phone"]),
@@ -9656,6 +9729,7 @@ class PanelStore:
                         row["cafe24_product_no"],
                         row["cafe24_variant_code"],
                         row["cafe24_custom_product_code"],
+                        row.get("cafe24_order_date") or "",
                         row["buyer_name"],
                         row.get("internal_product_name") or "",
                         row["standard_status"],
@@ -9699,6 +9773,126 @@ class PanelStore:
                 now_iso(),
             ),
         )
+
+    def list_cafe24_order_items(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        page = max(int(str(payload.get("page") or "1") or 1), 1)
+        page_size = min(max(int(str(payload.get("pageSize") or "5") or 5), 1), 50)
+        window = cafe24_poll_datetime_window(
+            start_raw=str(payload.get("from") or payload.get("startDate") or ""),
+            end_raw=str(payload.get("to") or payload.get("endDate") or ""),
+            use_cursor=False,
+        )
+        payment_filter = str(payload.get("payment") or "").strip()
+        mapping_filter = str(payload.get("mapping") or "").strip()
+        status_filter = str(payload.get("status") or "").strip()
+        search = str(payload.get("q") or payload.get("search") or "").strip().lower()
+        integration_id = str(payload.get("integrationId") or "").strip()
+        date_expr = (
+            "COALESCE(NULLIF(coi.cafe24_order_date, ''), NULLIF(coi.payment_paid_at, ''), "
+            "NULLIF(coi.last_synced_at, ''), coi.created_at)"
+        )
+        where: List[str] = [f"{date_expr} >= ?", f"{date_expr} <= ?"]
+        params: List[Any] = [window["start"], window["end"]]
+        summary_where: List[str] = list(where)
+        summary_params: List[Any] = list(params)
+        with self._connect() as conn:
+            if integration_id:
+                integration = self._cafe24_integration_row(conn, integration_id)
+                where.extend(["coi.mall_id = ?", "coi.shop_no = ?"])
+                params.extend([integration["mall_id"], int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO)])
+                summary_where.extend(["coi.mall_id = ?", "coi.shop_no = ?"])
+                summary_params.extend([integration["mall_id"], int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO)])
+            if payment_filter and payment_filter != "all":
+                where.append("coi.payment_gate_status = ?")
+                params.append(payment_filter)
+            if status_filter and status_filter != "all":
+                where.append("coi.standard_status = ?")
+                params.append(status_filter)
+            if mapping_filter == "mapped":
+                where.append("(coi.mapping_id <> '' OR coi.supplier_service_id <> '' OR coi.product_id <> '')")
+            elif mapping_filter == "unmapped":
+                where.append("(coi.mapping_id = '' AND coi.supplier_service_id = '' AND coi.product_id = '')")
+            if search:
+                searchable = (
+                    "LOWER(coi.mall_id || ' ' || coi.cafe24_order_id || ' ' || coi.cafe24_order_item_code || ' ' || "
+                    "coi.cafe24_product_no || ' ' || coi.cafe24_variant_code || ' ' || coi.cafe24_custom_product_code || ' ' || "
+                    "coi.buyer_name || ' ' || coi.payment_status || ' ' || coi.payment_gate_status || ' ' || "
+                    "coi.payment_method || ' ' || coi.payment_reference || ' ' || coi.standard_status || ' ' || coi.error_message)"
+                )
+                where.append(f"{searchable} LIKE ?")
+                params.append(f"%{search}%")
+            where_sql = " AND ".join(where)
+            summary_where_sql = " AND ".join(summary_where)
+            total_row = conn.execute(
+                f"SELECT COUNT(*) AS total_count FROM cafe24_order_items coi WHERE {where_sql}",
+                params,
+            ).fetchone()
+            total = int((total_row or {}).get("total_count") or 0)
+            offset = (page - 1) * page_size
+            rows = conn.execute(
+                f"""
+                SELECT
+                    coi.*,
+                    p.name AS internal_product_name,
+                    p.option_name AS internal_option_name
+                FROM cafe24_order_items coi
+                LEFT JOIN products p ON p.id = coi.product_id
+                WHERE {where_sql}
+                ORDER BY {date_expr} DESC, coi.updated_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, page_size, offset],
+            ).fetchall()
+            summary_row = conn.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS total_count,
+                    SUM(CASE WHEN coi.payment_gate_status = 'payment_confirmed' THEN 1 ELSE 0 END) AS payment_confirmed_count,
+                    SUM(CASE WHEN coi.payment_gate_status = 'payment_confirmed'
+                        AND coi.mapping_id = '' AND coi.supplier_service_id = '' AND coi.product_id = ''
+                        THEN 1 ELSE 0 END) AS unmapped_count,
+                    SUM(CASE WHEN coi.standard_status IN (
+                        'waiting_input', 'mapping_error', 'field_extract_failed', 'missing_required_field',
+                        'invalid_quantity', 'invalid_target', 'supplier_range_error', 'needs_manual_review',
+                        'payment_review_required'
+                    ) THEN 1 ELSE 0 END) AS review_required_count,
+                    SUM(CASE WHEN coi.standard_status = 'ready_to_submit'
+                        AND coi.payment_gate_status = 'payment_confirmed'
+                        AND coi.supplier_order_uuid = ''
+                        THEN 1 ELSE 0 END) AS ready_to_submit_count,
+                    SUM(CASE WHEN coi.standard_status = 'failed' THEN 1 ELSE 0 END) AS failed_count
+                FROM cafe24_order_items coi
+                WHERE {summary_where_sql}
+                """,
+                summary_params,
+            ).fetchone()
+        total_pages = max((total + page_size - 1) // page_size, 1)
+        return {
+            "items": [self._cafe24_order_item_payload(row) for row in rows],
+            "orderItems": [self._cafe24_order_item_payload(row) for row in rows],
+            "summary": {
+                "totalCount": int((summary_row or {}).get("total_count") or 0),
+                "paymentConfirmedCount": int((summary_row or {}).get("payment_confirmed_count") or 0),
+                "unmappedCount": int((summary_row or {}).get("unmapped_count") or 0),
+                "reviewRequiredCount": int((summary_row or {}).get("review_required_count") or 0),
+                "readyToSubmitCount": int((summary_row or {}).get("ready_to_submit_count") or 0),
+                "failedCount": int((summary_row or {}).get("failed_count") or 0),
+            },
+            "pagination": {
+                "page": page,
+                "pageSize": page_size,
+                "total": total,
+                "totalPages": total_pages,
+                "from": window["start"],
+                "to": window["end"],
+            },
+            "filters": {
+                "payment": payment_filter or "all",
+                "mapping": mapping_filter or "all",
+                "status": status_filter or "all",
+                "search": search,
+            },
+        }
 
     def create_cafe24_oauth_authorize_url(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         mall_id = re.sub(r"[^A-Za-z0-9_-]", "", str(payload.get("mallId") or "").strip())
@@ -11170,6 +11364,7 @@ class PanelStore:
         payment_status, payment_status_source = cafe24_payment_status_with_source(order_payload, item_payload, source_status)
         payment_gate_status = cafe24_payment_gate_status(source_status, payment_status)
         payment_snapshot = cafe24_payment_snapshot_from_payload(order_payload, item_payload)
+        order_date = cafe24_order_date_from_payload(order_payload, item_payload)
         status = normalize_cafe24_status(source_status)
         error_message = ""
         mapping_row = self._match_cafe24_mapping(conn, mall_id, shop_no, identity)
@@ -11289,18 +11484,19 @@ class PanelStore:
             INSERT INTO cafe24_order_items (
                 id, mall_id, shop_no, cafe24_order_id, cafe24_order_item_code,
                 cafe24_product_no, cafe24_variant_code, cafe24_custom_product_code,
-                buyer_name, buyer_email, buyer_phone, receiver_name, order_status_code,
+                cafe24_order_date, buyer_name, buyer_email, buyer_phone, receiver_name, order_status_code,
                 payment_status, payment_status_source, payment_gate_status, payment_method, payment_amount,
                 payment_paid_at, payment_reference, payment_snapshot_json, source_status, standard_status,
                 mapping_id, product_id, supplier_id, supplier_service_id, supplier_external_service_id,
                 normalized_fields_json, supplier_payload_json, raw_payload_json,
                 error_message, last_synced_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(mall_id, shop_no, cafe24_order_id, cafe24_order_item_code)
             DO UPDATE SET
                 cafe24_product_no = excluded.cafe24_product_no,
                 cafe24_variant_code = excluded.cafe24_variant_code,
                 cafe24_custom_product_code = excluded.cafe24_custom_product_code,
+                cafe24_order_date = excluded.cafe24_order_date,
                 buyer_name = excluded.buyer_name,
                 buyer_email = excluded.buyer_email,
                 buyer_phone = excluded.buyer_phone,
@@ -11341,6 +11537,7 @@ class PanelStore:
                 identity["productNo"],
                 identity["variantCode"],
                 identity["customProductCode"],
+                order_date,
                 cafe24_payload_value(buyer, ("name", "buyer_name")),
                 cafe24_payload_value(buyer, ("email", "buyer_email")),
                 cafe24_payload_value(buyer, ("cellphone", "phone", "mobile")),
@@ -11425,7 +11622,6 @@ class PanelStore:
     def poll_cafe24_orders(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         integration_id = str(payload.get("integrationId") or "").strip()
         submit_ready = bool(payload.get("submitReady", False))
-        include_all_statuses = bool(payload.get("includeAllStatuses", False))
         actor = self._admin_actor(payload)
         processed = 0
         waiting = 0
@@ -11464,18 +11660,30 @@ class PanelStore:
                 request_payload = {
                     "startDate": start_date,
                     "endDate": end_date,
+                    "dateType": "order_date",
                     "orderStatuses": status_filter or "all",
-                    "includeAllStatuses": include_all_statuses,
+                    "limit": CAFE24_ORDER_PAGE_LIMIT,
                 }
                 requested_windows.append({"mallId": mall_id, "shopNo": shop_no, **request_payload})
                 try:
                     client = self._cafe24_client_for_row(conn, integration)
-                    response = client.orders(
-                        start_date=start_date,
-                        end_date=end_date,
-                        statuses=status_filter,
-                    )
-                    orders = self._cafe24_orders_from_payload(response)
+                    orders: List[Dict[str, Any]] = []
+                    page_events: List[Dict[str, Any]] = []
+                    for page_index in range(CAFE24_ORDER_MAX_PAGES):
+                        offset = page_index * CAFE24_ORDER_PAGE_LIMIT
+                        response = client.orders(
+                            start_date=start_date,
+                            end_date=end_date,
+                            statuses=status_filter,
+                            limit=CAFE24_ORDER_PAGE_LIMIT,
+                            offset=offset,
+                            date_type="order_date",
+                        )
+                        page_orders = self._cafe24_orders_from_payload(response)
+                        page_events.append({"offset": offset, "count": len(page_orders)})
+                        orders.extend(page_orders)
+                        if len(page_orders) < CAFE24_ORDER_PAGE_LIMIT:
+                            break
                     response_order_count += len(orders)
                     self._log_cafe24_event(
                         conn,
@@ -11483,8 +11691,8 @@ class PanelStore:
                         shop_no=shop_no,
                         event_type="orders.poll",
                         status="success",
-                        request_payload=request_payload,
-                        response_payload={"orderCount": len(orders)},
+                        request_payload={**request_payload, "pages": page_events},
+                        response_payload={"orderCount": len(orders), "pages": page_events},
                     )
                     for order_payload in orders:
                         for index, item_payload in enumerate(self._cafe24_order_items_from_order(order_payload)):

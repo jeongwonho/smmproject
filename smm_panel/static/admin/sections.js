@@ -1,10 +1,9 @@
+import { renderCafe24Pagination, renderCafe24QueueToolbar } from "./cafe24-queue-ui.js";
 let runtime = {};
 let state = {};
 let DEFAULT_SITE_NAME = "인스타마트";
-let advancedOrderFieldBlueprints = {};
-let advancedOrderFieldKeys = [];
-let analyticsTabBlueprints = [];
-let analyticsRangeBlueprints = [];
+let advancedOrderFieldBlueprints = {}, advancedOrderFieldKeys = [];
+let analyticsTabBlueprints = [], analyticsRangeBlueprints = [];
 let statusMap = {};
 
 export function configureAdminSections(nextRuntime = {}) {
@@ -250,6 +249,7 @@ function cafe24OrderItemProductLabel(item = {}) {
 }
 
 function renderCafe24PaymentAuditPanel(orderItems = []) {
+  orderItems = Array.isArray(state.adminCafe24OrderList?.items) ? state.adminCafe24OrderList.items : orderItems;
   const paymentFilter = state.ui.adminCafe24PaymentFilter || "all";
   const mappingFilter = state.ui.adminCafe24MappingFilter || "all";
   const search = String(state.ui.adminCafe24Search || "").trim().toLowerCase();
@@ -1983,11 +1983,16 @@ function cafe24StatusTone(item = {}) {
 }
 
 function renderCafe24OpsBoard(orderItems = [], mappings = [], activeIntegration = {}) {
-  const paymentConfirmed = orderItems.filter((item) => item.paymentGateStatus === "payment_confirmed").length;
-  const readyToSubmit = orderItems.filter((item) => cafe24CanDispatchItem(item)).length;
-  const mappingMissing = orderItems.filter((item) => item.paymentGateStatus === "payment_confirmed" && !item.mappingId).length;
-  const needsReview = orderItems.filter((item) => ["waiting_input", "mapping_error", "field_extract_failed", "missing_required_field", "invalid_quantity", "invalid_target", "supplier_range_error", "needs_manual_review", "payment_review_required"].includes(item.standardStatus)).length;
-  const failed = orderItems.filter((item) => item.standardStatus === "failed").length;
+  const summary = state.adminCafe24OrderList?.summary || {};
+  const rangeLabel = state.adminCafe24OrderList?.pagination?.from && state.adminCafe24OrderList?.pagination?.to
+    ? `${state.adminCafe24OrderList.pagination.from.slice(0, 10)} ~ ${state.adminCafe24OrderList.pagination.to.slice(0, 10)}`
+    : "최근 1개월";
+  const totalCount = Number(summary.totalCount ?? orderItems.length ?? 0);
+  const paymentConfirmed = Number(summary.paymentConfirmedCount ?? orderItems.filter((item) => item.paymentGateStatus === "payment_confirmed").length);
+  const readyToSubmit = Number(summary.readyToSubmitCount ?? orderItems.filter((item) => cafe24CanDispatchItem(item)).length);
+  const mappingMissing = Number(summary.unmappedCount ?? orderItems.filter((item) => item.paymentGateStatus === "payment_confirmed" && !item.mappingId).length);
+  const needsReview = Number(summary.reviewRequiredCount ?? orderItems.filter((item) => ["waiting_input", "mapping_error", "field_extract_failed", "missing_required_field", "invalid_quantity", "invalid_target", "supplier_range_error", "needs_manual_review", "payment_review_required"].includes(item.standardStatus)).length);
+  const failed = Number(summary.failedCount ?? orderItems.filter((item) => item.standardStatus === "failed").length);
   const inProgress = orderItems.filter((item) => ["submitting", "supplier_submitted", "supplier_progress"].includes(item.standardStatus)).length;
   const completed = orderItems.filter((item) => item.standardStatus === "completed").length;
   const tokenRisk = !activeIntegration.id || ["reconnect_required", "failed"].includes(activeIntegration.tokenStatus || "");
@@ -1999,9 +2004,9 @@ function renderCafe24OpsBoard(orderItems = [], mappings = [], activeIntegration 
         <small>${escapeHtml(activeIntegration.mallId || "OAuth 연결 필요")}</small>
       </article>
       <article>
-        <span>오늘 수집 품주</span>
-        <strong>${escapeHtml(String(orderItems.length))}</strong>
-        <small>결제완료 ${escapeHtml(String(paymentConfirmed))}건</small>
+        <span>최근 1개월 주문</span>
+        <strong>${escapeHtml(String(totalCount))}</strong>
+        <small>${escapeHtml(rangeLabel)} · 결제완료 ${escapeHtml(String(paymentConfirmed))}건</small>
       </article>
       <article class="${mappingMissing ? "is-risk" : ""}">
         <span>매핑 필요</span>
@@ -2044,7 +2049,7 @@ function renderCafe24QuickControls(activeIntegration = {}) {
       <input type="hidden" name="scopes" value="${escapeHtml((activeIntegration.scopes || ["mall.read_order", "mall.write_order", "mall.read_product"]).join(","))}" />
       <div class="section-head section-head--compact">
         <h3>실시간 주문 조회</h3>
-        <p>오늘 주문을 즉시 다시 수집하거나, 누락 의심 주문번호를 직접 조회합니다. 자동 발주는 기본 OFF입니다.</p>
+        <p>최근 1개월 주문을 즉시 다시 수집하거나, 누락 의심 주문번호를 직접 조회합니다. 자동 발주는 기본 OFF입니다.</p>
       </div>
       <div class="cafe24-control-grid">
         <label class="form-field">
@@ -2074,7 +2079,7 @@ function renderCafe24QuickControls(activeIntegration = {}) {
         </div>
       </details>
       <div class="admin-action-row">
-        <button class="admin-primary-button" type="button" data-admin-cafe24-poll="${escapeHtml(activeIntegration.id || "")}" ${activeIntegration.id ? "" : "disabled"}>오늘 주문 실시간 조회</button>
+        <button class="admin-primary-button" type="button" data-admin-cafe24-poll="${escapeHtml(activeIntegration.id || "")}" ${activeIntegration.id ? "" : "disabled"}>최근 1개월 실시간 조회</button>
         <button class="admin-secondary-button" type="button" data-admin-cafe24-resync-by-id="${escapeHtml(activeIntegration.id || "")}" ${activeIntegration.id ? "" : "disabled"}>주문번호 조회</button>
         <button class="admin-secondary-button" type="button" data-admin-cafe24-oauth-start>OAuth 연결/재연결</button>
         <button class="admin-secondary-button" type="submit">연동 저장</button>
@@ -2191,7 +2196,10 @@ function renderCafe24MappingPanel(activeIntegration = {}, products = [], supplie
 }
 
 function renderCafe24OrderQueuePanel(orderItems = []) {
-  const sortedItems = [...orderItems].sort((a, b) => {
+  const list = state.adminCafe24OrderList || {};
+  const pagination = list.pagination || { page: state.ui.adminCafe24OrderPage || 1, pageSize: 5, total: orderItems.length, totalPages: 1 };
+  const sourceItems = Array.isArray(list.items) ? list.items : orderItems;
+  const sortedItems = [...sourceItems].sort((a, b) => {
     const aScore = cafe24CanDispatchItem(a) ? 0 : a.standardStatus === "failed" ? 1 : !a.mappingId ? 2 : 3;
     const bScore = cafe24CanDispatchItem(b) ? 0 : b.standardStatus === "failed" ? 1 : !b.mappingId ? 2 : 3;
     return aScore - bScore;
@@ -2200,8 +2208,9 @@ function renderCafe24OrderQueuePanel(orderItems = []) {
     <div class="admin-panel">
       <div class="section-head section-head--compact">
         <h3>주문 처리 큐</h3>
-        <p>결제완료·매핑완료·필드검증 통과 품주만 공급사 발주가 활성화됩니다.</p>
+        <p>최근 1개월 Cafe24 품주를 5개씩 조회합니다. 결제완료·매핑완료·필드검증 통과 품주만 공급사 발주가 활성화됩니다.</p>
       </div>
+      ${renderCafe24QueueToolbar({ state, escapeHtml })}
       <div class="admin-order-list cafe24-order-list">
         ${sortedItems.length ? sortedItems.map((item) => {
           const canDispatchCafe24Item = cafe24CanDispatchItem(item);
@@ -2211,7 +2220,7 @@ function renderCafe24OrderQueuePanel(orderItems = []) {
                 <div>
                   <span class="order-card__platform">Cafe24 · ${escapeHtml(item.mallId)} / ${escapeHtml(String(item.shopNo))}</span>
                   <strong>${escapeHtml(cafe24OrderItemProductLabel(item))}</strong>
-                  <p>${escapeHtml(item.orderId)} · ${escapeHtml(item.orderItemCode)}</p>
+                  <p>${escapeHtml(item.orderId)} · ${escapeHtml(item.orderItemCode)}${item.orderDate ? ` · ${escapeHtml(item.orderDate)}` : ""}</p>
                 </div>
                 <div class="admin-order-card__statusbox">
                   <span class="admin-order-card__number">${escapeHtml(item.orderStatusCode || "-")}</span>
@@ -2259,8 +2268,9 @@ function renderCafe24OrderQueuePanel(orderItems = []) {
               </form>
             </article>
           `;
-        }).join("") : `<div class="admin-empty-card"><strong>수집된 Cafe24 주문이 없습니다.</strong><p>상단에서 오늘 주문 실시간 조회를 실행하거나 주문번호로 직접 조회해 주세요.</p></div>`}
+        }).join("") : `<div class="admin-empty-card"><strong>조건에 맞는 Cafe24 주문이 없습니다.</strong><p>상단에서 최근 1개월 실시간 조회를 실행하거나 주문번호로 직접 조회해 주세요.</p></div>`}
       </div>
+      ${renderCafe24Pagination({ pagination, escapeHtml })}
     </div>
   `;
 }
@@ -2304,7 +2314,7 @@ function renderCafe24ConnectionPanel(activeIntegration = {}, cafe24OAuthRedirect
 function renderCafe24AdminSection() {
   const integrations = state.adminBootstrap?.cafe24Integrations || [];
   const mappings = state.adminBootstrap?.cafe24ProductMappings || [];
-  const orderItems = state.adminBootstrap?.cafe24OrderItems || [];
+  const orderItems = state.adminCafe24OrderList?.items || state.adminBootstrap?.cafe24OrderItems || [];
   const cafe24OAuthRedirectUri = state.adminBootstrap?.cafe24OAuthRedirectUri || "";
   const products = getAdminProducts();
   const suppliers = getAdminSuppliers();
