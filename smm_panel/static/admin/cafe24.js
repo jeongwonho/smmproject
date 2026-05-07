@@ -17,7 +17,6 @@ function callRuntime(name, ...args) {
 function apiGet(...args) { return callRuntime("apiGet", ...args); }
 function apiPost(...args) { return callRuntime("apiPost", ...args); }
 function refreshAdminData(...args) { return callRuntime("refreshAdminData", ...args); }
-function refreshCafe24OrderItems(...args) { return callRuntime("refreshCafe24OrderItems", ...args); }
 function renderRoute(...args) { return callRuntime("renderRoute", ...args); }
 function showToast(...args) { return callRuntime("showToast", ...args); }
 
