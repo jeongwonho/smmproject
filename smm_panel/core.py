@@ -3523,6 +3523,7 @@ class Cafe24ApiClient:
         start_date: str,
         end_date: str,
         statuses: Optional[List[str]] = None,
+        payment_statuses: Optional[List[str]] = None,
         order_id: str = "",
         limit: int = CAFE24_ORDER_PAGE_LIMIT,
         offset: int = 0,
@@ -3538,6 +3539,8 @@ class Cafe24ApiClient:
         }
         if statuses:
             query["order_status"] = ",".join(statuses)
+        if payment_statuses:
+            query["payment_status"] = ",".join(payment_statuses)
         normalized_order_id = str(order_id or "").strip()
         if normalized_order_id:
             query["order_id"] = normalized_order_id
@@ -3550,10 +3553,24 @@ class Cafe24ApiClient:
             query={"embed": "items,buyer,receivers"},
         )
 
-    def order_count(self, *, start_date: str, end_date: str, statuses: Optional[List[str]] = None) -> Any:
-        query: Dict[str, Any] = {"start_date": start_date, "end_date": end_date}
+    def order_count(
+        self,
+        *,
+        start_date: str,
+        end_date: str,
+        statuses: Optional[List[str]] = None,
+        payment_statuses: Optional[List[str]] = None,
+        date_type: str = "order_date",
+    ) -> Any:
+        query: Dict[str, Any] = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "date_type": str(date_type or "order_date").strip() or "order_date",
+        }
         if statuses:
             query["order_status"] = ",".join(statuses)
+        if payment_statuses:
+            query["payment_status"] = ",".join(payment_statuses)
         return self._request("GET", "/admin/orders/count", query=query)
 
     def update_order(self, order_id: str, payload: Dict[str, Any]) -> Any:
@@ -10820,13 +10837,19 @@ class PanelStore:
         return []
 
     def _cafe24_order_items_from_order(self, order_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-        for key in ("items", "order_items", "orderItems"):
+        for key in ("items", "item", "order_items", "orderItems"):
             value = order_payload.get(key)
             if isinstance(value, list):
                 return [item for item in value if isinstance(item, dict)]
             if isinstance(value, dict):
                 return [value]
         return [order_payload]
+
+    def _cafe24_order_has_embedded_items(self, order_payload: Dict[str, Any]) -> bool:
+        return any(
+            isinstance(order_payload.get(key), (list, dict))
+            for key in ("items", "item", "order_items", "orderItems")
+        )
 
     def _cafe24_item_code(self, order_payload: Dict[str, Any], item_payload: Dict[str, Any], index: int) -> str:
         code = cafe24_payload_value(
@@ -11673,6 +11696,9 @@ class PanelStore:
         errors: List[str] = []
         response_order_count = 0
         requested_windows: List[Dict[str, Any]] = []
+        query_pages: List[Dict[str, Any]] = []
+        detail_fetch_total = 0
+        detail_fetch_error_count = 0
         with self._connect() as conn:
             if integration_id:
                 integration_rows = [self._cafe24_integration_row(conn, integration_id)]
@@ -11702,30 +11728,67 @@ class PanelStore:
                 request_payload = {
                     "startDate": start_date,
                     "endDate": end_date,
-                    "dateType": "order_date",
                     "orderStatuses": status_filter or "all",
                     "limit": CAFE24_ORDER_PAGE_LIMIT,
                 }
                 requested_windows.append({"mallId": mall_id, "shopNo": shop_no, **request_payload})
                 try:
                     client = self._cafe24_client_for_row(conn, integration)
-                    orders: List[Dict[str, Any]] = []
+                    orders_by_key: Dict[str, Dict[str, Any]] = {}
                     page_events: List[Dict[str, Any]] = []
-                    for page_index in range(CAFE24_ORDER_MAX_PAGES):
-                        offset = page_index * CAFE24_ORDER_PAGE_LIMIT
-                        response = client.orders(
-                            start_date=start_date,
-                            end_date=end_date,
-                            statuses=status_filter,
-                            limit=CAFE24_ORDER_PAGE_LIMIT,
-                            offset=offset,
-                            date_type="order_date",
-                        )
-                        page_orders = self._cafe24_orders_from_payload(response)
-                        page_events.append({"offset": offset, "count": len(page_orders)})
-                        orders.extend(page_orders)
-                        if len(page_orders) < CAFE24_ORDER_PAGE_LIMIT:
+                    detail_fetch_count = 0
+                    detail_fetch_errors: List[str] = []
+                    query_variants = [
+                        {"dateType": "order_date", "paymentStatuses": None, "reason": "primary"},
+                        {"dateType": "pay_date", "paymentStatuses": ["P", "A", "T"], "reason": "paid-date-fallback"},
+                    ]
+                    for variant_index, variant in enumerate(query_variants):
+                        if variant_index > 0 and orders_by_key:
                             break
+                        date_type = str(variant["dateType"])
+                        payment_status_filter = variant["paymentStatuses"]
+                        for page_index in range(CAFE24_ORDER_MAX_PAGES):
+                            offset = page_index * CAFE24_ORDER_PAGE_LIMIT
+                            response = client.orders(
+                                start_date=start_date,
+                                end_date=end_date,
+                                statuses=status_filter,
+                                payment_statuses=payment_status_filter,
+                                limit=CAFE24_ORDER_PAGE_LIMIT,
+                                offset=offset,
+                                date_type=date_type,
+                            )
+                            page_orders = self._cafe24_orders_from_payload(response)
+                            page_events.append(
+                                {
+                                    "dateType": date_type,
+                                    "paymentStatuses": payment_status_filter or "all",
+                                    "reason": variant["reason"],
+                                    "offset": offset,
+                                    "count": len(page_orders),
+                                }
+                            )
+                            for order_payload in page_orders:
+                                order_id = cafe24_payload_value(order_payload, ("order_id", "order_no", "id"))
+                                if order_id and not self._cafe24_order_has_embedded_items(order_payload):
+                                    try:
+                                        detail_response = client.order(order_id)
+                                        detail_orders = self._cafe24_orders_from_payload(detail_response)
+                                        if detail_orders:
+                                            order_payload = detail_orders[0]
+                                            detail_fetch_count += 1
+                                    except Exception as detail_exc:
+                                        detail_fetch_errors.append(f"{order_id}: {str(detail_exc)[:200]}")
+                                order_key = order_id or f"{date_type}:{offset}:{len(orders_by_key)}"
+                                existing = orders_by_key.get(order_key)
+                                if existing is None or (
+                                    self._cafe24_order_has_embedded_items(order_payload)
+                                    and not self._cafe24_order_has_embedded_items(existing)
+                                ):
+                                    orders_by_key[order_key] = order_payload
+                            if len(page_orders) < CAFE24_ORDER_PAGE_LIMIT:
+                                break
+                    orders = list(orders_by_key.values())
                     response_order_count += len(orders)
                     self._log_cafe24_event(
                         conn,
@@ -11734,8 +11797,16 @@ class PanelStore:
                         event_type="orders.poll",
                         status="success",
                         request_payload={**request_payload, "pages": page_events},
-                        response_payload={"orderCount": len(orders), "pages": page_events},
+                        response_payload={
+                            "orderCount": len(orders),
+                            "pages": page_events,
+                            "detailFetchCount": detail_fetch_count,
+                            "detailFetchErrors": detail_fetch_errors,
+                        },
                     )
+                    query_pages.extend(page_events)
+                    detail_fetch_total += detail_fetch_count
+                    detail_fetch_error_count += len(detail_fetch_errors)
                     for order_payload in orders:
                         for index, item_payload in enumerate(self._cafe24_order_items_from_order(order_payload)):
                             result = self._process_cafe24_item(
@@ -11811,6 +11882,9 @@ class PanelStore:
             "submitReadyCount": max(processed - waiting - blocked - failed, 0),
             "submittedCount": submitted,
             "failedCount": failed,
+            "queryPages": query_pages,
+            "detailFetchCount": detail_fetch_total,
+            "detailFetchErrorCount": detail_fetch_error_count,
         }
         return {
             "processed": processed,

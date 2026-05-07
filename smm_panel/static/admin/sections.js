@@ -363,13 +363,9 @@ function renderCafe24CollectionResult(result = null) {
   if (!result) return "";
   const summary = result.summary || {};
   const windows = Array.isArray(summary.requestWindows) ? summary.requestWindows : [];
-  const requestLabel = windows.length
-    ? windows.map((item) => {
-      const statusLabel = Array.isArray(item.orderStatuses) ? item.orderStatuses.join(", ") : item.orderStatuses || "all";
-      const range = item.startDate && item.endDate ? `${item.startDate} ~ ${item.endDate}` : item.orderId || "-";
-      return `${item.mallId || "-"} / shop ${item.shopNo || "-"} · ${range} · status ${statusLabel}`;
-    }).join(" | ")
-    : "-";
+  const queryPages = Array.isArray(summary.queryPages) ? summary.queryPages : [];
+  const queryLabel = queryPages.map((page) => `${page.reason || "query"}:${page.dateType || "order_date"}:${Array.isArray(page.paymentStatuses) ? page.paymentStatuses.join("/") : page.paymentStatuses || "all"}:${page.count ?? 0}건`).join(" / ");
+  const requestLabel = windows.length ? windows.map((item) => `${item.mallId || "-"} / shop ${item.shopNo || "-"} · ${item.startDate && item.endDate ? `${item.startDate} ~ ${item.endDate}` : item.orderId || "-"} · status ${Array.isArray(item.orderStatuses) ? item.orderStatuses.join(", ") : item.orderStatuses || "all"}`).join(" | ") : "-";
   const errors = Array.isArray(result.errors) ? result.errors.filter(Boolean) : [];
   return `
     <div class="admin-empty-card">
@@ -382,6 +378,8 @@ function renderCafe24CollectionResult(result = null) {
         <article><span>검수 필요</span><strong>${escapeHtml(String(summary.reviewRequiredCount ?? result.waitingInput ?? 0))}</strong></article>
         <article><span>발주 대기</span><strong>${escapeHtml(String(summary.submitReadyCount ?? 0))}</strong></article>
       </div>
+      ${queryLabel ? `<p class="admin-inline-note">조회 상세: ${escapeHtml(queryLabel)}</p>` : ""}
+      ${summary.detailFetchCount ? `<p class="admin-inline-note">품주 상세 보강 조회: ${escapeHtml(String(summary.detailFetchCount))}건${summary.detailFetchErrorCount ? ` · 실패 ${escapeHtml(String(summary.detailFetchErrorCount))}건` : ""}</p>` : ""}
       ${errors.length ? `<p class="admin-inline-note is-danger">${escapeHtml(errors.join(" / "))}</p>` : ""}
     </div>
   `;
