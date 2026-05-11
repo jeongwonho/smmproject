@@ -9,15 +9,16 @@ import hmac
 import json
 import math
 import os
+import re
 import secrets
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse
 
 from core import APP_ROOT, DEFAULT_SITE_NAME, PanelError, PanelStore
@@ -79,6 +80,16 @@ def is_dev_runtime() -> bool:
     if mode in {"prod", "production", "live"}:
         return False
     return not bool(os.environ.get("VERCEL"))
+
+
+def cron_secret() -> str:
+    return str(os.environ.get("CRON_SECRET") or os.environ.get("SMM_PANEL_CRON_SECRET") or "").strip()
+
+
+def cron_authorization_valid(header_value: str) -> bool:
+    expected = cron_secret()
+    provided = str(header_value or "").strip()
+    return bool(expected and provided and hmac.compare_digest(provided, f"Bearer {expected}"))
 
 
 def parse_origins(raw_value: str) -> tuple[str, ...]:
@@ -564,6 +575,100 @@ class RuntimeContext:
 _RUNTIME_CONTEXT: RuntimeContext | None = None
 
 
+@dataclass(frozen=True)
+class RouteRequest:
+    path: str
+    parsed: Any
+    query: Dict[str, list[str]]
+    params: Dict[str, str]
+    payload: Dict[str, Any] = field(default_factory=dict)
+    raw_body: bytes = b""
+    admin_session: Optional[Dict[str, Any]] = None
+    public_session: Optional[Dict[str, Any]] = None
+
+
+RouteHandler = Callable[[Any, RouteRequest], None]
+
+
+def _compile_route_pattern(pattern: str) -> re.Pattern[str]:
+    parts: list[str] = []
+    cursor = 0
+    for match in re.finditer(r"<([a-zA-Z_][a-zA-Z0-9_]*)>", pattern):
+        parts.append(re.escape(pattern[cursor : match.start()]))
+        parts.append(f"(?P<{match.group(1)}>[^/]+)")
+        cursor = match.end()
+    parts.append(re.escape(pattern[cursor:]))
+    return re.compile(f"^{''.join(parts)}$")
+
+
+@dataclass(frozen=True)
+class RouteEntry:
+    method: str
+    pattern: str
+    handler: RouteHandler
+    auth: str = "none"
+    csrf: bool = False
+    trusted_origin: bool = False
+    read_json_body: bool = False
+    read_raw_json_body: bool = False
+    regex: re.Pattern[str] = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "regex", _compile_route_pattern(self.pattern))
+
+    def match(self, path: str) -> Optional[Dict[str, str]]:
+        matched = self.regex.match(path)
+        if matched is None:
+            return None
+        return {key: unquote(value) for key, value in matched.groupdict().items()}
+
+
+class RouterRegistry:
+    def __init__(self) -> None:
+        self.routes: Dict[str, list[RouteEntry]] = {"GET": [], "POST": []}
+
+    def add(self, entry: RouteEntry) -> None:
+        self.routes.setdefault(entry.method.upper(), []).append(entry)
+
+    def match(self, method: str, path: str) -> tuple[RouteEntry, Dict[str, str]] | None:
+        for entry in self.routes.get(method.upper(), []):
+            params = entry.match(path)
+            if params is not None:
+                return entry, params
+        return None
+
+
+ROUTER = RouterRegistry()
+
+
+def route(
+    method: str,
+    pattern: str,
+    *,
+    auth: str = "none",
+    csrf: bool = False,
+    trusted_origin: bool = False,
+    read_json_body: bool = False,
+    read_raw_json_body: bool = False,
+) -> Callable[[RouteHandler], RouteHandler]:
+    def decorator(handler: RouteHandler) -> RouteHandler:
+        ROUTER.add(
+            RouteEntry(
+                method=method.upper(),
+                pattern=pattern,
+                handler=handler,
+                auth=auth,
+                csrf=csrf,
+                trusted_origin=trusted_origin,
+                read_json_body=read_json_body,
+                read_raw_json_body=read_raw_json_body,
+            )
+        )
+        return handler
+
+    return decorator
+
+
 def build_runtime_context() -> RuntimeContext:
     session_secret = resolve_session_secret()
     return RuntimeContext(
@@ -728,7 +833,7 @@ class AppHandler(SimpleHTTPRequestHandler):
         if allowed_origin and self._request_path.startswith("/api/"):
             self.send_header("Access-Control-Allow-Origin", allowed_origin)
             self.send_header("Access-Control-Allow-Credentials", "true")
-            self.send_header("Access-Control-Allow-Headers", "Accept, Content-Type, X-SMM-CSRF-Token")
+            self.send_header("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, X-SMM-CSRF-Token")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Max-Age", "600")
             self.send_header("Vary", "Origin")
@@ -800,6 +905,12 @@ class AppHandler(SimpleHTTPRequestHandler):
         if not expected or not provided or not hmac.compare_digest(provided, expected):
             raise PanelError("로그인 세션 검증에 실패했습니다. 다시 로그인해 주세요.", status=403)
 
+    def _require_cron_auth(self) -> None:
+        if not cron_secret():
+            raise PanelError("CRON_SECRET 또는 SMM_PANEL_CRON_SECRET 환경변수가 필요합니다.", status=503)
+        if not cron_authorization_valid(self.headers.get("Authorization", "")):
+            raise PanelError("Cron 요청 인증에 실패했습니다.", status=401)
+
     def _public_session_payload(self) -> Dict[str, Any]:
         session = self._public_session()
         user = session.get("user") if session else None
@@ -839,251 +950,316 @@ class AppHandler(SimpleHTTPRequestHandler):
     def _public_cached_payload(self, cache_key: str, ttl_seconds: int, factory: Any) -> Dict[str, Any]:
         return self._server().public_cache.get_or_set(cache_key, ttl_seconds, factory)
 
+    def _query_value(self, request: RouteRequest, key: str, default: str = "") -> str:
+        return request.query.get(key, [default])[0]
+
+    def _dispatch_route(self, method: str, parsed: Any) -> bool:
+        matched = ROUTER.match(method, parsed.path)
+        if matched is None:
+            return False
+
+        entry, params = matched
+        if entry.trusted_origin:
+            self._require_trusted_origin()
+
+        admin_session: Optional[Dict[str, Any]] = None
+        public_session: Optional[Dict[str, Any]] = None
+        if entry.auth == "admin":
+            admin_session = self._require_admin_auth()
+            if entry.csrf:
+                self._require_admin_csrf(admin_session)
+        elif entry.auth == "public":
+            public_session = self._require_public_auth()
+            if entry.csrf:
+                self._require_public_csrf(public_session)
+        elif entry.auth == "cron":
+            self._require_cron_auth()
+        elif entry.auth != "none":
+            raise PanelError("라우트 인증 설정이 올바르지 않습니다.", status=500)
+
+        payload: Dict[str, Any] = {}
+        raw_body = b""
+        if entry.read_raw_json_body:
+            payload, raw_body = read_json_with_raw_body(self)
+        elif entry.read_json_body:
+            payload = read_json(self)
+        if admin_session is not None and (entry.read_json_body or entry.read_raw_json_body):
+            payload["_adminActor"] = str(admin_session.get("username") or "admin")
+
+        request = RouteRequest(
+            path=parsed.path,
+            parsed=parsed,
+            query=parse_qs(parsed.query),
+            params=params,
+            payload=payload,
+            raw_body=raw_body,
+            admin_session=admin_session,
+            public_session=public_session,
+        )
+        entry.handler(self, request)
+        return True
+
+    def _write_store_result(self, method_name: str, payload: Dict[str, Any]) -> None:
+        result = getattr(self._server().store, method_name)(payload)
+        write_json(self, 200, {"ok": True, **result})
+
+    @route("GET", "/api/health")
+    def _get_health(self, request: RouteRequest) -> None:
+        write_json(self, 200, {"ok": True, "service": f"{DEFAULT_SITE_NAME} Panel"})
+
+    @route("GET", "/api/cron/suppliers/sync", auth="cron")
+    def _get_cron_supplier_sync(self, request: RouteRequest) -> None:
+        limit = int(self._query_value(request, "limit", "10") or 10)
+        write_json(self, 200, {"ok": True, **self._server().store.sync_due_supplier_services(actor="cron", limit=limit)})
+
+    @route("GET", "/robots.txt")
+    def _get_robots(self, request: RouteRequest) -> None:
+        write_text(self, 200, ROBOTS_TXT)
+
+    @route("GET", "/api/admin/session")
+    def _get_admin_session(self, request: RouteRequest) -> None:
+        write_json(self, 200, {"ok": True, **self._server().admin_sessions.session_payload(self._admin_session_token())})
+
+    @route("GET", "/api/session")
+    def _get_public_session(self, request: RouteRequest) -> None:
+        write_json(self, 200, {"ok": True, **self._public_session_payload()})
+
+    @route("GET", "/api/public-shell")
+    def _get_public_shell(self, request: RouteRequest) -> None:
+        session = self._public_session()
+        user_id = str((session or {}).get("user", {}).get("id") or "")
+        payload = (
+            self._server().store.public_shell(user_id)
+            if user_id
+            else self._public_cached_payload("public-shell:v1", 15, lambda: self._server().store.public_shell(""))
+        )
+        payload["viewer"] = self._public_session_payload()
+        write_json(
+            self,
+            200,
+            {"ok": True, **payload},
+            cache_control="no-store" if session else "public, max-age=15, s-maxage=60, stale-while-revalidate=300",
+        )
+
+    @route("GET", "/api/bootstrap")
+    def _get_bootstrap(self, request: RouteRequest) -> None:
+        session = self._public_session()
+        user_id = str((session or {}).get("user", {}).get("id") or "")
+        payload = (
+            self._server().store.bootstrap(user_id)
+            if user_id
+            else self._public_cached_payload("bootstrap:v1", 15, lambda: self._server().store.bootstrap(""))
+        )
+        payload["viewer"] = self._public_session_payload()
+        write_json(
+            self,
+            200,
+            {"ok": True, **payload},
+            cache_control="no-store" if session else "public, max-age=15, s-maxage=60, stale-while-revalidate=300",
+        )
+
+    @route("GET", "/api/auth/oauth/<provider>/start")
+    def _get_oauth_start(self, request: RouteRequest) -> None:
+        provider = request.params.get("provider", "")
+        raise PanelError(f"{provider} OAuth는 환경변수 설정 후 활성화됩니다. 현재는 구조만 준비된 상태입니다.", status=503)
+
+    @route("GET", "/api/admin/cafe24/oauth/callback")
+    def _get_cafe24_oauth_callback(self, request: RouteRequest) -> None:
+        error = self._query_value(request, "error")
+        if error:
+            self._redirect(
+                "/admin/cafe24?"
+                + urlencode(
+                    {
+                        "cafe24OAuth": "error",
+                        "message": self._query_value(request, "error_description", error),
+                    }
+                )
+            )
+            return
+        try:
+            self._server().store.complete_cafe24_oauth_callback(
+                {
+                    "state": self._query_value(request, "state"),
+                    "code": self._query_value(request, "code"),
+                }
+            )
+            self._redirect("/admin/cafe24?cafe24OAuth=success")
+        except Exception as exc:
+            message = str(exc) if isinstance(exc, PanelError) else "Cafe24 OAuth 토큰 저장에 실패했습니다."
+            self._redirect("/admin/cafe24?" + urlencode({"cafe24OAuth": "error", "message": message}))
+
+    @route("GET", "/api/admin/bootstrap", auth="admin")
+    def _get_admin_bootstrap(self, request: RouteRequest) -> None:
+        payload = self._server().store.admin_bootstrap()
+        payload["cafe24OAuthRedirectUri"] = self._cafe24_oauth_redirect_uri()
+        write_json(self, 200, {"ok": True, **payload})
+
+    @route("GET", "/api/admin/cafe24/order-items", auth="admin")
+    def _get_admin_cafe24_order_items(self, request: RouteRequest) -> None:
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                **self._server().store.list_cafe24_order_items(
+                    {
+                        "integrationId": self._query_value(request, "integrationId"),
+                        "from": self._query_value(request, "from"),
+                        "to": self._query_value(request, "to"),
+                        "page": self._query_value(request, "page", "1"),
+                        "pageSize": self._query_value(request, "pageSize", "5"),
+                        "payment": self._query_value(request, "payment", "all"),
+                        "mapping": self._query_value(request, "mapping", "all"),
+                        "status": self._query_value(request, "status", "all"),
+                        "search": self._query_value(request, "q", self._query_value(request, "search")),
+                    }
+                ),
+            },
+        )
+
+    @route("GET", "/api/admin/customers/<customer_id>", auth="admin")
+    def _get_admin_customer_detail(self, request: RouteRequest) -> None:
+        write_json(self, 200, {"ok": True, **self._server().store.get_customer_detail(request.params["customer_id"])})
+
+    @route("GET", "/api/admin/cafe24/products", auth="admin")
+    def _get_admin_cafe24_products(self, request: RouteRequest) -> None:
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                **self._server().store.list_cafe24_products(
+                    {
+                        "integrationId": self._query_value(request, "integrationId"),
+                        "q": self._query_value(request, "q"),
+                        "productNo": self._query_value(request, "productNo"),
+                        "limit": self._query_value(request, "limit", "20"),
+                        "offset": self._query_value(request, "offset", "0"),
+                    }
+                ),
+            },
+        )
+
+    @route("GET", "/api/admin/cafe24/products/<product_no>", auth="admin")
+    def _get_admin_cafe24_product_detail(self, request: RouteRequest) -> None:
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                **self._server().store.get_cafe24_product_detail(
+                    {
+                        "integrationId": self._query_value(request, "integrationId"),
+                        "productNo": request.params["product_no"],
+                    }
+                ),
+            },
+        )
+
+    @route("GET", "/api/products")
+    def _get_products(self, request: RouteRequest) -> None:
+        write_json(
+            self,
+            200,
+            {"ok": True, **self._server().store.list_catalog(self._query_value(request, "q"))},
+            cache_control="public, max-age=30, s-maxage=120, stale-while-revalidate=600",
+        )
+
+    @route("GET", "/api/admin/suppliers/<supplier_id>/services", auth="admin")
+    def _get_admin_supplier_services(self, request: RouteRequest) -> None:
+        write_json(
+            self,
+            200,
+            {"ok": True, **self._server().store.list_supplier_services(request.params["supplier_id"], self._query_value(request, "q"))},
+        )
+
+    @route("GET", "/api/admin/suppliers/<supplier_id>/mkt24-product-settings/<product_uuid>", auth="admin")
+    def _get_admin_mkt24_product_setting(self, request: RouteRequest) -> None:
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                **self._server().store.get_mkt24_product_setting(
+                    {
+                        "supplierId": request.params["supplier_id"],
+                        "productUuid": request.params["product_uuid"],
+                        "refresh": self._query_value(request, "refresh", "0") in {"1", "true", "yes"},
+                    }
+                ),
+            },
+        )
+
+    @route("GET", "/api/product-categories/<category_id>")
+    def _get_product_category(self, request: RouteRequest) -> None:
+        write_json(
+            self,
+            200,
+            {"ok": True, "category": self._server().store.get_product_category(request.params["category_id"])},
+            cache_control="public, max-age=30, s-maxage=120, stale-while-revalidate=600",
+        )
+
+    @route("GET", "/api/orders", auth="public")
+    def _get_orders(self, request: RouteRequest) -> None:
+        user_id = str(request.public_session["user"]["id"]) if request.public_session else ""
+        write_json(self, 200, {"ok": True, **self._server().store.list_orders(self._query_value(request, "status"), user_id)})
+
+    @route("GET", "/api/wallet", auth="public")
+    def _get_wallet(self, request: RouteRequest) -> None:
+        user_id = str(request.public_session["user"]["id"]) if request.public_session else ""
+        write_json(self, 200, {"ok": True, **self._server().store.get_wallet(user_id)})
+
+    @route("GET", "/api/wallet/ledger", auth="public")
+    def _get_wallet_ledger(self, request: RouteRequest) -> None:
+        user_id = str(request.public_session["user"]["id"]) if request.public_session else ""
+        filters = {
+            "entryType": self._query_value(request, "entryType"),
+            "status": self._query_value(request, "status"),
+            "paymentChannel": self._query_value(request, "paymentChannel"),
+            "createdFrom": self._query_value(request, "createdFrom"),
+            "createdTo": self._query_value(request, "createdTo"),
+        }
+        write_json(
+            self,
+            200,
+            {"ok": True, **self._server().store.list_wallet_ledger(user_id, int(self._query_value(request, "limit", "50") or 50), filters)},
+        )
+
+    @route("GET", "/api/charge-orders", auth="public")
+    def _get_charge_orders(self, request: RouteRequest) -> None:
+        user_id = str(request.public_session["user"]["id"]) if request.public_session else ""
+        filters = {
+            "status": self._query_value(request, "status"),
+            "paymentChannel": self._query_value(request, "paymentChannel"),
+            "createdFrom": self._query_value(request, "createdFrom"),
+            "createdTo": self._query_value(request, "createdTo"),
+        }
+        write_json(
+            self,
+            200,
+            {"ok": True, **self._server().store.list_charge_orders(user_id, int(self._query_value(request, "limit", "50") or 50), filters)},
+        )
+
+    @route("GET", "/api/charge-orders/<charge_order_id>", auth="public")
+    def _get_charge_order(self, request: RouteRequest) -> None:
+        user_id = str(request.public_session["user"]["id"]) if request.public_session else ""
+        write_json(self, 200, {"ok": True, **self._server().store.get_charge_order(request.params["charge_order_id"], user_id)})
+
+    @route("GET", "/api/transactions", auth="public")
+    def _get_transactions(self, request: RouteRequest) -> None:
+        user_id = str(request.public_session["user"]["id"]) if request.public_session else ""
+        write_json(self, 200, {"ok": True, **self._server().store.list_transactions(user_id)})
+
     def do_GET(self) -> None:
         request_path = self._incoming_request_path(self.path)
         parsed = urlparse(request_path)
         self._request_path = parsed.path
         try:
-            if parsed.path == "/api/health":
-                write_json(self, 200, {"ok": True, "service": f"{DEFAULT_SITE_NAME} Panel"})
+            if self._dispatch_route("GET", parsed):
                 return
-            if parsed.path == "/robots.txt":
-                write_text(self, 200, ROBOTS_TXT)
-                return
-            if parsed.path == "/api/admin/session":
-                write_json(self, 200, {"ok": True, **self._server().admin_sessions.session_payload(self._admin_session_token())})
-                return
-            if parsed.path == "/api/session":
-                write_json(self, 200, {"ok": True, **self._public_session_payload()})
-                return
-            if parsed.path == "/api/public-shell":
-                session = self._public_session()
-                user_id = str((session or {}).get("user", {}).get("id") or "")
-                payload = (
-                    self._server().store.public_shell(user_id)
-                    if user_id
-                    else self._public_cached_payload("public-shell:v1", 15, lambda: self._server().store.public_shell(""))
-                )
-                payload["viewer"] = self._public_session_payload()
-                write_json(
-                    self,
-                    200,
-                    {"ok": True, **payload},
-                    cache_control="no-store" if session else "public, max-age=15, s-maxage=60, stale-while-revalidate=300",
-                )
-                return
-            if parsed.path == "/api/bootstrap":
-                session = self._public_session()
-                user_id = str((session or {}).get("user", {}).get("id") or "")
-                payload = (
-                    self._server().store.bootstrap(user_id)
-                    if user_id
-                    else self._public_cached_payload("bootstrap:v1", 15, lambda: self._server().store.bootstrap(""))
-                )
-                payload["viewer"] = self._public_session_payload()
-                write_json(
-                    self,
-                    200,
-                    {"ok": True, **payload},
-                    cache_control="no-store" if session else "public, max-age=15, s-maxage=60, stale-while-revalidate=300",
-                )
-                return
-            if parsed.path.startswith("/api/auth/oauth/") and parsed.path.endswith("/start"):
-                provider = parsed.path.split("/")[4]
-                raise PanelError(
-                    f"{provider} OAuth는 환경변수 설정 후 활성화됩니다. 현재는 구조만 준비된 상태입니다.",
-                    status=503,
-                )
-            if parsed.path == "/api/admin/cafe24/oauth/callback":
-                query = parse_qs(parsed.query)
-                error = query.get("error", [""])[0]
-                if error:
-                    self._redirect(
-                        "/admin/cafe24?"
-                        + urlencode(
-                            {
-                                "cafe24OAuth": "error",
-                                "message": query.get("error_description", [error])[0],
-                            }
-                        )
-                    )
-                    return
-                try:
-                    self._server().store.complete_cafe24_oauth_callback(
-                        {
-                            "state": query.get("state", [""])[0],
-                            "code": query.get("code", [""])[0],
-                        }
-                    )
-                    self._redirect("/admin/cafe24?cafe24OAuth=success")
-                except Exception as exc:
-                    message = str(exc) if isinstance(exc, PanelError) else "Cafe24 OAuth 토큰 저장에 실패했습니다."
-                    self._redirect("/admin/cafe24?" + urlencode({"cafe24OAuth": "error", "message": message}))
-                return
-            if parsed.path.startswith("/api/admin/"):
-                self._require_admin_auth()
-            if parsed.path == "/api/admin/bootstrap":
-                payload = self._server().store.admin_bootstrap()
-                payload["cafe24OAuthRedirectUri"] = self._cafe24_oauth_redirect_uri()
-                write_json(self, 200, {"ok": True, **payload})
-                return
-            if parsed.path == "/api/admin/cafe24/order-items":
-                query = parse_qs(parsed.query)
-                write_json(
-                    self,
-                    200,
-                    {
-                        "ok": True,
-                        **self._server().store.list_cafe24_order_items(
-                            {
-                                "integrationId": query.get("integrationId", [""])[0],
-                                "from": query.get("from", [""])[0],
-                                "to": query.get("to", [""])[0],
-                                "page": query.get("page", ["1"])[0],
-                                "pageSize": query.get("pageSize", ["5"])[0],
-                                "payment": query.get("payment", ["all"])[0],
-                                "mapping": query.get("mapping", ["all"])[0],
-                                "status": query.get("status", ["all"])[0],
-                                "search": query.get("q", query.get("search", [""]))[0],
-                            }
-                        ),
-                    },
-                )
-                return
-            if parsed.path.startswith("/api/admin/customers/"):
-                customer_id = parsed.path.rsplit("/", 1)[-1]
-                write_json(self, 200, {"ok": True, **self._server().store.get_customer_detail(customer_id)})
-                return
-            if parsed.path == "/api/admin/cafe24/products":
-                query = parse_qs(parsed.query)
-                write_json(
-                    self,
-                    200,
-                    {
-                        "ok": True,
-                        **self._server().store.list_cafe24_products(
-                            {
-                                "integrationId": query.get("integrationId", [""])[0],
-                                "q": query.get("q", [""])[0],
-                                "productNo": query.get("productNo", [""])[0],
-                                "limit": query.get("limit", ["20"])[0],
-                                "offset": query.get("offset", ["0"])[0],
-                            }
-                        ),
-                    },
-                )
-                return
-            if parsed.path.startswith("/api/admin/cafe24/products/"):
-                query = parse_qs(parsed.query)
-                product_no = parsed.path.rsplit("/", 1)[-1]
-                write_json(
-                    self,
-                    200,
-                    {
-                        "ok": True,
-                        **self._server().store.get_cafe24_product_detail(
-                            {
-                                "integrationId": query.get("integrationId", [""])[0],
-                                "productNo": product_no,
-                            }
-                        ),
-                    },
-                )
-                return
-            if parsed.path == "/api/products":
-                search = parse_qs(parsed.query).get("q", [""])[0]
-                write_json(
-                    self,
-                    200,
-                    {"ok": True, **self._server().store.list_catalog(search)},
-                    cache_control="public, max-age=30, s-maxage=120, stale-while-revalidate=600",
-                )
-                return
-            if parsed.path.startswith("/api/admin/suppliers/") and parsed.path.endswith("/services"):
-                supplier_id = parsed.path.split("/")[4]
-                search = parse_qs(parsed.query).get("q", [""])[0]
-                write_json(self, 200, {"ok": True, **self._server().store.list_supplier_services(supplier_id, search)})
-                return
-            if parsed.path.startswith("/api/admin/suppliers/") and "/mkt24-product-settings/" in parsed.path:
-                parts = parsed.path.split("/")
-                supplier_id = parts[4] if len(parts) > 4 else ""
-                product_uuid = unquote(parts[-1]) if parts else ""
-                query = parse_qs(parsed.query)
-                write_json(
-                    self,
-                    200,
-                    {
-                        "ok": True,
-                        **self._server().store.get_mkt24_product_setting(
-                            {
-                                "supplierId": supplier_id,
-                                "productUuid": product_uuid,
-                                "refresh": query.get("refresh", ["0"])[0] in {"1", "true", "yes"},
-                            }
-                        ),
-                    },
-                )
-                return
-            if parsed.path.startswith("/api/product-categories/"):
-                category_id = parsed.path.rsplit("/", 1)[-1]
-                write_json(
-                    self,
-                    200,
-                    {"ok": True, "category": self._server().store.get_product_category(category_id)},
-                    cache_control="public, max-age=30, s-maxage=120, stale-while-revalidate=600",
-                )
-                return
-            if parsed.path == "/api/orders":
-                session = self._require_public_auth()
-                status = parse_qs(parsed.query).get("status", [""])[0]
-                write_json(self, 200, {"ok": True, **self._server().store.list_orders(status, str(session["user"]["id"]))})
-                return
-            if parsed.path == "/api/wallet":
-                session = self._require_public_auth()
-                write_json(self, 200, {"ok": True, **self._server().store.get_wallet(str(session["user"]["id"]))})
-                return
-            if parsed.path == "/api/wallet/ledger":
-                session = self._require_public_auth()
-                query = parse_qs(parsed.query)
-                limit = query.get("limit", ["50"])[0]
-                filters = {
-                    "entryType": query.get("entryType", [""])[0],
-                    "status": query.get("status", [""])[0],
-                    "paymentChannel": query.get("paymentChannel", [""])[0],
-                    "createdFrom": query.get("createdFrom", [""])[0],
-                    "createdTo": query.get("createdTo", [""])[0],
-                }
-                write_json(
-                    self,
-                    200,
-                    {"ok": True, **self._server().store.list_wallet_ledger(str(session["user"]["id"]), int(limit or 50), filters)},
-                )
-                return
-            if parsed.path == "/api/charge-orders":
-                session = self._require_public_auth()
-                query = parse_qs(parsed.query)
-                limit = query.get("limit", ["50"])[0]
-                filters = {
-                    "status": query.get("status", [""])[0],
-                    "paymentChannel": query.get("paymentChannel", [""])[0],
-                    "createdFrom": query.get("createdFrom", [""])[0],
-                    "createdTo": query.get("createdTo", [""])[0],
-                }
-                write_json(
-                    self,
-                    200,
-                    {"ok": True, **self._server().store.list_charge_orders(str(session["user"]["id"]), int(limit or 50), filters)},
-                )
-                return
-            if parsed.path.startswith("/api/charge-orders/") and len([part for part in parsed.path.split("/") if part]) == 3:
-                session = self._require_public_auth()
-                charge_order_id = parsed.path.rsplit("/", 1)[-1]
-                write_json(self, 200, {"ok": True, **self._server().store.get_charge_order(charge_order_id, str(session["user"]["id"]))})
-                return
-            if parsed.path == "/api/transactions":
-                session = self._require_public_auth()
-                write_json(self, 200, {"ok": True, **self._server().store.list_transactions(str(session["user"]["id"]))})
-                return
+            if parsed.path.startswith("/api/"):
+                raise PanelError("지원하지 않는 API 경로입니다.", status=404)
         except Exception as exc:
             send_error_json(self, exc)
             return
@@ -1122,374 +1298,420 @@ class AppHandler(SimpleHTTPRequestHandler):
         except Exception as exc:
             send_error_json(self, exc)
 
+    @route("POST", "/api/payments/webhook", read_raw_json_body=True)
+    def _post_payment_webhook(self, request: RouteRequest) -> None:
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                **self._server().store.process_payment_webhook(
+                    request.payload,
+                    provided_secret=self.headers.get("X-SMM-Webhook-Secret", ""),
+                    provided_signature=self.headers.get("X-SMM-Webhook-Signature", "")
+                    or self.headers.get("X-Payment-Signature", ""),
+                    provided_timestamp=self.headers.get("X-SMM-Webhook-Timestamp", "")
+                    or self.headers.get("X-Payment-Timestamp", ""),
+                    raw_body=request.raw_body,
+                ),
+            },
+        )
+
+    @route("POST", "/api/cron/suppliers/sync", auth="cron", read_json_body=True)
+    def _post_cron_supplier_sync(self, request: RouteRequest) -> None:
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                **self._server().store.sync_due_supplier_services(
+                    actor="cron",
+                    limit=int(request.payload.get("limit") or 10),
+                ),
+            },
+        )
+
+    @route("POST", "/api/auth/email/send-code", trusted_origin=True, read_json_body=True)
+    def _post_auth_email_send_code(self, request: RouteRequest) -> None:
+        self._enforce_rate_limit("auth", "인증 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
+        write_json(self, 200, {"ok": True, **self._server().store.start_signup_email_verification(request.payload)})
+
+    @route("POST", "/api/auth/email/verify-code", trusted_origin=True, read_json_body=True)
+    def _post_auth_email_verify_code(self, request: RouteRequest) -> None:
+        self._enforce_rate_limit("auth", "인증 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
+        write_json(self, 200, {"ok": True, **self._server().store.verify_signup_email_code(request.payload)})
+
+    @route("POST", "/api/login", trusted_origin=True, read_json_body=True)
+    def _post_login(self, request: RouteRequest) -> None:
+        self._enforce_rate_limit("auth", "로그인 시도가 많습니다. {retry_after}초 후 다시 시도해 주세요.")
+        email = str(request.payload.get("email") or "").strip()
+        password = str(request.payload.get("password") or "")
+        remember_me = bool(request.payload.get("rememberMe"))
+        user = self._server().store.authenticate_public_user(email, password)
+        token = self._server().user_sessions.create_session(user["id"])
+        session = self._server().user_sessions.get_session(token) or {}
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                "authenticated": True,
+                "csrfToken": session.get("csrf_token", ""),
+                "user": user,
+            },
+            extra_headers=[
+                (
+                    "Set-Cookie",
+                    self._cookie_header(
+                        PUBLIC_SESSION_COOKIE,
+                        token,
+                        PUBLIC_SESSION_TTL_SECONDS if remember_me else None,
+                        self._config().public_cookie_samesite,
+                    ),
+                )
+            ],
+        )
+
+    @route("POST", "/api/signup", trusted_origin=True, read_json_body=True)
+    def _post_signup(self, request: RouteRequest) -> None:
+        self._enforce_rate_limit("auth", "가입 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
+        user = self._server().store.register_public_user(request.payload)
+        token = self._server().user_sessions.create_session(user["id"])
+        session = self._server().user_sessions.get_session(token) or {}
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                "authenticated": True,
+                "csrfToken": session.get("csrf_token", ""),
+                "user": user,
+            },
+            extra_headers=[
+                (
+                    "Set-Cookie",
+                    self._cookie_header(
+                        PUBLIC_SESSION_COOKIE,
+                        token,
+                        PUBLIC_SESSION_TTL_SECONDS,
+                        self._config().public_cookie_samesite,
+                    ),
+                )
+            ],
+        )
+
+    @route("POST", "/api/orders", auth="public", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_orders(self, request: RouteRequest) -> None:
+        self._enforce_rate_limit("orders", "주문 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
+        user_id = str(request.public_session["user"]["id"]) if request.public_session else ""
+        write_json(self, 200, self._server().store.create_order(request.payload, user_id))
+
+    @route("POST", "/api/charge-orders", auth="public", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_charge_orders(self, request: RouteRequest) -> None:
+        self._enforce_rate_limit("charge", "충전 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
+        user_id = str(request.public_session["user"]["id"]) if request.public_session else ""
+        write_json(self, 200, {"ok": True, **self._server().store.create_charge_order(request.payload, user_id)})
+
+    @route("POST", "/api/charge-orders/<charge_order_id>/start-payment", auth="public", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_charge_order_start_payment(self, request: RouteRequest) -> None:
+        self._enforce_rate_limit("charge", "충전 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
+        user_id = str(request.public_session["user"]["id"]) if request.public_session else ""
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                **self._server().store.start_charge_order_payment(request.params["charge_order_id"], request.payload, user_id),
+            },
+        )
+
+    @route("POST", "/api/charge-orders/<charge_order_id>/confirm", auth="public", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_charge_order_confirm(self, request: RouteRequest) -> None:
+        user_id = str(request.public_session["user"]["id"]) if request.public_session else ""
+        write_json(
+            self,
+            200,
+            {"ok": True, **self._server().store.confirm_charge_order(request.params["charge_order_id"], request.payload, user_id)},
+        )
+
+    @route("POST", "/api/charge-orders/<charge_order_id>/deposit-request", auth="public", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_charge_order_deposit_request(self, request: RouteRequest) -> None:
+        self._enforce_rate_limit("charge", "충전 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
+        user_id = str(request.public_session["user"]["id"]) if request.public_session else ""
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                **self._server().store.submit_charge_order_deposit_request(
+                    request.params["charge_order_id"],
+                    request.payload,
+                    user_id,
+                ),
+            },
+        )
+
+    @route("POST", "/api/analytics/track", trusted_origin=True, read_json_body=True)
+    def _post_analytics_track(self, request: RouteRequest) -> None:
+        self._enforce_rate_limit("analytics", "방문 수집 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                **self._server().store.record_site_visit(
+                    request.payload,
+                    user_agent=self.headers.get("User-Agent", ""),
+                    request_host=self.headers.get("Host", ""),
+                ),
+            },
+        )
+
+    @route("POST", "/api/admin/login", trusted_origin=True, read_json_body=True)
+    def _post_admin_login(self, request: RouteRequest) -> None:
+        username = str(request.payload.get("username") or "").strip()
+        password = str(request.payload.get("password") or "")
+        admin_sessions = self._server().admin_sessions
+        client_identity = self._client_identity()
+        if not admin_sessions.is_configured:
+            raise PanelError(
+                "관리자 보안 설정이 없습니다. SMM_PANEL_ADMIN_PASSWORD 환경변수를 설정한 뒤 서버를 다시 실행해 주세요.",
+                status=503,
+            )
+        retry_after = admin_sessions.login_retry_after(client_identity)
+        if retry_after:
+            raise PanelError(f"로그인 시도가 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.", status=429)
+        if not admin_sessions.verify_credentials(username, password):
+            admin_sessions.record_failed_login(client_identity)
+            raise PanelError("관리자 계정 또는 비밀번호가 올바르지 않습니다.", status=401)
+        admin_sessions.clear_failed_logins(client_identity)
+        token = admin_sessions.create_session()
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                "authenticated": True,
+                "username": admin_sessions.username,
+                "csrfToken": admin_sessions.session_payload(token).get("csrfToken", ""),
+            },
+            extra_headers=[
+                (
+                    "Set-Cookie",
+                    self._cookie_header(
+                        ADMIN_SESSION_COOKIE,
+                        token,
+                        ADMIN_SESSION_TTL_SECONDS,
+                        self._config().admin_cookie_samesite,
+                    ),
+                )
+            ],
+        )
+
+    @route("POST", "/api/logout", trusted_origin=True, read_json_body=True)
+    def _post_logout(self, request: RouteRequest) -> None:
+        session = self._public_session()
+        if session is not None:
+            self._require_public_csrf(session)
+        self._server().user_sessions.destroy_session(self._public_session_token())
+        write_json(
+            self,
+            200,
+            {"ok": True, "authenticated": False},
+            extra_headers=[
+                (
+                    "Set-Cookie",
+                    self._cookie_header(PUBLIC_SESSION_COOKIE, "", 0, self._config().public_cookie_samesite),
+                )
+            ],
+        )
+
+    @route("POST", "/api/admin/logout", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_logout(self, request: RouteRequest) -> None:
+        self._server().admin_sessions.destroy_session(self._admin_session_token())
+        write_json(
+            self,
+            200,
+            {"ok": True, "authenticated": False},
+            extra_headers=[
+                (
+                    "Set-Cookie",
+                    self._cookie_header(ADMIN_SESSION_COOKIE, "", 0, self._config().admin_cookie_samesite),
+                )
+            ],
+        )
+
+    @route("POST", "/api/admin/site-settings", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_site_settings(self, request: RouteRequest) -> None:
+        self._write_store_result("save_site_settings", request.payload)
+
+    @route("POST", "/api/admin/popup", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_popup(self, request: RouteRequest) -> None:
+        self._write_store_result("save_home_popup", request.payload)
+
+    @route("POST", "/api/admin/home-banners", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_home_banners(self, request: RouteRequest) -> None:
+        self._write_store_result("save_home_banner", request.payload)
+
+    @route("POST", "/api/admin/platform-sections", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_platform_sections(self, request: RouteRequest) -> None:
+        self._write_store_result("save_platform_section", request.payload)
+
+    @route("POST", "/api/admin/suppliers", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_suppliers(self, request: RouteRequest) -> None:
+        self._write_store_result("save_supplier", request.payload)
+
+    @route("POST", "/api/admin/mkt24-product-settings", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_mkt24_product_settings(self, request: RouteRequest) -> None:
+        self._write_store_result("save_mkt24_product_setting", request.payload)
+
+    @route("POST", "/api/admin/mkt24-product-settings/sync", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_mkt24_product_settings_sync(self, request: RouteRequest) -> None:
+        self._write_store_result("sync_mkt24_product_detail", request.payload)
+
+    @route("POST", "/api/admin/cafe24/oauth/start", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_oauth_start(self, request: RouteRequest) -> None:
+        request.payload["redirectUri"] = request.payload.get("redirectUri") or self._cafe24_oauth_redirect_uri()
+        self._write_store_result("create_cafe24_oauth_authorize_url", request.payload)
+
+    @route("POST", "/api/admin/cafe24/integrations", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_integrations(self, request: RouteRequest) -> None:
+        self._write_store_result("save_cafe24_integration", request.payload)
+
+    @route("POST", "/api/admin/cafe24/mappings", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_mappings(self, request: RouteRequest) -> None:
+        self._write_store_result("save_cafe24_product_mapping", request.payload)
+
+    @route("POST", "/api/admin/cafe24/mappings/delete", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_mappings_delete(self, request: RouteRequest) -> None:
+        self._write_store_result("delete_cafe24_product_mapping", request.payload)
+
+    @route("POST", "/api/admin/cafe24/poll", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_poll(self, request: RouteRequest) -> None:
+        self._write_store_result("poll_cafe24_orders", request.payload)
+
+    @route("POST", "/api/admin/cafe24/orders/resync-by-id", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_orders_resync_by_id(self, request: RouteRequest) -> None:
+        self._write_store_result("resync_cafe24_order_by_id", request.payload)
+
+    @route("POST", "/api/admin/cafe24/order-items/retry", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_order_items_retry(self, request: RouteRequest) -> None:
+        self._write_store_result("retry_cafe24_order_item", request.payload)
+
+    @route("POST", "/api/admin/cafe24/order-items/dispatch", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_order_items_dispatch(self, request: RouteRequest) -> None:
+        self._write_store_result("dispatch_cafe24_order_item", request.payload)
+
+    @route("POST", "/api/admin/cafe24/order-items/resync", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_order_items_resync(self, request: RouteRequest) -> None:
+        self._write_store_result("resync_cafe24_order_item", request.payload)
+
+    @route("POST", "/api/admin/cafe24/order-items/status", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_order_items_status(self, request: RouteRequest) -> None:
+        self._write_store_result("update_cafe24_order_item_status", request.payload)
+
+    @route("POST", "/api/admin/customers", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_customers(self, request: RouteRequest) -> None:
+        self._write_store_result("save_customer", request.payload)
+
+    @route("POST", "/api/admin/customers/delete", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_customers_delete(self, request: RouteRequest) -> None:
+        self._write_store_result("delete_customer", request.payload)
+
+    @route("POST", "/api/admin/customers/balance", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_customers_balance(self, request: RouteRequest) -> None:
+        self._write_store_result("adjust_customer_balance", request.payload)
+
+    @route("POST", "/api/admin/charge-orders/action", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_charge_orders_action(self, request: RouteRequest) -> None:
+        self._write_store_result("admin_update_charge_order", request.payload)
+
+    @route("POST", "/api/admin/categories", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_categories(self, request: RouteRequest) -> None:
+        self._write_store_result("save_category", request.payload)
+
+    @route("POST", "/api/admin/categories/delete", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_categories_delete(self, request: RouteRequest) -> None:
+        self._write_store_result("delete_category", request.payload)
+
+    @route("POST", "/api/admin/products", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_products(self, request: RouteRequest) -> None:
+        self._write_store_result("save_catalog_product", request.payload)
+
+    @route("POST", "/api/admin/products/delete", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_products_delete(self, request: RouteRequest) -> None:
+        self._write_store_result("delete_catalog_product", request.payload)
+
+    @route("POST", "/api/admin/orders/status", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_orders_status(self, request: RouteRequest) -> None:
+        self._write_store_result("update_admin_order_status", request.payload)
+
+    @route("POST", "/api/admin/orders/retry-supplier", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_orders_retry_supplier(self, request: RouteRequest) -> None:
+        self._write_store_result("retry_supplier_order", request.payload)
+
+    @route("POST", "/api/admin/orders/supplier-status", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_orders_supplier_status(self, request: RouteRequest) -> None:
+        self._write_store_result("refresh_supplier_order_status", request.payload)
+
+    @route("POST", "/api/admin/notices", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_notices(self, request: RouteRequest) -> None:
+        self._write_store_result("save_notice", request.payload)
+
+    @route("POST", "/api/admin/notices/delete", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_notices_delete(self, request: RouteRequest) -> None:
+        self._write_store_result("delete_notice", request.payload)
+
+    @route("POST", "/api/admin/faqs", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_faqs(self, request: RouteRequest) -> None:
+        self._write_store_result("save_faq", request.payload)
+
+    @route("POST", "/api/admin/faqs/delete", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_faqs_delete(self, request: RouteRequest) -> None:
+        self._write_store_result("delete_faq", request.payload)
+
+    @route("POST", "/api/admin/suppliers/test", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_suppliers_test(self, request: RouteRequest) -> None:
+        self._write_store_result("test_supplier_connection", request.payload)
+
+    @route("POST", "/api/admin/suppliers/<supplier_id>/sync-services", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_supplier_sync_services(self, request: RouteRequest) -> None:
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                **self._server().store.sync_supplier_services(
+                    request.params["supplier_id"],
+                    actor=str(request.payload.get("_adminActor") or "admin"),
+                ),
+            },
+        )
+
+    @route("POST", "/api/admin/mappings", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_mappings(self, request: RouteRequest) -> None:
+        self._write_store_result("save_product_mapping", request.payload)
+
+    @route("POST", "/api/admin/mappings/delete", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_mappings_delete(self, request: RouteRequest) -> None:
+        self._write_store_result("delete_product_mapping", request.payload)
+
+    @route("POST", "/api/link-preview", trusted_origin=True, read_json_body=True)
+    def _post_link_preview(self, request: RouteRequest) -> None:
+        self._enforce_rate_limit("link_preview", "링크 확인 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
+        write_json(self, 200, self._server().store.preview_link(request.payload))
+
+    @route("POST", "/api/charge", trusted_origin=True, read_json_body=True)
+    def _post_legacy_charge(self, request: RouteRequest) -> None:
+        raise PanelError("직접 잔액 충전 API는 종료되었습니다. /api/charge-orders 기반 충전 플로우를 사용해 주세요.", status=410)
+
     def do_POST(self) -> None:
         request_path = self._incoming_request_path(self.path)
         parsed = urlparse(request_path)
         self._request_path = parsed.path
         try:
-            if parsed.path == "/api/payments/webhook":
-                payload, raw_body = read_json_with_raw_body(self)
-                write_json(
-                    self,
-                    200,
-                    {
-                        "ok": True,
-                        **self._server().store.process_payment_webhook(
-                            payload,
-                            provided_secret=self.headers.get("X-SMM-Webhook-Secret", ""),
-                            provided_signature=self.headers.get("X-SMM-Webhook-Signature", "")
-                            or self.headers.get("X-Payment-Signature", ""),
-                            provided_timestamp=self.headers.get("X-SMM-Webhook-Timestamp", "")
-                            or self.headers.get("X-Payment-Timestamp", ""),
-                            raw_body=raw_body,
-                        ),
-                    },
-                )
+            if self._dispatch_route("POST", parsed):
                 return
-            self._require_trusted_origin()
-            payload = read_json(self)
-            if parsed.path == "/api/auth/email/send-code":
-                self._enforce_rate_limit("auth", "인증 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
-                write_json(self, 200, {"ok": True, **self._server().store.start_signup_email_verification(payload)})
-                return
-            if parsed.path == "/api/auth/email/verify-code":
-                self._enforce_rate_limit("auth", "인증 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
-                write_json(self, 200, {"ok": True, **self._server().store.verify_signup_email_code(payload)})
-                return
-            if parsed.path == "/api/login":
-                self._enforce_rate_limit("auth", "로그인 시도가 많습니다. {retry_after}초 후 다시 시도해 주세요.")
-                email = str(payload.get("email") or "").strip()
-                password = str(payload.get("password") or "")
-                remember_me = bool(payload.get("rememberMe"))
-                user = self._server().store.authenticate_public_user(email, password)
-                token = self._server().user_sessions.create_session(user["id"])
-                session = self._server().user_sessions.get_session(token) or {}
-                write_json(
-                    self,
-                    200,
-                    {
-                        "ok": True,
-                        "authenticated": True,
-                        "csrfToken": session.get("csrf_token", ""),
-                        "user": user,
-                    },
-                    extra_headers=[
-                        (
-                            "Set-Cookie",
-                            self._cookie_header(
-                                PUBLIC_SESSION_COOKIE,
-                                token,
-                                PUBLIC_SESSION_TTL_SECONDS if remember_me else None,
-                                self._config().public_cookie_samesite,
-                            ),
-                        )
-                    ],
-                )
-                return
-            if parsed.path == "/api/signup":
-                self._enforce_rate_limit("auth", "가입 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
-                user = self._server().store.register_public_user(payload)
-                token = self._server().user_sessions.create_session(user["id"])
-                session = self._server().user_sessions.get_session(token) or {}
-                write_json(
-                    self,
-                    200,
-                    {
-                        "ok": True,
-                        "authenticated": True,
-                        "csrfToken": session.get("csrf_token", ""),
-                        "user": user,
-                    },
-                    extra_headers=[
-                        (
-                            "Set-Cookie",
-                            self._cookie_header(
-                                PUBLIC_SESSION_COOKIE,
-                                token,
-                                PUBLIC_SESSION_TTL_SECONDS,
-                                self._config().public_cookie_samesite,
-                            ),
-                        )
-                    ],
-                )
-                return
-            if parsed.path == "/api/orders":
-                session = self._require_public_auth()
-                self._require_public_csrf(session)
-                self._enforce_rate_limit("orders", "주문 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
-                write_json(self, 200, self._server().store.create_order(payload, str(session["user"]["id"])))
-                return
-            if parsed.path == "/api/charge-orders":
-                session = self._require_public_auth()
-                self._require_public_csrf(session)
-                self._enforce_rate_limit("charge", "충전 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
-                write_json(self, 200, {"ok": True, **self._server().store.create_charge_order(payload, str(session["user"]["id"]))})
-                return
-            if parsed.path.startswith("/api/charge-orders/") and parsed.path.endswith("/start-payment"):
-                session = self._require_public_auth()
-                self._require_public_csrf(session)
-                self._enforce_rate_limit("charge", "충전 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
-                charge_order_id = parsed.path.split("/")[3]
-                write_json(
-                    self,
-                    200,
-                    {"ok": True, **self._server().store.start_charge_order_payment(charge_order_id, payload, str(session["user"]["id"]))},
-                )
-                return
-            if parsed.path.startswith("/api/charge-orders/") and parsed.path.endswith("/confirm"):
-                session = self._require_public_auth()
-                self._require_public_csrf(session)
-                charge_order_id = parsed.path.split("/")[3]
-                write_json(
-                    self,
-                    200,
-                    {"ok": True, **self._server().store.confirm_charge_order(charge_order_id, payload, str(session["user"]["id"]))},
-                )
-                return
-            if parsed.path.startswith("/api/charge-orders/") and parsed.path.endswith("/deposit-request"):
-                session = self._require_public_auth()
-                self._require_public_csrf(session)
-                self._enforce_rate_limit("charge", "충전 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
-                charge_order_id = parsed.path.split("/")[3]
-                write_json(
-                    self,
-                    200,
-                    {"ok": True, **self._server().store.submit_charge_order_deposit_request(charge_order_id, payload, str(session["user"]["id"]))},
-                )
-                return
-            if parsed.path == "/api/analytics/track":
-                self._enforce_rate_limit("analytics", "방문 수집 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
-                write_json(
-                    self,
-                    200,
-                    {
-                        "ok": True,
-                        **self._server().store.record_site_visit(
-                            payload,
-                            user_agent=self.headers.get("User-Agent", ""),
-                            request_host=self.headers.get("Host", ""),
-                        ),
-                    },
-                )
-                return
-            if parsed.path == "/api/admin/login":
-                username = str(payload.get("username") or "").strip()
-                password = str(payload.get("password") or "")
-                admin_sessions = self._server().admin_sessions
-                client_identity = self._client_identity()
-                if not admin_sessions.is_configured:
-                    raise PanelError(
-                        "관리자 보안 설정이 없습니다. SMM_PANEL_ADMIN_PASSWORD 환경변수를 설정한 뒤 서버를 다시 실행해 주세요.",
-                        status=503,
-                    )
-                retry_after = admin_sessions.login_retry_after(client_identity)
-                if retry_after:
-                    raise PanelError(
-                        f"로그인 시도가 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.",
-                        status=429,
-                    )
-                if not admin_sessions.verify_credentials(username, password):
-                    admin_sessions.record_failed_login(client_identity)
-                    raise PanelError("관리자 계정 또는 비밀번호가 올바르지 않습니다.", status=401)
-                admin_sessions.clear_failed_logins(client_identity)
-                token = admin_sessions.create_session()
-                write_json(
-                    self,
-                    200,
-                    {
-                        "ok": True,
-                        "authenticated": True,
-                        "username": admin_sessions.username,
-                        "csrfToken": admin_sessions.session_payload(token).get("csrfToken", ""),
-                    },
-                    extra_headers=[
-                        (
-                            "Set-Cookie",
-                            self._cookie_header(
-                                ADMIN_SESSION_COOKIE,
-                                token,
-                                ADMIN_SESSION_TTL_SECONDS,
-                                self._config().admin_cookie_samesite,
-                            ),
-                        )
-                    ],
-                )
-                return
-            session: Optional[Dict[str, Any]] = None
-            if parsed.path.startswith("/api/admin/"):
-                session = self._require_admin_auth()
-                self._require_admin_csrf(session)
-                payload["_adminActor"] = str(session.get("username") or "admin")
-            if parsed.path == "/api/logout":
-                session = self._public_session()
-                if session is not None:
-                    self._require_public_csrf(session)
-                self._server().user_sessions.destroy_session(self._public_session_token())
-                write_json(
-                    self,
-                    200,
-                    {"ok": True, "authenticated": False},
-                    extra_headers=[
-                        (
-                            "Set-Cookie",
-                            self._cookie_header(
-                                PUBLIC_SESSION_COOKIE,
-                                "",
-                                0,
-                                self._config().public_cookie_samesite,
-                            ),
-                        )
-                    ],
-                )
-                return
-            if parsed.path == "/api/admin/logout":
-                self._server().admin_sessions.destroy_session(self._admin_session_token())
-                write_json(
-                    self,
-                    200,
-                    {"ok": True, "authenticated": False},
-                    extra_headers=[
-                        (
-                            "Set-Cookie",
-                            self._cookie_header(
-                                ADMIN_SESSION_COOKIE,
-                                "",
-                                0,
-                                self._config().admin_cookie_samesite,
-                            ),
-                        )
-                    ],
-                )
-                return
-            if parsed.path == "/api/admin/site-settings":
-                write_json(self, 200, {"ok": True, **self._server().store.save_site_settings(payload)})
-                return
-            if parsed.path == "/api/admin/popup":
-                write_json(self, 200, {"ok": True, **self._server().store.save_home_popup(payload)})
-                return
-            if parsed.path == "/api/admin/home-banners":
-                write_json(self, 200, {"ok": True, **self._server().store.save_home_banner(payload)})
-                return
-            if parsed.path == "/api/admin/platform-sections":
-                write_json(self, 200, {"ok": True, **self._server().store.save_platform_section(payload)})
-                return
-            if parsed.path == "/api/admin/suppliers":
-                write_json(self, 200, {"ok": True, **self._server().store.save_supplier(payload)})
-                return
-            if parsed.path == "/api/admin/mkt24-product-settings":
-                write_json(self, 200, {"ok": True, **self._server().store.save_mkt24_product_setting(payload)})
-                return
-            if parsed.path == "/api/admin/mkt24-product-settings/sync":
-                write_json(self, 200, {"ok": True, **self._server().store.sync_mkt24_product_detail(payload)})
-                return
-            if parsed.path == "/api/admin/cafe24/oauth/start":
-                payload["redirectUri"] = payload.get("redirectUri") or self._cafe24_oauth_redirect_uri()
-                write_json(self, 200, {"ok": True, **self._server().store.create_cafe24_oauth_authorize_url(payload)})
-                return
-            if parsed.path == "/api/admin/cafe24/integrations":
-                write_json(self, 200, {"ok": True, **self._server().store.save_cafe24_integration(payload)})
-                return
-            if parsed.path == "/api/admin/cafe24/mappings":
-                write_json(self, 200, {"ok": True, **self._server().store.save_cafe24_product_mapping(payload)})
-                return
-            if parsed.path == "/api/admin/cafe24/mappings/delete":
-                write_json(self, 200, {"ok": True, **self._server().store.delete_cafe24_product_mapping(payload)})
-                return
-            if parsed.path == "/api/admin/cafe24/poll":
-                write_json(self, 200, {"ok": True, **self._server().store.poll_cafe24_orders(payload)})
-                return
-            if parsed.path == "/api/admin/cafe24/orders/resync-by-id":
-                write_json(self, 200, {"ok": True, **self._server().store.resync_cafe24_order_by_id(payload)})
-                return
-            if parsed.path == "/api/admin/cafe24/order-items/retry":
-                write_json(self, 200, {"ok": True, **self._server().store.retry_cafe24_order_item(payload)})
-                return
-            if parsed.path == "/api/admin/cafe24/order-items/dispatch":
-                write_json(self, 200, {"ok": True, **self._server().store.dispatch_cafe24_order_item(payload)})
-                return
-            if parsed.path == "/api/admin/cafe24/order-items/resync":
-                write_json(self, 200, {"ok": True, **self._server().store.resync_cafe24_order_item(payload)})
-                return
-            if parsed.path == "/api/admin/cafe24/order-items/status":
-                write_json(self, 200, {"ok": True, **self._server().store.update_cafe24_order_item_status(payload)})
-                return
-            if parsed.path == "/api/admin/customers":
-                write_json(self, 200, {"ok": True, **self._server().store.save_customer(payload)})
-                return
-            if parsed.path == "/api/admin/customers/delete":
-                write_json(self, 200, {"ok": True, **self._server().store.delete_customer(payload)})
-                return
-            if parsed.path == "/api/admin/customers/balance":
-                write_json(self, 200, {"ok": True, **self._server().store.adjust_customer_balance(payload)})
-                return
-            if parsed.path == "/api/admin/charge-orders/action":
-                write_json(self, 200, {"ok": True, **self._server().store.admin_update_charge_order(payload)})
-                return
-            if parsed.path == "/api/admin/categories":
-                write_json(self, 200, {"ok": True, **self._server().store.save_category(payload)})
-                return
-            if parsed.path == "/api/admin/categories/delete":
-                write_json(self, 200, {"ok": True, **self._server().store.delete_category(payload)})
-                return
-            if parsed.path == "/api/admin/products":
-                write_json(self, 200, {"ok": True, **self._server().store.save_catalog_product(payload)})
-                return
-            if parsed.path == "/api/admin/products/delete":
-                write_json(self, 200, {"ok": True, **self._server().store.delete_catalog_product(payload)})
-                return
-            if parsed.path == "/api/admin/orders/status":
-                write_json(self, 200, {"ok": True, **self._server().store.update_admin_order_status(payload)})
-                return
-            if parsed.path == "/api/admin/orders/retry-supplier":
-                write_json(self, 200, {"ok": True, **self._server().store.retry_supplier_order(payload)})
-                return
-            if parsed.path == "/api/admin/orders/supplier-status":
-                write_json(self, 200, {"ok": True, **self._server().store.refresh_supplier_order_status(payload)})
-                return
-            if parsed.path == "/api/admin/notices":
-                write_json(self, 200, {"ok": True, **self._server().store.save_notice(payload)})
-                return
-            if parsed.path == "/api/admin/notices/delete":
-                write_json(self, 200, {"ok": True, **self._server().store.delete_notice(payload)})
-                return
-            if parsed.path == "/api/admin/faqs":
-                write_json(self, 200, {"ok": True, **self._server().store.save_faq(payload)})
-                return
-            if parsed.path == "/api/admin/faqs/delete":
-                write_json(self, 200, {"ok": True, **self._server().store.delete_faq(payload)})
-                return
-            if parsed.path == "/api/admin/suppliers/test":
-                write_json(self, 200, {"ok": True, **self._server().store.test_supplier_connection(payload)})
-                return
-            if parsed.path.startswith("/api/admin/suppliers/") and parsed.path.endswith("/sync-services"):
-                supplier_id = parsed.path.split("/")[4]
-                write_json(
-                    self,
-                    200,
-                    {
-                        "ok": True,
-                        **self._server().store.sync_supplier_services(
-                            supplier_id,
-                            actor=str(payload.get("_adminActor") or "admin"),
-                        ),
-                    },
-                )
-                return
-            if parsed.path == "/api/admin/mappings":
-                write_json(self, 200, {"ok": True, **self._server().store.save_product_mapping(payload)})
-                return
-            if parsed.path == "/api/admin/mappings/delete":
-                write_json(self, 200, {"ok": True, **self._server().store.delete_product_mapping(payload)})
-                return
-            if parsed.path == "/api/link-preview":
-                self._enforce_rate_limit("link_preview", "링크 확인 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
-                write_json(self, 200, self._server().store.preview_link(payload))
-                return
-            if parsed.path == "/api/charge":
-                raise PanelError(
-                    "직접 잔액 충전 API는 종료되었습니다. /api/charge-orders 기반 충전 플로우를 사용해 주세요.",
-                    status=410,
-                )
             raise PanelError("지원하지 않는 API 경로입니다.", status=404)
         except Exception as exc:
             send_error_json(self, exc)

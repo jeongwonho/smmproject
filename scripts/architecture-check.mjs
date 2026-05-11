@@ -15,6 +15,7 @@ const LINE_BUDGETS = [
   ["static/public/auth.js", 600],
   ["static/styles/public.css", 2300],
   ["static/styles/admin.css", 800],
+  ["static/styles/admin-shared.css", 2800],
   ["static/styles/shared.css", 5200],
 ];
 

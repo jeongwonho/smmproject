@@ -1,11 +1,11 @@
 import { renderCafe24Pagination, renderCafe24QueueToolbar } from "./cafe24-queue-ui.js";
+import { supplierSyncInsight } from "./supplier-sync-ui.js";
 let runtime = {};
 let state = {};
 let DEFAULT_SITE_NAME = "인스타마트";
 let advancedOrderFieldBlueprints = {}, advancedOrderFieldKeys = [];
 let analyticsTabBlueprints = [], analyticsRangeBlueprints = [];
 let statusMap = {};
-
 export function configureAdminSections(nextRuntime = {}) {
   runtime = nextRuntime;
   state = nextRuntime.state || {};
@@ -16,7 +16,6 @@ export function configureAdminSections(nextRuntime = {}) {
   analyticsRangeBlueprints = nextRuntime.analyticsRangeBlueprints || [];
   statusMap = nextRuntime.statusMap || {};
 }
-
 function callRuntime(name, ...args) {
   const fn = runtime[name];
   if (typeof fn !== "function") {
@@ -24,7 +23,6 @@ function callRuntime(name, ...args) {
   }
   return fn(...args);
 }
-
 function escapeHtml(...args) { return callRuntime("escapeHtml", ...args); }
 function formatMoney(...args) { return callRuntime("formatMoney", ...args); }
 function formatNumber(...args) { return callRuntime("formatNumber", ...args); }
@@ -3685,7 +3683,6 @@ function renderMkt24FieldConfigRow(fieldKey, config = {}) {
     </div>
   `;
 }
-
 function renderSupplierAdminSection({
   suppliers,
   draft,
@@ -3707,6 +3704,8 @@ function renderSupplierAdminSection({
       ? draft.apiKeyMasked || "설정됨"
       : "미설정";
   const connectionState = activeConnection?.status || activeConnection?.lastTestStatus || "never";
+  const syncStatus = activeConnection?.serviceSyncStatus || selectedSupplier?.serviceSyncStatus || "never";
+  const inactiveServiceCount = Number(selectedSupplier?.inactiveServiceCount || 0);
   const currentIssue = connectionState === "success"
     ? "오류 없음"
     : activeConnection?.message || activeConnection?.lastTestMessage || "연결 확인을 아직 실행하지 않았습니다.";
@@ -3747,6 +3746,7 @@ function renderSupplierAdminSection({
                         <p>${escapeHtml(supplier.apiUrl)}</p>
                         <div class="admin-supplier-card__meta">
                           <span>서비스 ${escapeHtml(String(supplier.serviceCount || 0))}</span>
+                          ${Number(supplier.inactiveServiceCount || 0) ? `<span>비활성 ${escapeHtml(String(supplier.inactiveServiceCount || 0))}</span>` : ""}
                           <span>매핑 ${escapeHtml(String(supplier.mappingCount || 0))}</span>
                           <span>${supplier.isActive ? "활성" : "비활성"}</span>
                         </div>
@@ -3873,8 +3873,9 @@ function renderSupplierAdminSection({
               {
                 label: "사용 가능 서비스",
                 value: `${String(activeConnection?.serviceCount || selectedSupplier?.lastServiceCount || selectedSupplier?.serviceCount || 0)}개`,
-                description: activeConnection?.balance ? `잔액 ${`${activeConnection.balance} ${activeConnection.currency || ""}`.trim()}` : integrationGuide.balance,
+                description: inactiveServiceCount ? `비활성 ${inactiveServiceCount}개 · ${integrationGuide.balance}` : integrationGuide.balance,
               },
+              supplierSyncInsight(selectedSupplier, syncStatus),
             ],
             "admin-insight-grid--compact"
           )}
