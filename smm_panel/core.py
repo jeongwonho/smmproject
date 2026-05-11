@@ -30,6 +30,59 @@ except ImportError:  # pragma: no cover - optional runtime dependency
     psycopg = None
     psycopg_dict_row = None
 
+try:
+    from .backend.db import DatabaseConnection, DatabaseCursor, PanelStoreDatabaseMixin, normalize_database_row, rewrite_postgres_placeholders, split_sql_script
+    from .backend.auth import (
+        assess_public_password_strength,
+        generate_email_verification_code,
+        hash_password,
+        hash_token_value,
+        password_contains_repeated_pattern,
+        password_contains_sequence,
+        verify_password,
+    )
+    from .backend.orders import canonical_order_field_value as _canonical_order_field_value
+    from .backend.orders import derive_order_idempotency_key, sanitize_idempotency_key
+    from .backend.payments import normalize_webhook_signature, verify_payment_webhook_signature
+    from .backend.wallet import balance_transaction_kind_to_ledger_entry_type, generate_charge_order_code
+    from .backend.integrations.cafe24 import Cafe24ApiClient, Cafe24ApiError
+    from .backend.integrations.suppliers import (
+        SupplierApiClient,
+        SupplierApiError,
+        normalize_supplier_integration_type,
+        normalize_supplier_order_status_payload,
+        supplier_service_sync_due,
+        supplier_supports_auto_dispatch,
+        supplier_supports_balance_check,
+        supplier_sync_interval_minutes,
+    )
+except ImportError:  # pragma: no cover - top-level script runtime
+    from backend.db import DatabaseConnection, DatabaseCursor, PanelStoreDatabaseMixin, normalize_database_row, rewrite_postgres_placeholders, split_sql_script
+    from backend.auth import (
+        assess_public_password_strength,
+        generate_email_verification_code,
+        hash_password,
+        hash_token_value,
+        password_contains_repeated_pattern,
+        password_contains_sequence,
+        verify_password,
+    )
+    from backend.orders import canonical_order_field_value as _canonical_order_field_value
+    from backend.orders import derive_order_idempotency_key, sanitize_idempotency_key
+    from backend.payments import normalize_webhook_signature, verify_payment_webhook_signature
+    from backend.wallet import balance_transaction_kind_to_ledger_entry_type, generate_charge_order_code
+    from backend.integrations.cafe24 import Cafe24ApiClient, Cafe24ApiError
+    from backend.integrations.suppliers import (
+        SupplierApiClient,
+        SupplierApiError,
+        normalize_supplier_integration_type,
+        normalize_supplier_order_status_payload,
+        supplier_service_sync_due,
+        supplier_supports_auto_dispatch,
+        supplier_supports_balance_check,
+        supplier_sync_interval_minutes,
+    )
+
 
 APP_ROOT = Path(__file__).resolve().parent
 DATA_ROOT = APP_ROOT / "data"
@@ -63,6 +116,10 @@ SOCIAL_REFERRER_LABELS = {
 }
 SUPPLIER_INTEGRATION_CLASSIC = "classic"
 SUPPLIER_INTEGRATION_MKT24 = "mkt24"
+SUPPLIER_SERVICE_SYNC_DEFAULT_INTERVAL_MINUTES = 30
+SUPPLIER_SERVICE_SYNC_LOCK_MINUTES = 10
+SUPPLIER_SERVICE_SYNC_RETRY_BASE_MINUTES = 10
+SUPPLIER_SERVICE_SYNC_RETRY_MAX_MINUTES = 60
 SUPPLIER_PLATFORM_LABELS = {
     "instagram": "인스타그램",
     "youtube": "유튜브",
@@ -256,48 +313,6 @@ def legacy_payment_webhook_secret_allowed() -> bool:
     return (not is_production_runtime()) or env_flag(os.environ.get("SMM_PANEL_ALLOW_LEGACY_WEBHOOK_SECRET"))
 
 
-def normalize_webhook_signature(raw_signature: str) -> List[str]:
-    values: List[str] = []
-    for part in re.split(r"[,\s]+", str(raw_signature or "").strip()):
-        if not part:
-            continue
-        key, _, value = part.partition("=")
-        candidate = value if value else key
-        candidate = candidate.strip()
-        if candidate:
-            values.append(candidate)
-    return values
-
-
-def verify_payment_webhook_signature(
-    secret: str,
-    raw_body: bytes,
-    provided_signature: str,
-    provided_timestamp: str = "",
-) -> bool:
-    if not secret or not raw_body or not provided_signature:
-        return False
-    timestamp = str(provided_timestamp or "").strip()
-    signed_payloads = [raw_body]
-    if timestamp:
-        try:
-            timestamp_value = float(timestamp)
-        except ValueError:
-            return False
-        if abs(dt.datetime.now(dt.timezone.utc).timestamp() - timestamp_value) > WEBHOOK_SIGNATURE_TOLERANCE_SECONDS:
-            return False
-        signed_payloads.insert(0, f"{timestamp}.".encode("utf-8") + raw_body)
-    expected_values = {
-        hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
-        for payload in signed_payloads
-    }
-    return any(
-        hmac.compare_digest(candidate, expected)
-        for candidate in normalize_webhook_signature(provided_signature)
-        for expected in expected_values
-    )
-
-
 def card_payment_configured() -> bool:
     return bool(payment_provider_name() and payment_public_key() and payment_secret_key())
 
@@ -346,111 +361,6 @@ def auth_email_sender_name() -> str:
         or os.environ.get("SMM_PANEL_EMAIL_SENDER_NAME")
         or DEFAULT_SITE_NAME
     ).strip()
-
-
-def hash_token_value(value: str) -> str:
-    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
-
-
-def generate_email_verification_code() -> str:
-    return "".join(secrets.choice("0123456789") for _ in range(AUTH_VERIFICATION_CODE_LENGTH))
-
-
-def password_contains_sequence(password: str) -> bool:
-    normalized = str(password or "").lower()
-    for pattern in KEYBOARD_SEQUENCE_PATTERNS:
-        for index in range(len(pattern) - 3):
-            token = pattern[index : index + 4]
-            if token in normalized or token[::-1] in normalized:
-                return True
-    return False
-
-
-def password_contains_repeated_pattern(password: str) -> bool:
-    normalized = str(password or "").lower()
-    return bool(re.search(r"(.)\1{3,}", normalized))
-
-
-def _name_like_tokens(value: str) -> List[str]:
-    raw = str(value or "").strip().lower()
-    pieces = re.split(r"[^0-9a-zA-Z가-힣]+", raw)
-    return [piece for piece in pieces if len(piece) >= 3]
-
-
-def assess_public_password_strength(password: str, *, email: str = "", name: str = "") -> Dict[str, Any]:
-    raw = str(password or "")
-    normalized = raw.lower()
-    email_local = str(email or "").split("@", 1)[0].strip().lower()
-    email_tokens = _name_like_tokens(email_local)
-    name_tokens = _name_like_tokens(name)
-    warnings: List[str] = []
-    score = 0
-
-    if len(raw) >= PUBLIC_PASSWORD_MIN_LENGTH:
-        score += 1
-    if len(raw) >= PUBLIC_PASSWORD_RECOMMENDED_LENGTH:
-        score += 1
-    if len(raw) >= PUBLIC_PASSWORD_VERY_STRONG_LENGTH:
-        score += 1
-    if len(set(raw)) >= min(10, max(4, len(raw) // 2)):
-        score += 1
-    if re.search(r"[A-Za-z]", raw) and re.search(r"\d", raw):
-        score += 1
-    elif re.search(r"[^A-Za-z0-9\s]", raw):
-        score += 1
-
-    common_hit = normalized in COMMON_PASSWORD_PATTERNS or any(
-        pattern and pattern in normalized for pattern in COMMON_PASSWORD_PATTERNS
-    )
-    if common_hit:
-        warnings.append("너무 흔한 비밀번호는 사용할 수 없어요.")
-        score = max(0, score - 3)
-    if password_contains_sequence(raw):
-        warnings.append("연속된 문자나 키보드 패턴은 피해주세요.")
-        score = max(0, score - 2)
-    if password_contains_repeated_pattern(raw):
-        warnings.append("같은 문자 반복은 피해주세요.")
-        score = max(0, score - 2)
-    if any(token and token in normalized for token in email_tokens + name_tokens):
-        warnings.append("이메일이나 이름이 들어간 비밀번호는 사용할 수 없어요.")
-        score = max(0, score - 3)
-
-    if len(raw) < PUBLIC_PASSWORD_MIN_LENGTH:
-        warnings.append(f"{PUBLIC_PASSWORD_MIN_LENGTH}자 이상으로 입력해 주세요.")
-
-    if score <= 1:
-        label = "약함"
-        tone = "weak"
-        guidance = "길고 예측 어려운 비밀번호를 추천해요."
-    elif score == 2:
-        label = "보통"
-        tone = "fair"
-        guidance = "12자 이상으로 늘리면 더 안전해집니다."
-    elif score == 3:
-        label = "안전"
-        tone = "good"
-        guidance = "좋습니다. 숫자나 기호를 섞으면 더 안정적입니다."
-    else:
-        label = "매우 안전"
-        tone = "strong"
-        guidance = "현재 기준으로 충분히 강한 비밀번호입니다."
-
-    is_valid = (
-        len(raw) >= PUBLIC_PASSWORD_MIN_LENGTH
-        and not common_hit
-        and not password_contains_sequence(raw)
-        and not password_contains_repeated_pattern(raw)
-        and not any(token and token in normalized for token in email_tokens + name_tokens)
-    )
-
-    return {
-        "label": label,
-        "tone": tone,
-        "score": max(0, min(score, 4)),
-        "guidance": guidance,
-        "warnings": warnings,
-        "isValid": is_valid,
-    }
 
 
 def validate_public_password(password: str, *, email: str = "", name: str = "") -> None:
@@ -874,6 +784,13 @@ CREATE TABLE IF NOT EXISTS suppliers (
     last_currency TEXT NOT NULL DEFAULT '',
     last_service_count INTEGER NOT NULL DEFAULT 0,
     last_checked_at TEXT NOT NULL DEFAULT '',
+    service_sync_status TEXT NOT NULL DEFAULT 'never',
+    service_sync_message TEXT NOT NULL DEFAULT '',
+    service_sync_started_at TEXT NOT NULL DEFAULT '',
+    service_sync_completed_at TEXT NOT NULL DEFAULT '',
+    service_sync_lock_until TEXT NOT NULL DEFAULT '',
+    service_sync_error_count INTEGER NOT NULL DEFAULT 0,
+    service_sync_interval_minutes INTEGER NOT NULL DEFAULT 30,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -891,10 +808,16 @@ CREATE TABLE IF NOT EXISTS supplier_services (
     dripfeed INTEGER NOT NULL DEFAULT 0,
     refill INTEGER NOT NULL DEFAULT 0,
     cancel INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1,
     raw_json TEXT NOT NULL DEFAULT '{}',
     synced_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL DEFAULT '',
+    removed_at TEXT NOT NULL DEFAULT '',
     UNIQUE(supplier_id, external_service_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_supplier_services_supplier_active
+    ON supplier_services(supplier_id, is_active, category, name);
 
 CREATE TABLE IF NOT EXISTS product_supplier_mappings (
     id TEXT PRIMARY KEY,
@@ -1179,170 +1102,13 @@ CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_entity
     ON admin_audit_logs(entity_type, entity_id, created_at DESC);
 """
 
-RUNTIME_SCHEMA_VERSION = "2026-05-07-01"
+RUNTIME_SCHEMA_VERSION = "2026-05-08-01"
 
 
 class PanelError(Exception):
     def __init__(self, message: str, *, status: int = 400) -> None:
         super().__init__(message)
         self.status = status
-
-
-def split_sql_script(script: str) -> List[str]:
-    statements: List[str] = []
-    buffer: List[str] = []
-    for line in script.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        buffer.append(line)
-        if stripped.endswith(";"):
-            statement = "\n".join(buffer).strip().rstrip(";").strip()
-            if statement:
-                statements.append(statement)
-            buffer = []
-    if buffer:
-        statement = "\n".join(buffer).strip().rstrip(";").strip()
-        if statement:
-            statements.append(statement)
-    return statements
-
-
-def rewrite_postgres_placeholders(query: str) -> str:
-    if "?" not in query:
-        return query
-    result: List[str] = []
-    in_single = False
-    in_double = False
-    index = 0
-    while index < len(query):
-        char = query[index]
-        if char == "'" and not in_double:
-            result.append(char)
-            if in_single and index + 1 < len(query) and query[index + 1] == "'":
-                result.append("'")
-                index += 2
-                continue
-            in_single = not in_single
-            index += 1
-            continue
-        if char == '"' and not in_single:
-            result.append(char)
-            in_double = not in_double
-            index += 1
-            continue
-        if char == "?" and not in_single and not in_double:
-            result.append("%s")
-        else:
-            result.append(char)
-        index += 1
-    return "".join(result)
-
-
-def normalize_database_row(row: Any, description: Any = None) -> Optional[Dict[str, Any]]:
-    if row is None:
-        return None
-    if isinstance(row, dict):
-        return row
-    if isinstance(row, sqlite3.Row):
-        return dict(row)
-    if isinstance(row, (tuple, list)) and description:
-        columns: List[str] = []
-        for column in description:
-            if isinstance(column, (tuple, list)) and column:
-                columns.append(str(column[0]))
-            else:
-                columns.append(str(getattr(column, "name", "")))
-        return {column: value for column, value in zip(columns, row)}
-    return dict(row)
-
-
-class DatabaseCursor:
-    def __init__(self, raw_cursor: Any) -> None:
-        self.raw_cursor = raw_cursor
-
-    @property
-    def rowcount(self) -> int:
-        return int(getattr(self.raw_cursor, "rowcount", -1) or 0)
-
-    @property
-    def description(self) -> Any:
-        return getattr(self.raw_cursor, "description", None)
-
-    def fetchone(self) -> Optional[Dict[str, Any]]:
-        return normalize_database_row(self.raw_cursor.fetchone(), self.description)
-
-    def fetchall(self) -> List[Dict[str, Any]]:
-        return [
-            normalized
-            for row in self.raw_cursor.fetchall()
-            if (normalized := normalize_database_row(row, self.description)) is not None
-        ]
-
-    def __iter__(self):
-        for row in self.raw_cursor:
-            normalized = normalize_database_row(row, self.description)
-            if normalized is not None:
-                yield normalized
-
-
-class DatabaseConnection:
-    def __init__(self, backend: str, raw_connection: Any) -> None:
-        self.backend = backend
-        self.raw_connection = raw_connection
-
-    def _prepare_query(self, query: str) -> str:
-        if self.backend == "postgres":
-            return rewrite_postgres_placeholders(query)
-        return query
-
-    def execute(self, query: str, params: Iterable[Any] = ()) -> DatabaseCursor:
-        prepared_query = self._prepare_query(query)
-        if params:
-            raw_cursor = self.raw_connection.execute(prepared_query, tuple(params))
-        else:
-            raw_cursor = self.raw_connection.execute(prepared_query)
-        return DatabaseCursor(raw_cursor)
-
-    def executemany(self, query: str, rows: Iterable[Iterable[Any]]) -> DatabaseCursor:
-        prepared_query = self._prepare_query(query)
-        payload = [tuple(row) for row in rows]
-        if self.backend == "postgres":
-            raw_cursor = self.raw_connection.cursor()
-            raw_cursor.executemany(prepared_query, payload)
-            return DatabaseCursor(raw_cursor)
-        raw_cursor = self.raw_connection.executemany(prepared_query, payload)
-        return DatabaseCursor(raw_cursor)
-
-    def executescript(self, script: str) -> None:
-        if self.backend == "sqlite":
-            self.raw_connection.executescript(script)
-            return
-        for statement in split_sql_script(script):
-            if statement.upper().startswith("PRAGMA "):
-                continue
-            self.raw_connection.execute(statement)
-
-    def commit(self) -> None:
-        self.raw_connection.commit()
-
-    def rollback(self) -> None:
-        self.raw_connection.rollback()
-
-    def close(self) -> None:
-        self.raw_connection.close()
-
-    def __enter__(self) -> "DatabaseConnection":
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        try:
-            if exc_type is None:
-                self.commit()
-            else:
-                self.rollback()
-        finally:
-            self.close()
 
 
 class PreviewHTMLParser(HTMLParser):
@@ -1389,35 +1155,6 @@ def now_iso() -> str:
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-PASSWORD_HASH_ITERATIONS = 260_000
-
-
-def hash_password(password: str) -> str:
-    raw = str(password or "")
-    if not raw:
-        return ""
-    salt = secrets.token_hex(16)
-    derived = hashlib.pbkdf2_hmac("sha256", raw.encode("utf-8"), salt.encode("utf-8"), PASSWORD_HASH_ITERATIONS)
-    return f"pbkdf2_sha256${PASSWORD_HASH_ITERATIONS}${salt}${derived.hex()}"
-
-
-def verify_password(password: str, encoded_hash: str) -> bool:
-    raw_password = str(password or "")
-    stored = str(encoded_hash or "").strip()
-    if not raw_password or not stored:
-        return False
-    parts = stored.split("$", 3)
-    if len(parts) != 4 or parts[0] != "pbkdf2_sha256":
-        return False
-    _, iteration_text, salt, digest = parts
-    try:
-        iterations = int(iteration_text)
-    except ValueError:
-        return False
-    candidate = hashlib.pbkdf2_hmac("sha256", raw_password.encode("utf-8"), salt.encode("utf-8"), iterations)
-    return hmac.compare_digest(candidate.hex(), digest)
-
-
 def as_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
@@ -1433,20 +1170,6 @@ def parse_json(raw: str, fallback: Any) -> Any:
 
 def money(value: int) -> str:
     return f"{value:,}원"
-
-
-def generate_charge_order_code() -> str:
-    return f"CHG-{dt.datetime.now().strftime('%Y%m%d')}-{secrets.token_hex(3).upper()}"
-
-
-def balance_transaction_kind_to_ledger_entry_type(kind: str) -> str:
-    labels = {
-        "charge": "charge",
-        "order": "order_debit",
-        "admin_adjust": "admin_adjustment",
-    }
-    key = str(kind or "").strip().lower()
-    return labels.get(key, key or "admin_adjustment")
 
 
 def payment_method_label(method: str) -> str:
@@ -1839,41 +1562,6 @@ def oauth_provider_catalog() -> List[Dict[str, Any]]:
 
 def generate_public_order_number() -> str:
     return f"SMM-{dt.datetime.now().strftime('%Y%m%d')}-{secrets.token_hex(4).upper()}"
-
-
-def sanitize_idempotency_key(raw: Any) -> str:
-    value = re.sub(r"[^A-Za-z0-9._:-]", "", str(raw or "").strip())
-    return value[:ORDER_IDEMPOTENCY_KEY_MAX_LENGTH]
-
-
-def _canonical_order_field_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): _canonical_order_field_value(value[key]) for key in sorted(value)}
-    if isinstance(value, list):
-        return [_canonical_order_field_value(item) for item in value]
-    if value is None:
-        return ""
-    return str(value).strip()
-
-
-def derive_order_idempotency_key(
-    user_id: str,
-    product_id: str,
-    fields: Dict[str, Any],
-    *,
-    now_seconds: Optional[int] = None,
-) -> str:
-    bucket = int((now_seconds if now_seconds is not None else time.time()) // ORDER_AUTO_IDEMPOTENCY_WINDOW_SECONDS)
-    fingerprint_payload = {
-        "bucket": bucket,
-        "userId": str(user_id or "").strip(),
-        "productId": str(product_id or "").strip(),
-        "fields": _canonical_order_field_value(fields),
-    }
-    fingerprint = hashlib.sha256(
-        json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()[:32]
-    return sanitize_idempotency_key(f"auto:{bucket}:{fingerprint}")
 
 
 def sanitize_external_order_reference(raw: Any) -> str:
@@ -2346,50 +2034,6 @@ def is_unique_constraint_error(exc: BaseException) -> bool:
     if "unique" in error_name or "integrity" in error_name:
         return True
     return "unique" in str(exc).lower()
-
-
-def normalize_supplier_integration_type(raw: Any) -> str:
-    value = str(raw or "").strip().lower()
-    if value == SUPPLIER_INTEGRATION_MKT24:
-        return SUPPLIER_INTEGRATION_MKT24
-    return SUPPLIER_INTEGRATION_CLASSIC
-
-
-def supplier_supports_balance_check(integration_type: str) -> bool:
-    return normalize_supplier_integration_type(integration_type) == SUPPLIER_INTEGRATION_CLASSIC
-
-
-def supplier_supports_auto_dispatch(integration_type: str) -> bool:
-    return normalize_supplier_integration_type(integration_type) == SUPPLIER_INTEGRATION_CLASSIC
-
-
-def normalize_supplier_order_status_payload(payload: Any) -> str:
-    if isinstance(payload, dict):
-        raw_status = str(
-            payload.get("status")
-            or payload.get("Status")
-            or payload.get("state")
-            or payload.get("order_status")
-            or ""
-        ).strip()
-    else:
-        raw_status = str(payload or "").strip()
-    normalized = raw_status.lower().replace("_", " ").replace("-", " ")
-    if not normalized:
-        return "submitted"
-    if any(token in normalized for token in ("complete", "completed", "완료")):
-        return "completed"
-    if any(token in normalized for token in ("progress", "processing", "in progress", "진행")):
-        return "in_progress"
-    if any(token in normalized for token in ("partial", "부분")):
-        return "partial"
-    if any(token in normalized for token in ("cancel", "canceled", "cancelled", "취소")):
-        return "cancelled"
-    if any(token in normalized for token in ("fail", "failed", "error", "reject", "실패", "오류")):
-        return "failed"
-    if any(token in normalized for token in ("pending", "queue", "wait", "대기")):
-        return "pending"
-    return "submitted"
 
 
 def supplier_platform_label(platform_key: str) -> str:
@@ -3149,457 +2793,6 @@ def supplier_service_request_guide(integration_type: str, service: Dict[str, Any
         "callExamplePayload": example_payload,
         "callExampleIsEstimated": normalized_type != SUPPLIER_INTEGRATION_CLASSIC,
     }
-
-
-class SupplierApiError(Exception):
-    pass
-
-
-class SupplierApiClient:
-    def __init__(
-        self,
-        api_url: str,
-        api_key: str,
-        *,
-        integration_type: str = SUPPLIER_INTEGRATION_CLASSIC,
-        bearer_token: str = "",
-    ) -> None:
-        self.api_url = api_url.rstrip("/")
-        self.api_key = api_key.strip()
-        self.integration_type = normalize_supplier_integration_type(integration_type)
-        self.bearer_token = bearer_token.strip()
-
-    def _request_form(self, payload: Dict[str, Any]) -> Any:
-        encoded = urlencode(payload).encode("utf-8")
-        request = Request(
-            self.api_url,
-            data=encoded,
-            headers={
-                "User-Agent": PREVIEW_HEADERS["User-Agent"],
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json,text/plain,*/*",
-            },
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=12) as response:
-                raw = response.read().decode("utf-8", errors="replace")
-        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
-            raise SupplierApiError(str(exc)) from exc
-
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise SupplierApiError("공급사 API가 JSON이 아닌 응답을 반환했습니다.") from exc
-
-        if isinstance(parsed, dict) and parsed.get("error"):
-            raise SupplierApiError(str(parsed["error"]))
-        return parsed
-
-    def _request_json(
-        self,
-        *,
-        method: str,
-        url: Optional[str] = None,
-        headers: Optional[Dict[str, str]] = None,
-        payload: Optional[Dict[str, Any]] = None,
-    ) -> Any:
-        request_headers = {
-            "User-Agent": PREVIEW_HEADERS["User-Agent"],
-            "Accept": "application/json,text/plain,*/*",
-        }
-        if headers:
-            request_headers.update(headers)
-        data = None
-        if payload is not None:
-            data = json.dumps(payload).encode("utf-8")
-            request_headers.setdefault("Content-Type", "application/json")
-        request = Request(url or self.api_url, data=data, headers=request_headers, method=method)
-        try:
-            with urlopen(request, timeout=12) as response:
-                raw = response.read().decode("utf-8", errors="replace")
-        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
-            raise SupplierApiError(str(exc)) from exc
-
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise SupplierApiError("공급사 API가 JSON이 아닌 응답을 반환했습니다.") from exc
-
-        if isinstance(parsed, dict):
-            error_message = parsed.get("error") or parsed.get("message")
-            if parsed.get("success") is False and error_message:
-                raise SupplierApiError(str(error_message))
-        return parsed
-
-    def call(self, action: str, data: Optional[Dict[str, Any]] = None) -> Any:
-        payload = {"key": self.api_key, "action": action}
-        if data:
-            payload.update({key: value for key, value in data.items() if value not in (None, "")})
-        return self._request_form(payload)
-
-    def services(self) -> Any:
-        if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
-            if not self.api_key:
-                raise SupplierApiError("x-api-key가 필요합니다.")
-            if not self.bearer_token:
-                raise SupplierApiError("Bearer Token이 필요합니다.")
-            return self._request_json(
-                method="GET",
-                headers={
-                    "Authorization": f"Bearer {self.bearer_token}",
-                    "x-api-key": self.api_key,
-                },
-            )
-        return self.call("services")
-
-    def _mkt24_v3_url(self, path: str) -> str:
-        parsed = urlparse(self.api_url)
-        if not parsed.scheme or not parsed.netloc:
-            raise SupplierApiError("MKT24 API URL 형식이 올바르지 않습니다.")
-        base_path = parsed.path.rstrip("/")
-        marker = "/v3"
-        if marker in base_path:
-            base_path = base_path[: base_path.index(marker) + len(marker)]
-        else:
-            base_path = "/v3"
-        return f"{parsed.scheme}://{parsed.netloc}{base_path}/{path.lstrip('/')}"
-
-    def mkt24_product_detail(self, product_uuid: str) -> Any:
-        return self._request_json(
-            method="GET",
-            url=self._mkt24_v3_url(f"/products/{quote(str(product_uuid), safe='')}"),
-            headers={
-                "Authorization": f"Bearer {self.bearer_token}",
-                "x-api-key": self.api_key,
-            },
-        )
-
-    def mkt24_sns_lookup(self, *, product_uuid: str, sns_value: str) -> Any:
-        return self._request_json(
-            method="GET",
-            url=self._mkt24_v3_url(
-                f"/sns?snsValue={quote(str(sns_value), safe='')}&productUuid={quote(str(product_uuid), safe='')}"
-            ),
-            headers={
-                "Authorization": f"Bearer {self.bearer_token}",
-                "x-api-key": self.api_key,
-            },
-        )
-
-    def mkt24_estimate_sns(self, payload: Dict[str, Any]) -> Any:
-        return self._request_json(
-            method="POST",
-            url=self._mkt24_v3_url("/order/sns/estimate"),
-            headers={
-                "Authorization": f"Bearer {self.bearer_token}",
-                "x-api-key": self.api_key,
-            },
-            payload=payload,
-        )
-
-    def mkt24_order_sns(self, payload: Dict[str, Any]) -> Any:
-        return self._request_json(
-            method="POST",
-            url=self._mkt24_v3_url("/order/sns"),
-            headers={
-                "Authorization": f"Bearer {self.bearer_token}",
-                "x-api-key": self.api_key,
-            },
-            payload=payload,
-        )
-
-    def mkt24_order_status(self, order_uuid: str) -> Any:
-        return self._request_json(
-            method="GET",
-            url=self._mkt24_v3_url(f"/order/sns/{quote(str(order_uuid), safe='')}"),
-            headers={
-                "Authorization": f"Bearer {self.bearer_token}",
-                "x-api-key": self.api_key,
-            },
-        )
-
-    def balance(self) -> Any:
-        if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
-            raise SupplierApiError("잔액 API를 지원하지 않는 공급사 타입입니다.")
-        return self.call("balance")
-
-    def order(self, data: Dict[str, Any]) -> Any:
-        if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
-            if not self.api_key or not self.bearer_token:
-                raise SupplierApiError("MKT24 자동 발주에는 x-api-key와 Bearer Token이 필요합니다.")
-            payload = dict(data)
-            product_uuid = str(payload.pop("productUuid", "") or payload.pop("product_uuid", "") or payload.get("service") or "").strip()
-            if product_uuid:
-                payload["productUuid"] = product_uuid
-                payload.pop("service", None)
-            return self.mkt24_order_sns(payload)
-        return self.call("add", data)
-
-    def status(self, order_id: str) -> Any:
-        if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
-            if not self.api_key or not self.bearer_token:
-                raise SupplierApiError("MKT24 상태 조회에는 x-api-key와 Bearer Token이 필요합니다.")
-            return self.mkt24_order_status(order_id)
-        return self.call("status", {"order": order_id})
-
-    def multi_status(self, order_ids: List[str]) -> Any:
-        if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
-            raise SupplierApiError("이 공급사 타입은 아직 상태 조회 API가 연결되지 않았습니다.")
-        return self.call("status", {"orders": ",".join(order_ids)})
-
-    def refill(self, order_id: str) -> Any:
-        if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
-            raise SupplierApiError("이 공급사 타입은 아직 리필 API가 연결되지 않았습니다.")
-        return self.call("refill", {"order": order_id})
-
-    def balance_summary(self) -> Dict[str, str]:
-        payload = self.balance()
-        if not isinstance(payload, dict):
-            raise SupplierApiError("잔액 응답 형식이 올바르지 않습니다.")
-        if "balance" not in payload:
-            raise SupplierApiError("잔액 정보를 확인하지 못했습니다.")
-        return {
-            "balance": str(payload.get("balance", "")),
-            "currency": str(payload.get("currency", "")),
-        }
-
-
-class Cafe24ApiError(Exception):
-    pass
-
-
-class Cafe24ApiClient:
-    def __init__(self, mall_id: str, access_token: str, *, shop_no: int = CAFE24_DEFAULT_SHOP_NO) -> None:
-        self.mall_id = str(mall_id or "").strip()
-        self.access_token = str(access_token or "").strip()
-        self.shop_no = int(shop_no or CAFE24_DEFAULT_SHOP_NO)
-        if not self.mall_id:
-            raise Cafe24ApiError("Cafe24 mall_id가 필요합니다.")
-        if not self.access_token:
-            raise Cafe24ApiError("Cafe24 access token이 필요합니다.")
-        self.base_url = cafe24_api_base_url(self.mall_id)
-
-    def _request(
-        self,
-        method: str,
-        path: str,
-        *,
-        query: Optional[Dict[str, Any]] = None,
-        payload: Optional[Dict[str, Any]] = None,
-    ) -> Any:
-        normalized_path = "/" + path.lstrip("/")
-        url = f"{self.base_url}{normalized_path}"
-        params = dict(query or {})
-        params.setdefault("shop_no", self.shop_no)
-        if params:
-            url = f"{url}?{urlencode({key: value for key, value in params.items() if value not in (None, '')}, doseq=True)}"
-        headers = {
-            "Authorization": f"Bearer {self.access_token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": PREVIEW_HEADERS["User-Agent"],
-        }
-        data = json.dumps(payload).encode("utf-8") if payload is not None else None
-        raw = ""
-        for attempt in range(3):
-            request = Request(url, data=data, headers=headers, method=method.upper())
-            try:
-                with urlopen(request, timeout=15) as response:
-                    raw = response.read().decode("utf-8", errors="replace")
-                break
-            except HTTPError as exc:
-                body = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
-                if exc.code in {429, 500, 502, 503, 504} and attempt < 2:
-                    retry_after = str(exc.headers.get("Retry-After") or "").strip() if exc.headers else ""
-                    try:
-                        delay = min(max(float(retry_after), 0.5), 3.0) if retry_after else 0.5 * (attempt + 1)
-                    except ValueError:
-                        delay = 0.5 * (attempt + 1)
-                    time.sleep(delay)
-                    continue
-                raise Cafe24ApiError(f"Cafe24 API 오류 {exc.code}: {body or exc.reason}") from exc
-            except (URLError, TimeoutError, ValueError) as exc:
-                if attempt < 2:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                raise Cafe24ApiError(str(exc)) from exc
-        if not raw:
-            return {}
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise Cafe24ApiError("Cafe24 API가 JSON이 아닌 응답을 반환했습니다.") from exc
-        if isinstance(parsed, dict) and parsed.get("error"):
-            error = parsed.get("error")
-            if isinstance(error, dict):
-                raise Cafe24ApiError(str(error.get("message") or error.get("description") or error))
-            raise Cafe24ApiError(str(error))
-        return parsed
-
-    @staticmethod
-    def exchange_authorization_code(mall_id: str, code: str, redirect_uri: str) -> Dict[str, Any]:
-        client_id = cafe24_client_id()
-        client_secret = cafe24_client_secret()
-        if not client_id or not client_secret:
-            raise Cafe24ApiError("SMM_PANEL_CAFE24_CLIENT_ID / SMM_PANEL_CAFE24_CLIENT_SECRET 설정이 필요합니다.")
-        if not str(code or "").strip():
-            raise Cafe24ApiError("Cafe24 인증 code가 없습니다.")
-        if not str(redirect_uri or "").strip():
-            raise Cafe24ApiError("Cafe24 redirect_uri가 없습니다.")
-        token_url = f"{cafe24_api_base_url(mall_id)}/oauth/token"
-        basic = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
-        data = urlencode(
-            {
-                "grant_type": "authorization_code",
-                "code": str(code).strip(),
-                "redirect_uri": str(redirect_uri).strip(),
-            }
-        ).encode("utf-8")
-        request = Request(
-            token_url,
-            data=data,
-            headers={
-                "Authorization": f"Basic {basic}",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=15) as response:
-                raw = response.read().decode("utf-8", errors="replace")
-        except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
-            raise Cafe24ApiError(f"Cafe24 토큰 발급 실패 {exc.code}: {body or exc.reason}") from exc
-        except (URLError, TimeoutError, ValueError) as exc:
-            raise Cafe24ApiError(str(exc)) from exc
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise Cafe24ApiError("Cafe24 토큰 응답 형식이 올바르지 않습니다.") from exc
-        if not isinstance(parsed, dict) or not parsed.get("access_token"):
-            raise Cafe24ApiError("Cafe24 access token을 발급하지 못했습니다.")
-        return parsed
-
-    @staticmethod
-    def refresh_access_token(mall_id: str, refresh_token: str) -> Dict[str, Any]:
-        client_id = cafe24_client_id()
-        client_secret = cafe24_client_secret()
-        if not client_id or not client_secret:
-            raise Cafe24ApiError("SMM_PANEL_CAFE24_CLIENT_ID / SMM_PANEL_CAFE24_CLIENT_SECRET 설정이 필요합니다.")
-        token_url = f"{cafe24_api_base_url(mall_id)}/oauth/token"
-        basic = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
-        data = urlencode({"grant_type": "refresh_token", "refresh_token": refresh_token}).encode("utf-8")
-        request = Request(
-            token_url,
-            data=data,
-            headers={
-                "Authorization": f"Basic {basic}",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=15) as response:
-                raw = response.read().decode("utf-8", errors="replace")
-        except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
-            raise Cafe24ApiError(f"Cafe24 토큰 갱신 실패 {exc.code}: {body or exc.reason}") from exc
-        except (URLError, TimeoutError, ValueError) as exc:
-            raise Cafe24ApiError(str(exc)) from exc
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise Cafe24ApiError("Cafe24 토큰 응답 형식이 올바르지 않습니다.") from exc
-        if not isinstance(parsed, dict) or not parsed.get("access_token"):
-            raise Cafe24ApiError("Cafe24 access token을 갱신하지 못했습니다.")
-        return parsed
-
-    def orders(
-        self,
-        *,
-        start_date: str,
-        end_date: str,
-        statuses: Optional[List[str]] = None,
-        payment_statuses: Optional[List[str]] = None,
-        order_id: str = "",
-        limit: int = CAFE24_ORDER_PAGE_LIMIT,
-        offset: int = 0,
-        date_type: str = "order_date",
-    ) -> Any:
-        query: Dict[str, Any] = {
-            "start_date": start_date,
-            "end_date": end_date,
-            "date_type": str(date_type or "order_date").strip() or "order_date",
-            "limit": min(max(int(limit or CAFE24_ORDER_PAGE_LIMIT), 1), CAFE24_ORDER_PAGE_LIMIT),
-            "offset": max(int(offset or 0), 0),
-            "embed": "items,buyer,receivers",
-        }
-        if statuses:
-            query["order_status"] = ",".join(statuses)
-        if payment_statuses:
-            query["payment_status"] = ",".join(payment_statuses)
-        normalized_order_id = str(order_id or "").strip()
-        if normalized_order_id:
-            query["order_id"] = normalized_order_id
-        return self._request("GET", "/admin/orders", query=query)
-
-    def order(self, order_id: str) -> Any:
-        return self._request(
-            "GET",
-            f"/admin/orders/{quote(str(order_id), safe='')}",
-            query={"embed": "items,buyer,receivers"},
-        )
-
-    def order_count(
-        self,
-        *,
-        start_date: str,
-        end_date: str,
-        statuses: Optional[List[str]] = None,
-        payment_statuses: Optional[List[str]] = None,
-        date_type: str = "order_date",
-    ) -> Any:
-        query: Dict[str, Any] = {
-            "start_date": start_date,
-            "end_date": end_date,
-            "date_type": str(date_type or "order_date").strip() or "order_date",
-        }
-        if statuses:
-            query["order_status"] = ",".join(statuses)
-        if payment_statuses:
-            query["payment_status"] = ",".join(payment_statuses)
-        return self._request("GET", "/admin/orders/count", query=query)
-
-    def update_order(self, order_id: str, payload: Dict[str, Any]) -> Any:
-        return self._request("PUT", f"/admin/orders/{quote(str(order_id), safe='')}", payload=payload)
-
-    def products(self, *, keyword: str = "", product_no: str = "", limit: int = 20, offset: int = 0) -> Any:
-        query: Dict[str, Any] = {
-            "limit": min(max(int(limit or 20), 1), 100),
-            "offset": max(int(offset or 0), 0),
-        }
-        normalized_product_no = str(product_no or "").strip()
-        normalized_keyword = str(keyword or "").strip()
-        if normalized_product_no:
-            query["product_no"] = normalized_product_no
-        elif normalized_keyword:
-            if normalized_keyword.isdigit():
-                query["product_no"] = normalized_keyword
-            else:
-                query["product_name"] = normalized_keyword
-        return self._request("GET", "/admin/products", query=query)
-
-    def product(self, product_no: str) -> Any:
-        return self._request("GET", f"/admin/products/{quote(str(product_no), safe='')}")
-
-    def product_options(self, product_no: str) -> Any:
-        return self._request("GET", f"/admin/products/{quote(str(product_no), safe='')}/options")
-
-    def product_variants(self, product_no: str) -> Any:
-        return self._request("GET", f"/admin/products/{quote(str(product_no), safe='')}/variants")
 
 
 def service_html(title: str, lead: str, points: List[str], steps: List[str], note: str) -> str:
@@ -5122,115 +4315,11 @@ def catalog_blueprints() -> List[Dict[str, Any]]:
     return platforms
 
 
-class PanelStore:
-    def __init__(self, db_path: Path = DB_PATH, database_url: str = "") -> None:
-        self.db_path = db_path
-        self.database_url = str(database_url or "").strip()
-        if self.database_url:
-            if not self.database_url.startswith(("postgres://", "postgresql://")):
-                raise RuntimeError("SMM_PANEL_DATABASE_URL must be a postgres connection string.")
-            self.backend = "postgres"
-        else:
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            self.backend = "sqlite"
-        self._boot()
-
-    @classmethod
-    def from_env(cls, db_path: Path = DB_PATH) -> "PanelStore":
-        database_url = (
-            os.environ.get("SMM_PANEL_DATABASE_URL", "").strip()
-            or os.environ.get("SMM_PANEL_SUPABASE_DB_URL", "").strip()
-        )
-        if not database_url and is_production_runtime():
-            raise RuntimeError(
-                "SMM_PANEL_DATABASE_URL or SMM_PANEL_SUPABASE_DB_URL is required in production. "
-                "Refusing to start with a temporary SQLite database."
-            )
-        effective_db_path = db_path
-        return cls(db_path=effective_db_path, database_url=database_url)
-
-    def _connect(self) -> DatabaseConnection:
-        if self.backend == "postgres":
-            if psycopg is None or psycopg_dict_row is None:
-                raise RuntimeError(
-                    "Supabase/Postgres support requires psycopg. Install dependencies from requirements.txt first."
-                )
-            conn = psycopg.connect(
-                self.database_url,
-                autocommit=False,
-                prepare_threshold=None,
-                row_factory=psycopg_dict_row,
-            )
-            return DatabaseConnection(self.backend, conn)
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return DatabaseConnection(self.backend, conn)
-
-    def _boot(self) -> None:
-        if self.backend == "postgres" and is_production_runtime():
-            try:
-                with self._connect() as conn:
-                    schema_version = self._runtime_metadata_value_if_available(conn, "schema_version")
-                    if schema_version == RUNTIME_SCHEMA_VERSION:
-                        return
-            except Exception:
-                pass
-        self._initialize()
-
-    def _initialize(self) -> None:
-        with self._connect() as conn:
-            previous_schema_version = self._runtime_metadata_value_if_available(conn, "schema_version")
-            # Existing production databases may not yet have columns referenced by newer
-            # CREATE INDEX statements in SCHEMA_SQL. For those DBs, run additive
-            # migrations first instead of replaying the full schema script.
-            if not previous_schema_version:
-                conn.executescript(SCHEMA_SQL)
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS runtime_metadata (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL DEFAULT '',
-                    updated_at TEXT NOT NULL DEFAULT ''
-                )
-                """
-            )
-            if self._runtime_metadata_value(conn, "schema_version") != RUNTIME_SCHEMA_VERSION:
-                self._apply_migrations(conn)
-                self._set_runtime_metadata(conn, "schema_version", RUNTIME_SCHEMA_VERSION)
-            has_categories = conn.execute("SELECT COUNT(*) AS count FROM product_categories").fetchone()["count"]
-            if not has_categories:
-                self._seed(conn)
-            self._ensure_home_popup(conn)
-            self._ensure_site_settings(conn)
-            if demo_seed_enabled():
-                self._seed_management_samples(conn)
-                self._ensure_management_order_samples(conn)
-                self._ensure_analytics_samples(conn)
-            if self._wallet_runtime_repair_needed(conn):
-                self._sync_wallet_state(conn)
-            conn.commit()
-
-    def _runtime_metadata_value(self, conn: DatabaseConnection, key: str) -> str:
-        row = conn.execute("SELECT value FROM runtime_metadata WHERE key = ?", (key,)).fetchone()
-        if row is None:
-            return ""
-        return str(row["value"] or "")
-
-    def _runtime_metadata_value_if_available(self, conn: DatabaseConnection, key: str) -> str:
-        try:
-            return self._runtime_metadata_value(conn, key)
-        except Exception:
-            return ""
-
-    def _set_runtime_metadata(self, conn: DatabaseConnection, key: str, value: str) -> None:
-        conn.execute(
-            """
-            INSERT INTO runtime_metadata (key, value, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-            """,
-            (key, value, now_iso()),
-        )
+class PanelStore(PanelStoreDatabaseMixin):
+    default_db_path = DB_PATH
+    demo_user_id = DEMO_USER_ID
+    schema_sql = SCHEMA_SQL
+    runtime_schema_version = RUNTIME_SCHEMA_VERSION
 
     def _wallet_runtime_repair_needed(self, conn: DatabaseConnection) -> bool:
         missing_wallet = conn.execute(
@@ -5265,169 +4354,6 @@ class PanelStore:
             """
         ).fetchone()
         return unmigrated_legacy is not None
-
-    def _apply_migrations(self, conn: DatabaseConnection) -> None:
-        self._ensure_column(conn, "users", "password_hash", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "users", "role", "TEXT NOT NULL DEFAULT 'customer'")
-        self._ensure_column(conn, "users", "is_active", "INTEGER NOT NULL DEFAULT 1")
-        self._ensure_column(conn, "users", "account_status", "TEXT NOT NULL DEFAULT 'active'")
-        self._ensure_column(conn, "users", "marketing_opt_in", "INTEGER NOT NULL DEFAULT 0")
-        self._ensure_column(conn, "users", "marketing_opt_in_at", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "users", "withdrawn_at", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "users", "suspended_reason", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "users", "notes", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "users", "last_login_at", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "platform_sections", "image_url", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "site_settings", "header_logo_url", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "home_banners", "image_url", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "home_banners", "is_active", "INTEGER NOT NULL DEFAULT 1")
-        self._ensure_column(conn, "product_categories", "is_active", "INTEGER NOT NULL DEFAULT 1")
-        self._ensure_column(conn, "products", "is_active", "INTEGER NOT NULL DEFAULT 1")
-        self._ensure_column(conn, "suppliers", "integration_type", "TEXT NOT NULL DEFAULT 'classic'")
-        self._ensure_column(conn, "suppliers", "bearer_token", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "home_popups", "image_url", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "site_visit_events", "exclude_from_stats", "INTEGER NOT NULL DEFAULT 0")
-        self._ensure_column(conn, "charge_orders", "payment_payload_json", "TEXT NOT NULL DEFAULT '{}'")
-        self._ensure_column(conn, "charge_orders", "bank_account_snapshot_json", "TEXT NOT NULL DEFAULT '{}'")
-        self._ensure_column(conn, "charge_orders", "confirmed_at", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "orders", "idempotency_key", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "orders", "order_channel", "TEXT NOT NULL DEFAULT 'web'")
-        self._ensure_column(conn, "orders", "external_order_id", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "orders", "external_order_item_id", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "orders", "dispatch_status", "TEXT NOT NULL DEFAULT 'unmapped'")
-        self._ensure_column(conn, "orders", "dispatch_attempts", "INTEGER NOT NULL DEFAULT 0")
-        self._ensure_column(conn, "orders", "supplier_last_error", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "orders", "external_payload_json", "TEXT NOT NULL DEFAULT '{}'")
-        conn.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_user_idempotency_key
-                ON orders(user_id, idempotency_key)
-                WHERE idempotency_key <> ''
-            """
-        )
-        conn.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_channel_external_reference
-                ON orders(order_channel, external_order_id, external_order_item_id)
-                WHERE external_order_id <> ''
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_orders_channel_status_created_at
-                ON orders(order_channel, status, created_at DESC)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_orders_dispatch_status_created_at
-                ON orders(dispatch_status, created_at DESC)
-            """
-        )
-        self._ensure_charge_support_tables(conn)
-        self._ensure_cafe24_support_tables(conn)
-        self._ensure_mkt24_product_settings_table(conn)
-        self._ensure_column(conn, "cafe24_product_mappings", "supplier_id", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_product_mappings", "supplier_product_uuid", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_product_mappings", "supplier_product_code", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_product_mappings", "field_mapping_json", "TEXT NOT NULL DEFAULT '{}'")
-        self._ensure_column(conn, "cafe24_product_mappings", "enabled", "INTEGER NOT NULL DEFAULT 1")
-        self._ensure_column(conn, "cafe24_supplier_mappings", "supplier_service_id", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_supplier_mappings", "enabled", "INTEGER NOT NULL DEFAULT 1")
-        self._ensure_column(conn, "cafe24_integrations", "token_status", "TEXT NOT NULL DEFAULT 'connected'")
-        self._ensure_column(conn, "cafe24_integrations", "token_last_checked_at", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_integrations", "token_last_refreshed_at", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_integrations", "token_refresh_lock_until", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_integrations", "token_refresh_lock_owner", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_integrations", "reconnect_required_at", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_integrations", "reconnect_reason", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_order_items", "cafe24_order_date", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_order_items", "payment_status", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_order_items", "payment_status_source", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_order_items", "payment_gate_status", "TEXT NOT NULL DEFAULT 'unverified'")
-        self._ensure_column(conn, "cafe24_order_items", "payment_method", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_order_items", "payment_amount", "INTEGER NOT NULL DEFAULT 0")
-        self._ensure_column(conn, "cafe24_order_items", "payment_paid_at", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_order_items", "payment_reference", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_order_items", "payment_snapshot_json", "TEXT NOT NULL DEFAULT '{}'")
-        self._ensure_column(conn, "cafe24_order_items", "standard_status", "TEXT NOT NULL DEFAULT 'received'")
-        self._ensure_column(conn, "cafe24_order_items", "internal_order_id", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_order_items", "supplier_id", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_order_items", "supplier_service_id", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_order_items", "supplier_external_service_id", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column(conn, "cafe24_order_items", "supplier_response_json", "TEXT NOT NULL DEFAULT '{}'")
-        if not is_production_runtime():
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_cafe24_oauth_states_expires_at
-                    ON cafe24_oauth_states(expires_at)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_cafe24_integrations_active
-                    ON cafe24_integrations(is_active, updated_at DESC)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_cafe24_product_mappings_product
-                    ON cafe24_product_mappings(internal_product_id, enabled)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_cafe24_supplier_mappings_supplier
-                    ON cafe24_supplier_mappings(supplier_id, supplier_service_id, enabled)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_status_updated_at
-                    ON cafe24_order_items(standard_status, updated_at DESC)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_order_date
-                    ON cafe24_order_items(mall_id, shop_no, cafe24_order_date DESC)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_internal_order
-                    ON cafe24_order_items(internal_order_id)
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_cafe24_api_events_created_at
-                    ON cafe24_api_events(created_at DESC)
-                """
-            )
-        conn.execute("UPDATE cafe24_integrations SET auto_submit = 0 WHERE auto_submit != 0")
-        self._migrate_cafe24_supplier_mappings(conn)
-        if not is_production_runtime():
-            self._ensure_bigint_columns(
-                conn,
-                {
-                    "wallets": ["available_balance", "pending_balance"],
-                    "charge_orders": ["amount", "vat_amount", "total_amount"],
-                    "wallet_ledger": ["amount", "balance_after"],
-                    "payment_records": ["amount"],
-                    "balance_transactions": ["amount", "balance_after"],
-                },
-            )
-        conn.execute("UPDATE users SET email = lower(trim(email)) WHERE email != lower(trim(email))")
-        conn.execute("UPDATE support_links SET route = '/help#faq' WHERE id = 'support_faq'")
-        conn.execute("UPDATE support_links SET route = '/help#notice' WHERE id = 'support_notice'")
-        conn.execute("UPDATE support_links SET route = '/help#guide' WHERE id = 'support_guide'")
-        conn.execute(
-            "UPDATE users SET account_status = CASE WHEN is_active = 1 THEN 'active' ELSE 'suspended' END WHERE COALESCE(account_status, '') = ''"
-        )
-        conn.execute("UPDATE users SET role = 'admin', is_active = 1, account_status = 'active' WHERE id = ?", (DEMO_USER_ID,))
-        conn.execute("UPDATE users SET role = COALESCE(NULLIF(role, ''), 'customer') WHERE id != ?", (DEMO_USER_ID,))
-        self._migrate_supplier_secrets(conn)
 
     def _ensure_mkt24_product_settings_table(self, conn: DatabaseConnection) -> None:
         conn.executescript(
@@ -5749,32 +4675,6 @@ class PanelStore:
             """
         )
 
-    def _ensure_bigint_columns(self, conn: DatabaseConnection, table_columns: Dict[str, List[str]]) -> None:
-        if self.backend != "postgres":
-            return
-        for table, columns in table_columns.items():
-            for column in columns:
-                conn.execute(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE BIGINT")
-
-    def _ensure_column(self, conn: DatabaseConnection, table: str, column: str, definition: str) -> None:
-        if self.backend == "postgres":
-            columns = {
-                row["column_name"]
-                for row in conn.execute(
-                    """
-                    SELECT column_name
-                    FROM information_schema.columns
-                    WHERE table_schema = 'public' AND table_name = ? AND column_name = ?
-                    """,
-                    (table, column),
-                ).fetchall()
-            }
-        else:
-            columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-        if column in columns:
-            return
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
     def _sync_wallet_state(self, conn: DatabaseConnection) -> None:
         timestamp = now_iso()
         user_rows = conn.execute("SELECT id, balance FROM users").fetchall()
@@ -5995,7 +4895,7 @@ class PanelStore:
                     (f"{order['id']}_field_{index}", order["id"], field_key, field_label, field_value),
                 )
 
-    def _ensure_home_popup(self, conn: sqlite3.Connection) -> None:
+    def _ensure_home_popup(self, conn: DatabaseConnection) -> None:
         exists = conn.execute("SELECT id FROM home_popups LIMIT 1").fetchone()
         if exists is not None:
             return
@@ -6022,7 +4922,7 @@ class PanelStore:
             ),
         )
 
-    def _ensure_site_settings(self, conn: sqlite3.Connection) -> None:
+    def _ensure_site_settings(self, conn: DatabaseConnection) -> None:
         exists = conn.execute("SELECT id FROM site_settings LIMIT 1").fetchone()
         if exists is not None:
             return
@@ -6049,7 +4949,7 @@ class PanelStore:
             ),
         )
 
-    def _ensure_analytics_samples(self, conn: sqlite3.Connection) -> None:
+    def _ensure_analytics_samples(self, conn: DatabaseConnection) -> None:
         exists = conn.execute("SELECT COUNT(*) AS count FROM site_visit_events").fetchone()["count"]
         if exists:
             return
@@ -6135,7 +5035,7 @@ class PanelStore:
             event_rows,
         )
 
-    def _seed(self, conn: sqlite3.Connection) -> None:
+    def _seed(self, conn: DatabaseConnection) -> None:
         created_at = now_iso()
         if demo_seed_enabled():
             conn.execute(
@@ -6441,18 +5341,18 @@ class PanelStore:
                         (f"{order['id']}_field_{index}", order["id"], field_key, field_label, field_value),
                     )
 
-    def _fetchall(self, query: str, params: Iterable[Any] = ()) -> List[sqlite3.Row]:
+    def _fetchall(self, query: str, params: Iterable[Any] = ()) -> List[Dict[str, Any]]:
         with self._connect() as conn:
             return conn.execute(query, tuple(params)).fetchall()
 
-    def _fetchone(self, query: str, params: Iterable[Any] = ()) -> sqlite3.Row:
+    def _fetchone(self, query: str, params: Iterable[Any] = ()) -> Dict[str, Any]:
         with self._connect() as conn:
             row = conn.execute(query, tuple(params)).fetchone()
         if row is None:
             raise PanelError("요청한 데이터를 찾을 수 없습니다.", status=404)
         return row
 
-    def _public_user_row(self, conn: sqlite3.Connection, user_id: str) -> Optional[sqlite3.Row]:
+    def _public_user_row(self, conn: DatabaseConnection, user_id: str) -> Optional[Dict[str, Any]]:
         if not user_id:
             return None
         row = conn.execute(
@@ -6465,7 +5365,7 @@ class PanelStore:
         ).fetchone()
         return row
 
-    def _user_summary(self, conn: sqlite3.Connection, user_id: str) -> Dict[str, Any]:
+    def _user_summary(self, conn: DatabaseConnection, user_id: str) -> Dict[str, Any]:
         user = self._public_user_row(conn, user_id)
         if user is None:
             raise PanelError("로그인한 사용자를 찾을 수 없습니다.", status=401)
@@ -8581,7 +7481,7 @@ class PanelStore:
             conn.commit()
         return {"tracked": True}
 
-    def _analytics_page_label(self, conn: sqlite3.Connection, route: str) -> str:
+    def _analytics_page_label(self, conn: DatabaseConnection, route: str) -> str:
         normalized = normalize_analytics_route(route)
         if normalized == "/":
             return "홈"
@@ -9000,7 +7900,7 @@ class PanelStore:
             ],
         }
 
-    def _admin_analytics_payload(self, conn: sqlite3.Connection) -> Dict[str, Any]:
+    def _admin_analytics_payload(self, conn: DatabaseConnection) -> Dict[str, Any]:
         today = dt.datetime.now().astimezone().date()
         dates = [today - dt.timedelta(days=offset) for offset in range(ANALYTICS_LOOKBACK_DAYS - 1, -1, -1)]
         visits = []
@@ -9158,7 +8058,8 @@ class PanelStore:
                 """
                 SELECT
                     s.*,
-                    COUNT(DISTINCT ss.id) AS service_count,
+                    COUNT(DISTINCT CASE WHEN ss.is_active = 1 THEN ss.id END) AS service_count,
+                    COUNT(DISTINCT CASE WHEN ss.is_active = 0 THEN ss.id END) AS inactive_service_count,
                     COUNT(DISTINCT psm.id) AS mapping_count
                 FROM suppliers s
                 LEFT JOIN supplier_services ss ON ss.supplier_id = s.id
@@ -9188,7 +8089,15 @@ class PanelStore:
                     "lastCurrency": row["last_currency"],
                     "lastServiceCount": row["last_service_count"],
                     "lastCheckedAt": row["last_checked_at"],
+                    "serviceSyncStatus": row["service_sync_status"],
+                    "serviceSyncMessage": row["service_sync_message"],
+                    "serviceSyncStartedAt": row["service_sync_started_at"],
+                    "serviceSyncCompletedAt": row["service_sync_completed_at"],
+                    "serviceSyncLockUntil": row["service_sync_lock_until"],
+                    "serviceSyncErrorCount": row["service_sync_error_count"],
+                    "serviceSyncIntervalMinutes": row["service_sync_interval_minutes"],
                     "serviceCount": row["service_count"],
+                    "inactiveServiceCount": row["inactive_service_count"],
                     "mappingCount": row["mapping_count"],
                     "createdAt": row["created_at"],
                     "updatedAt": row["updated_at"],
@@ -10257,7 +9166,7 @@ class PanelStore:
             supplier_external_service_id = supplier_product_uuid or supplier_product_code
             if supplier_service_id:
                 supplier_service = conn.execute(
-                    "SELECT id, external_service_id FROM supplier_services WHERE id = ? AND supplier_id = ?",
+                    "SELECT id, external_service_id FROM supplier_services WHERE id = ? AND supplier_id = ? AND is_active = 1",
                     (supplier_service_id, supplier_id),
                 ).fetchone()
                 if supplier_service is None:
@@ -10981,7 +9890,8 @@ class PanelStore:
                 ss.external_service_id AS supplier_service_external_id,
                 ss.raw_json AS supplier_service_raw_json,
                 ss.min_amount AS supplier_min_amount,
-                ss.max_amount AS supplier_max_amount
+                ss.max_amount AS supplier_max_amount,
+                ss.is_active AS supplier_service_is_active
             FROM cafe24_supplier_mappings cm
             LEFT JOIN products p ON p.id = cm.internal_product_id
             JOIN suppliers s ON s.id = cm.supplier_id
@@ -11478,6 +10388,9 @@ class PanelStore:
             elif not bool(mapping.get("supplier_is_active")):
                 status = "mapping_error"
                 error_message = "Cafe24 상품에 연결된 공급사가 비활성 상태입니다."
+            elif mapping.get("supplier_service_id") and not bool(mapping.get("supplier_service_is_active")):
+                status = "mapping_error"
+                error_message = "Cafe24 상품에 연결된 공급사 서비스가 비활성 상태입니다. 서비스 동기화 또는 매핑 수정이 필요합니다."
             elif mapping.get("internal_product_id"):
                 product_row = conn.execute(
                     """
@@ -12302,7 +11215,7 @@ class PanelStore:
             query = """
                 SELECT *
                 FROM supplier_services
-                WHERE supplier_id = ?
+                WHERE supplier_id = ? AND is_active = 1
             """
             params: List[Any] = [supplier_id]
             if search.strip():
@@ -12321,7 +11234,7 @@ class PanelStore:
             "search": search,
         }
 
-    def _supplier_service_payload(self, row: sqlite3.Row, integration_type: str) -> Dict[str, Any]:
+    def _supplier_service_payload(self, row: Dict[str, Any], integration_type: str) -> Dict[str, Any]:
         raw_payload = parse_json(row["raw_json"], {})
         payload = {
             "id": row["id"],
@@ -12336,7 +11249,10 @@ class PanelStore:
             "dripfeed": bool(row["dripfeed"]),
             "refill": bool(row["refill"]),
             "cancel": bool(row["cancel"]),
+            "isActive": bool(row["is_active"]),
             "syncedAt": row["synced_at"],
+            "lastSeenAt": row["last_seen_at"],
+            "removedAt": row["removed_at"],
             "requestGuide": supplier_service_request_guide(
                 integration_type,
                 {
@@ -12495,7 +11411,7 @@ class PanelStore:
                 """
                 SELECT id, external_service_id
                 FROM supplier_services
-                WHERE supplier_id = ? AND id = ?
+                WHERE supplier_id = ? AND id = ? AND is_active = 1
                 LIMIT 1
                 """,
                 (supplier_id, supplier_service_id),
@@ -13090,20 +12006,106 @@ class PanelStore:
 
         return {"result": result}
 
-    def sync_supplier_services(self, supplier_id: str, *, actor: str = "admin") -> Dict[str, Any]:
-        supplier = self._supplier_by_id(supplier_id, include_api_key=True)
-        result = self._run_supplier_connection_test(
-            supplier["apiUrl"],
-            supplier["apiKey"],
-            integration_type=supplier["integrationType"],
-            bearer_token=supplier.get("bearerToken") or "",
-            require_services=True,
-        )
-        services_payload = result["servicesPayload"]
-        synced_at = now_iso()
+    def _acquire_supplier_service_sync_lock(self, supplier_id: str, *, force: bool = False) -> Dict[str, Any]:
+        started_at = now_iso()
+        lock_until = (
+            dt.datetime.now().astimezone() + dt.timedelta(minutes=SUPPLIER_SERVICE_SYNC_LOCK_MINUTES)
+        ).isoformat(timespec="seconds")
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM suppliers WHERE id = ?", (supplier_id,)).fetchone()
+            if row is None:
+                raise PanelError("공급사를 찾을 수 없습니다.", status=404)
+            if not bool(row["is_active"]):
+                raise PanelError("비활성 공급사는 서비스 동기화를 실행할 수 없습니다.")
+            active_lock = parse_iso_datetime(row.get("service_sync_lock_until"))
+            if active_lock and active_lock > dt.datetime.now().astimezone():
+                raise PanelError("이미 공급사 서비스 동기화가 진행 중입니다. 잠시 후 다시 시도해 주세요.", status=409)
+            if not force and not supplier_service_sync_due(row):
+                return {"acquired": False, "skipped": True, "supplier": self._supplier_by_id(supplier_id)}
+            conn.execute(
+                """
+                UPDATE suppliers
+                SET service_sync_status = 'syncing',
+                    service_sync_message = '서비스 동기화 진행 중',
+                    service_sync_started_at = ?,
+                    service_sync_lock_until = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (started_at, lock_until, started_at, supplier_id),
+            )
+            conn.commit()
+        return {"acquired": True, "skipped": False, "supplier": self._supplier_by_id(supplier_id, include_api_key=True)}
 
-        if not isinstance(services_payload, list):
-            raise PanelError("공급사 서비스 목록 형식이 올바르지 않습니다.")
+    def _mark_supplier_service_sync_failed(self, supplier_id: str, message: str, *, actor: str = "system") -> None:
+        timestamp = now_iso()
+        safe_message = str(message or "서비스 동기화에 실패했습니다.").strip()[:800]
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT service_sync_error_count FROM suppliers WHERE id = ?",
+                (supplier_id,),
+            ).fetchone()
+            if row is None:
+                return
+            error_count = int(row["service_sync_error_count"] or 0) + 1
+            conn.execute(
+                """
+                UPDATE suppliers
+                SET service_sync_status = 'failed',
+                    service_sync_message = ?,
+                    service_sync_completed_at = ?,
+                    service_sync_lock_until = '',
+                    service_sync_error_count = ?,
+                    last_test_status = 'failed',
+                    last_test_message = ?,
+                    last_checked_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (safe_message, timestamp, error_count, safe_message, timestamp, timestamp, supplier_id),
+            )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="supplier.services_sync_failed",
+                entity_type="supplier",
+                entity_id=supplier_id,
+                message="공급사 서비스 동기화 실패",
+                metadata={"error": safe_message, "errorCount": error_count},
+            )
+            conn.commit()
+
+    def _sync_supplier_services_internal(self, supplier_id: str, *, actor: str = "admin", force: bool = True) -> Dict[str, Any]:
+        lock = self._acquire_supplier_service_sync_lock(supplier_id, force=force)
+        if lock.get("skipped"):
+            return {
+                "supplier": lock["supplier"],
+                "serviceCount": lock["supplier"].get("lastServiceCount", 0),
+                "syncedAt": lock["supplier"].get("serviceSyncCompletedAt") or lock["supplier"].get("lastCheckedAt") or "",
+                "skipped": True,
+                "message": "최근 동기화 상태가 아직 유효합니다.",
+            }
+
+        supplier = lock["supplier"]
+        try:
+            result = self._run_supplier_connection_test(
+                supplier["apiUrl"],
+                supplier["apiKey"],
+                integration_type=supplier["integrationType"],
+                bearer_token=supplier.get("bearerToken") or "",
+                require_services=True,
+            )
+            services_payload = result["servicesPayload"]
+            if not isinstance(services_payload, list):
+                raise PanelError("공급사 서비스 목록 형식이 올바르지 않습니다.")
+        except Exception as exc:
+            message = str(exc) if isinstance(exc, (PanelError, SupplierApiError)) else "서비스 동기화 중 오류가 발생했습니다."
+            self._mark_supplier_service_sync_failed(supplier_id, message, actor=actor)
+            raise
+
+        synced_at = now_iso()
+        seen_external_ids: List[str] = []
+        unique_seen: set[str] = set()
 
         with self._connect() as conn:
             for item in services_payload:
@@ -13113,47 +12115,37 @@ class PanelStore:
                 if service_record is None:
                     continue
                 external_service_id = service_record["externalServiceId"]
+                if external_service_id in unique_seen:
+                    continue
+                unique_seen.add(external_service_id)
+                seen_external_ids.append(external_service_id)
                 row_id = conn.execute(
                     "SELECT id FROM supplier_services WHERE supplier_id = ? AND external_service_id = ?",
                     (supplier_id, external_service_id),
                 ).fetchone()
                 service_id = row_id["id"] if row_id else f"svc_{uuid4().hex[:12]}"
-                values = (
-                    service_id,
-                    supplier_id,
-                    external_service_id,
-                    service_record["name"],
-                    service_record["category"],
-                    service_record["type"],
-                    service_record["rate"],
-                    service_record["minAmount"],
-                    service_record["maxAmount"],
-                    bool_to_int(service_record["dripfeed"]),
-                    bool_to_int(service_record["refill"]),
-                    bool_to_int(service_record["cancel"]),
-                    service_record["rawJson"],
-                    synced_at,
-                )
                 if row_id:
                     conn.execute(
                         """
                         UPDATE supplier_services
                         SET name = ?, category = ?, type = ?, rate = ?, min_amount = ?, max_amount = ?,
-                            dripfeed = ?, refill = ?, cancel = ?, raw_json = ?, synced_at = ?
+                            dripfeed = ?, refill = ?, cancel = ?, is_active = 1, raw_json = ?,
+                            synced_at = ?, last_seen_at = ?, removed_at = ''
                         WHERE id = ?
                         """,
                         (
-                            values[3],
-                            values[4],
-                            values[5],
-                            values[6],
-                            values[7],
-                            values[8],
-                            values[9],
-                            values[10],
-                            values[11],
-                            values[12],
-                            values[13],
+                            service_record["name"],
+                            service_record["category"],
+                            service_record["type"],
+                            service_record["rate"],
+                            service_record["minAmount"],
+                            service_record["maxAmount"],
+                            bool_to_int(service_record["dripfeed"]),
+                            bool_to_int(service_record["refill"]),
+                            bool_to_int(service_record["cancel"]),
+                            service_record["rawJson"],
+                            synced_at,
+                            synced_at,
                             service_id,
                         ),
                     )
@@ -13162,18 +12154,66 @@ class PanelStore:
                         """
                         INSERT INTO supplier_services (
                             id, supplier_id, external_service_id, name, category, type, rate,
-                            min_amount, max_amount, dripfeed, refill, cancel, raw_json, synced_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            min_amount, max_amount, dripfeed, refill, cancel, is_active,
+                            raw_json, synced_at, last_seen_at, removed_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, '')
                         """,
-                        values,
+                        (
+                            service_id,
+                            supplier_id,
+                            external_service_id,
+                            service_record["name"],
+                            service_record["category"],
+                            service_record["type"],
+                            service_record["rate"],
+                            service_record["minAmount"],
+                            service_record["maxAmount"],
+                            bool_to_int(service_record["dripfeed"]),
+                            bool_to_int(service_record["refill"]),
+                            bool_to_int(service_record["cancel"]),
+                            service_record["rawJson"],
+                            synced_at,
+                            synced_at,
+                        ),
                     )
 
+            if seen_external_ids:
+                placeholders = ",".join("?" for _ in seen_external_ids)
+                conn.execute(
+                    f"""
+                    UPDATE supplier_services
+                    SET is_active = 0, removed_at = ?, synced_at = ?
+                    WHERE supplier_id = ? AND is_active = 1 AND external_service_id NOT IN ({placeholders})
+                    """,
+                    (synced_at, synced_at, supplier_id, *seen_external_ids),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE supplier_services
+                    SET is_active = 0, removed_at = ?, synced_at = ?
+                    WHERE supplier_id = ? AND is_active = 1
+                    """,
+                    (synced_at, synced_at, supplier_id),
+                )
+
+            inactive_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM supplier_services WHERE supplier_id = ? AND is_active = 0",
+                (supplier_id,),
+            ).fetchone()["count"]
             persisted_api_url = result.get("persistedApiUrl") or result["resolvedApiUrl"]
+            service_count = len(seen_external_ids)
             conn.execute(
                 """
                 UPDATE suppliers
                 SET api_url = ?, last_test_status = 'success', last_test_message = ?, last_balance = ?, last_currency = ?,
-                    last_service_count = ?, last_checked_at = ?, updated_at = ?
+                    last_service_count = ?, last_checked_at = ?,
+                    service_sync_status = 'success',
+                    service_sync_message = ?,
+                    service_sync_completed_at = ?,
+                    service_sync_lock_until = '',
+                    service_sync_error_count = 0,
+                    updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -13181,7 +12221,9 @@ class PanelStore:
                     "서비스 동기화 완료",
                     result["balance"],
                     result["currency"],
-                    result["serviceCount"],
+                    service_count,
+                    synced_at,
+                    "서비스 동기화 완료",
                     synced_at,
                     synced_at,
                     supplier_id,
@@ -13194,14 +12236,64 @@ class PanelStore:
                 entity_type="supplier",
                 entity_id=supplier_id,
                 message="공급사 서비스 목록 동기화",
-                metadata={"serviceCount": result["serviceCount"]},
+                metadata={"serviceCount": service_count, "inactiveServiceCount": inactive_count},
             )
             conn.commit()
 
         return {
             "supplier": self._supplier_by_id(supplier_id),
-            "serviceCount": result["serviceCount"],
+            "serviceCount": service_count,
+            "inactiveServiceCount": inactive_count,
             "syncedAt": synced_at,
+            "skipped": False,
+        }
+
+    def sync_supplier_services(self, supplier_id: str, *, actor: str = "admin") -> Dict[str, Any]:
+        return self._sync_supplier_services_internal(supplier_id, actor=actor, force=True)
+
+    def sync_due_supplier_services(self, *, actor: str = "cron", limit: int = 10) -> Dict[str, Any]:
+        max_items = max(1, min(int(limit or 10), 25))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM suppliers
+                WHERE is_active = 1
+                ORDER BY COALESCE(NULLIF(service_sync_completed_at, ''), NULLIF(last_checked_at, ''), created_at) ASC
+                LIMIT 100
+                """
+            ).fetchall()
+
+        checked = len(rows)
+        results: List[Dict[str, Any]] = []
+        synced = 0
+        failed = 0
+        skipped = 0
+        for row in rows:
+            if len(results) >= max_items:
+                break
+            if not supplier_service_sync_due(row):
+                skipped += 1
+                continue
+            supplier_id = str(row["id"])
+            try:
+                result = self._sync_supplier_services_internal(supplier_id, actor=actor, force=False)
+                if result.get("skipped"):
+                    skipped += 1
+                else:
+                    synced += 1
+                results.append({"supplierId": supplier_id, "ok": True, **result})
+            except Exception as exc:
+                failed += 1
+                results.append({"supplierId": supplier_id, "ok": False, "error": str(exc)})
+
+        return {
+            "checked": checked,
+            "synced": synced,
+            "failed": failed,
+            "skipped": skipped,
+            "results": results,
+            "ranAt": now_iso(),
         }
 
     def save_product_mapping(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -13229,7 +12321,7 @@ class PanelStore:
                 """
                 SELECT id, external_service_id, supplier_id
                 FROM supplier_services
-                WHERE id = ? AND supplier_id = ?
+                WHERE id = ? AND supplier_id = ? AND is_active = 1
                 """,
                 (supplier_service_id, supplier_id),
             ).fetchone()
@@ -13703,6 +12795,7 @@ class PanelStore:
             JOIN platform_sections ps ON ps.id = pg.platform_section_id
             JOIN product_supplier_mappings psm ON psm.product_id = p.id AND psm.is_primary = 1 AND psm.is_active = 1
             JOIN suppliers s ON s.id = psm.supplier_id
+            JOIN supplier_services ss ON ss.id = psm.supplier_service_id AND ss.is_active = 1
             WHERE o.id = ?
             LIMIT 1
             """,
@@ -14227,6 +13320,13 @@ class PanelStore:
             "lastCurrency": row["last_currency"],
             "lastServiceCount": row["last_service_count"],
             "lastCheckedAt": row["last_checked_at"],
+            "serviceSyncStatus": row["service_sync_status"],
+            "serviceSyncMessage": row["service_sync_message"],
+            "serviceSyncStartedAt": row["service_sync_started_at"],
+            "serviceSyncCompletedAt": row["service_sync_completed_at"],
+            "serviceSyncLockUntil": row["service_sync_lock_until"],
+            "serviceSyncErrorCount": row["service_sync_error_count"],
+            "serviceSyncIntervalMinutes": row["service_sync_interval_minutes"],
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }
@@ -14243,7 +13343,7 @@ class PanelStore:
         row = self._fetchone("SELECT * FROM site_settings ORDER BY updated_at DESC LIMIT 1")
         return {"siteSettings": self._site_settings_admin_payload(row)}
 
-    def _site_settings_row(self, conn: sqlite3.Connection) -> sqlite3.Row:
+    def _site_settings_row(self, conn: DatabaseConnection) -> Dict[str, Any]:
         row = conn.execute("SELECT * FROM site_settings ORDER BY updated_at DESC LIMIT 1").fetchone()
         if row is None:
             self._ensure_site_settings(conn)
@@ -14274,7 +13374,7 @@ class PanelStore:
                 raise PanelError("사이트 설정을 불러오지 못했습니다.", status=500)
         return row
 
-    def _site_settings_public_payload(self, row: sqlite3.Row) -> Dict[str, Any]:
+    def _site_settings_public_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
         effective_mail_sms_site_name = (
             row["mail_sms_site_name"].strip()
             if bool(row["use_mail_sms_site_name"]) and row["mail_sms_site_name"].strip()
@@ -14291,7 +13391,7 @@ class PanelStore:
             "shareImageUrl": row["share_image_url"],
         }
 
-    def _site_settings_admin_payload(self, row: sqlite3.Row) -> Dict[str, Any]:
+    def _site_settings_admin_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
         payload = self._site_settings_public_payload(row)
         payload.update(
             {
@@ -14301,7 +13401,7 @@ class PanelStore:
         )
         return payload
 
-    def _popup_public_payload(self, row: sqlite3.Row) -> Dict[str, Any]:
+    def _popup_public_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "id": row["id"],
             "badgeText": row["badge_text"],
@@ -14314,7 +13414,7 @@ class PanelStore:
             "updatedAt": row["updated_at"],
         }
 
-    def _popup_admin_payload(self, row: sqlite3.Row) -> Dict[str, Any]:
+    def _popup_admin_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "id": row["id"],
             "name": row["name"],
@@ -14329,7 +13429,7 @@ class PanelStore:
             "updatedAt": row["updated_at"],
         }
 
-    def _home_banner_payload(self, row: sqlite3.Row) -> Dict[str, Any]:
+    def _home_banner_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "id": row["id"],
             "title": row["title"],
@@ -14342,7 +13442,7 @@ class PanelStore:
             "sortOrder": row["sort_order"],
         }
 
-    def _platform_section_payload(self, row: sqlite3.Row) -> Dict[str, Any]:
+    def _platform_section_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "id": row["id"],
             "slug": row["slug"],
@@ -14573,7 +13673,7 @@ class PanelStore:
             else None,
         }
 
-    def _sync_category_order_options(self, conn: sqlite3.Connection, category_id: str) -> None:
+    def _sync_category_order_options(self, conn: DatabaseConnection, category_id: str) -> None:
         active_count = conn.execute(
             "SELECT COUNT(*) AS count FROM products WHERE product_category_id = ? AND is_active = 1",
             (category_id,),
@@ -14877,7 +13977,7 @@ class PanelStore:
                         ss.raw_json AS supplier_service_raw_json
                     FROM product_supplier_mappings psm
                     JOIN suppliers s ON s.id = psm.supplier_id
-                    JOIN supplier_services ss ON ss.id = psm.supplier_service_id
+                    JOIN supplier_services ss ON ss.id = psm.supplier_service_id AND ss.is_active = 1
                     WHERE psm.product_id = ? AND psm.is_primary = 1 AND psm.is_active = 1
                     LIMIT 1
                     """,
@@ -15384,7 +14484,7 @@ class PanelStore:
 
     def _validate_product_target(
         self,
-        product: sqlite3.Row,
+        product: Dict[str, Any],
         fields: Dict[str, Any],
         require_preview: bool = False,
     ) -> Dict[str, Any]:
@@ -15431,7 +14531,7 @@ class PanelStore:
             "requiresPreview": requires_preview,
         }
 
-    def _resolve_preview_target(self, product: sqlite3.Row, fields: Dict[str, Any]) -> Dict[str, str]:
+    def _resolve_preview_target(self, product: Dict[str, Any], fields: Dict[str, Any]) -> Dict[str, str]:
         form_structure = parse_json(product["form_structure_json"], {})
         template = form_structure.get("template", {})
         platform_hint = preview_platform_hint(product["product_code"], product["platform_slug"])
@@ -15480,7 +14580,7 @@ class PanelStore:
             "platformHint": platform_hint,
         }
 
-    def _resolve_quantity(self, product: sqlite3.Row, fields: Dict[str, Any]) -> int:
+    def _resolve_quantity(self, product: Dict[str, Any], fields: Dict[str, Any]) -> int:
         if product["price_strategy"] == "fixed":
             return 1
         raw = fields.get("orderedCount")

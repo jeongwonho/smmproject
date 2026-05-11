@@ -8,7 +8,8 @@ from unittest.mock import patch
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from smm_panel.core import Cafe24ApiError, PanelError, PanelStore, now_iso
+import bootstrap
+from core import Cafe24ApiError, PanelError, PanelStore, now_iso
 
 
 class FakeCafe24ProductClient:
@@ -106,8 +107,8 @@ class FakeCafe24OrderClient:
 
 class Cafe24OrderIntegrationTest(unittest.TestCase):
     def setUp(self):
-        self.db_path = Path(tempfile.gettempdir()) / "instamart_cafe24_orders_test.db"
-        self.db_path.unlink(missing_ok=True)
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tmpdir.name) / "instamart_cafe24_orders_test.db"
         self.store = PanelStore(db_path=self.db_path)
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
@@ -140,7 +141,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
 
     def tearDown(self):
         self.conn.close()
-        self.db_path.unlink(missing_ok=True)
+        self.tmpdir.cleanup()
 
     def _seed_supplier_mapping(self):
         timestamp = now_iso()
@@ -296,7 +297,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.conn.commit()
         item_id = self.conn.execute("SELECT id FROM cafe24_order_items").fetchone()["id"]
 
-        with patch("smm_panel.core.SupplierApiClient.order", return_value={"order": "SUP-1001"}) as order_call:
+        with patch("core.SupplierApiClient.order", return_value={"order": "SUP-1001"}) as order_call:
             result = self.store.dispatch_cafe24_order_item({"itemId": item_id, "_adminActor": "qa"})
             duplicate = self.store.dispatch_cafe24_order_item({"itemId": item_id, "_adminActor": "qa"})
 
@@ -326,7 +327,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.conn.commit()
         item_id = self.conn.execute("SELECT id FROM cafe24_order_items").fetchone()["id"]
 
-        with patch("smm_panel.core.SupplierApiClient.order") as order_call:
+        with patch("core.SupplierApiClient.order") as order_call:
             with self.assertRaises(PanelError):
                 self.store.dispatch_cafe24_order_item({"itemId": item_id, "_adminActor": "qa"})
 
@@ -653,7 +654,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
                 }
             )
             with patch(
-                "smm_panel.core.Cafe24ApiClient.exchange_authorization_code",
+                "core.Cafe24ApiClient.exchange_authorization_code",
                 return_value={
                     "access_token": "new-access-token",
                     "refresh_token": "new-refresh-token",
@@ -678,7 +679,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
     def test_expired_access_token_refreshes_once_and_rotates_refresh_token(self):
         self._set_integration_token_expiry(access_delta_seconds=-30, refresh_delta_days=10)
         with patch(
-            "smm_panel.core.Cafe24ApiClient.refresh_access_token",
+            "core.Cafe24ApiClient.refresh_access_token",
             return_value={
                 "access_token": "rotated-access-token",
                 "refresh_token": "rotated-refresh-token",

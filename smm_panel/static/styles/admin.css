@@ -1,3 +1,6 @@
+/* Admin entrypoint: imported modules hold extracted admin-only rules to keep this file under the architecture budget. */
+@import "./admin-shared.css";
+
 body[data-route-surface="admin"] {
   justify-content: stretch;
   padding: 0;

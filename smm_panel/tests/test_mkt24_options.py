@@ -4,7 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from smm_panel.core import PanelError, PanelStore, now_iso
+import bootstrap
+from core import PanelError, PanelStore, now_iso
 
 
 MKT24_DETAIL = {
@@ -56,8 +57,8 @@ MKT24_DETAIL = {
 
 class Mkt24OrderOptionTest(unittest.TestCase):
     def setUp(self):
-        self.db_path = Path(tempfile.gettempdir()) / "instamart_mkt24_options_test.db"
-        self.db_path.unlink(missing_ok=True)
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tmpdir.name) / "instamart_mkt24_options_test.db"
         self.store = PanelStore(db_path=self.db_path)
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
@@ -65,7 +66,7 @@ class Mkt24OrderOptionTest(unittest.TestCase):
 
     def tearDown(self):
         self.conn.close()
-        self.db_path.unlink(missing_ok=True)
+        self.tmpdir.cleanup()
 
     def _seed_mkt24_supplier(self):
         timestamp = now_iso()
@@ -113,7 +114,7 @@ class Mkt24OrderOptionTest(unittest.TestCase):
         self.conn.commit()
 
     def _sync_default_setting(self):
-        with patch("smm_panel.core.SupplierApiClient.mkt24_product_detail", return_value=MKT24_DETAIL):
+        with patch("core.SupplierApiClient.mkt24_product_detail", return_value=MKT24_DETAIL):
             return self.store.sync_mkt24_product_detail(
                 {
                     "supplierId": "supplier_mkt24",
@@ -191,7 +192,7 @@ class Mkt24OrderOptionTest(unittest.TestCase):
 
     def test_supports_order_options_false_omits_option_info(self):
         detail = {"data": {**MKT24_DETAIL["data"], "supportsOrderOptions": False}}
-        with patch("smm_panel.core.SupplierApiClient.mkt24_product_detail", return_value=detail):
+        with patch("core.SupplierApiClient.mkt24_product_detail", return_value=detail):
             self.store.sync_mkt24_product_detail(
                 {
                     "supplierId": "supplier_mkt24",

@@ -2,6 +2,12 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "buildCommand": "node build-static.mjs",
   "outputDirectory": "dist",
+  "crons": [
+    {
+      "path": "/api/cron/suppliers/sync",
+      "schedule": "*/30 * * * *"
+    }
+  ],
   "headers": [
     {
       "source": "/",

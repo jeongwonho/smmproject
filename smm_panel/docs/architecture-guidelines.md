@@ -4,7 +4,7 @@
 
 ## 핵심 원칙
 
-- `static/app.js` 는 bootstrap, route orchestration, global event delegation 만 담당한다.
+- `static/app.js` 는 bootstrap, route orchestration, public/admin 이벤트 모듈 등록만 담당한다.
 - 고객용 화면/상태/상호작용은 `static/public/` 아래에 둔다.
 - 관리자 화면/상태/상호작용은 `static/admin/` 아래에 둔다.
 - 양쪽에서 같이 쓰는 순수 유틸만 `static/shared/` 아래에 둔다.
@@ -18,12 +18,14 @@
 
 | 영역 | 위치 | 책임 |
 |---|---|---|
-| App entry | `static/app.js` | 초기화, route 분기, 공통 API 호출, 전역 이벤트 연결 |
+| App entry | `static/app.js` | 초기화, route 분기, 공통 API 호출, public/admin 이벤트 모듈 등록 |
 | Public pages | `static/public/pages.js` | 홈, 상품, 상세, 주문내역, 마이 렌더 |
 | Public auth | `static/public/auth.js`, `static/public/auth-state.js` | 로그인/회원가입 UI와 검증 상태 |
 | Public charge | `static/public/charge.js` | 충전 UI, 충전내역 UI |
+| Public events | `static/public/events.js` | 고객용 click/input/change/submit/keydown 이벤트 위임 |
 | Admin shell | `static/admin/pages.js` | 관리자 프레임, 네비게이션, 섹션 라우팅 |
 | Admin sections | `static/admin/sections.js` | 관리자 각 섹션 렌더, 미리보기, 통계 렌더 |
+| Admin events | `static/admin/events.js` | 관리자용 click/input/change/submit/mouse 이벤트 위임 |
 | Shared route/runtime | `static/shared/` | 라우트 파싱, runtime config, 순수 유틸 |
 
 ## 새 기능 추가 규칙
@@ -39,18 +41,30 @@
 
 ## 백엔드 분리 방향
 
-현재 `core.py` 는 아직 모놀리식이다. 다음 기능 수정부터는 아래 도메인으로 분리한다.
+`core.py` 의 `PanelStore` 는 아직 서버 호환성을 위한 facade 로 유지한다. 신규/수정 기능은 먼저 아래 도메인 모듈에 배치하고, `PanelStore` 는 필요한 모듈을 조합하거나 얇게 위임한다.
 
 | 도메인 | 권장 위치 |
 |---|---|
-| DB 연결/마이그레이션 | `backend/db.py`, `backend/migrations.py` |
+| DB 연결/마이그레이션 | `backend/db.py` |
 | 고객 인증/동의 | `backend/auth.py`, `backend/consents.py` |
 | Wallet/충전/결제 | `backend/wallet.py`, `backend/payments.py` |
 | 주문 | `backend/orders.py` |
 | 상품/카탈로그 | `backend/catalog.py` |
-| 공급사 | `backend/suppliers.py` |
+| 공급사 | `backend/integrations/suppliers.py` |
+| Cafe24 | `backend/integrations/cafe24.py` |
 | 관리자 | `backend/admin.py` |
 | 분석 | `backend/analytics.py` |
+
+### 백엔드 작업 규칙
+
+1. `core.py` 에 새 외부 API 클라이언트, 순수 유틸, 해시/검증 로직을 추가하지 않는다.
+2. DB 부트/마이그레이션 변경은 `backend/db.py` 의 `PanelStoreDatabaseMixin` 에 추가한다.
+3. 고객 인증, 이메일 인증, 비밀번호 정책 변경은 `backend/auth.py` 에 먼저 추가한다.
+4. 주문 중복 방지, idempotency, 주문 payload 유틸은 `backend/orders.py` 에 둔다.
+5. 지갑 원장/충전 코드/결제 웹훅 검증은 `backend/wallet.py` 또는 `backend/payments.py` 에 둔다.
+6. 공급사/Cafe24 HTTP 호출은 `backend/integrations/` 하위 모듈에 둔다.
+7. `core.py` 에 남는 코드는 기존 `server.py` 호환 facade, DB 트랜잭션 오케스트레이션, 단계적 이전 중인 레거시 메서드로 제한한다.
+8. 새 모듈은 타입 힌트를 유지하고, `core.py` 양방향 import 를 만들지 않는다.
 
 ## 자동 구조 검사
 
@@ -66,7 +80,8 @@
 
 ## 현재 남은 구조 부채
 
-- `static/app.js` 는 8천 줄에서 약 5천 줄로 줄었지만, 아직 이벤트 핸들러와 API orchestration 이 크다.
+- `static/app.js` 는 8천 줄에서 약 3천 줄대로 줄었고, 이벤트 핸들러는 public/admin 모듈로 분리되었다. 아직 route orchestration 과 공통 API context 가 크다.
 - `static/styles/shared.css` 는 아직 5천 줄 규모이고 public/admin 스타일이 일부 섞여 있다.
-- `core.py` 는 아직 1만 줄 이상이며 백엔드 도메인 분리가 필요하다.
-- 다음 리팩터링 우선순위는 `static/app.js` 의 event handler 분리, API client 분리, `shared.css` 정리, `core.py` 도메인 분리다.
+- `core.py` 는 아직 1만 줄 이상이며 `PanelStore` 의 DB 접근 메서드가 많이 남아 있다.
+- 백엔드는 DB 부트/마이그레이션, 인증 유틸, 주문 idempotency, 지갑/결제 유틸, Cafe24/Supplier 클라이언트가 1차 분리되었다.
+- 다음 리팩터링 우선순위는 `PanelStore` 의 주문/지갑/관리자 DB 메서드를 도메인 repository 또는 mixin 으로 추가 분리하고, `static/app.js` 의 event handler/API client 와 `shared.css` 를 정리하는 것이다.

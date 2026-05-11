@@ -1,0 +1,186 @@
+import datetime as dt
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import bootstrap
+from core import (
+    PanelError,
+    PanelStore,
+    SupplierApiClient,
+    now_iso,
+    supplier_service_sync_due,
+)
+
+
+class SupplierServiceSyncTest(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tmpdir.name) / "instamart_supplier_sync_test.db"
+        self.store = PanelStore(db_path=self.db_path)
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.row_factory = sqlite3.Row
+        self._seed_supplier()
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmpdir.cleanup()
+
+    def _seed_supplier(self):
+        timestamp = now_iso()
+        self.conn.execute(
+            """
+            INSERT INTO suppliers (
+                id, name, api_url, integration_type, api_key, bearer_token,
+                is_active, notes, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "supplier_sync",
+                "Sync Supplier",
+                "https://supplier.example/api/v2",
+                "classic",
+                "classic-key",
+                "",
+                1,
+                "",
+                timestamp,
+                timestamp,
+            ),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO supplier_services (
+                id, supplier_id, external_service_id, name, category, type,
+                rate, min_amount, max_amount, raw_json, synced_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "svc_removed",
+                "supplier_sync",
+                "removed-1",
+                "Removed Service",
+                "Old",
+                "Default",
+                1.0,
+                1,
+                100,
+                "{}",
+                timestamp,
+                timestamp,
+            ),
+        )
+        self.conn.commit()
+
+    def test_sync_upserts_latest_services_and_marks_missing_inactive(self):
+        payload = [
+            {
+                "service": "svc-100",
+                "name": "Active Service",
+                "category": "Instagram",
+                "type": "Default",
+                "rate": "12.5",
+                "min": "5",
+                "max": "5000",
+            }
+        ]
+        with patch.object(
+            PanelStore,
+            "_run_supplier_connection_test",
+            return_value={
+                "status": "success",
+                "message": "ok",
+                "resolvedApiUrl": "https://supplier.example/api/v2",
+                "persistedApiUrl": "https://supplier.example/api/v2",
+                "balance": "",
+                "currency": "",
+                "serviceCount": 1,
+                "checkedAt": now_iso(),
+                "servicesPayload": payload,
+            },
+        ):
+            result = self.store.sync_supplier_services("supplier_sync", actor="test")
+
+        self.assertEqual(result["serviceCount"], 1)
+        active = self.conn.execute(
+            "SELECT * FROM supplier_services WHERE supplier_id = ? AND external_service_id = ?",
+            ("supplier_sync", "svc-100"),
+        ).fetchone()
+        removed = self.conn.execute(
+            "SELECT * FROM supplier_services WHERE supplier_id = ? AND external_service_id = ?",
+            ("supplier_sync", "removed-1"),
+        ).fetchone()
+        supplier = self.conn.execute("SELECT * FROM suppliers WHERE id = ?", ("supplier_sync",)).fetchone()
+        self.assertIsNotNone(active)
+        self.assertEqual(active["is_active"], 1)
+        self.assertEqual(active["min_amount"], 5)
+        self.assertEqual(removed["is_active"], 0)
+        self.assertTrue(removed["removed_at"])
+        self.assertEqual(supplier["service_sync_status"], "success")
+        self.assertEqual(supplier["service_sync_error_count"], 0)
+
+    def test_active_lock_blocks_duplicate_sync(self):
+        future = (dt.datetime.now().astimezone() + dt.timedelta(minutes=5)).isoformat(timespec="seconds")
+        self.conn.execute(
+            "UPDATE suppliers SET service_sync_status = 'syncing', service_sync_lock_until = ? WHERE id = ?",
+            (future, "supplier_sync"),
+        )
+        self.conn.commit()
+
+        with self.assertRaises(PanelError):
+            self.store.sync_supplier_services("supplier_sync", actor="test")
+
+    def test_due_helper_respects_lock_and_interval(self):
+        now = dt.datetime.now().astimezone()
+        old_completed = (now - dt.timedelta(minutes=45)).isoformat(timespec="seconds")
+        future_lock = (now + dt.timedelta(minutes=5)).isoformat(timespec="seconds")
+        self.assertTrue(
+            supplier_service_sync_due(
+                {
+                    "is_active": 1,
+                    "service_sync_completed_at": old_completed,
+                    "last_checked_at": "",
+                    "service_sync_status": "success",
+                    "service_sync_lock_until": "",
+                    "service_sync_interval_minutes": 30,
+                },
+                now,
+            )
+        )
+        self.assertFalse(
+            supplier_service_sync_due(
+                {
+                    "is_active": 1,
+                    "service_sync_completed_at": old_completed,
+                    "last_checked_at": "",
+                    "service_sync_status": "success",
+                    "service_sync_lock_until": future_lock,
+                    "service_sync_interval_minutes": 30,
+                },
+                now,
+            )
+        )
+
+    def test_mkt24_services_always_uses_products_sns_endpoint(self):
+        client = SupplierApiClient(
+            "https://api.mkt24.co.kr/v3",
+            "api-key",
+            integration_type="mkt24",
+            bearer_token="bearer-token",
+        )
+        captured = {}
+
+        def fake_request_json(**kwargs):
+            captured.update(kwargs)
+            return {"data": {}}
+
+        with patch.object(client, "_request_json", side_effect=fake_request_json):
+            client.services()
+
+        self.assertEqual(captured["url"], "https://api.mkt24.co.kr/v3/products/sns")
+
+
+if __name__ == "__main__":
+    unittest.main()
