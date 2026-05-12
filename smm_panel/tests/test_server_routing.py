@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -12,6 +13,22 @@ sys.path.insert(0, str(APP_ROOT))
 
 from server import AppHandler, ROUTER, cron_authorization_valid
 from core import derive_order_idempotency_key
+
+
+class FakeGithubResponse:
+    status = 200
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
 
 
 class VercelRewriteRoutingTest(unittest.TestCase):
@@ -60,6 +77,33 @@ class CronAuthorizationTest(unittest.TestCase):
             self.assertTrue(cron_authorization_valid("Bearer cron-secret"))
             self.assertFalse(cron_authorization_valid("Bearer wrong"))
             self.assertFalse(cron_authorization_valid(""))
+
+    def test_cron_authorization_accepts_verified_github_actions_run(self):
+        headers = {
+            "Authorization": "Bearer github-token",
+            "X-GitHub-Repository": "jeongwonho/smmproject",
+            "X-GitHub-Run-Id": "12345",
+            "X-GitHub-Workflow": "Cafe24 Order Poll",
+        }
+        payload = {
+            "id": 12345,
+            "event": "schedule",
+            "repository": {"full_name": "jeongwonho/smmproject"},
+        }
+        with patch.dict(os.environ, {"CRON_SECRET": "", "SMM_PANEL_CRON_SECRET": ""}, clear=False):
+            with patch("server.urllib_request.urlopen", return_value=FakeGithubResponse(payload)) as urlopen:
+                self.assertTrue(cron_authorization_valid("Bearer github-token", headers))
+                self.assertTrue(urlopen.called)
+
+    def test_cron_authorization_rejects_wrong_github_repository(self):
+        headers = {
+            "Authorization": "Bearer github-token",
+            "X-GitHub-Repository": "someone/else",
+            "X-GitHub-Run-Id": "12345",
+        }
+
+        with patch.dict(os.environ, {"CRON_SECRET": "", "SMM_PANEL_CRON_SECRET": ""}, clear=False):
+            self.assertFalse(cron_authorization_valid("Bearer github-token", headers))
 
 
 class RouterRegistryTest(unittest.TestCase):

@@ -19,7 +19,9 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence
+from urllib import error as urllib_error
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse
+from urllib import request as urllib_request
 
 from core import APP_ROOT, DEFAULT_SITE_NAME, PanelError, PanelStore
 
@@ -86,10 +88,50 @@ def cron_secret() -> str:
     return str(os.environ.get("CRON_SECRET") or os.environ.get("SMM_PANEL_CRON_SECRET") or "").strip()
 
 
-def cron_authorization_valid(header_value: str) -> bool:
+def github_actions_cron_authorization_valid(headers: Any) -> bool:
+    auth_header = str(headers.get("Authorization", "") if headers else "").strip()
+    if not auth_header.startswith("Bearer "):
+        return False
+    repository = str(headers.get("X-GitHub-Repository", "") if headers else "").strip()
+    run_id = str(headers.get("X-GitHub-Run-Id", "") if headers else "").strip()
+    expected_repository = str(
+        os.environ.get("SMM_PANEL_GITHUB_CRON_REPOSITORY") or "jeongwonho/smmproject"
+    ).strip()
+    if repository != expected_repository or not run_id.isdigit():
+        return False
+
+    request = urllib_request.Request(
+        f"https://api.github.com/repos/{expected_repository}/actions/runs/{run_id}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": auth_header,
+            "User-Agent": "instamart-cafe24-cron-verifier",
+        },
+        method="GET",
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=5) as response:
+            if int(getattr(response, "status", 0) or 0) != 200:
+                return False
+            payload = json.load(response)
+    except (urllib_error.URLError, TimeoutError, ValueError, json.JSONDecodeError):
+        return False
+
+    run_repository = str((payload.get("repository") or {}).get("full_name") or "")
+    run_event = str(payload.get("event") or "")
+    return (
+        str(payload.get("id") or "") == run_id
+        and run_repository == expected_repository
+        and run_event in {"schedule", "workflow_dispatch"}
+    )
+
+
+def cron_authorization_valid(header_value: str, headers: Any = None) -> bool:
     expected = cron_secret()
     provided = str(header_value or "").strip()
-    return bool(expected and provided and hmac.compare_digest(provided, f"Bearer {expected}"))
+    if expected and provided and hmac.compare_digest(provided, f"Bearer {expected}"):
+        return True
+    return github_actions_cron_authorization_valid(headers)
 
 
 def parse_origins(raw_value: str) -> tuple[str, ...]:
@@ -906,10 +948,11 @@ class AppHandler(SimpleHTTPRequestHandler):
             raise PanelError("로그인 세션 검증에 실패했습니다. 다시 로그인해 주세요.", status=403)
 
     def _require_cron_auth(self) -> None:
+        if cron_authorization_valid(self.headers.get("Authorization", ""), self.headers):
+            return
         if not cron_secret():
-            raise PanelError("CRON_SECRET 또는 SMM_PANEL_CRON_SECRET 환경변수가 필요합니다.", status=503)
-        if not cron_authorization_valid(self.headers.get("Authorization", "")):
-            raise PanelError("Cron 요청 인증에 실패했습니다.", status=401)
+            raise PanelError("CRON_SECRET 또는 GitHub Actions Cron 검증이 필요합니다.", status=503)
+        raise PanelError("Cron 요청 인증에 실패했습니다.", status=401)
 
     def _public_session_payload(self) -> Dict[str, Any]:
         session = self._public_session()
