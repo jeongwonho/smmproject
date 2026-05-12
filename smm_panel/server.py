@@ -1331,6 +1331,19 @@ class AppHandler(SimpleHTTPRequestHandler):
             },
         )
 
+    @route("POST", "/api/cron/cafe24/orders/poll", auth="cron", read_json_body=True)
+    def _post_cron_cafe24_orders_poll(self, request: RouteRequest) -> None:
+        payload = dict(request.payload or {})
+        payload["_adminActor"] = "cron"
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                **self._server().store.poll_due_cafe24_orders(payload),
+            },
+        )
+
     @route("POST", "/api/auth/email/send-code", trusted_origin=True, read_json_body=True)
     def _post_auth_email_send_code(self, request: RouteRequest) -> None:
         self._enforce_rate_limit("auth", "인증 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")

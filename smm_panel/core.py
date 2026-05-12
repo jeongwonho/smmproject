@@ -179,6 +179,8 @@ CAFE24_DEFAULT_SHOP_NO = 1
 CAFE24_OAUTH_STATE_TTL_SECONDS = 10 * 60
 CAFE24_DEFAULT_SCOPES = ("mall.read_order", "mall.write_order", "mall.read_product")
 CAFE24_REFRESH_LOCK_SECONDS = 90
+CAFE24_POLL_LOCK_SECONDS = 8 * 60
+CAFE24_AUTO_POLL_INTERVAL_MINUTES = 10
 CAFE24_REFRESH_TOKEN_EXPIRY_WARNING_DAYS = 2
 CAFE24_TOKEN_STATUS_CONNECTED = "connected"
 CAFE24_TOKEN_STATUS_EXPIRING = "token_expiring"
@@ -904,6 +906,11 @@ CREATE TABLE IF NOT EXISTS cafe24_integrations (
     token_refresh_lock_owner TEXT NOT NULL DEFAULT '',
     reconnect_required_at TEXT NOT NULL DEFAULT '',
     reconnect_reason TEXT NOT NULL DEFAULT '',
+    cafe24_poll_lock_until TEXT NOT NULL DEFAULT '',
+    cafe24_poll_lock_owner TEXT NOT NULL DEFAULT '',
+    last_auto_poll_at TEXT NOT NULL DEFAULT '',
+    last_auto_poll_status TEXT NOT NULL DEFAULT 'never',
+    last_auto_poll_message TEXT NOT NULL DEFAULT '',
     is_active INTEGER NOT NULL DEFAULT 1,
     last_sync_status TEXT NOT NULL DEFAULT 'never',
     last_sync_message TEXT NOT NULL DEFAULT '',
@@ -4572,6 +4579,11 @@ class PanelStore(PanelStoreDatabaseMixin):
                 token_refresh_lock_owner TEXT NOT NULL DEFAULT '',
                 reconnect_required_at TEXT NOT NULL DEFAULT '',
                 reconnect_reason TEXT NOT NULL DEFAULT '',
+                cafe24_poll_lock_until TEXT NOT NULL DEFAULT '',
+                cafe24_poll_lock_owner TEXT NOT NULL DEFAULT '',
+                last_auto_poll_at TEXT NOT NULL DEFAULT '',
+                last_auto_poll_status TEXT NOT NULL DEFAULT 'never',
+                last_auto_poll_message TEXT NOT NULL DEFAULT '',
                 is_active INTEGER NOT NULL DEFAULT 1,
                 last_sync_status TEXT NOT NULL DEFAULT 'never',
                 last_sync_message TEXT NOT NULL DEFAULT '',
@@ -8544,6 +8556,7 @@ class PanelStore(PanelStoreDatabaseMixin):
             }
 
     def _cafe24_integration_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        next_auto_poll_at = self._cafe24_next_auto_poll_at(row)
         return {
             "id": row["id"],
             "mallId": row["mall_id"],
@@ -8567,12 +8580,32 @@ class PanelStore(PanelStoreDatabaseMixin):
             "tokenRefreshLockUntil": row.get("token_refresh_lock_until") or "",
             "reconnectRequiredAt": row.get("reconnect_required_at") or "",
             "reconnectReason": row.get("reconnect_reason") or "",
+            "cafe24PollLockUntil": row.get("cafe24_poll_lock_until") or "",
+            "lastAutoPollAt": row.get("last_auto_poll_at") or "",
+            "lastAutoPollStatus": row.get("last_auto_poll_status") or "never",
+            "lastAutoPollMessage": row.get("last_auto_poll_message") or "",
+            "nextAutoPollAt": next_auto_poll_at,
+            "autoPollIntervalMinutes": CAFE24_AUTO_POLL_INTERVAL_MINUTES,
             "isActive": bool(row["is_active"]),
             "lastSyncStatus": row["last_sync_status"] or "never",
             "lastSyncMessage": row["last_sync_message"] or "",
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }
+
+    def _cafe24_next_auto_poll_at(self, row: Dict[str, Any]) -> str:
+        last_auto_poll_at = parse_iso_datetime(row.get("last_auto_poll_at"))
+        if not last_auto_poll_at:
+            return ""
+        return (last_auto_poll_at + dt.timedelta(minutes=CAFE24_AUTO_POLL_INTERVAL_MINUTES)).isoformat(timespec="seconds")
+
+    def _cafe24_auto_poll_due(self, row: Dict[str, Any], *, force: bool = False) -> bool:
+        if force:
+            return True
+        last_auto_poll_at = parse_iso_datetime(row.get("last_auto_poll_at"))
+        if not last_auto_poll_at:
+            return True
+        return last_auto_poll_at <= dt.datetime.now().astimezone() - dt.timedelta(minutes=CAFE24_AUTO_POLL_INTERVAL_MINUTES)
 
     def _cafe24_token_status(self, row: Dict[str, Any]) -> str:
         stored = str(row.get("token_status") or CAFE24_TOKEN_STATUS_CONNECTED).strip() or CAFE24_TOKEN_STATUS_CONNECTED
@@ -9423,6 +9456,57 @@ class PanelStore(PanelStoreDatabaseMixin):
             ),
         )
         return owner if cursor.rowcount == 1 else ""
+
+    def _acquire_cafe24_poll_lock(self, conn: DatabaseConnection, integration_id: str) -> str:
+        owner = f"poll_{uuid4().hex[:16]}"
+        timestamp = now_iso()
+        lock_until = (dt.datetime.now().astimezone() + dt.timedelta(seconds=CAFE24_POLL_LOCK_SECONDS)).isoformat(timespec="seconds")
+        cursor = conn.execute(
+            """
+            UPDATE cafe24_integrations
+            SET cafe24_poll_lock_owner = ?, cafe24_poll_lock_until = ?,
+                last_auto_poll_status = ?, last_auto_poll_message = ?, updated_at = ?
+            WHERE id = ?
+              AND (
+                cafe24_poll_lock_until = ''
+                OR cafe24_poll_lock_until < ?
+                OR cafe24_poll_lock_owner = ?
+              )
+            """,
+            (
+                owner,
+                lock_until,
+                "running",
+                "자동 주문 수집 진행 중",
+                timestamp,
+                integration_id,
+                timestamp,
+                owner,
+            ),
+        )
+        return owner if cursor.rowcount == 1 else ""
+
+    def _release_cafe24_poll_lock(
+        self,
+        conn: DatabaseConnection,
+        integration_id: str,
+        owner: str,
+        *,
+        status: str,
+        message: str,
+        completed_at: Optional[str] = None,
+    ) -> None:
+        timestamp = completed_at or now_iso()
+        conn.execute(
+            """
+            UPDATE cafe24_integrations
+            SET cafe24_poll_lock_owner = ?, cafe24_poll_lock_until = ?,
+                last_auto_poll_at = ?, last_auto_poll_status = ?,
+                last_auto_poll_message = ?, updated_at = ?
+            WHERE id = ? AND cafe24_poll_lock_owner = ?
+            """,
+            ("", "", timestamp, status, str(message or "")[:1000], timestamp, integration_id, owner),
+        )
 
     def _cafe24_client_for_row(self, conn: DatabaseConnection, row: Dict[str, Any]) -> Cafe24ApiClient:
         mall_id = str(row["mall_id"])
@@ -10596,6 +10680,173 @@ class PanelStore(PanelStoreDatabaseMixin):
                 dispatch_conn.commit()
             return {"id": current["id"], "status": next_status, "submitted": True}
         return {"id": current["id"], "status": current_status, "submitted": False}
+
+    def poll_due_cafe24_orders(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = payload or {}
+        actor = str(payload.get("_adminActor") or payload.get("actor") or "cron").strip() or "cron"
+        force = bool(payload.get("force", False))
+        try:
+            lookback_days = int(payload.get("lookbackDays") or CAFE24_ORDER_DEFAULT_LOOKBACK_DAYS)
+        except (TypeError, ValueError):
+            lookback_days = CAFE24_ORDER_DEFAULT_LOOKBACK_DAYS
+        lookback_days = min(max(lookback_days, 1), 90)
+        try:
+            limit = int(payload.get("limit") or 50)
+        except (TypeError, ValueError):
+            limit = 50
+        limit = min(max(limit, 1), 200)
+        now = dt.datetime.now().astimezone()
+        start_date = (now - dt.timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        end_date = now.strftime("%Y-%m-%d %H:%M:%S")
+        with self._connect() as conn:
+            integration_rows = conn.execute(
+                """
+                SELECT *
+                FROM cafe24_integrations
+                WHERE is_active = 1
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        results: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        processed_integrations = 0
+        skipped_integrations = 0
+        locked_integrations = 0
+        reconnect_required = 0
+        stored_order_items = 0
+        response_orders = 0
+        for integration_row in integration_rows:
+            integration = dict(integration_row)
+            integration_id = str(integration["id"])
+            mall_id = str(integration["mall_id"])
+            shop_no = int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO)
+            token_status = self._cafe24_token_status(integration)
+            if token_status == CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED:
+                reconnect_required += 1
+                skipped_integrations += 1
+                message = self._cafe24_token_status_message(integration)
+                with self._connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE cafe24_integrations
+                        SET last_auto_poll_status = ?, last_auto_poll_message = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        ("reconnect_required", message[:1000], now_iso(), integration_id),
+                    )
+                    conn.commit()
+                results.append({"integrationId": integration_id, "mallId": mall_id, "shopNo": shop_no, "status": "reconnect_required", "message": message})
+                continue
+            if not self._cafe24_auto_poll_due(integration, force=force):
+                skipped_integrations += 1
+                results.append({"integrationId": integration_id, "mallId": mall_id, "shopNo": shop_no, "status": "skipped", "message": "아직 다음 자동 수집 주기가 아닙니다."})
+                continue
+            with self._connect() as conn:
+                owner = self._acquire_cafe24_poll_lock(conn, integration_id)
+                conn.commit()
+            if not owner:
+                locked_integrations += 1
+                results.append({"integrationId": integration_id, "mallId": mall_id, "shopNo": shop_no, "status": "locked", "message": "이미 자동 수집이 진행 중입니다."})
+                continue
+
+            started = time.perf_counter()
+            try:
+                result = self.poll_cafe24_orders(
+                    {
+                        "integrationId": integration_id,
+                        "startDate": start_date,
+                        "endDate": end_date,
+                        "submitReady": False,
+                        "_adminActor": actor,
+                    }
+                )
+                duration_ms = int((time.perf_counter() - started) * 1000)
+                summary = result.get("summary", {})
+                stored_count = int(summary.get("storedOrderItemCount") or result.get("processed") or 0)
+                response_count = int(summary.get("responseOrderCount") or 0)
+                stored_order_items += stored_count
+                response_orders += response_count
+                processed_integrations += 1
+                message = f"자동 수집 완료 · Cafe24 {response_count}건 · 품주 {stored_count}개 저장 · {duration_ms}ms"
+                with self._connect() as conn:
+                    self._release_cafe24_poll_lock(conn, integration_id, owner, status="success", message=message)
+                    self._log_cafe24_event(
+                        conn,
+                        mall_id=mall_id,
+                        shop_no=shop_no,
+                        event_type="orders.auto_poll",
+                        status="success",
+                        request_payload={
+                            "lookbackDays": lookback_days,
+                            "startDate": start_date,
+                            "endDate": end_date,
+                            "submitReady": False,
+                            "autoDispatch": False,
+                        },
+                        response_payload={"durationMs": duration_ms, **summary},
+                    )
+                    conn.commit()
+                results.append({"integrationId": integration_id, "mallId": mall_id, "shopNo": shop_no, "status": "success", "message": message, "summary": summary})
+            except Exception as exc:
+                duration_ms = int((time.perf_counter() - started) * 1000)
+                message = str(exc)
+                errors.append(f"{mall_id}/{shop_no}: {message}")
+                status = (
+                    "reconnect_required"
+                    if cafe24_refresh_error_requires_reconnect(message) or "재연결" in message or "refresh token" in message.lower()
+                    else "failed"
+                )
+                if status == "reconnect_required":
+                    reconnect_required += 1
+                with self._connect() as conn:
+                    if status == "reconnect_required":
+                        self._mark_cafe24_token_state(
+                            conn,
+                            integration_id,
+                            status=CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED,
+                            message=message,
+                            reconnect_required=True,
+                            clear_lock=False,
+                        )
+                    self._release_cafe24_poll_lock(conn, integration_id, owner, status=status, message=message)
+                    self._log_cafe24_event(
+                        conn,
+                        mall_id=mall_id,
+                        shop_no=shop_no,
+                        event_type="orders.auto_poll",
+                        status="failed",
+                        request_payload={
+                            "lookbackDays": lookback_days,
+                            "startDate": start_date,
+                            "endDate": end_date,
+                            "submitReady": False,
+                            "autoDispatch": False,
+                        },
+                        response_payload={"durationMs": duration_ms},
+                        error_message=message,
+                    )
+                    conn.commit()
+                results.append({"integrationId": integration_id, "mallId": mall_id, "shopNo": shop_no, "status": status, "message": message})
+
+        return {
+            "processedIntegrations": processed_integrations,
+            "skippedIntegrations": skipped_integrations,
+            "lockedIntegrations": locked_integrations,
+            "reconnectRequiredIntegrations": reconnect_required,
+            "responseOrderCount": response_orders,
+            "storedOrderItemCount": stored_order_items,
+            "errors": errors,
+            "results": results,
+            "summary": {
+                "lookbackDays": lookback_days,
+                "intervalMinutes": CAFE24_AUTO_POLL_INTERVAL_MINUTES,
+                "autoDispatch": False,
+                "submitReady": False,
+            },
+        }
 
     def poll_cafe24_orders(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         integration_id = str(payload.get("integrationId") or "").strip()

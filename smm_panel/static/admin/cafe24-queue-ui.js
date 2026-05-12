@@ -28,6 +28,44 @@ export function renderCafe24QueueToolbar({ state, escapeHtml }) {
   `;
 }
 
+export function renderCafe24AutoPollCards({ activeIntegration = {}, escapeHtml }) {
+  const autoPollStatus = activeIntegration.lastAutoPollStatus || "never";
+  const autoPollRisk = ["failed", "reconnect_required"].includes(autoPollStatus);
+  const statusLabel = autoPollStatus === "success"
+    ? "정상"
+    : autoPollStatus === "running"
+      ? "진행 중"
+      : autoPollStatus === "reconnect_required"
+        ? "재연결 필요"
+        : autoPollStatus === "failed"
+          ? "실패"
+          : "대기";
+  return `
+    <article class="${autoPollRisk ? "is-risk" : autoPollStatus === "success" ? "is-hot" : ""}">
+      <span>자동 수집</span>
+      <strong>${escapeHtml(statusLabel)}</strong>
+      <small>${escapeHtml(activeIntegration.lastAutoPollAt || activeIntegration.lastAutoPollMessage || "외부 스케줄러 미호출")}</small>
+    </article>
+    <article>
+      <span>다음 예상 수집</span>
+      <strong>${escapeHtml(activeIntegration.nextAutoPollAt || "10분 주기")}</strong>
+      <small>외부 스케줄러 호출 기준</small>
+    </article>
+  `;
+}
+
+export function renderCafe24SchedulerNotice({ origin, escapeHtml }) {
+  const cronEndpoint = `${origin}/api/cron/cafe24/orders/poll`;
+  return `
+    <div class="admin-inline-note">
+      <strong>10분 자동 수집 설정</strong><br />
+      외부 스케줄러에서 <code>POST ${escapeHtml(cronEndpoint)}</code>를 10분마다 호출하세요.
+      헤더는 <code>Authorization: Bearer &lt;CRON_SECRET&gt;</code>, Body는 비워도 됩니다.
+      Access token은 서버에서 자동 갱신하며, refresh token 만료/폐기 시에만 OAuth 재연결이 필요합니다.
+    </div>
+  `;
+}
+
 export function renderCafe24Pagination({ pagination, escapeHtml }) {
   const page = Number(pagination.page || 1);
   const totalPages = Math.max(Number(pagination.totalPages || 1), 1);

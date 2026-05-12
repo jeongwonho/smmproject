@@ -1,4 +1,4 @@
-import { renderCafe24Pagination, renderCafe24QueueToolbar } from "./cafe24-queue-ui.js";
+import { renderCafe24AutoPollCards, renderCafe24Pagination, renderCafe24QueueToolbar, renderCafe24SchedulerNotice } from "./cafe24-queue-ui.js";
 import { supplierSyncInsight } from "./supplier-sync-ui.js";
 let runtime = {};
 let state = {};
@@ -1999,6 +1999,7 @@ function renderCafe24OpsBoard(orderItems = [], mappings = [], activeIntegration 
         <strong>${escapeHtml(activeIntegration.tokenStatusLabel || "미연결")}</strong>
         <small>${escapeHtml(activeIntegration.mallId || "OAuth 연결 필요")}</small>
       </article>
+      ${renderCafe24AutoPollCards({ activeIntegration, escapeHtml })}
       <article>
         <span>최근 1개월 주문</span>
         <strong>${escapeHtml(String(totalCount))}</strong>
@@ -2037,7 +2038,6 @@ function renderCafe24OpsBoard(orderItems = [], mappings = [], activeIntegration 
     </div>
   `;
 }
-
 function renderCafe24QuickControls(activeIntegration = {}) {
   return `
     <form class="admin-panel admin-form cafe24-quick-controls" data-admin-cafe24-integration-form>
@@ -2086,6 +2086,7 @@ function renderCafe24QuickControls(activeIntegration = {}) {
       </label>
       <input type="hidden" name="autoSubmit" value="" />
       <p class="admin-inline-note">자동 발주는 안전을 위해 비활성 상태로 운용합니다. 수집된 주문은 검수 후 공급사 발주 버튼으로 처리합니다.</p>
+      ${renderCafe24SchedulerNotice({ origin: window.location.origin, escapeHtml })}
     </form>
   `;
 }
