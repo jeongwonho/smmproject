@@ -6,8 +6,9 @@ from unittest.mock import patch
 
 
 APP_ROOT = Path(__file__).resolve().parents[1]
-if str(APP_ROOT) not in sys.path:
-    sys.path.insert(0, str(APP_ROOT))
+if str(APP_ROOT) in sys.path:
+    sys.path.remove(str(APP_ROOT))
+sys.path.insert(0, str(APP_ROOT))
 
 from server import AppHandler, ROUTER, cron_authorization_valid
 from core import derive_order_idempotency_key
@@ -79,6 +80,15 @@ class RouterRegistryTest(unittest.TestCase):
         self.assertEqual(params["supplier_id"], "supplier_123")
         self.assertEqual(route.auth, "admin")
         self.assertTrue(route.csrf)
+
+    def test_cafe24_cron_route_declares_cron_auth(self):
+        matched = ROUTER.match("POST", "/api/cron/cafe24/orders/poll")
+
+        self.assertIsNotNone(matched)
+        route, params = matched
+        self.assertEqual(params, {})
+        self.assertEqual(route.auth, "cron")
+        self.assertFalse(route.csrf)
 
     def test_unknown_api_route_does_not_match(self):
         self.assertIsNone(ROUTER.match("GET", "/api/does-not-exist"))

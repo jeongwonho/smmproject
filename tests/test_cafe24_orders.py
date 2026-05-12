@@ -560,6 +560,76 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
         self.assertEqual(item["cafe24_order_item_code"], "20260426-000001-01")
 
+    def test_cron_poll_collects_active_integration_without_auto_dispatch(self):
+        fake_client = FakeCafe24OrderClient(self._order_payload())
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client), patch("core.SupplierApiClient.order") as order_call:
+            result = self.store.poll_due_cafe24_orders({"actor": "cron", "lookbackDays": 30})
+
+        self.assertEqual(result["processedIntegrations"], 1)
+        self.assertEqual(result["storedOrderItemCount"], 1)
+        self.assertFalse(result["summary"]["autoDispatch"])
+        order_call.assert_not_called()
+        row = self._integration_row()
+        self.assertEqual(row["last_auto_poll_status"], "success")
+        self.assertTrue(row["last_auto_poll_at"])
+        self.assertFalse(row["cafe24_poll_lock_owner"])
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.assertEqual(item["standard_status"], "ready_to_submit")
+
+    def test_cron_poll_skips_recent_success_until_interval_passes(self):
+        timestamp = now_iso()
+        self.conn.execute(
+            "UPDATE cafe24_integrations SET last_auto_poll_at = ?, last_auto_poll_status = ? WHERE id = ?",
+            (timestamp, "success", self.integration["id"]),
+        )
+        self.conn.commit()
+        fake_client = FakeCafe24OrderClient(self._order_payload())
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client):
+            result = self.store.poll_due_cafe24_orders({"actor": "cron"})
+
+        self.assertEqual(result["processedIntegrations"], 0)
+        self.assertEqual(result["skippedIntegrations"], 1)
+        self.assertEqual(fake_client.orders_calls, [])
+
+    def test_cron_poll_lock_blocks_duplicate_collection(self):
+        future = (dt.datetime.now().astimezone() + dt.timedelta(minutes=5)).isoformat(timespec="seconds")
+        self.conn.execute(
+            "UPDATE cafe24_integrations SET cafe24_poll_lock_until = ?, cafe24_poll_lock_owner = ? WHERE id = ?",
+            (future, "poll_existing", self.integration["id"]),
+        )
+        self.conn.commit()
+        fake_client = FakeCafe24OrderClient(self._order_payload())
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client):
+            result = self.store.poll_due_cafe24_orders({"actor": "cron", "force": True})
+
+        self.assertEqual(result["processedIntegrations"], 0)
+        self.assertEqual(result["lockedIntegrations"], 1)
+        self.assertEqual(fake_client.orders_calls, [])
+
+    def test_cron_poll_reconnect_required_is_reported_without_collection(self):
+        self.conn.execute(
+            """
+            UPDATE cafe24_integrations
+            SET token_status = ?, reconnect_reason = ?
+            WHERE id = ?
+            """,
+            ("reconnect_required", "refresh token expired", self.integration["id"]),
+        )
+        self.conn.commit()
+        fake_client = FakeCafe24OrderClient(self._order_payload())
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client):
+            result = self.store.poll_due_cafe24_orders({"actor": "cron", "force": True})
+
+        self.assertEqual(result["processedIntegrations"], 0)
+        self.assertEqual(result["reconnectRequiredIntegrations"], 1)
+        self.assertEqual(fake_client.orders_calls, [])
+        row = self._integration_row()
+        self.assertEqual(row["last_auto_poll_status"], "reconnect_required")
+
     def test_cafe24_order_items_list_defaults_to_five_per_page_for_month_window(self):
         for index in range(6):
             payload = json.loads(json.dumps(self._order_payload()))
