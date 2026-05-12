@@ -1,0 +1,47 @@
+name: Cafe24 Order Poll
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cafe24-order-poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Poll Cafe24 orders
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          POLL_URL: https://smmproject-lime.vercel.app/api/cron/cafe24/orders/poll
+        run: |
+          set -euo pipefail
+          if [ -z "${CRON_SECRET:-}" ]; then
+            echo "CRON_SECRET repository secret is required."
+            exit 1
+          fi
+
+          response_file="$(mktemp)"
+          http_code="$(
+            curl -sS -X POST "$POLL_URL" \
+              -H "Authorization: Bearer ${CRON_SECRET}" \
+              -H "Content-Type: application/json" \
+              --data '{"lookbackDays":30}' \
+              -o "$response_file" \
+              -w "%{http_code}"
+          )"
+
+          cat "$response_file"
+          echo
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "Cafe24 poll failed with HTTP ${http_code}"
+            exit 1
+          fi
