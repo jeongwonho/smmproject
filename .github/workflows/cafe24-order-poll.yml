@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -20,18 +21,23 @@ jobs:
       - name: Poll Cafe24 orders
         env:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          GITHUB_TOKEN: ${{ github.token }}
           POLL_URL: https://smmproject-lime.vercel.app/api/cron/cafe24/orders/poll
         run: |
           set -euo pipefail
-          if [ -z "${CRON_SECRET:-}" ]; then
-            echo "CRON_SECRET repository secret is required."
+          auth_token="${CRON_SECRET:-${GITHUB_TOKEN:-}}"
+          if [ -z "${auth_token:-}" ]; then
+            echo "CRON_SECRET or GITHUB_TOKEN is required."
             exit 1
           fi
 
           response_file="$(mktemp)"
           http_code="$(
             curl -sS -X POST "$POLL_URL" \
-              -H "Authorization: Bearer ${CRON_SECRET}" \
+              -H "Authorization: Bearer ${auth_token}" \
+              -H "X-GitHub-Repository: ${GITHUB_REPOSITORY}" \
+              -H "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" \
+              -H "X-GitHub-Workflow: ${GITHUB_WORKFLOW}" \
               -H "Content-Type: application/json" \
               --data '{"lookbackDays":30}' \
               -o "$response_file" \

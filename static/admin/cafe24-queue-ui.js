@@ -59,8 +59,8 @@ export function renderCafe24SchedulerNotice({ origin, escapeHtml }) {
   return `
     <div class="admin-inline-note">
       <strong>10분 자동 수집 설정</strong><br />
-      외부 스케줄러에서 <code>POST ${escapeHtml(cronEndpoint)}</code>를 10분마다 호출하세요.
-      헤더는 <code>Authorization: Bearer &lt;CRON_SECRET&gt;</code>, Body는 비워도 됩니다.
+      GitHub Actions 외부 스케줄러가 <code>POST ${escapeHtml(cronEndpoint)}</code>를 10분마다 호출하도록 구성되어 있습니다.
+      다른 스케줄러를 추가할 때는 헤더 <code>Authorization: Bearer &lt;CRON_SECRET&gt;</code>를 사용하세요.
       Access token은 서버에서 자동 갱신하며, refresh token 만료/폐기 시에만 OAuth 재연결이 필요합니다.
     </div>
   `;
