@@ -1109,7 +1109,7 @@ CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_entity
     ON admin_audit_logs(entity_type, entity_id, created_at DESC);
 """
 
-RUNTIME_SCHEMA_VERSION = "2026-05-08-01"
+RUNTIME_SCHEMA_VERSION = "2026-05-12-01"
 
 
 class PanelError(Exception):
