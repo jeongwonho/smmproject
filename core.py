@@ -10760,6 +10760,21 @@ class PanelStore(PanelStoreDatabaseMixin):
         except (TypeError, ValueError):
             limit = 50
         limit = min(max(limit, 1), 200)
+        try:
+            page_limit = int(payload.get("pageLimit") or CAFE24_ORDER_PAGE_LIMIT)
+        except (TypeError, ValueError):
+            page_limit = CAFE24_ORDER_PAGE_LIMIT
+        page_limit = min(max(page_limit, 1), CAFE24_ORDER_PAGE_LIMIT)
+        try:
+            max_pages = int(payload.get("maxPages") or CAFE24_ORDER_MAX_PAGES)
+        except (TypeError, ValueError):
+            max_pages = CAFE24_ORDER_MAX_PAGES
+        max_pages = min(max(max_pages, 1), CAFE24_ORDER_MAX_PAGES)
+        try:
+            detail_fetch_limit = int(payload.get("detailFetchLimit") or 200)
+        except (TypeError, ValueError):
+            detail_fetch_limit = 200
+        detail_fetch_limit = min(max(detail_fetch_limit, 0), 500)
         now = dt.datetime.now().astimezone()
         start_date = (now - dt.timedelta(days=lookback_days)).strftime("%Y-%m-%d")
         end_date = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -10824,6 +10839,9 @@ class PanelStore(PanelStoreDatabaseMixin):
                         "integrationId": integration_id,
                         "startDate": start_date,
                         "endDate": end_date,
+                        "pageLimit": page_limit,
+                        "maxPages": max_pages,
+                        "detailFetchLimit": detail_fetch_limit,
                         "submitReady": False,
                         "_adminActor": actor,
                     }
@@ -10848,6 +10866,9 @@ class PanelStore(PanelStoreDatabaseMixin):
                             "lookbackDays": lookback_days,
                             "startDate": start_date,
                             "endDate": end_date,
+                            "pageLimit": page_limit,
+                            "maxPages": max_pages,
+                            "detailFetchLimit": detail_fetch_limit,
                             "submitReady": False,
                             "autoDispatch": False,
                         },
@@ -10887,6 +10908,9 @@ class PanelStore(PanelStoreDatabaseMixin):
                             "lookbackDays": lookback_days,
                             "startDate": start_date,
                             "endDate": end_date,
+                            "pageLimit": page_limit,
+                            "maxPages": max_pages,
+                            "detailFetchLimit": detail_fetch_limit,
                             "submitReady": False,
                             "autoDispatch": False,
                         },
@@ -10908,6 +10932,9 @@ class PanelStore(PanelStoreDatabaseMixin):
             "summary": {
                 "lookbackDays": lookback_days,
                 "intervalMinutes": CAFE24_AUTO_POLL_INTERVAL_MINUTES,
+                "pageLimit": page_limit,
+                "maxPages": max_pages,
+                "detailFetchLimit": detail_fetch_limit,
                 "autoDispatch": False,
                 "submitReady": False,
             },
@@ -10954,11 +10981,28 @@ class PanelStore(PanelStoreDatabaseMixin):
                     status_filter = None
                 start_date = window["start"]
                 end_date = window["end"]
+                try:
+                    page_limit = int(payload.get("pageLimit") or CAFE24_ORDER_PAGE_LIMIT)
+                except (TypeError, ValueError):
+                    page_limit = CAFE24_ORDER_PAGE_LIMIT
+                page_limit = min(max(page_limit, 1), CAFE24_ORDER_PAGE_LIMIT)
+                try:
+                    max_pages = int(payload.get("maxPages") or CAFE24_ORDER_MAX_PAGES)
+                except (TypeError, ValueError):
+                    max_pages = CAFE24_ORDER_MAX_PAGES
+                max_pages = min(max(max_pages, 1), CAFE24_ORDER_MAX_PAGES)
+                try:
+                    detail_fetch_limit = int(payload.get("detailFetchLimit") or 200)
+                except (TypeError, ValueError):
+                    detail_fetch_limit = 200
+                detail_fetch_limit = min(max(detail_fetch_limit, 0), 500)
                 request_payload = {
                     "startDate": start_date,
                     "endDate": end_date,
                     "orderStatuses": status_filter or "all",
-                    "limit": CAFE24_ORDER_PAGE_LIMIT,
+                    "limit": page_limit,
+                    "maxPages": max_pages,
+                    "detailFetchLimit": detail_fetch_limit,
                 }
                 requested_windows.append({"mallId": mall_id, "shopNo": shop_no, **request_payload})
                 try:
@@ -10976,14 +11020,14 @@ class PanelStore(PanelStoreDatabaseMixin):
                             break
                         date_type = str(variant["dateType"])
                         payment_status_filter = variant["paymentStatuses"]
-                        for page_index in range(CAFE24_ORDER_MAX_PAGES):
-                            offset = page_index * CAFE24_ORDER_PAGE_LIMIT
+                        for page_index in range(max_pages):
+                            offset = page_index * page_limit
                             response = client.orders(
                                 start_date=start_date,
                                 end_date=end_date,
                                 statuses=status_filter,
                                 payment_statuses=payment_status_filter,
-                                limit=CAFE24_ORDER_PAGE_LIMIT,
+                                limit=page_limit,
                                 offset=offset,
                                 date_type=date_type,
                             )
@@ -10999,7 +11043,11 @@ class PanelStore(PanelStoreDatabaseMixin):
                             )
                             for order_payload in page_orders:
                                 order_id = cafe24_payload_value(order_payload, ("order_id", "order_no", "id"))
-                                if order_id and not self._cafe24_order_has_embedded_items(order_payload):
+                                if (
+                                    order_id
+                                    and not self._cafe24_order_has_embedded_items(order_payload)
+                                    and detail_fetch_count < detail_fetch_limit
+                                ):
                                     try:
                                         detail_response = client.order(order_id)
                                         detail_orders = self._cafe24_orders_from_payload(detail_response)
@@ -11015,7 +11063,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                                     and not self._cafe24_order_has_embedded_items(existing)
                                 ):
                                     orders_by_key[order_key] = order_payload
-                            if len(page_orders) < CAFE24_ORDER_PAGE_LIMIT:
+                            if len(page_orders) < page_limit:
                                 break
                     orders = list(orders_by_key.values())
                     response_order_count += len(orders)
@@ -13301,6 +13349,10 @@ class PanelStore(PanelStoreDatabaseMixin):
         started_perf = time.perf_counter()
         lookback_days = int(payload.get("lookbackDays") or CAFE24_ORDER_DEFAULT_LOOKBACK_DAYS)
         supplier_limit = int(payload.get("supplierLimit") or 10)
+        cafe24_limit = int(payload.get("cafe24Limit") or 1)
+        cafe24_page_limit = int(payload.get("cafe24PageLimit") or 100)
+        cafe24_max_pages = int(payload.get("cafe24MaxPages") or 1)
+        cafe24_detail_fetch_limit = int(payload.get("cafe24DetailFetchLimit") or 10)
         dispatch_limit = int(payload.get("dispatchLimit") or 20)
         status_limit = int(payload.get("statusLimit") or 50)
         completion_limit = int(payload.get("completionLimit") or 20)
@@ -13320,7 +13372,16 @@ class PanelStore(PanelStoreDatabaseMixin):
         try:
             result["supplierServiceSync"] = self.sync_due_supplier_services(actor=actor, limit=supplier_limit)
             result["supplierHealth"] = self.check_due_supplier_health(actor=actor, limit=max(supplier_limit, 20))
-            result["cafe24Poll"] = self.poll_due_cafe24_orders({"actor": actor, "lookbackDays": lookback_days})
+            result["cafe24Poll"] = self.poll_due_cafe24_orders(
+                {
+                    "actor": actor,
+                    "lookbackDays": lookback_days,
+                    "limit": cafe24_limit,
+                    "pageLimit": cafe24_page_limit,
+                    "maxPages": cafe24_max_pages,
+                    "detailFetchLimit": cafe24_detail_fetch_limit,
+                }
+            )
             if not paused:
                 result["webDispatch"] = self.dispatch_due_web_orders(actor=actor, limit=dispatch_limit)
                 result["cafe24Dispatch"] = self.dispatch_due_cafe24_order_items(actor=actor, limit=dispatch_limit)
