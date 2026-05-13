@@ -1999,7 +1999,7 @@ function renderCafe24OpsBoard(orderItems = [], mappings = [], activeIntegration 
         <strong>${escapeHtml(activeIntegration.tokenStatusLabel || "미연결")}</strong>
         <small>${escapeHtml(activeIntegration.mallId || "OAuth 연결 필요")}</small>
       </article>
-      ${renderCafe24AutoPollCards({ activeIntegration, escapeHtml })}
+      ${renderCafe24AutoPollCards({ activeIntegration, automation: state.adminBootstrap?.automation || {}, summary, escapeHtml })}
       <article>
         <span>최근 1개월 주문</span>
         <strong>${escapeHtml(String(totalCount))}</strong>
@@ -2018,7 +2018,7 @@ function renderCafe24OpsBoard(orderItems = [], mappings = [], activeIntegration 
       <article class="${readyToSubmit ? "is-hot" : ""}">
         <span>발주 대기</span>
         <strong>${escapeHtml(String(readyToSubmit))}</strong>
-        <small>수동 발주 가능</small>
+        <small>자동/수동 발주 가능</small>
       </article>
       <article class="${failed ? "is-risk" : ""}">
         <span>발주 실패</span>
@@ -2045,7 +2045,7 @@ function renderCafe24QuickControls(activeIntegration = {}) {
       <input type="hidden" name="scopes" value="${escapeHtml((activeIntegration.scopes || ["mall.read_order", "mall.write_order", "mall.read_product"]).join(","))}" />
       <div class="section-head section-head--compact">
         <h3>실시간 주문 조회</h3>
-        <p>최근 1개월 주문을 즉시 다시 수집하거나, 누락 의심 주문번호를 직접 조회합니다. 자동 발주는 기본 OFF입니다.</p>
+        <p>최근 1개월 주문을 즉시 다시 수집하거나, 누락 의심 주문번호를 직접 조회합니다. 자동 발주는 서버 자동화 Tick에서 안전 조건 통과 시 처리됩니다.</p>
       </div>
       <div class="cafe24-control-grid">
         <label class="form-field">
@@ -2084,8 +2084,8 @@ function renderCafe24QuickControls(activeIntegration = {}) {
         <input type="checkbox" name="isActive" ${activeIntegration.isActive !== false ? "checked" : ""} />
         <span>연동 활성화</span>
       </label>
-      <input type="hidden" name="autoSubmit" value="" />
-      <p class="admin-inline-note">자동 발주는 안전을 위해 비활성 상태로 운용합니다. 수집된 주문은 검수 후 공급사 발주 버튼으로 처리합니다.</p>
+      <label class="admin-toggle"><input type="checkbox" name="autoSubmit" ${activeIntegration.autoSubmit !== false ? "checked" : ""} /><span>자동 발주 활성화</span></label>
+      <p class="admin-inline-note">자동 발주는 결제완료, 매핑완료, 공급사 상태 정상, 중복 발주 없음 조건을 모두 통과한 주문만 실행합니다. 긴급 중단은 <code>SMM_PANEL_AUTOMATION_PAUSED=1</code>로 제어합니다.</p>
       ${renderCafe24SchedulerNotice({ origin: window.location.origin, escapeHtml })}
     </form>
   `;

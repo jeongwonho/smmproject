@@ -181,6 +181,10 @@ CAFE24_DEFAULT_SCOPES = ("mall.read_order", "mall.write_order", "mall.read_produ
 CAFE24_REFRESH_LOCK_SECONDS = 90
 CAFE24_POLL_LOCK_SECONDS = 8 * 60
 CAFE24_AUTO_POLL_INTERVAL_MINUTES = 10
+AUTOMATION_RETRY_MAX_ATTEMPTS = 3
+AUTOMATION_RETRY_BACKOFF_MINUTES = (10, 30, 120)
+SUPPLIER_STATUS_CHECK_INTERVAL_MINUTES = 10
+CAFE24_COMPLETION_RETRY_INTERVAL_MINUTES = 10
 CAFE24_REFRESH_TOKEN_EXPIRY_WARNING_DAYS = 2
 CAFE24_TOKEN_STATUS_CONNECTED = "connected"
 CAFE24_TOKEN_STATUS_EXPIRING = "token_expiring"
@@ -793,6 +797,11 @@ CREATE TABLE IF NOT EXISTS suppliers (
     service_sync_lock_until TEXT NOT NULL DEFAULT '',
     service_sync_error_count INTEGER NOT NULL DEFAULT 0,
     service_sync_interval_minutes INTEGER NOT NULL DEFAULT 30,
+    health_status TEXT NOT NULL DEFAULT 'unknown',
+    health_message TEXT NOT NULL DEFAULT '',
+    health_checked_at TEXT NOT NULL DEFAULT '',
+    balance_status TEXT NOT NULL DEFAULT 'unknown',
+    balance_checked_at TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -867,6 +876,10 @@ CREATE TABLE IF NOT EXISTS supplier_orders (
     request_payload_json TEXT NOT NULL DEFAULT '{}',
     response_json TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'pending',
+    last_status_checked_at TEXT NOT NULL DEFAULT '',
+    next_status_check_at TEXT NOT NULL DEFAULT '',
+    status_check_attempts INTEGER NOT NULL DEFAULT 0,
+    status_check_message TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -1003,9 +1016,17 @@ CREATE TABLE IF NOT EXISTS cafe24_order_items (
     raw_payload_json TEXT NOT NULL DEFAULT '{}',
     error_message TEXT NOT NULL DEFAULT '',
     retry_count INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TEXT NOT NULL DEFAULT '',
+    automation_last_checked_at TEXT NOT NULL DEFAULT '',
+    automation_error_code TEXT NOT NULL DEFAULT '',
     supplier_order_id TEXT NOT NULL DEFAULT '',
     supplier_order_uuid TEXT NOT NULL DEFAULT '',
     supplier_response_json TEXT NOT NULL DEFAULT '{}',
+    cafe24_completion_status TEXT NOT NULL DEFAULT 'pending',
+    cafe24_completion_message TEXT NOT NULL DEFAULT '',
+    cafe24_completed_at TEXT NOT NULL DEFAULT '',
+    cafe24_completion_attempts INTEGER NOT NULL DEFAULT 0,
+    cafe24_next_completion_retry_at TEXT NOT NULL DEFAULT '',
     last_submitted_at TEXT NOT NULL DEFAULT '',
     last_synced_at TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
@@ -1109,7 +1130,7 @@ CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_entity
     ON admin_audit_logs(entity_type, entity_id, created_at DESC);
 """
 
-RUNTIME_SCHEMA_VERSION = "2026-05-12-01"
+RUNTIME_SCHEMA_VERSION = "2026-05-13-01"
 
 
 class PanelError(Exception):
@@ -1689,6 +1710,19 @@ def cafe24_refresh_token_expiring_soon(expires_at: Any) -> bool:
         return False
     threshold = dt.datetime.now().astimezone() + dt.timedelta(days=CAFE24_REFRESH_TOKEN_EXPIRY_WARNING_DAYS)
     return parsed <= threshold
+
+
+def automation_paused() -> bool:
+    return str(os.environ.get("SMM_PANEL_AUTOMATION_PAUSED") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def automation_retry_at(attempts: int) -> str:
+    safe_attempts = max(int(attempts or 1), 1)
+    index = min(safe_attempts - 1, len(AUTOMATION_RETRY_BACKOFF_MINUTES) - 1)
+    return (
+        dt.datetime.now().astimezone()
+        + dt.timedelta(minutes=AUTOMATION_RETRY_BACKOFF_MINUTES[index])
+    ).isoformat(timespec="seconds")
 
 
 def cafe24_refresh_error_requires_reconnect(error_message: Any) -> bool:
@@ -4664,9 +4698,17 @@ class PanelStore(PanelStoreDatabaseMixin):
                 raw_payload_json TEXT NOT NULL DEFAULT '{}',
                 error_message TEXT NOT NULL DEFAULT '',
                 retry_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_at TEXT NOT NULL DEFAULT '',
+                automation_last_checked_at TEXT NOT NULL DEFAULT '',
+                automation_error_code TEXT NOT NULL DEFAULT '',
                 supplier_order_id TEXT NOT NULL DEFAULT '',
                 supplier_order_uuid TEXT NOT NULL DEFAULT '',
                 supplier_response_json TEXT NOT NULL DEFAULT '{}',
+                cafe24_completion_status TEXT NOT NULL DEFAULT 'pending',
+                cafe24_completion_message TEXT NOT NULL DEFAULT '',
+                cafe24_completed_at TEXT NOT NULL DEFAULT '',
+                cafe24_completion_attempts INTEGER NOT NULL DEFAULT 0,
+                cafe24_next_completion_retry_at TEXT NOT NULL DEFAULT '',
                 last_submitted_at TEXT NOT NULL DEFAULT '',
                 last_synced_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
@@ -8108,6 +8150,11 @@ class PanelStore(PanelStoreDatabaseMixin):
                     "serviceSyncLockUntil": row["service_sync_lock_until"],
                     "serviceSyncErrorCount": row["service_sync_error_count"],
                     "serviceSyncIntervalMinutes": row["service_sync_interval_minutes"],
+                    "healthStatus": row.get("health_status") or "unknown",
+                    "healthMessage": row.get("health_message") or "",
+                    "healthCheckedAt": row.get("health_checked_at") or "",
+                    "balanceStatus": row.get("balance_status") or "unknown",
+                    "balanceCheckedAt": row.get("balance_checked_at") or "",
                     "serviceCount": row["service_count"],
                     "inactiveServiceCount": row["inactive_service_count"],
                     "mappingCount": row["mapping_count"],
@@ -8502,6 +8549,10 @@ class PanelStore(PanelStoreDatabaseMixin):
             audit_rows = conn.execute(
                 "SELECT * FROM admin_audit_logs ORDER BY created_at DESC LIMIT 80"
             ).fetchall()
+            automation_snapshot = parse_json(self._runtime_metadata_value(conn, "automation.last_tick"), {})
+            automation_last_tick_at = self._runtime_metadata_value(conn, "automation.last_tick_at")
+            automation_last_tick_status = self._runtime_metadata_value(conn, "automation.last_tick_status")
+            automation_paused_value = self._runtime_metadata_value(conn, "automation.paused")
 
             mapped_product_count = sum(1 for item in internal_products if item["mapping"])
             total_service_count = sum(int(item["serviceCount"]) for item in suppliers)
@@ -8534,6 +8585,12 @@ class PanelStore(PanelStoreDatabaseMixin):
                 "notices": [self._notice_payload(row) for row in notice_rows],
                 "faqs": [self._faq_payload(row) for row in faq_rows],
                 "auditLogs": [self._admin_audit_payload(row) for row in audit_rows],
+                "automation": {
+                    "lastTick": automation_snapshot,
+                    "lastTickAt": automation_last_tick_at,
+                    "lastTickStatus": automation_last_tick_status or automation_snapshot.get("status") or "never",
+                    "paused": automation_paused() or automation_paused_value == "1",
+                },
                 "stats": {
                     "supplierCount": len(suppliers),
                     "activeSupplierCount": active_suppliers,
@@ -8713,9 +8770,17 @@ class PanelStore(PanelStoreDatabaseMixin):
             "rawPayloadPreview": redact_external_payload(raw_payload),
             "errorMessage": row["error_message"] or "",
             "retryCount": int(row["retry_count"] or 0),
+            "nextRetryAt": row.get("next_retry_at") or "",
+            "automationLastCheckedAt": row.get("automation_last_checked_at") or "",
+            "automationErrorCode": row.get("automation_error_code") or "",
             "supplierOrderId": row["supplier_order_id"] or "",
             "supplierOrderUuid": row["supplier_order_uuid"] or "",
             "lastSubmittedAt": row["last_submitted_at"] or "",
+            "cafe24CompletionStatus": row.get("cafe24_completion_status") or "pending",
+            "cafe24CompletionMessage": row.get("cafe24_completion_message") or "",
+            "cafe24CompletedAt": row.get("cafe24_completed_at") or "",
+            "cafe24CompletionAttempts": int(row.get("cafe24_completion_attempts") or 0),
+            "cafe24NextCompletionRetryAt": row.get("cafe24_next_completion_retry_at") or "",
             "lastSyncedAt": row["last_synced_at"] or "",
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
@@ -11276,12 +11341,14 @@ class PanelStore(PanelStoreDatabaseMixin):
                 """
                 UPDATE cafe24_order_items
                 SET standard_status = ?, supplier_order_id = ?, error_message = ?,
-                    retry_count = COALESCE(retry_count, 0) + 1, updated_at = ?
+                    retry_count = COALESCE(retry_count, 0) + 1,
+                    automation_last_checked_at = ?, automation_error_code = '', next_retry_at = '',
+                    updated_at = ?
                 WHERE id = ?
                   AND supplier_order_uuid = ''
                   AND standard_status IN ('ready_to_submit', 'failed')
                 """,
-                ("submitting", dispatch_id, "", timestamp, item_id),
+                ("submitting", dispatch_id, "", timestamp, timestamp, item_id),
             )
             if cursor.rowcount != 1:
                 raise PanelError("다른 요청에서 이미 발주 처리 중입니다.")
@@ -11327,12 +11394,26 @@ class PanelStore(PanelStoreDatabaseMixin):
             error_message = str(exc)
             next_status = "failed"
 
+        attempts_after = int(row["retry_count"] or 0) + 1
+        next_retry_at = ""
+        automation_error_code = ""
+        if next_status == "failed":
+            automation_error_code = "supplier_dispatch_failed"
+            if attempts_after >= AUTOMATION_RETRY_MAX_ATTEMPTS:
+                next_status = "needs_manual_review"
+                error_message = (error_message or "공급사 발주 실패") + " · 자동 재시도 한도를 초과해 수동 확인이 필요합니다."
+            else:
+                next_retry_at = automation_retry_at(attempts_after)
+        elif next_status == "needs_manual_review":
+            automation_error_code = "supplier_response_ambiguous"
+
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE cafe24_order_items
                 SET standard_status = ?, supplier_order_uuid = ?, supplier_response_json = ?,
-                    error_message = ?, last_submitted_at = ?, updated_at = ?
+                    error_message = ?, automation_error_code = ?, next_retry_at = ?,
+                    last_submitted_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -11340,6 +11421,8 @@ class PanelStore(PanelStoreDatabaseMixin):
                     supplier_external_order_id,
                     as_json(redact_external_payload(response_payload)),
                     error_message,
+                    automation_error_code,
+                    next_retry_at,
                     now_iso(),
                     now_iso(),
                     item_id,
@@ -12547,6 +12630,721 @@ class PanelStore(PanelStoreDatabaseMixin):
             "ranAt": now_iso(),
         }
 
+    def _supplier_auto_dispatch_readiness(
+        self,
+        conn: DatabaseConnection,
+        *,
+        supplier_id: str,
+        supplier_service_id: str = "",
+    ) -> Dict[str, Any]:
+        row = conn.execute(
+            """
+            SELECT
+                s.*,
+                ss.is_active AS service_is_active,
+                ss.external_service_id AS service_external_id,
+                (
+                    SELECT COUNT(*)
+                    FROM supplier_services active_ss
+                    WHERE active_ss.supplier_id = s.id AND active_ss.is_active = 1
+                ) AS active_service_count
+            FROM suppliers s
+            LEFT JOIN supplier_services ss ON ss.supplier_id = s.id AND ss.id = ?
+            WHERE s.id = ?
+            """,
+            (supplier_service_id, supplier_id),
+        ).fetchone()
+        if row is None:
+            return {"ok": False, "retryable": False, "code": "supplier_missing", "message": "공급사를 찾을 수 없습니다."}
+        if not bool(row["is_active"]):
+            return {"ok": False, "retryable": False, "code": "supplier_inactive", "message": "공급사가 비활성 상태입니다."}
+        if supplier_service_id and row.get("service_is_active") is None:
+            return {"ok": False, "retryable": False, "code": "supplier_service_missing", "message": "공급사 서비스를 찾을 수 없습니다."}
+        if supplier_service_id and not bool(row.get("service_is_active")):
+            return {"ok": False, "retryable": False, "code": "supplier_service_inactive", "message": "공급사 서비스가 비활성 상태입니다."}
+        if int(row.get("active_service_count") or 0) <= 0:
+            return {"ok": False, "retryable": True, "code": "supplier_services_empty", "message": "동기화된 활성 공급사 서비스가 없습니다."}
+        if str(row.get("service_sync_status") or "") == "failed":
+            return {"ok": False, "retryable": True, "code": "supplier_sync_failed", "message": row.get("service_sync_message") or "공급사 서비스 동기화가 실패 상태입니다."}
+        health_status = str(row.get("health_status") or "unknown")
+        if health_status != "ok":
+            return {"ok": False, "retryable": True, "code": "supplier_health_not_ok", "message": row.get("health_message") or "공급사 상태 점검이 필요합니다."}
+        balance_status = str(row.get("balance_status") or "unknown")
+        if balance_status == "failed":
+            return {"ok": False, "retryable": True, "code": "supplier_balance_failed", "message": "공급사 잔액 확인에 실패했습니다."}
+        return {"ok": True, "retryable": False, "code": "ok", "message": "발주 가능"}
+
+    def check_due_supplier_health(self, *, actor: str = "cron", limit: int = 20) -> Dict[str, Any]:
+        max_items = max(1, min(int(limit or 20), 50))
+        due_before = (dt.datetime.now().astimezone() - dt.timedelta(minutes=SUPPLIER_STATUS_CHECK_INTERVAL_MINUTES)).isoformat(timespec="seconds")
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    s.*,
+                    (
+                        SELECT COUNT(*)
+                        FROM supplier_services ss
+                        WHERE ss.supplier_id = s.id AND ss.is_active = 1
+                    ) AS active_service_count
+                FROM suppliers s
+                WHERE s.is_active = 1
+                  AND (s.health_checked_at = '' OR s.health_checked_at <= ?)
+                ORDER BY COALESCE(NULLIF(s.health_checked_at, ''), s.created_at) ASC
+                LIMIT ?
+                """,
+                (due_before, max_items),
+            ).fetchall()
+
+        checked = 0
+        ok = 0
+        failed = 0
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            checked += 1
+            supplier_id = str(row["id"])
+            integration_type = normalize_supplier_integration_type(row.get("integration_type"))
+            timestamp = now_iso()
+            health_status = "ok"
+            health_message = "공급사 상태 정상"
+            balance_status = "unsupported"
+            last_balance = str(row.get("last_balance") or "")
+            last_currency = str(row.get("last_currency") or "")
+            active_service_count = int(row.get("active_service_count") or 0)
+            if not str(row.get("api_key") or "").strip():
+                health_status = "failed"
+                health_message = "공급사 API key가 없습니다."
+            elif integration_type == SUPPLIER_INTEGRATION_MKT24 and not str(row.get("bearer_token") or "").strip():
+                health_status = "failed"
+                health_message = "MKT24 Bearer token이 없습니다."
+            elif active_service_count <= 0:
+                health_status = "failed"
+                health_message = "활성 공급사 서비스가 없습니다. 서비스 동기화가 필요합니다."
+            elif str(row.get("service_sync_status") or "") == "failed":
+                health_status = "failed"
+                health_message = str(row.get("service_sync_message") or "최근 서비스 동기화가 실패했습니다.")[:1000]
+
+            if health_status == "ok" and supplier_supports_balance_check(integration_type):
+                try:
+                    client = SupplierApiClient(
+                        str(row["api_url"]),
+                        decrypt_secret_value(row["api_key"]),
+                        integration_type=integration_type,
+                        bearer_token=decrypt_secret_value(row.get("bearer_token") or ""),
+                    )
+                    balance = client.balance_summary()
+                    last_balance = str(balance.get("balance") or "")
+                    last_currency = str(balance.get("currency") or "")
+                    balance_status = "ok"
+                    health_message = "공급사 연결/잔액 확인 완료"
+                except Exception as exc:
+                    health_status = "failed"
+                    balance_status = "failed"
+                    health_message = str(exc)[:1000]
+
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE suppliers
+                    SET health_status = ?, health_message = ?, health_checked_at = ?,
+                        balance_status = ?, balance_checked_at = ?, last_balance = ?, last_currency = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        health_status,
+                        health_message,
+                        timestamp,
+                        balance_status,
+                        timestamp,
+                        last_balance,
+                        last_currency,
+                        timestamp,
+                        supplier_id,
+                    ),
+                )
+                conn.commit()
+            if health_status == "ok":
+                ok += 1
+            else:
+                failed += 1
+            results.append({"supplierId": supplier_id, "status": health_status, "message": health_message})
+
+        return {"checked": checked, "ok": ok, "failed": failed, "results": results, "ranAt": now_iso()}
+
+    def _mark_cafe24_retry_state(
+        self,
+        conn: DatabaseConnection,
+        *,
+        item_id: str,
+        attempts: int,
+        code: str,
+        message: str,
+        retryable: bool = True,
+    ) -> None:
+        timestamp = now_iso()
+        if not retryable or attempts >= AUTOMATION_RETRY_MAX_ATTEMPTS:
+            conn.execute(
+                """
+                UPDATE cafe24_order_items
+                SET standard_status = ?, automation_last_checked_at = ?, automation_error_code = ?,
+                    next_retry_at = '', error_message = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                ("needs_manual_review", timestamp, code, message[:1000], timestamp, item_id),
+            )
+            return
+        conn.execute(
+            """
+            UPDATE cafe24_order_items
+            SET automation_last_checked_at = ?, automation_error_code = ?,
+                next_retry_at = ?, error_message = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (timestamp, code, automation_retry_at(attempts), message[:1000], timestamp, item_id),
+        )
+
+    def dispatch_due_cafe24_order_items(self, *, actor: str = "cron", limit: int = 20) -> Dict[str, Any]:
+        max_items = max(1, min(int(limit or 20), 100))
+        timestamp = now_iso()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT coi.id, coi.supplier_id, coi.supplier_service_id, coi.retry_count
+                FROM cafe24_order_items coi
+                JOIN cafe24_integrations ci ON ci.mall_id = coi.mall_id AND ci.shop_no = coi.shop_no
+                WHERE ci.is_active = 1
+                  AND ci.auto_submit = 1
+                  AND coi.payment_gate_status = 'payment_confirmed'
+                  AND coi.standard_status IN ('ready_to_submit', 'failed')
+                  AND coi.supplier_order_uuid = ''
+                  AND coi.supplier_id <> ''
+                  AND coi.supplier_external_service_id <> ''
+                  AND COALESCE(coi.retry_count, 0) < ?
+                  AND (coi.next_retry_at = '' OR coi.next_retry_at <= ?)
+                ORDER BY coi.updated_at ASC
+                LIMIT ?
+                """,
+                (AUTOMATION_RETRY_MAX_ATTEMPTS, timestamp, max_items),
+            ).fetchall()
+
+        submitted = 0
+        blocked = 0
+        failed = 0
+        duplicates = 0
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            item_id = str(row["id"])
+            with self._connect() as conn:
+                readiness = self._supplier_auto_dispatch_readiness(
+                    conn,
+                    supplier_id=str(row["supplier_id"] or ""),
+                    supplier_service_id=str(row["supplier_service_id"] or ""),
+                )
+                if not readiness["ok"]:
+                    blocked += 1
+                    self._mark_cafe24_retry_state(
+                        conn,
+                        item_id=item_id,
+                        attempts=max(int(row["retry_count"] or 0), 1),
+                        code=str(readiness["code"]),
+                        message=str(readiness["message"]),
+                        retryable=bool(readiness.get("retryable")),
+                    )
+                    conn.commit()
+                    results.append({"itemId": item_id, "status": "blocked", **readiness})
+                    continue
+            try:
+                result = self.dispatch_cafe24_order_item({"itemId": item_id, "_adminActor": actor})
+                if result.get("duplicate"):
+                    duplicates += 1
+                elif result.get("submitted"):
+                    submitted += 1
+                elif result.get("status") == "failed":
+                    failed += 1
+                results.append(result)
+            except Exception as exc:
+                failed += 1
+                with self._connect() as conn:
+                    attempts_row = conn.execute("SELECT retry_count FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
+                    self._mark_cafe24_retry_state(
+                        conn,
+                        item_id=item_id,
+                        attempts=int((attempts_row or {}).get("retry_count") or 1),
+                        code="dispatch_exception",
+                        message=str(exc),
+                        retryable=True,
+                    )
+                    conn.commit()
+                results.append({"itemId": item_id, "status": "failed", "error": str(exc)})
+        return {
+            "checked": len(rows),
+            "submitted": submitted,
+            "blocked": blocked,
+            "failed": failed,
+            "duplicates": duplicates,
+            "results": results,
+            "ranAt": now_iso(),
+        }
+
+    def dispatch_due_web_orders(self, *, actor: str = "cron", limit: int = 20) -> Dict[str, Any]:
+        max_items = max(1, min(int(limit or 20), 100))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, dispatch_attempts
+                FROM orders
+                WHERE order_channel = ?
+                  AND dispatch_status IN (?, ?)
+                  AND COALESCE(dispatch_attempts, 0) < ?
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (ORDER_CHANNEL_WEB, ORDER_DISPATCH_READY, ORDER_DISPATCH_FAILED, AUTOMATION_RETRY_MAX_ATTEMPTS, max_items),
+            ).fetchall()
+
+        submitted = 0
+        blocked = 0
+        failed = 0
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            order_id = str(row["id"])
+            try:
+                with self._connect() as conn:
+                    context = self._supplier_dispatch_context(conn, order_id)
+                    readiness = self._supplier_auto_dispatch_readiness(
+                        conn,
+                        supplier_id=str(context["mapping"]["supplier_id"]),
+                        supplier_service_id=str(context["mapping"]["supplier_service_id"]),
+                    )
+                    if not readiness["ok"]:
+                        blocked += 1
+                        conn.execute(
+                            "UPDATE orders SET supplier_last_error = ?, updated_at = ? WHERE id = ?",
+                            (str(readiness["message"])[:1000], now_iso(), order_id),
+                        )
+                        conn.commit()
+                        results.append({"orderId": order_id, "status": "blocked", **readiness})
+                        continue
+                dispatch = self._dispatch_supplier_order(order_id, context["product"], context["fields"], context["mapping"])
+                if dispatch["status"] in {ORDER_DISPATCH_SUBMITTED, ORDER_DISPATCH_ACCEPTED}:
+                    submitted += 1
+                elif dispatch["status"] == ORDER_DISPATCH_FAILED:
+                    failed += 1
+                results.append({"orderId": order_id, **dispatch})
+            except Exception as exc:
+                failed += 1
+                with self._connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE orders
+                        SET dispatch_attempts = COALESCE(dispatch_attempts, 0) + 1,
+                            supplier_last_error = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (str(exc)[:1000], now_iso(), order_id),
+                    )
+                    conn.commit()
+                results.append({"orderId": order_id, "status": "failed", "error": str(exc)})
+        return {"checked": len(rows), "submitted": submitted, "blocked": blocked, "failed": failed, "results": results, "ranAt": now_iso()}
+
+    def _supplier_status_to_cafe24_status(self, supplier_status: str) -> str:
+        if supplier_status == "completed":
+            return "completed"
+        if supplier_status in {"in_progress", "pending", "submitted", "accepted", "partial"}:
+            return "supplier_progress"
+        if supplier_status in {"failed", "cancelled"}:
+            return "failed"
+        return "supplier_progress"
+
+    def _next_supplier_status_check_at(self, supplier_status: str) -> str:
+        if supplier_status in {"completed", "failed", "cancelled"}:
+            return ""
+        return (
+            dt.datetime.now().astimezone()
+            + dt.timedelta(minutes=SUPPLIER_STATUS_CHECK_INTERVAL_MINUTES)
+        ).isoformat(timespec="seconds")
+
+    def refresh_due_supplier_order_statuses(self, *, actor: str = "cron", limit: int = 50) -> Dict[str, Any]:
+        max_items = max(1, min(int(limit or 50), 150))
+        timestamp = now_iso()
+        terminal_statuses = {"completed", "failed", "cancelled"}
+        checked = 0
+        completed = 0
+        failed = 0
+        errors = 0
+        results: List[Dict[str, Any]] = []
+
+        with self._connect() as conn:
+            supplier_order_rows = conn.execute(
+                """
+                SELECT
+                    so.*,
+                    o.order_channel,
+                    o.external_order_id,
+                    o.external_order_item_id,
+                    s.api_url,
+                    s.integration_type,
+                    s.api_key,
+                    s.bearer_token
+                FROM supplier_orders so
+                JOIN orders o ON o.id = so.order_id
+                JOIN suppliers s ON s.id = so.supplier_id
+                WHERE so.supplier_external_order_id <> ''
+                  AND so.status NOT IN ('completed', 'failed', 'cancelled')
+                  AND (so.next_status_check_at = '' OR so.next_status_check_at <= ?)
+                ORDER BY COALESCE(NULLIF(so.next_status_check_at, ''), so.updated_at) ASC
+                LIMIT ?
+                """,
+                (timestamp, max_items),
+            ).fetchall()
+
+        for row in supplier_order_rows:
+            checked += 1
+            try:
+                client = SupplierApiClient(
+                    str(row["api_url"]),
+                    decrypt_secret_value(row["api_key"]),
+                    integration_type=str(row["integration_type"]),
+                    bearer_token=decrypt_secret_value(row["bearer_token"]),
+                )
+                status_payload = client.status(str(row["supplier_external_order_id"]))
+                supplier_status = normalize_supplier_order_status_payload(status_payload)
+                next_check = self._next_supplier_status_check_at(supplier_status)
+                response_json = parse_json(row["response_json"], {})
+                response_json["lastStatusCheck"] = {"checkedAt": now_iso(), "payload": status_payload}
+                message = ""
+                if isinstance(status_payload, dict):
+                    message = str(status_payload.get("error") or status_payload.get("message") or "").strip()
+                with self._connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE supplier_orders
+                        SET status = ?, response_json = ?, last_status_checked_at = ?,
+                            next_status_check_at = ?, status_check_attempts = COALESCE(status_check_attempts, 0) + 1,
+                            status_check_message = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            supplier_status,
+                            as_json(redact_external_payload(response_json)),
+                            now_iso(),
+                            next_check,
+                            message[:1000],
+                            now_iso(),
+                            row["id"],
+                        ),
+                    )
+                    conn.execute(
+                        "UPDATE orders SET dispatch_status = ?, supplier_last_error = ?, updated_at = ? WHERE id = ?",
+                        (
+                            normalize_order_dispatch_status(supplier_status),
+                            message[:1000] if supplier_status in {"failed", "cancelled"} else "",
+                            now_iso(),
+                            row["order_id"],
+                        ),
+                    )
+                    if supplier_status in terminal_statuses:
+                        conn.execute("UPDATE orders SET status = ?, updated_at = ? WHERE id = ?", (supplier_status, now_iso(), row["order_id"]))
+                    elif supplier_status in {"in_progress", "pending", "submitted", "accepted", "partial"}:
+                        conn.execute("UPDATE orders SET status = ?, updated_at = ? WHERE id = ?", ("in_progress", now_iso(), row["order_id"]))
+                    if row["order_channel"] == ORDER_CHANNEL_CAFE24 and row["external_order_id"]:
+                        cafe24_status = self._supplier_status_to_cafe24_status(supplier_status)
+                        completion_status = "pending" if supplier_status == "completed" else ""
+                        conn.execute(
+                            """
+                            UPDATE cafe24_order_items
+                            SET standard_status = ?, error_message = ?, automation_last_checked_at = ?,
+                                cafe24_completion_status = CASE
+                                    WHEN ? <> '' AND cafe24_completion_status <> 'done' THEN ?
+                                    ELSE cafe24_completion_status
+                                END,
+                                updated_at = ?
+                            WHERE cafe24_order_id = ? AND cafe24_order_item_code = ?
+                            """,
+                            (
+                                cafe24_status,
+                                message[:1000],
+                                now_iso(),
+                                completion_status,
+                                completion_status,
+                                now_iso(),
+                                row["external_order_id"],
+                                row["external_order_item_id"],
+                            ),
+                        )
+                    conn.commit()
+                if supplier_status == "completed":
+                    completed += 1
+                elif supplier_status in {"failed", "cancelled"}:
+                    failed += 1
+                results.append({"supplierOrderId": row["id"], "status": supplier_status})
+            except Exception as exc:
+                errors += 1
+                with self._connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE supplier_orders
+                        SET last_status_checked_at = ?, next_status_check_at = ?,
+                            status_check_attempts = COALESCE(status_check_attempts, 0) + 1,
+                            status_check_message = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now_iso(), automation_retry_at(1), str(exc)[:1000], now_iso(), row["id"]),
+                    )
+                    conn.commit()
+                results.append({"supplierOrderId": row["id"], "status": "failed", "error": str(exc)})
+
+        remaining_limit = max(max_items - checked, 0)
+        if remaining_limit:
+            cutoff = (dt.datetime.now().astimezone() - dt.timedelta(minutes=SUPPLIER_STATUS_CHECK_INTERVAL_MINUTES)).isoformat(timespec="seconds")
+            with self._connect() as conn:
+                cafe24_rows = conn.execute(
+                    """
+                    SELECT
+                        coi.*,
+                        s.api_url,
+                        s.integration_type,
+                        s.api_key,
+                        s.bearer_token
+                    FROM cafe24_order_items coi
+                    JOIN suppliers s ON s.id = coi.supplier_id
+                    WHERE coi.supplier_order_uuid <> ''
+                      AND coi.standard_status IN ('submitting', 'supplier_submitted', 'supplier_progress')
+                      AND (coi.automation_last_checked_at = '' OR coi.automation_last_checked_at <= ?)
+                    ORDER BY COALESCE(NULLIF(coi.automation_last_checked_at, ''), coi.last_submitted_at, coi.updated_at) ASC
+                    LIMIT ?
+                    """,
+                    (cutoff, remaining_limit),
+                ).fetchall()
+
+            for row in cafe24_rows:
+                checked += 1
+                try:
+                    client = SupplierApiClient(
+                        str(row["api_url"]),
+                        decrypt_secret_value(row["api_key"]),
+                        integration_type=str(row["integration_type"]),
+                        bearer_token=decrypt_secret_value(row["bearer_token"]),
+                    )
+                    status_payload = client.status(str(row["supplier_order_uuid"]))
+                    supplier_status = normalize_supplier_order_status_payload(status_payload)
+                    cafe24_status = self._supplier_status_to_cafe24_status(supplier_status)
+                    response_json = parse_json(row["supplier_response_json"], {})
+                    response_json["lastStatusCheck"] = {"checkedAt": now_iso(), "payload": status_payload}
+                    message = ""
+                    if isinstance(status_payload, dict):
+                        message = str(status_payload.get("error") or status_payload.get("message") or "").strip()
+                    with self._connect() as conn:
+                        conn.execute(
+                            """
+                            UPDATE cafe24_order_items
+                            SET standard_status = ?, supplier_response_json = ?, error_message = ?,
+                                automation_last_checked_at = ?, cafe24_completion_status = CASE
+                                    WHEN ? = 'completed' AND cafe24_completion_status <> 'done' THEN 'pending'
+                                    ELSE cafe24_completion_status
+                                END,
+                                updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                cafe24_status,
+                                as_json(redact_external_payload(response_json)),
+                                message[:1000],
+                                now_iso(),
+                                supplier_status,
+                                now_iso(),
+                                row["id"],
+                            ),
+                        )
+                        conn.commit()
+                    if supplier_status == "completed":
+                        completed += 1
+                    elif supplier_status in {"failed", "cancelled"}:
+                        failed += 1
+                    results.append({"itemId": row["id"], "status": supplier_status})
+                except Exception as exc:
+                    errors += 1
+                    with self._connect() as conn:
+                        conn.execute(
+                            """
+                            UPDATE cafe24_order_items
+                            SET automation_last_checked_at = ?, automation_error_code = ?,
+                                error_message = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (now_iso(), "supplier_status_check_failed", str(exc)[:1000], now_iso(), row["id"]),
+                        )
+                        conn.commit()
+                    results.append({"itemId": row["id"], "status": "failed", "error": str(exc)})
+
+        return {"checked": checked, "completed": completed, "failed": failed, "errors": errors, "results": results, "ranAt": now_iso()}
+
+    def complete_due_cafe24_order_items(self, *, actor: str = "cron", limit: int = 20) -> Dict[str, Any]:
+        max_items = max(1, min(int(limit or 20), 100))
+        timestamp = now_iso()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    coi.*,
+                    ci.id AS integration_id,
+                    ci.scopes_json,
+                    ci.access_token,
+                    ci.refresh_token,
+                    ci.expires_at,
+                    ci.refresh_token_expires_at,
+                    ci.token_status,
+                    ci.token_refresh_lock_until,
+                    ci.reconnect_reason
+                FROM cafe24_order_items coi
+                JOIN cafe24_integrations ci ON ci.mall_id = coi.mall_id AND ci.shop_no = coi.shop_no
+                WHERE ci.is_active = 1
+                  AND coi.standard_status = 'completed'
+                  AND coi.payment_gate_status = 'payment_confirmed'
+                  AND coi.cafe24_completion_status IN ('pending', 'failed')
+                  AND COALESCE(coi.cafe24_completion_attempts, 0) < ?
+                  AND (coi.cafe24_next_completion_retry_at = '' OR coi.cafe24_next_completion_retry_at <= ?)
+                ORDER BY coi.updated_at ASC
+                LIMIT ?
+                """,
+                (AUTOMATION_RETRY_MAX_ATTEMPTS, timestamp, max_items),
+            ).fetchall()
+
+        done = 0
+        failed = 0
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE cafe24_order_items
+                    SET cafe24_completion_status = ?, cafe24_completion_attempts = COALESCE(cafe24_completion_attempts, 0) + 1,
+                        cafe24_completion_message = '', updated_at = ?
+                    WHERE id = ?
+                      AND cafe24_completion_status IN ('pending', 'failed')
+                      AND cafe24_completed_at = ''
+                    """,
+                    ("processing", now_iso(), row["id"]),
+                )
+                conn.commit()
+            if cursor.rowcount != 1:
+                continue
+            try:
+                with self._connect() as conn:
+                    integration_payload = dict(row)
+                    integration_payload["id"] = integration_payload.get("integration_id") or integration_payload.get("id")
+                    client = self._cafe24_client_for_row(conn, integration_payload)
+                    response = client.confirm_purchase(str(row["cafe24_order_id"]), str(row["cafe24_order_item_code"]))
+                    conn.execute(
+                        """
+                        UPDATE cafe24_order_items
+                        SET cafe24_completion_status = ?, cafe24_completion_message = ?,
+                            cafe24_completed_at = ?, cafe24_next_completion_retry_at = '', updated_at = ?
+                        WHERE id = ?
+                        """,
+                        ("done", as_json(redact_external_payload(response))[:1000], now_iso(), now_iso(), row["id"]),
+                    )
+                    self._log_cafe24_event(
+                        conn,
+                        mall_id=str(row["mall_id"]),
+                        shop_no=int(row["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                        event_type="order_item.purchase_confirm",
+                        status="success",
+                        request_payload={
+                            "orderId": row["cafe24_order_id"],
+                            "orderItemCode": row["cafe24_order_item_code"],
+                            "purchase_confirmation": "T",
+                            "collect_points": "F",
+                        },
+                        response_payload=response,
+                    )
+                    conn.commit()
+                done += 1
+                results.append({"itemId": row["id"], "status": "done"})
+            except Exception as exc:
+                failed += 1
+                with self._connect() as conn:
+                    attempts_row = conn.execute(
+                        "SELECT cafe24_completion_attempts FROM cafe24_order_items WHERE id = ?",
+                        (row["id"],),
+                    ).fetchone()
+                    attempts = int((attempts_row or {}).get("cafe24_completion_attempts") or 1)
+                    next_retry = "" if attempts >= AUTOMATION_RETRY_MAX_ATTEMPTS else automation_retry_at(attempts)
+                    conn.execute(
+                        """
+                        UPDATE cafe24_order_items
+                        SET cafe24_completion_status = ?, cafe24_completion_message = ?,
+                            cafe24_next_completion_retry_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        ("failed", str(exc)[:1000], next_retry, now_iso(), row["id"]),
+                    )
+                    self._log_cafe24_event(
+                        conn,
+                        mall_id=str(row["mall_id"]),
+                        shop_no=int(row["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                        event_type="order_item.purchase_confirm",
+                        status="failed",
+                        request_payload={"orderId": row["cafe24_order_id"], "orderItemCode": row["cafe24_order_item_code"]},
+                        error_message=str(exc),
+                    )
+                    conn.commit()
+                results.append({"itemId": row["id"], "status": "failed", "error": str(exc)})
+        return {"checked": len(rows), "done": done, "failed": failed, "results": results, "ranAt": now_iso()}
+
+    def run_automation_tick(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = payload or {}
+        actor = str(payload.get("_adminActor") or payload.get("actor") or "cron").strip() or "cron"
+        paused = automation_paused()
+        started_at = now_iso()
+        started_perf = time.perf_counter()
+        lookback_days = int(payload.get("lookbackDays") or CAFE24_ORDER_DEFAULT_LOOKBACK_DAYS)
+        supplier_limit = int(payload.get("supplierLimit") or 10)
+        dispatch_limit = int(payload.get("dispatchLimit") or 20)
+        status_limit = int(payload.get("statusLimit") or 50)
+        completion_limit = int(payload.get("completionLimit") or 20)
+        result: Dict[str, Any] = {
+            "startedAt": started_at,
+            "paused": paused,
+            "supplierServiceSync": {},
+            "supplierHealth": {},
+            "cafe24Poll": {},
+            "webDispatch": {"skipped": paused},
+            "cafe24Dispatch": {"skipped": paused},
+            "supplierStatusRefresh": {"skipped": paused},
+            "cafe24Completion": {"skipped": paused},
+        }
+        status = "success"
+        message = "automation tick completed"
+        try:
+            result["supplierServiceSync"] = self.sync_due_supplier_services(actor=actor, limit=supplier_limit)
+            result["supplierHealth"] = self.check_due_supplier_health(actor=actor, limit=max(supplier_limit, 20))
+            result["cafe24Poll"] = self.poll_due_cafe24_orders({"actor": actor, "lookbackDays": lookback_days})
+            if not paused:
+                result["webDispatch"] = self.dispatch_due_web_orders(actor=actor, limit=dispatch_limit)
+                result["cafe24Dispatch"] = self.dispatch_due_cafe24_order_items(actor=actor, limit=dispatch_limit)
+                result["supplierStatusRefresh"] = self.refresh_due_supplier_order_statuses(actor=actor, limit=status_limit)
+                result["cafe24Completion"] = self.complete_due_cafe24_order_items(actor=actor, limit=completion_limit)
+            else:
+                message = "automation paused: collection only"
+        except Exception as exc:
+            status = "failed"
+            message = str(exc)
+            result["error"] = message
+        finally:
+            result["finishedAt"] = now_iso()
+            result["durationMs"] = int((time.perf_counter() - started_perf) * 1000)
+            result["status"] = status
+            result["message"] = message
+            with self._connect() as conn:
+                self._set_runtime_metadata(conn, "automation.last_tick", as_json(redact_external_payload(result)))
+                self._set_runtime_metadata(conn, "automation.last_tick_at", result["finishedAt"])
+                self._set_runtime_metadata(conn, "automation.last_tick_status", status)
+                self._set_runtime_metadata(conn, "automation.paused", "1" if paused else "0")
+                conn.commit()
+        return result
+
     def save_product_mapping(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         product_id = str(payload.get("productId") or "").strip()
         supplier_id = str(payload.get("supplierId") or "").strip()
@@ -13578,6 +14376,11 @@ class PanelStore(PanelStoreDatabaseMixin):
             "serviceSyncLockUntil": row["service_sync_lock_until"],
             "serviceSyncErrorCount": row["service_sync_error_count"],
             "serviceSyncIntervalMinutes": row["service_sync_interval_minutes"],
+            "healthStatus": row.get("health_status") or "unknown",
+            "healthMessage": row.get("health_message") or "",
+            "healthCheckedAt": row.get("health_checked_at") or "",
+            "balanceStatus": row.get("balance_status") or "unknown",
+            "balanceCheckedAt": row.get("balance_checked_at") or "",
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }

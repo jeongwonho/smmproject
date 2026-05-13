@@ -337,6 +337,11 @@ class PanelStoreDatabaseMixin:
         self._ensure_column(conn, "suppliers", "service_sync_lock_until", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "suppliers", "service_sync_error_count", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column(conn, "suppliers", "service_sync_interval_minutes", "INTEGER NOT NULL DEFAULT 30")
+        self._ensure_column(conn, "suppliers", "health_status", "TEXT NOT NULL DEFAULT 'unknown'")
+        self._ensure_column(conn, "suppliers", "health_message", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "suppliers", "health_checked_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "suppliers", "balance_status", "TEXT NOT NULL DEFAULT 'unknown'")
+        self._ensure_column(conn, "suppliers", "balance_checked_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "supplier_services", "is_active", "INTEGER NOT NULL DEFAULT 1")
         self._ensure_column(conn, "supplier_services", "last_seen_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "supplier_services", "removed_at", "TEXT NOT NULL DEFAULT ''")
@@ -372,6 +377,10 @@ class PanelStoreDatabaseMixin:
         self._ensure_column(conn, "orders", "dispatch_attempts", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column(conn, "orders", "supplier_last_error", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "orders", "external_payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column(conn, "supplier_orders", "last_status_checked_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "supplier_orders", "next_status_check_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "supplier_orders", "status_check_attempts", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "supplier_orders", "status_check_message", "TEXT NOT NULL DEFAULT ''")
         conn.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_user_idempotency_key
@@ -435,6 +444,32 @@ class PanelStoreDatabaseMixin:
         self._ensure_column(conn, "cafe24_order_items", "supplier_service_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "supplier_external_service_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "supplier_response_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column(conn, "cafe24_order_items", "next_retry_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_order_items", "automation_last_checked_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_order_items", "automation_error_code", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_order_items", "cafe24_completion_status", "TEXT NOT NULL DEFAULT 'pending'")
+        self._ensure_column(conn, "cafe24_order_items", "cafe24_completion_message", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_order_items", "cafe24_completed_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_order_items", "cafe24_completion_attempts", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "cafe24_order_items", "cafe24_next_completion_retry_at", "TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_supplier_orders_next_status_check
+                ON supplier_orders(status, next_status_check_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_automation_retry
+                ON cafe24_order_items(standard_status, next_retry_at, payment_gate_status)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_completion_retry
+                ON cafe24_order_items(cafe24_completion_status, cafe24_next_completion_retry_at)
+            """
+        )
         if not is_production_runtime():
             conn.execute(
                 """
@@ -484,7 +519,7 @@ class PanelStoreDatabaseMixin:
                     ON cafe24_api_events(created_at DESC)
                 """
             )
-        conn.execute("UPDATE cafe24_integrations SET auto_submit = 0 WHERE auto_submit != 0")
+        conn.execute("UPDATE cafe24_integrations SET auto_submit = 1 WHERE is_active = 1")
         self._migrate_cafe24_supplier_mappings(conn)
         if not is_production_runtime():
             self._ensure_bigint_columns(
