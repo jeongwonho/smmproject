@@ -1,4 +1,4 @@
-name: Cafe24 Order Poll
+name: Instamart Automation Tick
 
 on:
   schedule:
@@ -10,19 +10,19 @@ permissions:
   contents: read
 
 concurrency:
-  group: cafe24-order-poll
+  group: instamart-automation
   cancel-in-progress: false
 
 jobs:
-  poll:
+  tick:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Poll Cafe24 orders
+      - name: Run automation tick
         env:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
           GITHUB_TOKEN: ${{ github.token }}
-          POLL_URL: https://smmproject-lime.vercel.app/api/cron/cafe24/orders/poll
+          TICK_URL: https://smmproject-lime.vercel.app/api/cron/automation/tick
         run: |
           set -euo pipefail
           auth_token="${CRON_SECRET:-${GITHUB_TOKEN:-}}"
@@ -33,13 +33,13 @@ jobs:
 
           response_file="$(mktemp)"
           http_code="$(
-            curl -sS -X POST "$POLL_URL" \
+            curl -sS -X POST "$TICK_URL" \
               -H "Authorization: Bearer ${auth_token}" \
               -H "X-GitHub-Repository: ${GITHUB_REPOSITORY}" \
               -H "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" \
               -H "X-GitHub-Workflow: ${GITHUB_WORKFLOW}" \
               -H "Content-Type: application/json" \
-              --data '{"lookbackDays":30}' \
+              --data '{"lookbackDays":30,"supplierLimit":10,"dispatchLimit":20,"statusLimit":50,"completionLimit":20}' \
               -o "$response_file" \
               -w "%{http_code}"
           )"
@@ -48,6 +48,6 @@ jobs:
           echo
 
           if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
-            echo "Cafe24 poll failed with HTTP ${http_code}"
+            echo "Instamart automation tick failed with HTTP ${http_code}"
             exit 1
           fi

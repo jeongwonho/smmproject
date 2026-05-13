@@ -68,6 +68,7 @@ class FakeCafe24OrderClient:
         self.order_pages = None
         self.orders_calls = []
         self.order_calls = []
+        self.confirm_purchase_calls = []
 
     def orders(
         self,
@@ -103,6 +104,12 @@ class FakeCafe24OrderClient:
     def order(self, order_id):
         self.order_calls.append(order_id)
         return {"order": self.order_payload}
+
+    def confirm_purchase(self, order_id, order_item_code, *, collect_points="F"):
+        self.confirm_purchase_calls.append(
+            {"order_id": order_id, "order_item_code": order_item_code, "collect_points": collect_points}
+        )
+        return {"order": {"order_id": order_id, "order_item_code": order_item_code, "purchase_confirmation": "T"}}
 
 
 class Cafe24OrderIntegrationTest(unittest.TestCase):
@@ -239,6 +246,28 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
     def _integration_row(self):
         return self.conn.execute("SELECT * FROM cafe24_integrations WHERE mall_id = ?", ("instamart",)).fetchone()
 
+    def _enable_auto_submit_and_supplier_ready(self):
+        timestamp = now_iso()
+        self.conn.execute(
+            """
+            UPDATE cafe24_integrations
+            SET auto_submit = 1
+            WHERE id = ?
+            """,
+            (self.integration["id"],),
+        )
+        self.conn.execute(
+            """
+            UPDATE suppliers
+            SET health_status = 'ok', health_message = 'ok', health_checked_at = ?,
+                balance_status = 'ok', balance_checked_at = ?,
+                service_sync_status = 'success', service_sync_completed_at = ?
+            WHERE id = ?
+            """,
+            (timestamp, timestamp, timestamp, "supplier_test"),
+        )
+        self.conn.commit()
+
     def _set_integration_token_expiry(self, *, access_delta_seconds=7200, refresh_delta_days=14):
         now = dt.datetime.now().astimezone()
         self.conn.execute(
@@ -312,6 +341,116 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(item["supplier_order_uuid"], "SUP-1001")
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders WHERE order_channel = 'cafe24'").fetchone()[0], 0)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM wallet_ledger").fetchone()[0], 0)
+
+    def test_automation_dispatches_ready_cafe24_item_once(self):
+        self._enable_auto_submit_and_supplier_ready()
+        order_payload = self._order_payload()
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+
+        with patch("core.SupplierApiClient.order", return_value={"order": "SUP-AUTO"}) as order_call:
+            first = self.store.dispatch_due_cafe24_order_items(actor="cron", limit=10)
+            second = self.store.dispatch_due_cafe24_order_items(actor="cron", limit=10)
+
+        self.assertEqual(first["submitted"], 1)
+        self.assertEqual(second["checked"], 0)
+        order_call.assert_called_once()
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.assertEqual(item["standard_status"], "supplier_submitted")
+        self.assertEqual(item["supplier_order_uuid"], "SUP-AUTO")
+
+    def test_automation_blocks_cafe24_dispatch_when_supplier_health_failed(self):
+        self._enable_auto_submit_and_supplier_ready()
+        self.conn.execute(
+            "UPDATE suppliers SET health_status = 'failed', health_message = 'balance unavailable' WHERE id = ?",
+            ("supplier_test",),
+        )
+        order_payload = self._order_payload()
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+
+        with patch("core.SupplierApiClient.order") as order_call:
+            result = self.store.dispatch_due_cafe24_order_items(actor="cron", limit=10)
+
+        self.assertEqual(result["blocked"], 1)
+        order_call.assert_not_called()
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.assertEqual(item["automation_error_code"], "supplier_health_not_ok")
+        self.assertTrue(item["next_retry_at"])
+
+    def test_supplier_completed_status_marks_cafe24_item_ready_for_completion(self):
+        self._enable_auto_submit_and_supplier_ready()
+        order_payload = self._order_payload()
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+        item_id = self.conn.execute("SELECT id FROM cafe24_order_items").fetchone()["id"]
+        with patch("core.SupplierApiClient.order", return_value={"order": "SUP-COMPLETE"}):
+            self.store.dispatch_cafe24_order_item({"itemId": item_id, "_adminActor": "qa"})
+        old_check = (dt.datetime.now().astimezone() - dt.timedelta(minutes=20)).isoformat(timespec="seconds")
+        self.conn.execute(
+            "UPDATE cafe24_order_items SET automation_last_checked_at = ? WHERE id = ?",
+            (old_check, item_id),
+        )
+        self.conn.commit()
+
+        with patch("core.SupplierApiClient.status", return_value={"status": "completed"}):
+            result = self.store.refresh_due_supplier_order_statuses(actor="cron", limit=10)
+
+        self.assertEqual(result["completed"], 1)
+        item = self.conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
+        self.assertEqual(item["standard_status"], "completed")
+        self.assertEqual(item["cafe24_completion_status"], "pending")
+
+    def test_cafe24_completion_confirms_purchase_once_supplier_completed(self):
+        self._enable_auto_submit_and_supplier_ready()
+        order_payload = self._order_payload()
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.execute(
+            """
+            UPDATE cafe24_order_items
+            SET standard_status = 'completed', cafe24_completion_status = 'pending'
+            """
+        )
+        self.conn.commit()
+        fake_client = FakeCafe24OrderClient(order_payload)
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client):
+            result = self.store.complete_due_cafe24_order_items(actor="cron", limit=10)
+
+        self.assertEqual(result["done"], 1)
+        self.assertEqual(fake_client.confirm_purchase_calls[0]["order_id"], "20260426-000001")
+        self.assertEqual(fake_client.confirm_purchase_calls[0]["order_item_code"], "20260426-000001-01")
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.assertEqual(item["cafe24_completion_status"], "done")
+        self.assertTrue(item["cafe24_completed_at"])
 
     def test_payment_pending_cafe24_item_cannot_be_dispatched(self):
         order_payload = self._order_payload()

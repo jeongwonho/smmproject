@@ -1387,6 +1387,20 @@ class AppHandler(SimpleHTTPRequestHandler):
             },
         )
 
+    @route("POST", "/api/cron/automation/tick", auth="cron", read_json_body=True)
+    def _post_cron_automation_tick(self, request: RouteRequest) -> None:
+        payload = dict(request.payload or {})
+        payload["_adminActor"] = "cron"
+        result = self._server().store.run_automation_tick(payload)
+        write_json(
+            self,
+            500 if result.get("status") == "failed" else 200,
+            {
+                "ok": result.get("status") != "failed",
+                **result,
+            },
+        )
+
     @route("POST", "/api/auth/email/send-code", trusted_origin=True, read_json_body=True)
     def _post_auth_email_send_code(self, request: RouteRequest) -> None:
         self._enforce_rate_limit("auth", "인증 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")

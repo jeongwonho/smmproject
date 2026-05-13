@@ -59,6 +59,9 @@ def normalize_supplier_order_status_payload(payload: Any) -> str:
             or payload.get("Status")
             or payload.get("state")
             or payload.get("order_status")
+            or payload.get("orderStatus")
+            or payload.get("order_status_name")
+            or payload.get("orderStatusName")
             or ""
         ).strip()
     else:

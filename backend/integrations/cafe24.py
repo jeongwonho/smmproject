@@ -245,6 +245,18 @@ class Cafe24ApiClient:
     def update_order(self, order_id: str, payload: Dict[str, Any]) -> Any:
         return self._request("PUT", f"/admin/orders/{quote(str(order_id), safe='')}", payload=payload)
 
+    def confirm_purchase(self, order_id: str, order_item_code: str, *, collect_points: str = "F") -> Any:
+        return self.update_order(
+            order_id,
+            {
+                "order": {
+                    "order_item_code": str(order_item_code or "").strip(),
+                    "purchase_confirmation": "T",
+                    "collect_points": str(collect_points or "F").strip() or "F",
+                }
+            },
+        )
+
     def products(self, *, keyword: str = "", product_no: str = "", limit: int = 20, offset: int = 0) -> Any:
         query: Dict[str, Any] = {
             "limit": min(max(int(limit or 20), 1), 100),
