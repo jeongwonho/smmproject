@@ -13371,7 +13371,7 @@ class PanelStore(PanelStoreDatabaseMixin):
         message = "automation tick completed"
         try:
             result["supplierServiceSync"] = self.sync_due_supplier_services(actor=actor, limit=supplier_limit)
-            result["supplierHealth"] = self.check_due_supplier_health(actor=actor, limit=max(supplier_limit, 20))
+            result["supplierHealth"] = self.check_due_supplier_health(actor=actor, limit=supplier_limit)
             result["cafe24Poll"] = self.poll_due_cafe24_orders(
                 {
                     "actor": actor,
