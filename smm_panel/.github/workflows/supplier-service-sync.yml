@@ -1,0 +1,53 @@
+name: Instamart Supplier Catalog Sync
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: instamart-supplier-catalog-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Sync due supplier services
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SYNC_URL: https://smmproject-lime.vercel.app/api/cron/suppliers/sync
+        run: |
+          set -euo pipefail
+          auth_token="${CRON_SECRET:-${GITHUB_TOKEN:-}}"
+          if [ -z "${auth_token:-}" ]; then
+            echo "CRON_SECRET or GITHUB_TOKEN is required."
+            exit 1
+          fi
+
+          response_file="$(mktemp)"
+          http_code="$(
+            curl -sS -X POST "$SYNC_URL" \
+              -H "Authorization: Bearer ${auth_token}" \
+              -H "X-GitHub-Repository: ${GITHUB_REPOSITORY}" \
+              -H "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" \
+              -H "X-GitHub-Workflow: ${GITHUB_WORKFLOW}" \
+              -H "Content-Type: application/json" \
+              --data '{"limit":1}' \
+              -o "$response_file" \
+              -w "%{http_code}"
+          )"
+
+          cat "$response_file"
+          echo
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "Supplier catalog sync failed with HTTP ${http_code}"
+            exit 1
+          fi
