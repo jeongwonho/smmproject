@@ -12634,7 +12634,10 @@ class PanelStore(PanelStoreDatabaseMixin):
         return self._sync_supplier_services_internal(supplier_id, actor=actor, force=True)
 
     def sync_due_supplier_services(self, *, actor: str = "cron", limit: int = 10) -> Dict[str, Any]:
-        max_items = max(1, min(int(limit or 10), 25))
+        requested_limit = 10 if limit is None else int(limit)
+        if requested_limit <= 0:
+            return {"checked": 0, "synced": 0, "failed": 0, "skipped": 0, "results": [], "ranAt": now_iso(), "skippedByLimit": True}
+        max_items = max(1, min(requested_limit, 25))
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -12723,7 +12726,10 @@ class PanelStore(PanelStoreDatabaseMixin):
         return {"ok": True, "retryable": False, "code": "ok", "message": "발주 가능"}
 
     def check_due_supplier_health(self, *, actor: str = "cron", limit: int = 20) -> Dict[str, Any]:
-        max_items = max(1, min(int(limit or 20), 50))
+        requested_limit = 20 if limit is None else int(limit)
+        if requested_limit <= 0:
+            return {"checked": 0, "ok": 0, "failed": 0, "results": [], "ranAt": now_iso(), "skippedByLimit": True}
+        max_items = max(1, min(requested_limit, 50))
         due_before = (dt.datetime.now().astimezone() - dt.timedelta(minutes=SUPPLIER_STATUS_CHECK_INTERVAL_MINUTES)).isoformat(timespec="seconds")
         with self._connect() as conn:
             rows = conn.execute(
@@ -12853,7 +12859,10 @@ class PanelStore(PanelStoreDatabaseMixin):
         )
 
     def dispatch_due_cafe24_order_items(self, *, actor: str = "cron", limit: int = 20) -> Dict[str, Any]:
-        max_items = max(1, min(int(limit or 20), 100))
+        requested_limit = 20 if limit is None else int(limit)
+        if requested_limit <= 0:
+            return {"checked": 0, "submitted": 0, "blocked": 0, "failed": 0, "duplicates": 0, "results": [], "ranAt": now_iso(), "skippedByLimit": True}
+        max_items = max(1, min(requested_limit, 100))
         timestamp = now_iso()
         with self._connect() as conn:
             rows = conn.execute(
@@ -12936,7 +12945,10 @@ class PanelStore(PanelStoreDatabaseMixin):
         }
 
     def dispatch_due_web_orders(self, *, actor: str = "cron", limit: int = 20) -> Dict[str, Any]:
-        max_items = max(1, min(int(limit or 20), 100))
+        requested_limit = 20 if limit is None else int(limit)
+        if requested_limit <= 0:
+            return {"checked": 0, "submitted": 0, "blocked": 0, "failed": 0, "results": [], "ranAt": now_iso(), "skippedByLimit": True}
+        max_items = max(1, min(requested_limit, 100))
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -13014,7 +13026,10 @@ class PanelStore(PanelStoreDatabaseMixin):
         ).isoformat(timespec="seconds")
 
     def refresh_due_supplier_order_statuses(self, *, actor: str = "cron", limit: int = 50) -> Dict[str, Any]:
-        max_items = max(1, min(int(limit or 50), 150))
+        requested_limit = 50 if limit is None else int(limit)
+        if requested_limit <= 0:
+            return {"checked": 0, "completed": 0, "failed": 0, "errors": 0, "results": [], "ranAt": now_iso(), "skippedByLimit": True}
+        max_items = max(1, min(requested_limit, 150))
         timestamp = now_iso()
         terminal_statuses = {"completed", "failed", "cancelled"}
         checked = 0
@@ -13229,7 +13244,10 @@ class PanelStore(PanelStoreDatabaseMixin):
         return {"checked": checked, "completed": completed, "failed": failed, "errors": errors, "results": results, "ranAt": now_iso()}
 
     def complete_due_cafe24_order_items(self, *, actor: str = "cron", limit: int = 20) -> Dict[str, Any]:
-        max_items = max(1, min(int(limit or 20), 100))
+        requested_limit = 20 if limit is None else int(limit)
+        if requested_limit <= 0:
+            return {"checked": 0, "done": 0, "failed": 0, "results": [], "ranAt": now_iso(), "skippedByLimit": True}
+        max_items = max(1, min(requested_limit, 100))
         timestamp = now_iso()
         with self._connect() as conn:
             rows = conn.execute(
@@ -13349,6 +13367,8 @@ class PanelStore(PanelStoreDatabaseMixin):
         started_perf = time.perf_counter()
         lookback_days = int(payload.get("lookbackDays") or CAFE24_ORDER_DEFAULT_LOOKBACK_DAYS)
         supplier_limit = int(payload.get("supplierLimit") or 10)
+        supplier_sync_limit = int(payload.get("supplierSyncLimit") if payload.get("supplierSyncLimit") is not None else supplier_limit)
+        supplier_health_limit = int(payload.get("supplierHealthLimit") if payload.get("supplierHealthLimit") is not None else supplier_limit)
         cafe24_limit = int(payload.get("cafe24Limit") or 1)
         cafe24_page_limit = int(payload.get("cafe24PageLimit") or 100)
         cafe24_max_pages = int(payload.get("cafe24MaxPages") or 1)
@@ -13370,8 +13390,8 @@ class PanelStore(PanelStoreDatabaseMixin):
         status = "success"
         message = "automation tick completed"
         try:
-            result["supplierServiceSync"] = self.sync_due_supplier_services(actor=actor, limit=supplier_limit)
-            result["supplierHealth"] = self.check_due_supplier_health(actor=actor, limit=supplier_limit)
+            result["supplierServiceSync"] = self.sync_due_supplier_services(actor=actor, limit=supplier_sync_limit)
+            result["supplierHealth"] = self.check_due_supplier_health(actor=actor, limit=supplier_health_limit)
             result["cafe24Poll"] = self.poll_due_cafe24_orders(
                 {
                     "actor": actor,
