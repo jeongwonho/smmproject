@@ -10771,7 +10771,7 @@ class PanelStore(PanelStoreDatabaseMixin):
             max_pages = CAFE24_ORDER_MAX_PAGES
         max_pages = min(max(max_pages, 1), CAFE24_ORDER_MAX_PAGES)
         try:
-            detail_fetch_limit = int(payload.get("detailFetchLimit") or 200)
+            detail_fetch_limit = int(payload.get("detailFetchLimit") if payload.get("detailFetchLimit") is not None else 200)
         except (TypeError, ValueError):
             detail_fetch_limit = 200
         detail_fetch_limit = min(max(detail_fetch_limit, 0), 500)
@@ -10992,7 +10992,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                     max_pages = CAFE24_ORDER_MAX_PAGES
                 max_pages = min(max(max_pages, 1), CAFE24_ORDER_MAX_PAGES)
                 try:
-                    detail_fetch_limit = int(payload.get("detailFetchLimit") or 200)
+                    detail_fetch_limit = int(payload.get("detailFetchLimit") if payload.get("detailFetchLimit") is not None else 200)
                 except (TypeError, ValueError):
                     detail_fetch_limit = 200
                 detail_fetch_limit = min(max(detail_fetch_limit, 0), 500)
@@ -13372,7 +13372,7 @@ class PanelStore(PanelStoreDatabaseMixin):
         cafe24_limit = int(payload.get("cafe24Limit") or 1)
         cafe24_page_limit = int(payload.get("cafe24PageLimit") or 100)
         cafe24_max_pages = int(payload.get("cafe24MaxPages") or 1)
-        cafe24_detail_fetch_limit = int(payload.get("cafe24DetailFetchLimit") or 10)
+        cafe24_detail_fetch_limit = int(payload.get("cafe24DetailFetchLimit") if payload.get("cafe24DetailFetchLimit") is not None else 10)
         dispatch_limit = int(payload.get("dispatchLimit") or 20)
         status_limit = int(payload.get("statusLimit") or 50)
         completion_limit = int(payload.get("completionLimit") or 20)
