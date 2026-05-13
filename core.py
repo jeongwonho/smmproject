@@ -12488,8 +12488,18 @@ class PanelStore(PanelStoreDatabaseMixin):
         synced_at = now_iso()
         seen_external_ids: List[str] = []
         unique_seen: set[str] = set()
+        update_rows: List[Tuple[Any, ...]] = []
+        insert_rows: List[Tuple[Any, ...]] = []
 
         with self._connect() as conn:
+            existing_rows = conn.execute(
+                "SELECT id, external_service_id FROM supplier_services WHERE supplier_id = ?",
+                (supplier_id,),
+            ).fetchall()
+            existing_by_external_id = {
+                str(row["external_service_id"]): str(row["id"])
+                for row in existing_rows
+            }
             for item in services_payload:
                 if not isinstance(item, dict):
                     continue
@@ -12501,20 +12511,9 @@ class PanelStore(PanelStoreDatabaseMixin):
                     continue
                 unique_seen.add(external_service_id)
                 seen_external_ids.append(external_service_id)
-                row_id = conn.execute(
-                    "SELECT id FROM supplier_services WHERE supplier_id = ? AND external_service_id = ?",
-                    (supplier_id, external_service_id),
-                ).fetchone()
-                service_id = row_id["id"] if row_id else f"svc_{uuid4().hex[:12]}"
-                if row_id:
-                    conn.execute(
-                        """
-                        UPDATE supplier_services
-                        SET name = ?, category = ?, type = ?, rate = ?, min_amount = ?, max_amount = ?,
-                            dripfeed = ?, refill = ?, cancel = ?, is_active = 1, raw_json = ?,
-                            synced_at = ?, last_seen_at = ?, removed_at = ''
-                        WHERE id = ?
-                        """,
+                service_id = existing_by_external_id.get(external_service_id) or f"svc_{uuid4().hex[:12]}"
+                if external_service_id in existing_by_external_id:
+                    update_rows.append(
                         (
                             service_record["name"],
                             service_record["category"],
@@ -12529,17 +12528,10 @@ class PanelStore(PanelStoreDatabaseMixin):
                             synced_at,
                             synced_at,
                             service_id,
-                        ),
+                        )
                     )
                 else:
-                    conn.execute(
-                        """
-                        INSERT INTO supplier_services (
-                            id, supplier_id, external_service_id, name, category, type, rate,
-                            min_amount, max_amount, dripfeed, refill, cancel, is_active,
-                            raw_json, synced_at, last_seen_at, removed_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, '')
-                        """,
+                    insert_rows.append(
                         (
                             service_id,
                             supplier_id,
@@ -12558,6 +12550,29 @@ class PanelStore(PanelStoreDatabaseMixin):
                             synced_at,
                         ),
                     )
+
+            if update_rows:
+                conn.executemany(
+                    """
+                    UPDATE supplier_services
+                    SET name = ?, category = ?, type = ?, rate = ?, min_amount = ?, max_amount = ?,
+                        dripfeed = ?, refill = ?, cancel = ?, is_active = 1, raw_json = ?,
+                        synced_at = ?, last_seen_at = ?, removed_at = ''
+                    WHERE id = ?
+                    """,
+                    update_rows,
+                )
+            if insert_rows:
+                conn.executemany(
+                    """
+                    INSERT INTO supplier_services (
+                        id, supplier_id, external_service_id, name, category, type, rate,
+                        min_amount, max_amount, dripfeed, refill, cancel, is_active,
+                        raw_json, synced_at, last_seen_at, removed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, '')
+                    """,
+                    insert_rows,
+                )
 
             if seen_external_ids:
                 placeholders = ",".join("?" for _ in seen_external_ids)
