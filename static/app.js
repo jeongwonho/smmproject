@@ -649,16 +649,15 @@ function resolveHomeBannerImageUrl(banner) {
 }
 
 function renderPlatformLogoMarkup(platform, className) {
-  const accentColor = escapeHtml(platform?.accentColor || "#4c76ff");
   const logoImageUrl = String(platform?.logoImageUrl || "").trim();
   if (logoImageUrl) {
     return `
-      <span class="${className} is-image" style="--platform-accent:${accentColor}">
+      <span class="${className} is-image">
         <img src="${escapeHtml(logoImageUrl)}" alt="${escapeHtml(platform?.displayName || "")}" loading="lazy" />
       </span>
     `;
   }
-  return `<span class="${className}" style="--platform-accent:${accentColor}">${escapeHtml(platform?.icon || "●")}</span>`;
+  return `<span class="${className}">${escapeHtml(platform?.icon || "●")}</span>`;
 }
 
 function getActiveHomeBanners() {
@@ -2952,6 +2951,9 @@ async function renderRoute() {
     }
 
     updateLiveSummary();
+    if (route.name === "home") {
+      setHomeBannerIndex(state.ui.bannerIndex);
+    }
     if (route.name === "auth") {
       updateSignupPasswordFeedback(app);
     }
@@ -3082,7 +3084,7 @@ function updateAnalyticsChartTooltip(chart, clientX) {
       .map(
         (item) => `
           <span>
-            <i style="--legend-color:${escapeHtml(item.color)}"></i>
+            <i></i>
             ${escapeHtml(item.label)} ${escapeHtml(formatAnalyticsTooltipValue(item.value, item.format))}
           </span>
         `

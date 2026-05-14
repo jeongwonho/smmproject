@@ -342,7 +342,7 @@ export function renderHome() {
             ? `
               <section class="content-section">
                 <div class="banner-carousel banner-carousel--media">
-                  <div class="banner-track" data-home-banner-track style="transform: translateX(-${safeBannerIndex * 100}%);">
+                  <div class="banner-track" data-home-banner-track>
                     ${activeBanners
                       .map((banner, index) => renderHomeBannerCard(banner, { compact: false, index, total: activeBanners.length }))
                       .join("")}

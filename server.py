@@ -889,7 +889,7 @@ class AppHandler(SimpleHTTPRequestHandler):
         return (
             "default-src 'self'; "
             "img-src 'self' data: https:; "
-            "style-src 'self' 'unsafe-inline'; "
+            "style-src 'self'; "
             "script-src 'self'; "
             f"connect-src {' '.join(connect_sources)}; "
             "object-src 'none'; "
@@ -904,7 +904,7 @@ class AppHandler(SimpleHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         if self._request_scheme() == "https" or self._config().force_secure_cookies:
-            self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+            self.send_header("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
         if self._disable_static_cache():
             self.send_header("Cache-Control", "no-store")
         if self._robots_blocked_path():
