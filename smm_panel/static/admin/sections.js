@@ -2877,7 +2877,7 @@ function renderAnalyticsTrendChart(series, metrics, title) {
           .map(
             (metric) => `
               <span>
-                <i style="--legend-color:${escapeHtml(metric.color)}"></i>
+                <i></i>
                 ${escapeHtml(metric.label)}
               </span>
             `

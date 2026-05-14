@@ -206,7 +206,7 @@ function signupAccountStepMarkup({ signupState, legalDocuments, authConfig, esca
           </div>
         </label>
         <div class="password-strength" data-password-strength data-tone="${strength.tone}">
-          <div class="password-strength__bar"><span style="width:${(strength.score / 4) * 100}%"></span></div>
+          <div class="password-strength__bar"><span></span></div>
           <div class="password-strength__meta">
             <strong data-password-strength-label>${strength.label}</strong>
             <span data-password-strength-guidance>${strength.guidance}</span>
