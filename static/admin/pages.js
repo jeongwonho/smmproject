@@ -136,7 +136,7 @@ export function renderAdminAuth() {
                     <label class="form-field">
                       <span class="field-label">관리자 계정</span>
                       <div class="field-shell">
-                        <input class="field-input" type="text" name="username" value="admin" autocomplete="username" />
+                        <input class="field-input" type="text" name="username" autocomplete="username" />
                       </div>
                     </label>
                     <label class="form-field">

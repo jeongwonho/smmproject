@@ -1334,7 +1334,7 @@ function renderCustomerAdminSection() {
                 <label class="form-field">
                   <span class="field-label">고객 로그인 비밀번호</span>
                   <div class="field-shell">
-                    <input class="field-input" type="password" name="password" value="" placeholder="${draft.id ? "변경 시에만 입력" : "8자 이상 입력"}" data-admin-customer-field="password" />
+                    <input class="field-input" type="password" name="password" value="" autocomplete="new-password" placeholder="${draft.id ? "변경 시에만 입력" : "8자 이상 입력"}" data-admin-customer-field="password" />
                   </div>
                 </label>
               </div>
@@ -3792,7 +3792,7 @@ function renderSupplierAdminSection({
             <label class="form-field">
               <span class="field-label">${escapeHtml(apiKeyLabel)}</span>
               <div class="field-shell">
-                <input class="field-input" type="password" name="apiKey" value="${escapeHtml(draft.apiKey)}" placeholder="${escapeHtml(supplierApiKeyPlaceholder(integrationType, Boolean(draft.id)))}" data-admin-supplier-field="apiKey" />
+                <input class="field-input" type="password" name="apiKey" value="${escapeHtml(draft.apiKey)}" autocomplete="new-password" placeholder="${escapeHtml(supplierApiKeyPlaceholder(integrationType, Boolean(draft.id)))}" data-admin-supplier-field="apiKey" />
               </div>
             </label>
             ${integrationType === "mkt24"
