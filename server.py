@@ -23,6 +23,7 @@ from urllib import error as urllib_error
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse
 from urllib import request as urllib_request
 
+from backend.auth import hash_password, verify_password
 from core import APP_ROOT, DEFAULT_SITE_NAME, PanelError, PanelStore
 
 
@@ -316,10 +317,24 @@ class SignedSessionStore:
         self.secret = secret.encode("utf-8")
         self.ttl_seconds = ttl_seconds
         self.audience = audience
+        self.revoked_tokens: Dict[str, int] = {}
 
     def _sign(self, payload_segment: str) -> str:
         digest = hmac.new(self.secret, payload_segment.encode("utf-8"), hashlib.sha256).digest()
         return _base64url_encode(digest)
+
+    def _token_fingerprint(self, token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _prune_revoked_tokens(self) -> None:
+        now = int(time.time())
+        expired = [fingerprint for fingerprint, expires_at in self.revoked_tokens.items() if expires_at <= now]
+        for fingerprint in expired:
+            self.revoked_tokens.pop(fingerprint, None)
+
+    def _is_revoked(self, token: str) -> bool:
+        self._prune_revoked_tokens()
+        return self._token_fingerprint(token) in self.revoked_tokens
 
     def create_session(self, payload: Dict[str, Any]) -> str:
         session_payload = {
@@ -335,6 +350,8 @@ class SignedSessionStore:
 
     def get_session(self, token: str) -> Optional[Dict[str, Any]]:
         if not token or "." not in token:
+            return None
+        if self._is_revoked(token):
             return None
         payload_segment, signature = token.rsplit(".", 1)
         expected_signature = self._sign(payload_segment)
@@ -353,7 +370,25 @@ class SignedSessionStore:
         return payload
 
     def destroy_session(self, token: str) -> None:
-        return None
+        if not token or "." not in token:
+            return
+        payload_segment, signature = token.rsplit(".", 1)
+        expected_signature = self._sign(payload_segment)
+        if not hmac.compare_digest(signature, expected_signature):
+            return
+        try:
+            payload = json.loads(_base64url_decode(payload_segment).decode("utf-8"))
+        except (ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        if str(payload.get("aud") or "") != self.audience:
+            return
+        expires_at = int(payload.get("exp") or 0)
+        if expires_at <= int(time.time()):
+            return
+        self._prune_revoked_tokens()
+        self.revoked_tokens[self._token_fingerprint(token)] = expires_at
 
 
 class AdminSessionStore:
@@ -379,7 +414,10 @@ class AdminSessionStore:
         return bool(self.password_hash)
 
     def _hash_value(self, value: str) -> str:
-        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+        raw = str(value or "")
+        if raw.startswith("pbkdf2_sha256$"):
+            return raw
+        return hash_password(raw)
 
     def session_payload(self, token: str = "") -> Dict[str, Any]:
         session = self.get_session(token)
@@ -395,7 +433,7 @@ class AdminSessionStore:
             return False
         if not hmac.compare_digest(username.strip(), self.username):
             return False
-        return hmac.compare_digest(self._hash_value(password), self.password_hash)
+        return verify_password(password, self.password_hash)
 
     def create_session(self) -> str:
         return self.signer.create_session({"username": self.username})
