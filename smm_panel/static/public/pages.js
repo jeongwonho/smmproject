@@ -184,6 +184,24 @@ function buildHomeHeroStats(formatNumber) {
   ];
 }
 
+function categoryMetaLabel(category) {
+  const parts = [
+    `${category.startingPriceLabel}부터`,
+    `${category.optionCount}개 옵션`,
+    "수량·정책은 상세 확인",
+  ];
+  return parts.filter(Boolean);
+}
+
+function productQuantityRange(product, formatNumber) {
+  if (!product) return "상세 확인";
+  if (product.priceStrategy === "fixed") return "패키지형";
+  const min = formatNumber(product.minAmount || 0);
+  const max = formatNumber(product.maxAmount || product.minAmount || 0);
+  const unit = product.unitLabel || "개";
+  return `${min}~${max}${unit}`;
+}
+
 export function renderAuthPage() {
   const { getRoute, state, escapeHtml } = useRuntime();
   const route = getRoute();
@@ -233,7 +251,6 @@ export function renderHome() {
   if (safeBannerIndex !== state.ui.bannerIndex) {
     state.ui.bannerIndex = safeBannerIndex;
   }
-  const topBanner = activeBanners[0] || null;
   const quickLinks = data.topLinks?.length ? data.topLinks : [{ label: "서비스 소개서", route: "/products" }, { label: "이용 가이드", route: "/help" }];
   const noticePreview = data.notices?.[0] || null;
   const compactPlatforms = (data.platforms || []).slice(0, 10);
@@ -280,16 +297,6 @@ export function renderHome() {
           ${renderHomeHeroStats(heroStats)}
         </section>
 
-        ${
-          topBanner
-            ? `
-              <section class="content-section content-section--tight">
-                ${renderHomeBannerCard(topBanner, { compact: true })}
-              </section>
-            `
-            : ""
-        }
-
         <section class="content-section content-section--tight home-discovery-section">
           <div class="home-search">
             <input
@@ -324,8 +331,8 @@ export function renderHome() {
           </div>
           <div class="home-sales-strip home-sales-strip--steps">
             <div class="home-sales-strip__head">
-              <span class="mini-badge">빠른 선택</span>
-              <p>상품 확인부터 주문까지 3단계로 진행됩니다.</p>
+              <span class="mini-badge">빠른 주문</span>
+              <p>상품 비교는 공개, 로그인은 주문 직전에만 진행합니다.</p>
             </div>
             <div class="home-sales-steps" aria-label="주문 흐름">
               <span class="home-sales-step"><b>1</b> 플랫폼 선택</span>
@@ -334,8 +341,6 @@ export function renderHome() {
             </div>
           </div>
         </section>
-
-        ${renderHomePlatformDock(data)}
 
         ${
           activeBanners.length
@@ -374,9 +379,9 @@ export function renderHome() {
         }
 
         <section class="content-section content-section--tight">
-          <div class="section-head section-head--compact public-section-head">
-            <h2>바로 선택하기</h2>
-            <p>자주 찾는 서비스를 먼저 열어보고 상세에서 가격과 정책을 확인할 수 있습니다.</p>
+          <div class="section-head section-head--compact public-section-head public-section-head--sales">
+            <h2>인기 서비스</h2>
+            <p>많이 찾는 상품만 짧게 모았습니다.</p>
           </div>
           <div class="spotlight-list spotlight-list--compact">
             ${featuredServices
@@ -397,7 +402,7 @@ export function renderHome() {
         </section>
 
         <section class="content-section content-section--tight">
-          <div class="home-help-inline">
+          <div class="home-help-inline home-help-inline--compact">
             <div class="home-help-inline__links">
               ${supportLinks
                 .map(
@@ -466,16 +471,16 @@ export function renderProducts() {
         <section class="content-section">
           <div class="catalog-toolbar-card">
             <div class="section-head section-head--compact public-section-head">
-              <h2>상품 목록</h2>
-              <p>${escapeHtml(activePlatform ? `${activePlatform.displayName} 카테고리 ${activeProductCount}개` : "검색어에 맞는 플랫폼과 상품을 찾지 못했습니다.")}</p>
+              <h2>${escapeHtml(activePlatform ? activePlatform.displayName : "상품 목록")}</h2>
+              <p>${escapeHtml(activePlatform ? `${activeProductCount}개 상품을 가격부터 비교하세요.` : "검색어에 맞는 플랫폼과 상품을 찾지 못했습니다.")}</p>
             </div>
             ${
               activePlatform
                 ? `
-                  <div class="catalog-entry-card">
+                  <div class="catalog-entry-card catalog-entry-card--compact">
                     <div>
-                      <strong>로그인 없이 상품을 먼저 비교하세요</strong>
-                      <p>가격, 수량, 예상 소요시간, 주의사항을 확인한 뒤 주문 직전에 로그인하면 됩니다.</p>
+                      <strong>로그인 없이 가격과 조건을 먼저 확인하세요</strong>
+                      <p>상세에서 수량, 입력값, 정책을 확인한 뒤 주문 직전에 로그인합니다.</p>
                     </div>
                     <div class="catalog-entry-actions">
                       ${
@@ -513,25 +518,10 @@ export function renderProducts() {
             ${
               activePlatform
                 ? `
-                  <div class="catalog-hero catalog-hero--public">
-                      <span class="catalog-hero__eyebrow">${escapeHtml(activePlatform.displayName)}</span>
-                      <h2>${escapeHtml(activePlatform.description)}</h2>
-                      <div class="catalog-hero__summary">
-                        <span class="meta-chip">${escapeHtml(String(activePlatform.groups.length))}개 그룹</span>
-                        <span class="meta-chip">${escapeHtml(String(activeProductCount))}개 카테고리</span>
-                        <span class="meta-chip">로그인 없이 탐색</span>
-                        <button class="meta-chip meta-chip--button" type="button" data-route="/help">이용 가이드</button>
-                      </div>
-                    </div>
-                    <div class="catalog-purchase-strip" aria-label="구매 전 확인사항">
-                      <span class="catalog-purchase-point">가격 공개</span>
-                      <span class="catalog-purchase-point">입력값 검수</span>
-                      <span class="catalog-purchase-point">정책 확인 후 주문</span>
-                    </div>
                   ${activePlatform.groups
                     .map(
                       (group) => `
-                        <section class="catalog-group">
+                        <section class="catalog-group catalog-group--compact">
                           <div class="section-head section-head--compact">
                             <h3>${escapeHtml(group.name)}</h3>
                             <p>${escapeHtml(group.description)}</p>
@@ -551,9 +541,7 @@ export function renderProducts() {
                                       </div>
                                       <p>${escapeHtml(category.description)}</p>
                                       <div class="catalog-card__meta">
-                                        <span>${escapeHtml(category.startingPriceLabel)}부터</span>
-                                        <span>${escapeHtml(String(category.optionCount))}개 옵션</span>
-                                        <span>상세에서 정책 확인</span>
+                                        ${categoryMetaLabel(category).map((item) => `<span>${escapeHtml(item)}</span>`).join("")}
                                       </div>
                                     </div>
                                     <span class="catalog-card__cta">보기</span>
@@ -609,6 +597,8 @@ export function renderDetail(detail) {
   const previewSource = getPreviewSource(detail, selectedProduct);
   const orderValidation = getOrderValidationState(detail, selectedProduct);
   const loggedIn = isLoggedIn();
+  const quantityRange = productQuantityRange(selectedProduct, formatNumber);
+  const policySummary = detail.refundNotice?.[0] || "상품 정책 기준 적용";
   const stickyHint = orderValidation.blocked
     ? orderValidation.reason || "입력값을 확인해 주세요."
     : loggedIn
@@ -644,53 +634,27 @@ export function renderDetail(detail) {
               <strong>${escapeHtml(selectedProduct?.priceLabel || "0원")}</strong>
             </article>
             <article class="detail-hero-card__fact">
-              <span>예상 시작</span>
+              <span>주문 수량</span>
+              <strong>${escapeHtml(quantityRange)}</strong>
+            </article>
+            <article class="detail-hero-card__fact">
+              <span>예상 소요</span>
               <strong>${escapeHtml(selectedProduct?.estimatedTurnaround || "상품별 상이")}</strong>
             </article>
             <article class="detail-hero-card__fact">
               <span>정책 요약</span>
-              <strong>${escapeHtml(detail.refundNotice?.[0] || "상품 정책 기준 적용")}</strong>
+              <strong>${escapeHtml(policySummary)}</strong>
             </article>
           </div>
         </section>
 
-        <section class="content-section content-section--tight">
-          <div class="detail-checklist-card">
-            <div class="detail-checklist-card__head">
-              <strong>주문 전 핵심 체크</strong>
-              <span>확인 후 주문하면 반려 가능성이 줄어듭니다.</span>
-            </div>
-            <div class="detail-checklist-card__grid">
-              <span class="detail-checklist-card__item">계정·게시물 공개 상태</span>
-              <span class="detail-checklist-card__item">링크 형식 정상 여부</span>
-              <span class="detail-checklist-card__item">환불·리필 기준</span>
-            </div>
-          </div>
-        </section>
-
-        ${
-          !loggedIn
-            ? `
-              <section class="content-section">
-                <div class="detail-login-gate">
-                  <div class="detail-login-gate__copy">
-                    <strong>주문 직전 로그인하면 됩니다</strong>
-                    <p>상품 탐색과 정책 확인은 열려 있습니다. 주문·충전·내역 관리는 로그인 후 이용할 수 있습니다.</p>
-                  </div>
-                  <button class="full-width-cta" type="button" data-route="/auth">로그인 / 회원가입</button>
-                </div>
-              </section>
-            `
-            : ""
-        }
-
         ${
           detail.products.length > 1
             ? `
-              <section class="content-section">
+              <section class="content-section content-section--tight">
                 <div class="section-head section-head--compact">
                   <h2>${escapeHtml(detail.optionLabelName || "옵션 선택")}</h2>
-                  <p>옵션별 가격과 조건을 한 화면에서 비교한 뒤 바로 주문할 수 있습니다.</p>
+                  <p>가격과 조건을 보고 주문할 옵션을 선택하세요.</p>
                 </div>
                 <div class="option-chip-row">
                   ${detail.products
@@ -714,26 +678,23 @@ export function renderDetail(detail) {
             : ""
         }
 
-        <section class="content-section">
-          <div class="detail-trust-row">
-            <article class="info-card">
-              <strong>판매가</strong>
-              <p>${escapeHtml(selectedProduct?.priceLabel || "0원")} ${selectedProduct?.priceStrategy === "fixed" ? "패키지" : `· 최소 ${formatNumber(selectedProduct?.minAmount || 0)}${escapeHtml(selectedProduct?.unitLabel || "개")}`}</p>
-            </article>
-            <article class="info-card">
-              <strong>예상 소요시간</strong>
-              <p>${escapeHtml(selectedProduct?.estimatedTurnaround || "상품별 상이 · 주문 후 순차 진행")}</p>
-            </article>
-            <article class="info-card">
-              <strong>핵심 정책</strong>
-              <p>${escapeHtml(detail.refundNotice?.[0] || "작업 시작 후 환불·취소 기준은 상품 정책을 따릅니다.")}</p>
-            </article>
+        <section class="content-section content-section--tight">
+          <div class="detail-checklist-card detail-checklist-card--compact">
+            <div class="detail-checklist-card__head">
+              <strong>주문 전 체크</strong>
+              <span>비밀번호는 요구하지 않습니다. 계정 ID 또는 게시물 링크만 정확히 입력하세요.</span>
+            </div>
+            <div class="detail-checklist-card__grid">
+              <span class="detail-checklist-card__item">공개 상태 확인</span>
+              <span class="detail-checklist-card__item">링크 형식 확인</span>
+              <span class="detail-checklist-card__item">정책 확인</span>
+            </div>
           </div>
         </section>
 
         <section class="content-section">
           <div class="section-head section-head--compact">
-            <h2>주문 폼</h2>
+            <h2>주문 정보 입력</h2>
             <p>${escapeHtml(detail.description)}</p>
           </div>
           <div class="detail-order-meta">
