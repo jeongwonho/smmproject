@@ -24,6 +24,25 @@ class SupplierApiError(Exception):
     pass
 
 
+def supplier_http_error_message(status_code: int, payload: Any, fallback: str = "") -> str:
+    if isinstance(payload, dict):
+        code = str(payload.get("code") or payload.get("error") or "").strip()
+        message = str(payload.get("message") or payload.get("error_description") or "").strip()
+        trace_uuid = str(payload.get("uuid") or payload.get("traceId") or payload.get("trace_id") or "").strip()
+        if code == "token_expired":
+            detail = "공급사 Bearer Token이 만료되었습니다. 관리자 공급사 설정에서 새 Bearer Token을 저장한 뒤 연결 확인과 서비스 동기화를 다시 실행해 주세요."
+            return f"{detail} 추적 UUID: {trace_uuid}" if trace_uuid else detail
+        if message:
+            return message
+        if code:
+            return f"공급사 API 오류 코드 {code}" + (f" · 추적 UUID: {trace_uuid}" if trace_uuid else "")
+        redacted = _redact_external_payload(payload)
+        return str(redacted)
+    if isinstance(payload, str) and payload.strip():
+        return payload.strip()
+    return fallback or f"공급사 API 요청이 실패했습니다. HTTP {status_code}"
+
+
 def parse_iso_datetime(value: Any) -> Optional[dt.datetime]:
     raw = str(value or "").strip()
     if not raw:
@@ -50,6 +69,18 @@ def supplier_supports_balance_check(integration_type: str) -> bool:
 
 def supplier_supports_auto_dispatch(integration_type: str) -> bool:
     return normalize_supplier_integration_type(integration_type) == SUPPLIER_INTEGRATION_CLASSIC
+
+
+def supplier_error_is_auth_failure(error: Any, *, integration_type: str = "") -> bool:
+    text = str(error or "").lower()
+    normalized_type = normalize_supplier_integration_type(integration_type)
+    if "token_expired" in text:
+        return True
+    if normalized_type == SUPPLIER_INTEGRATION_MKT24 and "http 401" in text:
+        return True
+    if normalized_type == SUPPLIER_INTEGRATION_MKT24 and "bearer token" in text and "만료" in text:
+        return True
+    return False
 
 
 def normalize_supplier_order_status_payload(payload: Any) -> str:
@@ -211,14 +242,7 @@ class SupplierApiClient:
             if detail:
                 try:
                     parsed_error = json.loads(detail)
-                    if isinstance(parsed_error, dict):
-                        message = (
-                            parsed_error.get("error_description")
-                            or parsed_error.get("message")
-                            or parsed_error.get("error")
-                            or _redact_external_payload(parsed_error)
-                        )
-                        detail = str(message)
+                    detail = supplier_http_error_message(exc.code, parsed_error, detail)
                 except json.JSONDecodeError:
                     pass
             raise SupplierApiError(f"HTTP {exc.code}: {detail or exc.reason}") from exc

@@ -49,6 +49,7 @@ try:
     from .backend.integrations.suppliers import (
         SupplierApiClient,
         SupplierApiError,
+        supplier_error_is_auth_failure,
         normalize_supplier_integration_type,
         normalize_supplier_order_status_payload,
         supplier_service_sync_due,
@@ -75,6 +76,7 @@ except ImportError:  # pragma: no cover - top-level script runtime
     from backend.integrations.suppliers import (
         SupplierApiClient,
         SupplierApiError,
+        supplier_error_is_auth_failure,
         normalize_supplier_integration_type,
         normalize_supplier_order_status_payload,
         supplier_service_sync_due,
@@ -11376,7 +11378,12 @@ class PanelStore(PanelStoreDatabaseMixin):
                 }
             if str(row["payment_gate_status"] or "") != "payment_confirmed":
                 raise PanelError("Cafe24 결제완료가 확인되지 않아 발주할 수 없습니다.")
-            if str(row["standard_status"] or "") not in {"ready_to_submit", "failed"}:
+            current_standard_status = str(row["standard_status"] or "")
+            retrying_token_expired = (
+                current_standard_status == "needs_manual_review"
+                and str(row.get("automation_error_code") or "") == "supplier_token_expired"
+            )
+            if current_standard_status not in {"ready_to_submit", "failed"} and not retrying_token_expired:
                 raise PanelError("발주 가능한 상태가 아닙니다. 먼저 재검증을 실행해 주세요.")
             if not bool(row.get("supplier_is_active")):
                 raise PanelError("연결된 공급사가 비활성 상태입니다.")
@@ -11394,7 +11401,10 @@ class PanelStore(PanelStoreDatabaseMixin):
                     updated_at = ?
                 WHERE id = ?
                   AND supplier_order_uuid = ''
-                  AND standard_status IN ('ready_to_submit', 'failed')
+                  AND (
+                    standard_status IN ('ready_to_submit', 'failed')
+                    OR (standard_status = 'needs_manual_review' AND automation_error_code = 'supplier_token_expired')
+                  )
                 """,
                 ("submitting", dispatch_id, "", timestamp, timestamp, item_id),
             )
@@ -11445,6 +11455,16 @@ class PanelStore(PanelStoreDatabaseMixin):
         attempts_after = int(row["retry_count"] or 0) + 1
         next_retry_at = ""
         automation_error_code = ""
+        supplier_auth_failed = supplier_error_is_auth_failure(
+            error_message,
+            integration_type=str(row.get("integration_type") or ""),
+        )
+        if supplier_auth_failed:
+            next_status = "needs_manual_review"
+            automation_error_code = "supplier_token_expired"
+            next_retry_at = ""
+            if not error_message:
+                error_message = "공급사 인증 토큰이 만료되었습니다. 공급사 설정에서 토큰을 갱신한 뒤 재발주하세요."
         if next_status == "failed":
             automation_error_code = "supplier_dispatch_failed"
             if attempts_after >= AUTOMATION_RETRY_MAX_ATTEMPTS:
@@ -11452,7 +11472,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                 error_message = (error_message or "공급사 발주 실패") + " · 자동 재시도 한도를 초과해 수동 확인이 필요합니다."
             else:
                 next_retry_at = automation_retry_at(attempts_after)
-        elif next_status == "needs_manual_review":
+        elif next_status == "needs_manual_review" and not automation_error_code:
             automation_error_code = "supplier_response_ambiguous"
 
         with self._connect() as conn:
@@ -11476,6 +11496,21 @@ class PanelStore(PanelStoreDatabaseMixin):
                     item_id,
                 ),
             )
+            if supplier_auth_failed and str(row.get("supplier_id") or "").strip():
+                conn.execute(
+                    """
+                    UPDATE suppliers
+                    SET health_status = ?, health_message = ?, health_checked_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "failed",
+                        (error_message or "공급사 인증 토큰이 만료되었습니다.")[:1000],
+                        now_iso(),
+                        now_iso(),
+                        str(row["supplier_id"]),
+                    ),
+                )
             self._log_cafe24_event(
                 conn,
                 mall_id=str(row["mall_id"]),
@@ -12793,6 +12828,20 @@ class PanelStore(PanelStoreDatabaseMixin):
                 health_status = "failed"
                 health_message = str(row.get("service_sync_message") or "최근 서비스 동기화가 실패했습니다.")[:1000]
 
+            if health_status == "ok" and integration_type == SUPPLIER_INTEGRATION_MKT24:
+                try:
+                    client = SupplierApiClient(
+                        str(row["api_url"]),
+                        decrypt_secret_value(row["api_key"]),
+                        integration_type=integration_type,
+                        bearer_token=decrypt_secret_value(row.get("bearer_token") or ""),
+                    )
+                    client.services()
+                    health_message = "MKT24 연결 확인 완료"
+                    balance_status = "unsupported"
+                except Exception as exc:
+                    health_status = "failed"
+                    health_message = str(exc)[:1000]
             if health_status == "ok" and supplier_supports_balance_check(integration_type):
                 try:
                     client = SupplierApiClient(
@@ -15351,6 +15400,10 @@ class PanelStore(PanelStoreDatabaseMixin):
             supplier_last_error = str(exc)
         if not supplier_last_error and isinstance(response_payload, dict):
             supplier_last_error = str(response_payload.get("error") or response_payload.get("message") or "").strip()
+        supplier_auth_failed = supplier_error_is_auth_failure(
+            supplier_last_error,
+            integration_type=str(mapping.get("integration_type") or ""),
+        )
         dispatch_status = normalize_order_dispatch_status(status)
 
         with self._connect() as conn:
@@ -15390,6 +15443,21 @@ class PanelStore(PanelStoreDatabaseMixin):
                     order_id,
                 ),
             )
+            if supplier_auth_failed and str(mapping.get("supplier_id") or "").strip():
+                conn.execute(
+                    """
+                    UPDATE suppliers
+                    SET health_status = ?, health_message = ?, health_checked_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "failed",
+                        (supplier_last_error or "공급사 인증 토큰이 만료되었습니다.")[:1000],
+                        timestamp,
+                        timestamp,
+                        str(mapping["supplier_id"]),
+                    ),
+                )
             conn.commit()
 
         return {

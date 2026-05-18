@@ -1966,9 +1966,9 @@ function renderAdminOrdersSection() {
 }
 
 function cafe24CanDispatchItem(item = {}) {
-  return item.standardStatus === "ready_to_submit"
-    && item.paymentGateStatus === "payment_confirmed"
-    && !item.supplierOrderUuid;
+  const status = item.standardStatus;
+  return (status === "ready_to_submit" || status === "failed" || (status === "needs_manual_review" && item.automationErrorCode === "supplier_token_expired"))
+    && item.paymentGateStatus === "payment_confirmed" && !item.supplierOrderUuid;
 }
 
 function cafe24StatusTone(item = {}) {
