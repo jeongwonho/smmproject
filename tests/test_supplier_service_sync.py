@@ -1,8 +1,10 @@
 import datetime as dt
+from io import BytesIO
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 import bootstrap
@@ -180,6 +182,20 @@ class SupplierServiceSyncTest(unittest.TestCase):
             client.services()
 
         self.assertEqual(captured["url"], "https://api.mkt24.co.kr/v3/products/sns")
+
+    def test_mkt24_token_expired_error_is_actionable(self):
+        client = SupplierApiClient(
+            "https://api.mkt24.co.kr/v3",
+            "api-key",
+            integration_type="mkt24",
+            bearer_token="expired-token",
+        )
+        body = b'{"code":"token_expired","uuid":"019e3ac5-b3e7-753e-8f5e-f425742ba7ca"}'
+        error = HTTPError("https://api.mkt24.co.kr/v3/products/sns", 401, "Unauthorized", {}, BytesIO(body))
+
+        with patch(f"{SupplierApiClient.__module__}.urlopen", side_effect=error):
+            with self.assertRaisesRegex(Exception, "Bearer Token.*만료"):
+                client.services()
 
 
 if __name__ == "__main__":

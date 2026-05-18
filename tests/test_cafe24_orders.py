@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import bootstrap
-from core import Cafe24ApiError, PanelError, PanelStore, now_iso
+from core import Cafe24ApiError, PanelError, PanelStore, SupplierApiError, now_iso
 
 
 class FakeCafe24ProductClient:
@@ -341,6 +341,55 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(item["supplier_order_uuid"], "SUP-1001")
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders WHERE order_channel = 'cafe24'").fetchone()[0], 0)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM wallet_ledger").fetchone()[0], 0)
+
+    def test_mkt24_token_expired_dispatch_requires_manual_token_refresh(self):
+        order_payload = self._order_payload()
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        timestamp = now_iso()
+        self.conn.execute(
+            """
+            UPDATE suppliers
+            SET integration_type = 'mkt24',
+                api_url = 'https://api.mkt24.co.kr/v3',
+                bearer_token = 'expired-token',
+                health_status = 'ok',
+                health_message = 'ok',
+                health_checked_at = ?,
+                service_sync_status = 'success',
+                service_sync_completed_at = ?
+            WHERE id = ?
+            """,
+            (timestamp, timestamp, "supplier_test"),
+        )
+        self.conn.commit()
+        item_id = self.conn.execute("SELECT id FROM cafe24_order_items").fetchone()["id"]
+
+        with patch(
+            "core.SupplierApiClient.order",
+            side_effect=SupplierApiError(
+                "HTTP 401: 공급사 Bearer Token이 만료되었습니다. 관리자 공급사 설정에서 새 Bearer Token을 저장해 주세요. code=token_expired"
+            ),
+        ) as order_call:
+            result = self.store.dispatch_cafe24_order_item({"itemId": item_id, "_adminActor": "qa"})
+
+        order_call.assert_called_once()
+        self.assertEqual(result["status"], "needs_manual_review")
+        self.assertFalse(result["submitted"])
+        item = self.conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
+        self.assertEqual(item["standard_status"], "needs_manual_review")
+        self.assertEqual(item["automation_error_code"], "supplier_token_expired")
+        self.assertEqual(item["next_retry_at"], "")
+        self.assertIn("Bearer Token", item["error_message"])
+        supplier = self.conn.execute("SELECT * FROM suppliers WHERE id = ?", ("supplier_test",)).fetchone()
+        self.assertEqual(supplier["health_status"], "failed")
+        self.assertIn("Bearer Token", supplier["health_message"])
 
     def test_automation_dispatches_ready_cafe24_item_once(self):
         self._enable_auto_submit_and_supplier_ready()
