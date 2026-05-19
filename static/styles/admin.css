@@ -30,6 +30,95 @@ body[data-route-surface="admin"] .admin-module-header__row {
   align-items: flex-start;
 }
 
+.admin-action-loader {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 80;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+  width: min(360px, calc(100vw - 32px));
+  padding: 14px 16px;
+  border: 1px solid rgba(185, 107, 198, 0.2);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 20px 44px rgba(47, 37, 68, 0.16);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(12px);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.admin-action-loader.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.admin-action-loader__mark {
+  width: 42px;
+  height: 42px;
+  border-radius: 15px;
+  background:
+    linear-gradient(135deg, rgba(185, 107, 198, 0.15), rgba(124, 58, 237, 0.1)),
+    #f7f0fb;
+  position: relative;
+  overflow: hidden;
+}
+
+.admin-action-loader__mark::after {
+  content: "";
+  position: absolute;
+  inset: 9px;
+  border: 3px solid rgba(185, 107, 198, 0.22);
+  border-top-color: var(--primary);
+  border-radius: 999px;
+  animation: admin-action-spin 0.82s linear infinite;
+}
+
+.admin-action-loader strong,
+.admin-action-loader span {
+  display: block;
+}
+
+.admin-action-loader strong {
+  font-size: 0.9rem;
+  letter-spacing: -0.02em;
+}
+
+.admin-action-loader span {
+  margin-top: 3px;
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+}
+
+.admin-primary-button.is-admin-loading,
+.admin-secondary-button.is-admin-loading,
+.admin-erp-utility.is-admin-loading {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  opacity: 0.82;
+  cursor: wait;
+}
+
+.admin-button-spinner {
+  width: 15px;
+  height: 15px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 999px;
+  animation: admin-action-spin 0.72s linear infinite;
+}
+
+@keyframes admin-action-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .admin-console-header {
   display: grid;
   grid-template-columns: minmax(0, 1.35fr) minmax(420px, 0.95fr) auto;

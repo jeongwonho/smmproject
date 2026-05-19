@@ -1740,6 +1740,139 @@ function clearAdminSessionState(configured = true) {
   resetAdminState({ preserveSession: true });
 }
 
+const adminButtonLoadingState = new WeakMap();
+
+function adminRequestLabel(path, method = "GET") {
+  const normalizedPath = String(path || "");
+  if (normalizedPath.includes("/cafe24/poll")) return "Cafe24 주문을 수집하는 중...";
+  if (normalizedPath.includes("/cafe24/orders/resync-by-id")) return "Cafe24 주문번호를 조회하는 중...";
+  if (normalizedPath.includes("/cafe24/order-items/dispatch")) return "공급사 발주를 요청하는 중...";
+  if (normalizedPath.includes("/cafe24/order-items/retry")) return "Cafe24 주문을 재검증하는 중...";
+  if (normalizedPath.includes("/cafe24/products")) return "Cafe24 상품 정보를 조회하는 중...";
+  if (normalizedPath.includes("/sync-services")) return "공급사 서비스를 동기화하는 중...";
+  if (normalizedPath.includes("/mkt24-product-settings")) return "MKT24 옵션 설정을 확인하는 중...";
+  if (normalizedPath.includes("/admin/bootstrap")) return "운영 데이터를 새로고침하는 중...";
+  if (normalizedPath.includes("/admin/login")) return "관리자 로그인을 확인하는 중...";
+  return method === "POST" ? "관리자 작업을 처리하는 중..." : "관리자 데이터를 불러오는 중...";
+}
+
+function shouldTrackAdminRequest(path) {
+  return isAdminApiPath(String(path || "")) && (getRoute().name === "admin" || document.body.dataset.routeSurface === "admin");
+}
+
+function ensureAdminActionLoader() {
+  let loader = document.getElementById("admin-action-loader");
+  if (loader) return loader;
+  loader = document.createElement("div");
+  loader.id = "admin-action-loader";
+  loader.className = "admin-action-loader";
+  loader.setAttribute("role", "status");
+  loader.setAttribute("aria-live", "polite");
+  loader.innerHTML = `
+    <div class="admin-action-loader__mark" aria-hidden="true"></div>
+    <div>
+      <strong data-admin-action-loader-label>관리자 작업을 처리하는 중...</strong>
+      <span>잠시만 기다려 주세요.</span>
+    </div>
+  `;
+  document.body.appendChild(loader);
+  return loader;
+}
+
+function setAdminActionLoaderVisible(visible, label = "") {
+  const loader = ensureAdminActionLoader();
+  if (label) {
+    const labelNode = loader.querySelector("[data-admin-action-loader-label]");
+    if (labelNode) labelNode.textContent = label;
+  }
+  loader.classList.toggle("is-visible", Boolean(visible));
+}
+
+function captureAdminActionElement(event) {
+  if (getRoute().name !== "admin" && document.body.dataset.routeSurface !== "admin") return;
+  const target = event.target instanceof Element ? event.target : null;
+  const button = target?.closest("button, input[type='submit'], input[type='button']");
+  if (!(button instanceof HTMLElement)) return;
+  if (button.hasAttribute("disabled") || button.getAttribute("aria-disabled") === "true") return;
+  state.ui.adminPendingActionElement = button;
+}
+
+function captureAdminSubmitElement(event) {
+  if (getRoute().name !== "admin" && document.body.dataset.routeSurface !== "admin") return;
+  const submitter = event.submitter instanceof HTMLElement ? event.submitter : null;
+  if (submitter && !submitter.hasAttribute("disabled")) {
+    state.ui.adminPendingActionElement = submitter;
+    return;
+  }
+  const form = event.target instanceof HTMLFormElement ? event.target : null;
+  const button = form?.querySelector('button[type="submit"], input[type="submit"]');
+  if (button instanceof HTMLElement && !button.hasAttribute("disabled")) {
+    state.ui.adminPendingActionElement = button;
+  }
+}
+
+function setAdminButtonLoading(button, active, label = "처리 중...") {
+  if (!(button instanceof HTMLElement)) return;
+  if (active) {
+    if (!adminButtonLoadingState.has(button)) {
+      adminButtonLoadingState.set(button, {
+        html: button.innerHTML,
+        disabled: button.hasAttribute("disabled"),
+        ariaBusy: button.getAttribute("aria-busy"),
+      });
+    }
+    button.classList.add("is-admin-loading");
+    button.setAttribute("aria-busy", "true");
+    button.setAttribute("disabled", "disabled");
+    if (button.tagName === "BUTTON") {
+      button.innerHTML = `<span class="admin-button-spinner" aria-hidden="true"></span><span>${escapeHtml(label)}</span>`;
+    }
+    return;
+  }
+  const previous = adminButtonLoadingState.get(button);
+  if (!previous) return;
+  button.classList.remove("is-admin-loading");
+  if (previous.ariaBusy === null) {
+    button.removeAttribute("aria-busy");
+  } else {
+    button.setAttribute("aria-busy", previous.ariaBusy);
+  }
+  if (!previous.disabled) {
+    button.removeAttribute("disabled");
+  }
+  if (button.tagName === "BUTTON") {
+    button.innerHTML = previous.html;
+  }
+  adminButtonLoadingState.delete(button);
+}
+
+function beginAdminRequestFeedback(path, method = "GET") {
+  if (!shouldTrackAdminRequest(path)) return null;
+  const label = adminRequestLabel(path, method);
+  const button =
+    state.ui.adminPendingActionElement instanceof HTMLElement && document.contains(state.ui.adminPendingActionElement)
+      ? state.ui.adminPendingActionElement
+      : null;
+  state.ui.adminPendingActionElement = null;
+  state.ui.adminPendingRequestCount = Number(state.ui.adminPendingRequestCount || 0) + 1;
+  setAdminActionLoaderVisible(true, label);
+  if (button) {
+    setAdminButtonLoading(button, true, "처리 중...");
+  }
+  return { button };
+}
+
+function endAdminRequestFeedback(tracker) {
+  if (!tracker) return;
+  state.ui.adminPendingRequestCount = Math.max(0, Number(state.ui.adminPendingRequestCount || 0) - 1);
+  if (tracker.button) {
+    setAdminButtonLoading(tracker.button, false);
+  }
+  if (!state.ui.adminPendingRequestCount) {
+    setAdminActionLoaderVisible(false);
+  }
+}
+
 function clearPublicSessionState() {
   state.publicCsrfToken = "";
   if (state.bootstrap) {
@@ -1788,26 +1921,31 @@ function delay(ms) {
 }
 
 async function apiGet(path) {
-  const response = await fetch(apiUrl(path), {
-    headers: { Accept: "application/json" },
-    credentials: requestCredentials(path),
-  });
-  const data = await parseApiResponse(response);
-  if (!isAdminApiPath(path) && response.status === 401) {
-    clearPublicSessionState();
+  const adminFeedback = beginAdminRequestFeedback(path, "GET");
+  try {
+    const response = await fetch(apiUrl(path), {
+      headers: { Accept: "application/json" },
+      credentials: requestCredentials(path),
+    });
+    const data = await parseApiResponse(response);
+    if (!isAdminApiPath(path) && response.status === 401) {
+      clearPublicSessionState();
+    }
+    if (isAdminApiPath(path) && response.status === 401) {
+      clearAdminSessionState(true);
+    }
+    if (isAdminApiPath(path) && response.status === 503) {
+      clearAdminSessionState(false);
+    }
+    if (!response.ok || data.ok === false) {
+      const error = new Error(readableApiErrorMessage(data.error));
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  } finally {
+    endAdminRequestFeedback(adminFeedback);
   }
-  if (isAdminApiPath(path) && response.status === 401) {
-    clearAdminSessionState(true);
-  }
-  if (isAdminApiPath(path) && response.status === 503) {
-    clearAdminSessionState(false);
-  }
-  if (!response.ok || data.ok === false) {
-    const error = new Error(readableApiErrorMessage(data.error));
-    error.status = response.status;
-    throw error;
-  }
-  return data;
 }
 
 async function apiGetWithRetry(path, { retries = 1, retryDelay = 900 } = {}) {
@@ -1823,6 +1961,7 @@ async function apiGetWithRetry(path, { retries = 1, retryDelay = 900 } = {}) {
 }
 
 async function apiPost(path, payload) {
+  const adminFeedback = beginAdminRequestFeedback(path, "POST");
   const headers = {
     Accept: "application/json",
     "Content-Type": "application/json",
@@ -1837,28 +1976,32 @@ async function apiPost(path, payload) {
   if (isAdminApiPath(path) && path !== "/api/admin/login" && state.adminCsrfToken) {
     headers["X-SMM-CSRF-Token"] = state.adminCsrfToken;
   }
-  const response = await fetch(apiUrl(path), {
-    method: "POST",
-    headers,
-    body: JSON.stringify(payload),
-    credentials: requestCredentials(path),
-  });
-  const data = await parseApiResponse(response);
-  if (!isAdminApiPath(path) && response.status === 401) {
-    clearPublicSessionState();
+  try {
+    const response = await fetch(apiUrl(path), {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      credentials: requestCredentials(path),
+    });
+    const data = await parseApiResponse(response);
+    if (!isAdminApiPath(path) && response.status === 401) {
+      clearPublicSessionState();
+    }
+    if (isAdminApiPath(path) && response.status === 401) {
+      clearAdminSessionState(true);
+    }
+    if (isAdminApiPath(path) && response.status === 503) {
+      clearAdminSessionState(false);
+    }
+    if (!response.ok || data.ok === false) {
+      const error = new Error(readableApiErrorMessage(data.error));
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  } finally {
+    endAdminRequestFeedback(adminFeedback);
   }
-  if (isAdminApiPath(path) && response.status === 401) {
-    clearAdminSessionState(true);
-  }
-  if (isAdminApiPath(path) && response.status === 503) {
-    clearAdminSessionState(false);
-  }
-  if (!response.ok || data.ok === false) {
-    const error = new Error(readableApiErrorMessage(data.error));
-    error.status = response.status;
-    throw error;
-  }
-  return data;
 }
 
 function getRoute() {
@@ -3323,6 +3466,8 @@ const eventContext = {
   updateAdminPlatformSectionPreview, updateAdminPopupPreview, updateAdminSiteSettingsPreview, updateAnalyticsChartTooltip,
   updateLiveSummary, updateSignupPasswordFeedback,
 };
+document.addEventListener("click", captureAdminActionElement, true);
+document.addEventListener("submit", captureAdminSubmitElement, true);
 registerAdminEvents(eventContext);
 registerPublicEvents(eventContext);
 
