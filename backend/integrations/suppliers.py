@@ -83,6 +83,27 @@ def supplier_uses_panel_api(integration_type: str, api_url: str) -> bool:
     return normalized_type == SUPPLIER_INTEGRATION_MKT24 and parsed.path.rstrip("/").endswith("/panel")
 
 
+def normalize_mkt24_panel_api_url(api_url: str) -> str:
+    raw = str(api_url or "").strip()
+    if not raw:
+        return raw
+    if not raw.startswith(("http://", "https://")):
+        raw = f"https://{raw}"
+    parsed = urlparse(raw.rstrip("/"))
+    if not parsed.scheme or not parsed.netloc:
+        return raw.rstrip("/")
+    path = parsed.path.rstrip("/")
+    if path.endswith("/panel"):
+        return raw.rstrip("/")
+    base_path = path
+    marker = "/v3"
+    if marker in base_path:
+        base_path = base_path[: base_path.index(marker) + len(marker)]
+    else:
+        base_path = "/v3"
+    return f"{parsed.scheme}://{parsed.netloc}{base_path}/panel"
+
+
 def supplier_error_is_auth_failure(error: Any, *, integration_type: str = "") -> bool:
     text = str(error or "").lower()
     normalized_type = normalize_supplier_integration_type(integration_type)
@@ -190,9 +211,10 @@ class SupplierApiClient:
         integration_type: str = SUPPLIER_INTEGRATION_CLASSIC,
         bearer_token: str = "",
     ) -> None:
-        self.api_url = api_url.rstrip("/")
-        self.api_key = api_key.strip()
         self.integration_type = normalize_supplier_integration_type(integration_type)
+        normalized_api_url = normalize_mkt24_panel_api_url(api_url) if self.integration_type == SUPPLIER_INTEGRATION_MKT24 else str(api_url or "").rstrip("/")
+        self.api_url = normalized_api_url.rstrip("/")
+        self.api_key = api_key.strip()
         self.bearer_token = bearer_token.strip()
 
     @property
@@ -214,6 +236,20 @@ class SupplierApiClient:
         try:
             with urlopen(request, timeout=12) as response:
                 raw = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            raw_error = ""
+            try:
+                raw_error = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                raw_error = ""
+            detail = raw_error[:800].strip()
+            if detail:
+                try:
+                    parsed_error = json.loads(detail)
+                    detail = supplier_http_error_message(exc.code, parsed_error, detail)
+                except json.JSONDecodeError:
+                    pass
+            raise SupplierApiError(f"HTTP {exc.code}: {detail or exc.reason}") from exc
         except (URLError, TimeoutError, ValueError) as exc:
             raise SupplierApiError(str(exc)) from exc
 

@@ -136,6 +136,7 @@ class SupplierServiceSyncTest(unittest.TestCase):
         )
 
         self.assertEqual(result["supplier"]["integrationType"], "mkt24")
+        self.assertEqual(result["supplier"]["apiUrl"], "https://api.mkt24.co.kr/v3/panel")
         self.assertTrue(result["supplier"]["hasApiKey"])
         self.assertFalse(result["supplier"]["hasBearerToken"])
 
@@ -181,7 +182,7 @@ class SupplierServiceSyncTest(unittest.TestCase):
             )
         )
 
-    def test_mkt24_services_always_uses_products_sns_endpoint(self):
+    def test_mkt24_services_normalizes_v3_url_to_panel_endpoint(self):
         client = SupplierApiClient(
             "https://api.mkt24.co.kr/v3",
             "api-key",
@@ -189,15 +190,15 @@ class SupplierServiceSyncTest(unittest.TestCase):
         )
         captured = {}
 
-        def fake_request_json(**kwargs):
-            captured.update(kwargs)
-            return {"data": {}}
+        def fake_request_form(payload):
+            captured.update(payload)
+            return [{"service": "12", "name": "Panel Service", "min": "5", "max": "1000"}]
 
-        with patch.object(client, "_request_json", side_effect=fake_request_json):
+        with patch.object(client, "_request_form", side_effect=fake_request_form):
             client.services()
 
-        self.assertEqual(captured["url"], "https://api.mkt24.co.kr/v3/products/sns")
-        self.assertEqual(captured["headers"], {"x-api-key": "api-key"})
+        self.assertEqual(client.api_url, "https://api.mkt24.co.kr/v3/panel")
+        self.assertEqual(captured, {"key": "api-key", "action": "services"})
 
     def test_mkt24_panel_endpoint_uses_standard_panel_services_action(self):
         client = SupplierApiClient(
@@ -260,7 +261,7 @@ class SupplierServiceSyncTest(unittest.TestCase):
             bearer_token="expired-token",
         )
         body = b'{"code":"token_expired","uuid":"019e3ac5-b3e7-753e-8f5e-f425742ba7ca"}'
-        error = HTTPError("https://api.mkt24.co.kr/v3/products/sns", 401, "Unauthorized", {}, BytesIO(body))
+        error = HTTPError("https://api.mkt24.co.kr/v3/panel", 401, "Unauthorized", {}, BytesIO(body))
 
         with patch(f"{SupplierApiClient.__module__}.urlopen", side_effect=error):
             with self.assertRaisesRegex(Exception, "Bearer Token.*만료"):
