@@ -199,6 +199,59 @@ class SupplierServiceSyncTest(unittest.TestCase):
         self.assertEqual(captured["url"], "https://api.mkt24.co.kr/v3/products/sns")
         self.assertEqual(captured["headers"], {"x-api-key": "api-key"})
 
+    def test_mkt24_panel_endpoint_uses_standard_panel_services_action(self):
+        client = SupplierApiClient(
+            "https://api.mkt24.co.kr/v3/panel",
+            "api-key",
+            integration_type="mkt24",
+        )
+        captured = {}
+
+        def fake_request_form(payload):
+            captured.update(payload)
+            return [{"service": "12", "name": "Panel Service", "min": "5", "max": "1000"}]
+
+        with patch.object(client, "_request_form", side_effect=fake_request_form):
+            payload = client.services()
+
+        self.assertEqual(captured, {"key": "api-key", "action": "services"})
+        self.assertEqual(payload[0]["service"], "12")
+
+    def test_mkt24_panel_endpoint_uses_standard_panel_order_and_status_actions(self):
+        client = SupplierApiClient(
+            "https://api.mkt24.co.kr/v3/panel",
+            "api-key",
+            integration_type="mkt24",
+        )
+        calls = []
+
+        def fake_request_form(payload):
+            calls.append(dict(payload))
+            return {"order": "1001"}
+
+        with patch.object(client, "_request_form", side_effect=fake_request_form):
+            order_payload = client.order({"service": "12", "link": "https://example.com/post", "quantity": 10})
+            status_payload = client.status("1001")
+
+        self.assertEqual(order_payload["order"], "1001")
+        self.assertEqual(status_payload["order"], "1001")
+        self.assertEqual(calls[0]["action"], "add")
+        self.assertEqual(calls[0]["service"], "12")
+        self.assertEqual(calls[1], {"key": "api-key", "action": "status", "order": "1001"})
+
+    def test_mkt24_panel_service_payload_normalizes_like_classic_panel_api(self):
+        with patch("core.SupplierApiClient.services", return_value=[{"service": "12", "name": "Panel Service", "min": "5", "max": "1000"}]):
+            result = self.store._run_supplier_connection_test(
+                "https://api.mkt24.co.kr/v3/panel",
+                "api-key",
+                integration_type="mkt24",
+                require_services=True,
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["resolvedApiUrl"], "https://api.mkt24.co.kr/v3/panel")
+        self.assertEqual(result["servicesPayload"][0]["service"], "12")
+
     def test_mkt24_token_expired_error_is_actionable(self):
         client = SupplierApiClient(
             "https://api.mkt24.co.kr/v3",

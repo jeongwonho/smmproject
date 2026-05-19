@@ -68,7 +68,19 @@ def supplier_supports_balance_check(integration_type: str) -> bool:
 
 
 def supplier_supports_auto_dispatch(integration_type: str) -> bool:
-    return normalize_supplier_integration_type(integration_type) == SUPPLIER_INTEGRATION_CLASSIC
+    return normalize_supplier_integration_type(integration_type) in {
+        SUPPLIER_INTEGRATION_CLASSIC,
+        SUPPLIER_INTEGRATION_MKT24,
+    }
+
+
+def supplier_uses_panel_api(integration_type: str, api_url: str) -> bool:
+    """Return true for endpoints that follow the standard SMM panel key/action API."""
+    normalized_type = normalize_supplier_integration_type(integration_type)
+    if normalized_type == SUPPLIER_INTEGRATION_CLASSIC:
+        return True
+    parsed = urlparse(str(api_url or ""))
+    return normalized_type == SUPPLIER_INTEGRATION_MKT24 and parsed.path.rstrip("/").endswith("/panel")
 
 
 def supplier_error_is_auth_failure(error: Any, *, integration_type: str = "") -> bool:
@@ -183,6 +195,10 @@ class SupplierApiClient:
         self.integration_type = normalize_supplier_integration_type(integration_type)
         self.bearer_token = bearer_token.strip()
 
+    @property
+    def uses_panel_api(self) -> bool:
+        return supplier_uses_panel_api(self.integration_type, self.api_url)
+
     def _request_form(self, payload: Dict[str, Any]) -> Any:
         encoded = urlencode(payload).encode("utf-8")
         request = Request(
@@ -267,6 +283,8 @@ class SupplierApiClient:
         return self._request_form(payload)
 
     def services(self) -> Any:
+        if self.uses_panel_api:
+            return self.call("services")
         if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
             if not self.api_key:
                 raise SupplierApiError("x-api-key가 필요합니다.")
@@ -337,11 +355,13 @@ class SupplierApiClient:
         )
 
     def balance(self) -> Any:
-        if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
+        if self.integration_type == SUPPLIER_INTEGRATION_MKT24 and not self.uses_panel_api:
             raise SupplierApiError("잔액 API를 지원하지 않는 공급사 타입입니다.")
         return self.call("balance")
 
     def order(self, data: Dict[str, Any]) -> Any:
+        if self.uses_panel_api:
+            return self.call("add", data)
         if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
             if not self.api_key:
                 raise SupplierApiError("MKT24 자동 발주에는 x-api-key가 필요합니다.")
@@ -354,6 +374,8 @@ class SupplierApiClient:
         return self.call("add", data)
 
     def status(self, order_id: str) -> Any:
+        if self.uses_panel_api:
+            return self.call("status", {"order": order_id})
         if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
             if not self.api_key:
                 raise SupplierApiError("MKT24 상태 조회에는 x-api-key가 필요합니다.")
@@ -361,12 +383,12 @@ class SupplierApiClient:
         return self.call("status", {"order": order_id})
 
     def multi_status(self, order_ids: List[str]) -> Any:
-        if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
+        if self.integration_type == SUPPLIER_INTEGRATION_MKT24 and not self.uses_panel_api:
             raise SupplierApiError("이 공급사 타입은 아직 상태 조회 API가 연결되지 않았습니다.")
         return self.call("status", {"orders": ",".join(order_ids)})
 
     def refill(self, order_id: str) -> Any:
-        if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
+        if self.integration_type == SUPPLIER_INTEGRATION_MKT24 and not self.uses_panel_api:
             raise SupplierApiError("이 공급사 타입은 아직 리필 API가 연결되지 않았습니다.")
         return self.call("refill", {"order": order_id})
 

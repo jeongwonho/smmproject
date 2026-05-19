@@ -190,6 +190,24 @@ class Mkt24OrderOptionTest(unittest.TestCase):
         self.assertEqual(payload["value"]["orderInfo"]["snsValue"], "instamart_official")
         self.assertEqual(payload["value"]["optionInfo"]["followerOption"]["value"]["radio"], "none")
 
+    def test_mkt24_panel_endpoint_uses_standard_panel_order_payload(self):
+        payload = self.store._build_supplier_order_payload(
+            {"name": "인스타 팔로워", "product_code": "ig-followers", "platform_slug": "instagram", "price_strategy": "unit"},
+            {"targetValue": "instamart_official", "orderedCount": "25"},
+            {
+                **self._mapping(),
+                "api_url": "https://api.mkt24.co.kr/v3/panel",
+                "bearer_token": "",
+                "supplier_external_service_id": "12",
+            },
+        )
+
+        self.assertEqual(payload["service"], "12")
+        self.assertEqual(payload["quantity"], "25")
+        self.assertEqual(payload["username"], "instamart_official")
+        self.assertNotIn("productUuid", payload)
+        self.assertNotIn("value", payload)
+
     def test_supports_order_options_false_omits_option_info(self):
         detail = {"data": {**MKT24_DETAIL["data"], "supportsOrderOptions": False}}
         with patch("core.SupplierApiClient.mkt24_product_detail", return_value=detail):

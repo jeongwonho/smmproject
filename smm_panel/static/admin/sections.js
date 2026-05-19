@@ -3700,7 +3700,7 @@ function renderSupplierAdminSection({
   const apiKeyLabel = supplierApiKeyLabel(integrationType);
   const visibleServices = filteredServices.slice(0, 160);
   const savedSecretSummary = integrationType === "mkt24"
-    ? `x-api-key ${draft.hasApiKey ? draft.apiKeyMasked || "설정됨" : "미설정"} · Bearer 선택 ${draft.hasBearerToken ? draft.bearerTokenMasked || "설정됨" : "미설정"}`
+    ? `API Key ${draft.hasApiKey ? draft.apiKeyMasked || "설정됨" : "미설정"} · Bearer 선택 ${draft.hasBearerToken ? draft.bearerTokenMasked || "설정됨" : "미설정"}`
     : draft.hasApiKey
       ? draft.apiKeyMasked || "설정됨"
       : "미설정";
@@ -3762,7 +3762,7 @@ function renderSupplierAdminSection({
         <section class="admin-card">
           <div class="section-head section-head--compact">
             <h2>${draft.id ? "공급사 수정" : "공급사 등록"}</h2>
-            <p>${escapeHtml(integrationType === "mkt24" ? "MKT24는 /v3 또는 전체 products/sns URL을 입력하면 백엔드에서 자동 보정합니다." : "/api, /api/v2 형태를 모두 시도하도록 백엔드에서 자동 보정합니다.")}</p>
+            <p>${escapeHtml(integrationType === "mkt24" ? "MKT24 대행사용 API는 https://api.mkt24.co.kr/v3/panel 엔드포인트를 사용합니다." : "/api, /api/v2 형태를 모두 시도하도록 백엔드에서 자동 보정합니다.")}</p>
           </div>
           <form class="admin-form" data-admin-supplier-form>
             <label class="form-field">
@@ -3800,7 +3800,7 @@ function renderSupplierAdminSection({
                 <label class="form-field">
                   <span class="field-label">Bearer Token 선택</span>
                   <div class="field-shell">
-                    <textarea class="field-textarea" name="bearerToken" rows="3" placeholder="${draft.id ? "필요할 때만 새 토큰을 입력합니다." : "API key만으로 호출 가능하면 비워두세요."}" data-admin-supplier-field="bearerToken">${escapeHtml(draft.bearerToken)}</textarea>
+                    <textarea class="field-textarea" name="bearerToken" rows="3" placeholder="${draft.id ? "v3 JSON API를 별도로 사용할 때만 새 토큰을 입력합니다." : "대행사용 /v3/panel API만 사용하면 비워두세요."}" data-admin-supplier-field="bearerToken">${escapeHtml(draft.bearerToken)}</textarea>
                   </div>
                 </label>
               `
