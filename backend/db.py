@@ -342,6 +342,7 @@ class PanelStoreDatabaseMixin:
         self._ensure_column(conn, "suppliers", "health_checked_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "suppliers", "balance_status", "TEXT NOT NULL DEFAULT 'unknown'")
         self._ensure_column(conn, "suppliers", "balance_checked_at", "TEXT NOT NULL DEFAULT ''")
+        self._migrate_mkt24_panel_endpoint(conn)
         self._ensure_column(conn, "supplier_services", "is_active", "INTEGER NOT NULL DEFAULT 1")
         self._ensure_column(conn, "supplier_services", "last_seen_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "supplier_services", "removed_at", "TEXT NOT NULL DEFAULT ''")
@@ -543,6 +544,62 @@ class PanelStoreDatabaseMixin:
         conn.execute("UPDATE users SET role = 'admin', is_active = 1, account_status = 'active' WHERE id = ?", (demo_user_id,))
         conn.execute("UPDATE users SET role = COALESCE(NULLIF(role, ''), 'customer') WHERE id != ?", (demo_user_id,))
         self._migrate_supplier_secrets(conn)
+
+    def _migrate_mkt24_panel_endpoint(self, conn: DatabaseConnection) -> None:
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM suppliers
+            WHERE integration_type = 'mkt24'
+              AND lower(api_url) LIKE '%api.mkt24.co.kr%'
+              AND lower(api_url) NOT LIKE '%/panel'
+            """
+        ).fetchall()
+        supplier_ids = [str(row["id"]) for row in rows]
+        if not supplier_ids:
+            return
+        timestamp = now_iso()
+        placeholders = ",".join("?" for _ in supplier_ids)
+        conn.execute(
+            f"""
+            UPDATE suppliers
+            SET api_url = ?,
+                last_test_status = 'never',
+                last_test_message = ?,
+                last_service_count = 0,
+                service_sync_status = 'never',
+                service_sync_message = ?,
+                service_sync_started_at = '',
+                service_sync_completed_at = '',
+                service_sync_lock_until = '',
+                service_sync_error_count = 0,
+                health_status = 'unknown',
+                health_message = '',
+                health_checked_at = '',
+                balance_status = 'unknown',
+                balance_checked_at = '',
+                updated_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            (
+                "https://api.mkt24.co.kr/v3/panel",
+                "MKT24 대행사용 API endpoint가 /v3/panel로 전환되었습니다. 연결 확인과 서비스 동기화를 다시 실행하세요.",
+                "MKT24 대행사용 API endpoint가 /v3/panel로 전환되었습니다. 서비스 동기화가 필요합니다.",
+                timestamp,
+                *supplier_ids,
+            ),
+        )
+        conn.execute(
+            f"""
+            UPDATE supplier_services
+            SET is_active = 0,
+                removed_at = ?,
+                synced_at = ?
+            WHERE supplier_id IN ({placeholders})
+              AND is_active = 1
+            """,
+            (timestamp, timestamp, *supplier_ids),
+        )
 
     def _ensure_bigint_columns(self, conn: DatabaseConnection, table_columns: Dict[str, List[str]]) -> None:
         if self.backend != "postgres":
