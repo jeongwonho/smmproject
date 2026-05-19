@@ -52,6 +52,7 @@ try:
         supplier_error_is_auth_failure,
         normalize_supplier_integration_type,
         normalize_supplier_order_status_payload,
+        supplier_uses_panel_api,
         supplier_service_sync_due,
         supplier_supports_auto_dispatch,
         supplier_supports_balance_check,
@@ -79,6 +80,7 @@ except ImportError:  # pragma: no cover - top-level script runtime
         supplier_error_is_auth_failure,
         normalize_supplier_integration_type,
         normalize_supplier_order_status_payload,
+        supplier_uses_panel_api,
         supplier_service_sync_due,
         supplier_supports_auto_dispatch,
         supplier_supports_balance_check,
@@ -2451,16 +2453,18 @@ def normalize_mkt24_candidates(raw_api_url: str) -> List[str]:
     path = parsed.path.rstrip("/")
     candidates: List[str] = []
 
-    if path.endswith("/products/sns"):
+    if path.endswith("/panel"):
+        candidates.append(candidate)
+    elif path.endswith("/products/sns"):
         candidates.append(candidate)
     elif path.endswith("/products"):
         candidates.append(f"{candidate}/sns")
     elif path.endswith("/v3"):
-        candidates.append(f"{candidate}/products/sns")
+        candidates.extend([f"{candidate}/panel", f"{candidate}/products/sns"])
     elif not path or path == "/":
-        candidates.extend([f"{origin}/v3/products/sns", f"{origin}/products/sns"])
+        candidates.extend([f"{origin}/v3/panel", f"{origin}/v3/products/sns", f"{origin}/products/sns"])
     else:
-        candidates.extend([candidate, f"{candidate}/products/sns", f"{origin}/v3/products/sns"])
+        candidates.extend([candidate, f"{candidate}/panel", f"{candidate}/products/sns", f"{origin}/v3/panel", f"{origin}/v3/products/sns"])
 
     deduped: List[str] = []
     for item in candidates:
@@ -2480,6 +2484,10 @@ def normalize_supplier_api_candidates(integration_type: str, raw_api_url: str) -
 def normalize_supplier_services_payload(integration_type: str, payload: Any) -> List[Dict[str, Any]]:
     normalized_type = normalize_supplier_integration_type(integration_type)
     if normalized_type == SUPPLIER_INTEGRATION_MKT24:
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if isinstance(payload, dict) and isinstance(payload.get("services"), list):
+            return [item for item in payload["services"] if isinstance(item, dict)]
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, dict):
             raise SupplierApiError("서비스 목록 형식이 올바르지 않습니다.")
@@ -2503,6 +2511,21 @@ def normalize_supplier_services_payload(integration_type: str, payload: Any) -> 
 def supplier_service_record(integration_type: str, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     normalized_type = normalize_supplier_integration_type(integration_type)
     if normalized_type == SUPPLIER_INTEGRATION_MKT24:
+        panel_service_id = str(item.get("service") or item.get("id") or "").strip()
+        if panel_service_id:
+            return {
+                "externalServiceId": panel_service_id,
+                "name": str(item.get("name") or f"서비스 {panel_service_id}").strip(),
+                "category": str(item.get("category") or "").strip(),
+                "type": str(item.get("type") or "").strip(),
+                "rate": safe_float(item.get("rate"), 0.0),
+                "minAmount": int(float(item.get("min") or 0) or 0),
+                "maxAmount": int(float(item.get("max") or 0) or 0),
+                "dripfeed": bool(item.get("dripfeed")),
+                "refill": bool(item.get("refill")),
+                "cancel": bool(item.get("cancel")),
+                "rawJson": as_json(item),
+            }
         external_service_id = str(item.get("productUuid") or "").strip()
         if not external_service_id:
             return None
@@ -2733,6 +2756,7 @@ def supplier_example_value(field_key: str) -> Any:
 
 def supplier_service_request_guide(integration_type: str, service: Dict[str, Any], raw_payload: Dict[str, Any]) -> Dict[str, Any]:
     normalized_type = normalize_supplier_integration_type(integration_type)
+    panel_like_service = normalized_type == SUPPLIER_INTEGRATION_MKT24 and bool(raw_payload.get("service") or raw_payload.get("id"))
     platform_key = infer_supplier_platform_key(str(service.get("category") or ""), raw_payload)
     target_kind = infer_supplier_target_kind(str(service.get("name") or ""), str(service.get("type") or ""), str(service.get("category") or ""))
     package_like = infer_supplier_package_like(str(service.get("name") or ""), str(service.get("type") or ""))
@@ -2792,11 +2816,13 @@ def supplier_service_request_guide(integration_type: str, service: Dict[str, Any
         notes.append("투표형 서비스로 보여 응답 번호 선택 필드를 함께 두는 것이 안전합니다.")
     if any(key in advanced_field_keys for key in ("country", "device", "typeOfTraffic", "googleKeyword")):
         notes.append("트래픽/검색형 서비스로 추정되어 국가, 디바이스, 유입 유형, 키워드 옵션까지 설계하는 편이 좋습니다.")
-    if normalized_type == SUPPLIER_INTEGRATION_MKT24:
-        notes.append("이 추천은 MKT24 상품 목록 메타데이터 기준 추정값입니다. 실제 발주 API 문서 확인 후 확정하는 것이 안전합니다.")
+    if normalized_type == SUPPLIER_INTEGRATION_MKT24 and panel_like_service:
+        notes.append("MKT24 대행사용 /v3/panel 표준 API 기준으로 key + action=add payload를 구성합니다.")
+    elif normalized_type == SUPPLIER_INTEGRATION_MKT24:
+        notes.append("이 추천은 MKT24 v3 상품 목록 메타데이터 기준 추정값입니다. 실제 발주 API 문서 확인 후 확정하는 것이 안전합니다.")
 
     example_payload: Dict[str, Any] = {}
-    if normalized_type == SUPPLIER_INTEGRATION_CLASSIC:
+    if normalized_type == SUPPLIER_INTEGRATION_CLASSIC or panel_like_service:
         example_payload["service"] = str(service.get("externalServiceId") or "")
         if target_kind == "keyword_url":
             example_payload["link"] = supplier_target_placeholder(platform_key, "url").replace("예: ", "")
@@ -2829,12 +2855,12 @@ def supplier_service_request_guide(integration_type: str, service: Dict[str, Any
             example_payload[field_key] = supplier_example_value(field_key)
 
     return {
-        "confidence": "high" if normalized_type == SUPPLIER_INTEGRATION_CLASSIC else "medium",
+        "confidence": "high" if normalized_type == SUPPLIER_INTEGRATION_CLASSIC or panel_like_service else "medium",
         "notes": notes,
         "formRecommendation": recommendation,
-        "callExampleTitle": "공급사 호출 예시" if normalized_type == SUPPLIER_INTEGRATION_CLASSIC else "추천 입력 예시",
+        "callExampleTitle": "공급사 호출 예시" if normalized_type == SUPPLIER_INTEGRATION_CLASSIC or panel_like_service else "추천 입력 예시",
         "callExamplePayload": example_payload,
-        "callExampleIsEstimated": normalized_type != SUPPLIER_INTEGRATION_CLASSIC,
+        "callExampleIsEstimated": not (normalized_type == SUPPLIER_INTEGRATION_CLASSIC or panel_like_service),
     }
 
 
@@ -12055,7 +12081,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                     bearer_token = decrypt_secret_value(existing["bearer_token"])
             if integration_type == SUPPLIER_INTEGRATION_MKT24:
                 if not api_key:
-                    raise PanelError("x-api-key를 입력해 주세요.")
+                    raise PanelError("MKT24 API Key를 입력해 주세요.")
             else:
                 if not api_key:
                     raise PanelError("API 키를 입력해 주세요.")
@@ -12366,7 +12392,7 @@ class PanelStore(PanelStoreDatabaseMixin):
         if not api_url:
             raise PanelError("API URL을 입력해 주세요.")
         if not api_key:
-            label = "x-api-key" if integration_type == SUPPLIER_INTEGRATION_MKT24 else "API 키"
+            label = "MKT24 API Key" if integration_type == SUPPLIER_INTEGRATION_MKT24 else "API 키"
             raise PanelError(f"{label}를 입력해 주세요.")
 
         result = self._run_supplier_connection_test(
@@ -14469,11 +14495,12 @@ class PanelStore(PanelStoreDatabaseMixin):
                     success_message = "서비스 목록 조회가 확인되었습니다. 잔액 API는 제공되지 않습니다."
                 raw_services_payload = client.services()
                 services_payload = normalize_supplier_services_payload(normalized_type, raw_services_payload)
+                persisted_api_url = candidate if normalized_type == SUPPLIER_INTEGRATION_MKT24 else (api_url.strip() or candidate)
                 return {
                     "status": "success",
                     "message": success_message,
                     "resolvedApiUrl": candidate,
-                    "persistedApiUrl": api_url.strip() or candidate,
+                    "persistedApiUrl": persisted_api_url,
                     "balance": balance_payload["balance"],
                     "currency": balance_payload["currency"],
                     "serviceCount": len(services_payload),
@@ -15360,7 +15387,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                 integration_type=str(mapping.get("integration_type") or SUPPLIER_INTEGRATION_CLASSIC),
                 bearer_token=bearer_token,
             )
-            if client.integration_type == SUPPLIER_INTEGRATION_MKT24:
+            if client.integration_type == SUPPLIER_INTEGRATION_MKT24 and not client.uses_panel_api:
                 for check in self._mkt24_load_input_checks(mapping, request_payload):
                     client.mkt24_sns_lookup(
                         product_uuid=check["productUuid"],
@@ -15465,7 +15492,8 @@ class PanelStore(PanelStoreDatabaseMixin):
         fields: Dict[str, Any],
         mapping: Dict[str, Any],
     ) -> Dict[str, Any]:
-        if normalize_supplier_integration_type(str(mapping.get("integration_type") or "")) == SUPPLIER_INTEGRATION_MKT24:
+        integration_type = normalize_supplier_integration_type(str(mapping.get("integration_type") or ""))
+        if integration_type == SUPPLIER_INTEGRATION_MKT24 and not supplier_uses_panel_api(integration_type, str(mapping.get("api_url") or "")):
             return self._build_mkt24_supplier_order_payload(product, fields, mapping)
 
         payload: Dict[str, Any] = {

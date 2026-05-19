@@ -718,26 +718,26 @@ function supplierToDraft(supplier) {
 }
 
 function supplierApiKeyLabel(integrationType) {
-  return integrationType === "mkt24" ? "x-api-key" : "API Key";
+  return integrationType === "mkt24" ? "API Key" : "API Key";
 }
 
 function supplierApiKeyPlaceholder(integrationType, hasId) {
   if (hasId) {
-    return integrationType === "mkt24" ? "새 x-api-key 입력 시에만 변경됩니다." : "새 키 입력 시에만 변경됩니다.";
+    return integrationType === "mkt24" ? "새 API Key 입력 시에만 변경됩니다." : "새 키 입력 시에만 변경됩니다.";
   }
-  return integrationType === "mkt24" ? "공급사 x-api-key" : "공급사 API Key";
+  return integrationType === "mkt24" ? "공급사 API Key" : "공급사 API Key";
 }
 
 function supplierUrlPlaceholder(integrationType) {
-  return integrationType === "mkt24" ? "https://api.mkt24.co.kr/v3 또는 전체 products/sns URL" : "https://example.com/api/v2";
+  return integrationType === "mkt24" ? "https://api.mkt24.co.kr/v3/panel" : "https://example.com/api/v2";
 }
 
 function supplierConnectionGuide(integrationType) {
   if (integrationType === "mkt24") {
     return {
-      status: "서비스 목록 조회가 성공하면 연결된 것으로 처리됩니다.",
-      balance: "이 연동 방식은 잔액 API가 문서화되지 않아 서비스 수만 확인합니다.",
-      dispatch: "상품 상세 주문 필드와 optionInfo 기본값을 저장하면 MKT24 주문 API로 발주합니다.",
+      status: "MKT24 대행사용 API는 /v3/panel 엔드포인트에 key + action 방식으로 연결합니다.",
+      balance: "표준 SMM panel 방식의 services/add/status 응답을 기준으로 상태를 확인합니다.",
+      dispatch: "API URL은 https://api.mkt24.co.kr/v3/panel, API Key는 공급사에서 발급받은 key 값을 사용하세요.",
     };
   }
   return {
