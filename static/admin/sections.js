@@ -3700,7 +3700,7 @@ function renderSupplierAdminSection({
   const apiKeyLabel = supplierApiKeyLabel(integrationType);
   const visibleServices = filteredServices.slice(0, 160);
   const savedSecretSummary = integrationType === "mkt24"
-    ? `x-api-key ${draft.hasApiKey ? draft.apiKeyMasked || "설정됨" : "미설정"} · Bearer ${draft.hasBearerToken ? draft.bearerTokenMasked || "설정됨" : "미설정"}`
+    ? `x-api-key ${draft.hasApiKey ? draft.apiKeyMasked || "설정됨" : "미설정"} · Bearer 선택 ${draft.hasBearerToken ? draft.bearerTokenMasked || "설정됨" : "미설정"}`
     : draft.hasApiKey
       ? draft.apiKeyMasked || "설정됨"
       : "미설정";
@@ -3743,7 +3743,7 @@ function renderSupplierAdminSection({
                           <strong>${escapeHtml(supplier.name)}</strong>
                           ${renderAdminHealthBadge(supplier.lastTestStatus)}
                         </div>
-                        <p class="admin-inline-note">${escapeHtml(supplier.integrationType === "mkt24" ? "MKT24 Bearer 연동" : "기존 SMM API 연동")}</p>
+                        <p class="admin-inline-note">${escapeHtml(supplier.integrationType === "mkt24" ? "MKT24 API 연동" : "기존 SMM API 연동")}</p>
                         <p>${escapeHtml(supplier.apiUrl)}</p>
                         <div class="admin-supplier-card__meta">
                           <span>서비스 ${escapeHtml(String(supplier.serviceCount || 0))}</span>
@@ -3770,7 +3770,7 @@ function renderSupplierAdminSection({
               <div class="field-shell">
                 <select class="field-select" name="integrationType" data-admin-supplier-field="integrationType">
                   <option value="classic" ${integrationType === "classic" ? "selected" : ""}>기존 SMM API</option>
-                  <option value="mkt24" ${integrationType === "mkt24" ? "selected" : ""}>MKT24 Bearer API</option>
+                  <option value="mkt24" ${integrationType === "mkt24" ? "selected" : ""}>MKT24 API</option>
                 </select>
               </div>
             </label>
@@ -3798,9 +3798,9 @@ function renderSupplierAdminSection({
             ${integrationType === "mkt24"
               ? `
                 <label class="form-field">
-                  <span class="field-label">Bearer Token</span>
+                  <span class="field-label">Bearer Token 선택</span>
                   <div class="field-shell">
-                    <textarea class="field-textarea" name="bearerToken" rows="3" placeholder="${draft.id ? "새 토큰 입력 시에만 변경됩니다." : "Bearer Token"}" data-admin-supplier-field="bearerToken">${escapeHtml(draft.bearerToken)}</textarea>
+                    <textarea class="field-textarea" name="bearerToken" rows="3" placeholder="${draft.id ? "필요할 때만 새 토큰을 입력합니다." : "API key만으로 호출 가능하면 비워두세요."}" data-admin-supplier-field="bearerToken">${escapeHtml(draft.bearerToken)}</textarea>
                   </div>
                 </label>
               `

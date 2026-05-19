@@ -270,17 +270,20 @@ class SupplierApiClient:
         if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
             if not self.api_key:
                 raise SupplierApiError("x-api-key가 필요합니다.")
-            if not self.bearer_token:
-                raise SupplierApiError("Bearer Token이 필요합니다.")
             return self._request_json(
                 method="GET",
                 url=self._mkt24_v3_url("/products/sns"),
-                headers={
-                    "Authorization": f"Bearer {self.bearer_token}",
-                    "x-api-key": self.api_key,
-                },
+                headers=self._mkt24_headers(),
             )
         return self.call("services")
+
+    def _mkt24_headers(self) -> Dict[str, str]:
+        if not self.api_key:
+            raise SupplierApiError("x-api-key가 필요합니다.")
+        headers = {"x-api-key": self.api_key}
+        if self.bearer_token:
+            headers["Authorization"] = f"Bearer {self.bearer_token}"
+        return headers
 
     def _mkt24_v3_url(self, path: str) -> str:
         parsed = urlparse(self.api_url)
@@ -298,10 +301,7 @@ class SupplierApiClient:
         return self._request_json(
             method="GET",
             url=self._mkt24_v3_url(f"/products/{quote(str(product_uuid), safe='')}"),
-            headers={
-                "Authorization": f"Bearer {self.bearer_token}",
-                "x-api-key": self.api_key,
-            },
+            headers=self._mkt24_headers(),
         )
 
     def mkt24_sns_lookup(self, *, product_uuid: str, sns_value: str) -> Any:
@@ -310,20 +310,14 @@ class SupplierApiClient:
             url=self._mkt24_v3_url(
                 f"/sns?snsValue={quote(str(sns_value), safe='')}&productUuid={quote(str(product_uuid), safe='')}"
             ),
-            headers={
-                "Authorization": f"Bearer {self.bearer_token}",
-                "x-api-key": self.api_key,
-            },
+            headers=self._mkt24_headers(),
         )
 
     def mkt24_estimate_sns(self, payload: Dict[str, Any]) -> Any:
         return self._request_json(
             method="POST",
             url=self._mkt24_v3_url("/order/sns/estimate"),
-            headers={
-                "Authorization": f"Bearer {self.bearer_token}",
-                "x-api-key": self.api_key,
-            },
+            headers=self._mkt24_headers(),
             payload=payload,
         )
 
@@ -331,10 +325,7 @@ class SupplierApiClient:
         return self._request_json(
             method="POST",
             url=self._mkt24_v3_url("/order/sns"),
-            headers={
-                "Authorization": f"Bearer {self.bearer_token}",
-                "x-api-key": self.api_key,
-            },
+            headers=self._mkt24_headers(),
             payload=payload,
         )
 
@@ -342,10 +333,7 @@ class SupplierApiClient:
         return self._request_json(
             method="GET",
             url=self._mkt24_v3_url(f"/order/sns/{quote(str(order_uuid), safe='')}"),
-            headers={
-                "Authorization": f"Bearer {self.bearer_token}",
-                "x-api-key": self.api_key,
-            },
+            headers=self._mkt24_headers(),
         )
 
     def balance(self) -> Any:
@@ -355,8 +343,8 @@ class SupplierApiClient:
 
     def order(self, data: Dict[str, Any]) -> Any:
         if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
-            if not self.api_key or not self.bearer_token:
-                raise SupplierApiError("MKT24 자동 발주에는 x-api-key와 Bearer Token이 필요합니다.")
+            if not self.api_key:
+                raise SupplierApiError("MKT24 자동 발주에는 x-api-key가 필요합니다.")
             payload = dict(data)
             product_uuid = str(payload.pop("productUuid", "") or payload.pop("product_uuid", "") or payload.get("service") or "").strip()
             if product_uuid:
@@ -367,8 +355,8 @@ class SupplierApiClient:
 
     def status(self, order_id: str) -> Any:
         if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
-            if not self.api_key or not self.bearer_token:
-                raise SupplierApiError("MKT24 상태 조회에는 x-api-key와 Bearer Token이 필요합니다.")
+            if not self.api_key:
+                raise SupplierApiError("MKT24 상태 조회에는 x-api-key가 필요합니다.")
             return self.mkt24_order_status(order_id)
         return self.call("status", {"order": order_id})
 
