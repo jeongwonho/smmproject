@@ -140,6 +140,76 @@ class SupplierServiceSyncTest(unittest.TestCase):
         self.assertTrue(result["supplier"]["hasApiKey"])
         self.assertFalse(result["supplier"]["hasBearerToken"])
 
+    def test_mkt24_supplier_save_clears_legacy_bearer_token(self):
+        created_at = now_iso()
+        self.conn.execute(
+            """
+            INSERT INTO suppliers (
+                id, name, api_url, integration_type, api_key, bearer_token,
+                is_active, notes, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "supplier_mkt24_legacy",
+                "MKT24 Legacy",
+                "https://api.mkt24.co.kr/v3/panel",
+                "mkt24",
+                "old-key",
+                "legacy-bearer",
+                1,
+                "",
+                created_at,
+                created_at,
+            ),
+        )
+        self.conn.commit()
+
+        result = self.store.save_supplier(
+            {
+                "id": "supplier_mkt24_legacy",
+                "name": "MKT24 Legacy",
+                "apiUrl": "https://api.mkt24.co.kr/v3/panel",
+                "integrationType": "mkt24",
+                "apiKey": "new-key",
+                "bearerToken": "should-be-ignored",
+                "isActive": True,
+                "_adminActor": "qa",
+            }
+        )
+
+        row = self.conn.execute("SELECT bearer_token FROM suppliers WHERE id = ?", ("supplier_mkt24_legacy",)).fetchone()
+        self.assertEqual(row["bearer_token"], "")
+        self.assertFalse(result["supplier"]["hasBearerToken"])
+
+    def test_boot_clears_mkt24_legacy_bearer_tokens(self):
+        created_at = now_iso()
+        self.conn.execute(
+            """
+            INSERT INTO suppliers (
+                id, name, api_url, integration_type, api_key, bearer_token,
+                is_active, notes, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "supplier_mkt24_boot_cleanup",
+                "MKT24 Boot Cleanup",
+                "https://api.mkt24.co.kr/v3/panel",
+                "mkt24",
+                "api-key",
+                "legacy-bearer",
+                1,
+                "",
+                created_at,
+                created_at,
+            ),
+        )
+        self.conn.commit()
+
+        PanelStore(db_path=self.db_path)
+
+        row = self.conn.execute("SELECT bearer_token FROM suppliers WHERE id = ?", ("supplier_mkt24_boot_cleanup",)).fetchone()
+        self.assertEqual(row["bearer_token"], "")
+
     def test_active_lock_blocks_duplicate_sync(self):
         future = (dt.datetime.now().astimezone() + dt.timedelta(minutes=5)).isoformat(timespec="seconds")
         self.conn.execute(
@@ -264,7 +334,7 @@ class SupplierServiceSyncTest(unittest.TestCase):
         error = HTTPError("https://api.mkt24.co.kr/v3/panel", 401, "Unauthorized", {}, BytesIO(body))
 
         with patch(f"{SupplierApiClient.__module__}.urlopen", side_effect=error):
-            with self.assertRaisesRegex(Exception, "Bearer Token.*만료"):
+            with self.assertRaisesRegex(Exception, "인증 정보.*만료"):
                 client.services()
 
 
