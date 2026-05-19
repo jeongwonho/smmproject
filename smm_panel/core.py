@@ -12056,8 +12056,6 @@ class PanelStore(PanelStoreDatabaseMixin):
             if integration_type == SUPPLIER_INTEGRATION_MKT24:
                 if not api_key:
                     raise PanelError("x-api-key를 입력해 주세요.")
-                if not bearer_token:
-                    raise PanelError("Bearer Token을 입력해 주세요.")
             else:
                 if not api_key:
                     raise PanelError("API 키를 입력해 주세요.")
@@ -12370,8 +12368,6 @@ class PanelStore(PanelStoreDatabaseMixin):
         if not api_key:
             label = "x-api-key" if integration_type == SUPPLIER_INTEGRATION_MKT24 else "API 키"
             raise PanelError(f"{label}를 입력해 주세요.")
-        if integration_type == SUPPLIER_INTEGRATION_MKT24 and not bearer_token:
-            raise PanelError("Bearer Token을 입력해 주세요.")
 
         result = self._run_supplier_connection_test(
             api_url,
@@ -12818,9 +12814,6 @@ class PanelStore(PanelStoreDatabaseMixin):
             if not str(row.get("api_key") or "").strip():
                 health_status = "failed"
                 health_message = "공급사 API key가 없습니다."
-            elif integration_type == SUPPLIER_INTEGRATION_MKT24 and not str(row.get("bearer_token") or "").strip():
-                health_status = "failed"
-                health_message = "MKT24 Bearer token이 없습니다."
             elif active_service_count <= 0:
                 health_status = "failed"
                 health_message = "활성 공급사 서비스가 없습니다. 서비스 동기화가 필요합니다."

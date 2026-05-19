@@ -123,6 +123,22 @@ class SupplierServiceSyncTest(unittest.TestCase):
         self.assertEqual(supplier["service_sync_status"], "success")
         self.assertEqual(supplier["service_sync_error_count"], 0)
 
+    def test_mkt24_supplier_can_be_saved_with_api_key_only(self):
+        result = self.store.save_supplier(
+            {
+                "name": "MKT24 API Key Only",
+                "apiUrl": "https://api.mkt24.co.kr/v3",
+                "integrationType": "mkt24",
+                "apiKey": "mkt24-api-key",
+                "isActive": True,
+                "_adminActor": "qa",
+            }
+        )
+
+        self.assertEqual(result["supplier"]["integrationType"], "mkt24")
+        self.assertTrue(result["supplier"]["hasApiKey"])
+        self.assertFalse(result["supplier"]["hasBearerToken"])
+
     def test_active_lock_blocks_duplicate_sync(self):
         future = (dt.datetime.now().astimezone() + dt.timedelta(minutes=5)).isoformat(timespec="seconds")
         self.conn.execute(
@@ -170,7 +186,6 @@ class SupplierServiceSyncTest(unittest.TestCase):
             "https://api.mkt24.co.kr/v3",
             "api-key",
             integration_type="mkt24",
-            bearer_token="bearer-token",
         )
         captured = {}
 
@@ -182,6 +197,7 @@ class SupplierServiceSyncTest(unittest.TestCase):
             client.services()
 
         self.assertEqual(captured["url"], "https://api.mkt24.co.kr/v3/products/sns")
+        self.assertEqual(captured["headers"], {"x-api-key": "api-key"})
 
     def test_mkt24_token_expired_error_is_actionable(self):
         client = SupplierApiClient(
