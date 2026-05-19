@@ -3700,7 +3700,7 @@ function renderSupplierAdminSection({
   const apiKeyLabel = supplierApiKeyLabel(integrationType);
   const visibleServices = filteredServices.slice(0, 160);
   const savedSecretSummary = integrationType === "mkt24"
-    ? `API Key ${draft.hasApiKey ? draft.apiKeyMasked || "설정됨" : "미설정"} · Bearer 선택 ${draft.hasBearerToken ? draft.bearerTokenMasked || "설정됨" : "미설정"}`
+    ? `API Key ${draft.hasApiKey ? draft.apiKeyMasked || "설정됨" : "미설정"} · /v3/panel 방식은 Bearer Token을 사용하지 않음`
     : draft.hasApiKey
       ? draft.apiKeyMasked || "설정됨"
       : "미설정";
@@ -3796,14 +3796,7 @@ function renderSupplierAdminSection({
               </div>
             </label>
             ${integrationType === "mkt24"
-              ? `
-                <label class="form-field">
-                  <span class="field-label">Bearer Token 선택</span>
-                  <div class="field-shell">
-                    <textarea class="field-textarea" name="bearerToken" rows="3" placeholder="${draft.id ? "v3 JSON API를 별도로 사용할 때만 새 토큰을 입력합니다." : "대행사용 /v3/panel API만 사용하면 비워두세요."}" data-admin-supplier-field="bearerToken">${escapeHtml(draft.bearerToken)}</textarea>
-                  </div>
-                </label>
-              `
+              ? `<p class="admin-inline-note">MKT24 대행사용 API는 기존 API Key만 사용합니다. Bearer Token은 저장하거나 갱신할 필요가 없습니다.</p>`
               : ""}
             <p class="admin-inline-note">저장된 시크릿 상태: ${escapeHtml(savedSecretSummary)} · 기존 원문은 브라우저로 다시 내려오지 않습니다.</p>
 

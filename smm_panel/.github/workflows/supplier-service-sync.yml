@@ -39,7 +39,7 @@ jobs:
               -H "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" \
               -H "X-GitHub-Workflow: ${GITHUB_WORKFLOW}" \
               -H "Content-Type: application/json" \
-              --data '{"limit":1}' \
+              --data '{"limit":10}' \
               -o "$response_file" \
               -w "%{http_code}"
           )"

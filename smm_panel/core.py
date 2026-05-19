@@ -120,6 +120,11 @@ SOCIAL_REFERRER_LABELS = {
 }
 SUPPLIER_INTEGRATION_CLASSIC = "classic"
 SUPPLIER_INTEGRATION_MKT24 = "mkt24"
+MKT24_PANEL_API_URL = "https://api.mkt24.co.kr/v3/panel"
+UUID_LIKE_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 SUPPLIER_SERVICE_SYNC_DEFAULT_INTERVAL_MINUTES = 30
 SUPPLIER_SERVICE_SYNC_LOCK_MINUTES = 10
 SUPPLIER_SERVICE_SYNC_RETRY_BASE_MINUTES = 10
@@ -2455,16 +2460,14 @@ def normalize_mkt24_candidates(raw_api_url: str) -> List[str]:
 
     if path.endswith("/panel"):
         candidates.append(candidate)
-    elif path.endswith("/products/sns"):
-        candidates.append(candidate)
-    elif path.endswith("/products"):
-        candidates.append(f"{candidate}/sns")
+    elif path.endswith("/products/sns") or path.endswith("/products"):
+        candidates.append(f"{origin}/v3/panel")
     elif path.endswith("/v3"):
-        candidates.extend([f"{candidate}/panel", f"{candidate}/products/sns"])
+        candidates.append(f"{candidate}/panel")
     elif not path or path == "/":
-        candidates.extend([f"{origin}/v3/panel", f"{origin}/v3/products/sns", f"{origin}/products/sns"])
+        candidates.append(f"{origin}/v3/panel")
     else:
-        candidates.extend([candidate, f"{candidate}/panel", f"{candidate}/products/sns", f"{origin}/v3/panel", f"{origin}/v3/products/sns"])
+        candidates.extend([f"{candidate}/panel", f"{origin}/v3/panel"])
 
     deduped: List[str] = []
     for item in candidates:
@@ -2472,6 +2475,10 @@ def normalize_mkt24_candidates(raw_api_url: str) -> List[str]:
         if normalized and normalized not in deduped:
             deduped.append(normalized)
     return deduped
+
+
+def looks_like_uuid(value: Any) -> bool:
+    return bool(UUID_LIKE_RE.match(str(value or "").strip()))
 
 
 def normalize_supplier_api_candidates(integration_type: str, raw_api_url: str) -> List[str]:
@@ -12064,6 +12071,9 @@ class PanelStore(PanelStoreDatabaseMixin):
             raise PanelError("공급사 이름을 입력해 주세요.")
         if not api_url:
             raise PanelError("API URL을 입력해 주세요.")
+        if integration_type == SUPPLIER_INTEGRATION_MKT24:
+            candidates = normalize_mkt24_candidates(api_url)
+            api_url = candidates[0] if candidates else api_url
 
         timestamp = now_iso()
         with self._connect() as conn:
@@ -12785,6 +12795,19 @@ class PanelStore(PanelStoreDatabaseMixin):
             return {"ok": False, "retryable": False, "code": "supplier_service_missing", "message": "공급사 서비스를 찾을 수 없습니다."}
         if supplier_service_id and not bool(row.get("service_is_active")):
             return {"ok": False, "retryable": False, "code": "supplier_service_inactive", "message": "공급사 서비스가 비활성 상태입니다."}
+        integration_type = normalize_supplier_integration_type(row.get("integration_type"))
+        if (
+            supplier_service_id
+            and integration_type == SUPPLIER_INTEGRATION_MKT24
+            and supplier_uses_panel_api(integration_type, str(row.get("api_url") or ""))
+            and looks_like_uuid(row.get("service_external_id"))
+        ):
+            return {
+                "ok": False,
+                "retryable": False,
+                "code": "mkt24_panel_service_id_invalid",
+                "message": "MKT24 /v3/panel 발주는 숫자형 panel 서비스 ID 매핑이 필요합니다. 기존 v3 상품 UUID 매핑을 새로 동기화된 panel 서비스로 재매핑해 주세요.",
+            }
         if int(row.get("active_service_count") or 0) <= 0:
             return {"ok": False, "retryable": True, "code": "supplier_services_empty", "message": "동기화된 활성 공급사 서비스가 없습니다."}
         if str(row.get("service_sync_status") or "") == "failed":
@@ -13452,13 +13475,13 @@ class PanelStore(PanelStoreDatabaseMixin):
         supplier_limit = int(payload.get("supplierLimit") or 10)
         supplier_sync_limit = int(payload.get("supplierSyncLimit") if payload.get("supplierSyncLimit") is not None else supplier_limit)
         supplier_health_limit = int(payload.get("supplierHealthLimit") if payload.get("supplierHealthLimit") is not None else supplier_limit)
-        cafe24_limit = int(payload.get("cafe24Limit") or 1)
-        cafe24_page_limit = int(payload.get("cafe24PageLimit") or 100)
-        cafe24_max_pages = int(payload.get("cafe24MaxPages") or 1)
-        cafe24_detail_fetch_limit = int(payload.get("cafe24DetailFetchLimit") if payload.get("cafe24DetailFetchLimit") is not None else 10)
-        dispatch_limit = int(payload.get("dispatchLimit") or 20)
+        cafe24_limit = int(payload.get("cafe24Limit") or 5)
+        cafe24_page_limit = int(payload.get("cafe24PageLimit") or CAFE24_ORDER_PAGE_LIMIT)
+        cafe24_max_pages = int(payload.get("cafe24MaxPages") or CAFE24_ORDER_MAX_PAGES)
+        cafe24_detail_fetch_limit = int(payload.get("cafe24DetailFetchLimit") if payload.get("cafe24DetailFetchLimit") is not None else 200)
+        dispatch_limit = int(payload.get("dispatchLimit") or 25)
         status_limit = int(payload.get("statusLimit") or 50)
-        completion_limit = int(payload.get("completionLimit") or 20)
+        completion_limit = int(payload.get("completionLimit") or 25)
         result: Dict[str, Any] = {
             "startedAt": started_at,
             "paused": paused,

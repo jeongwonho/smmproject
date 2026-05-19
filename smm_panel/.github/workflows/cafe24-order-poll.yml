@@ -39,7 +39,7 @@ jobs:
               -H "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" \
               -H "X-GitHub-Workflow: ${GITHUB_WORKFLOW}" \
               -H "Content-Type: application/json" \
-              --data '{"lookbackDays":30,"supplierLimit":1,"supplierSyncLimit":0,"supplierHealthLimit":5,"cafe24Limit":1,"cafe24PageLimit":100,"cafe24MaxPages":1,"cafe24DetailFetchLimit":0,"dispatchLimit":5,"statusLimit":5,"completionLimit":5}' \
+              --data '{"lookbackDays":30,"supplierLimit":10,"supplierSyncLimit":10,"supplierHealthLimit":10,"cafe24Limit":5,"cafe24PageLimit":1000,"cafe24MaxPages":30,"cafe24DetailFetchLimit":200,"dispatchLimit":25,"statusLimit":50,"completionLimit":25}' \
               -o "$response_file" \
               -w "%{http_code}"
           )"

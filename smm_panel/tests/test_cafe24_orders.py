@@ -441,6 +441,54 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(item["automation_error_code"], "supplier_health_not_ok")
         self.assertTrue(item["next_retry_at"])
 
+    def test_automation_blocks_mkt24_panel_dispatch_when_mapping_uses_legacy_uuid(self):
+        self._enable_auto_submit_and_supplier_ready()
+        legacy_uuid = "01811868-0f05-4000-8000-000000000018"
+        self.conn.execute(
+            """
+            UPDATE suppliers
+            SET integration_type = 'mkt24', api_url = 'https://api.mkt24.co.kr/v3/panel'
+            WHERE id = ?
+            """,
+            ("supplier_test",),
+        )
+        self.conn.execute(
+            """
+            UPDATE supplier_services
+            SET external_service_id = ?
+            WHERE id = ?
+            """,
+            (legacy_uuid, "supplier_service_test"),
+        )
+        self.conn.execute(
+            """
+            UPDATE cafe24_supplier_mappings
+            SET supplier_external_service_id = ?
+            WHERE supplier_id = ?
+            """,
+            (legacy_uuid, "supplier_test"),
+        )
+        order_payload = self._order_payload()
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+
+        with patch("core.SupplierApiClient.order") as order_call:
+            result = self.store.dispatch_due_cafe24_order_items(actor="cron", limit=10)
+
+        self.assertEqual(result["blocked"], 1)
+        order_call.assert_not_called()
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.assertEqual(item["standard_status"], "needs_manual_review")
+        self.assertEqual(item["automation_error_code"], "mkt24_panel_service_id_invalid")
+        self.assertEqual(item["next_retry_at"], "")
+
     def test_supplier_completed_status_marks_cafe24_item_ready_for_completion(self):
         self._enable_auto_submit_and_supplier_ready()
         order_payload = self._order_payload()
