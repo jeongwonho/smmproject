@@ -30,7 +30,7 @@ def supplier_http_error_message(status_code: int, payload: Any, fallback: str = 
         message = str(payload.get("message") or payload.get("error_description") or "").strip()
         trace_uuid = str(payload.get("uuid") or payload.get("traceId") or payload.get("trace_id") or "").strip()
         if code == "token_expired":
-            detail = "공급사 Bearer Token이 만료되었습니다. 관리자 공급사 설정에서 새 Bearer Token을 저장한 뒤 연결 확인과 서비스 동기화를 다시 실행해 주세요."
+            detail = "공급사 인증 정보가 만료되었습니다. 관리자 공급사 설정에서 API 키/권한을 확인한 뒤 연결 확인과 서비스 동기화를 다시 실행해 주세요."
             return f"{detail} 추적 UUID: {trace_uuid}" if trace_uuid else detail
         if message:
             return message

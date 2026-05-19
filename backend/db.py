@@ -281,6 +281,7 @@ class PanelStoreDatabaseMixin:
                 self._seed(conn)
             self._ensure_home_popup(conn)
             self._ensure_site_settings(conn)
+            self._clear_mkt24_bearer_tokens(conn)
             if demo_seed_enabled():
                 self._seed_management_samples(conn)
                 self._ensure_management_order_samples(conn)
@@ -343,6 +344,7 @@ class PanelStoreDatabaseMixin:
         self._ensure_column(conn, "suppliers", "balance_status", "TEXT NOT NULL DEFAULT 'unknown'")
         self._ensure_column(conn, "suppliers", "balance_checked_at", "TEXT NOT NULL DEFAULT ''")
         self._migrate_mkt24_panel_endpoint(conn)
+        self._clear_mkt24_bearer_tokens(conn)
         self._ensure_column(conn, "supplier_services", "is_active", "INTEGER NOT NULL DEFAULT 1")
         self._ensure_column(conn, "supplier_services", "last_seen_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "supplier_services", "removed_at", "TEXT NOT NULL DEFAULT ''")
@@ -599,6 +601,18 @@ class PanelStoreDatabaseMixin:
               AND is_active = 1
             """,
             (timestamp, timestamp, *supplier_ids),
+        )
+
+    def _clear_mkt24_bearer_tokens(self, conn: DatabaseConnection) -> None:
+        conn.execute(
+            """
+            UPDATE suppliers
+            SET bearer_token = '',
+                updated_at = ?
+            WHERE integration_type = 'mkt24'
+              AND COALESCE(bearer_token, '') <> ''
+            """,
+            (now_iso(),),
         )
 
     def _ensure_bigint_columns(self, conn: DatabaseConnection, table_columns: Dict[str, List[str]]) -> None:

@@ -12087,11 +12087,10 @@ class PanelStore(PanelStoreDatabaseMixin):
                 integration_changed = existing_type != integration_type
                 if not api_key and not integration_changed:
                     api_key = decrypt_secret_value(existing["api_key"])
-                if integration_type == SUPPLIER_INTEGRATION_MKT24 and not bearer_token and not integration_changed:
-                    bearer_token = decrypt_secret_value(existing["bearer_token"])
             if integration_type == SUPPLIER_INTEGRATION_MKT24:
                 if not api_key:
                     raise PanelError("MKT24 API Key를 입력해 주세요.")
+                bearer_token = ""
             else:
                 if not api_key:
                     raise PanelError("API 키를 입력해 주세요.")
@@ -12397,6 +12396,8 @@ class PanelStore(PanelStoreDatabaseMixin):
         api_url = str(payload.get("apiUrl") or (supplier["apiUrl"] if supplier else "")).strip()
         api_key = str(payload.get("apiKey") or (supplier["apiKey"] if supplier else "")).strip()
         bearer_token = str(payload.get("bearerToken") or (supplier["bearerToken"] if supplier else "")).strip()
+        if integration_type == SUPPLIER_INTEGRATION_MKT24:
+            bearer_token = ""
         actor = self._admin_actor(payload)
 
         if not api_url:
@@ -12416,7 +12417,7 @@ class PanelStore(PanelStoreDatabaseMixin):
             persisted_api_url = result.get("persistedApiUrl") or result["resolvedApiUrl"]
             stored_api_key = encrypt_secret_value(api_key, require_key=_secret_encryption_required())
             stored_bearer_token = encrypt_secret_value(
-                bearer_token if integration_type == SUPPLIER_INTEGRATION_MKT24 else "",
+                "",
                 require_key=_secret_encryption_required(),
             )
             with self._connect() as conn:
@@ -14545,8 +14546,8 @@ class PanelStore(PanelStoreDatabaseMixin):
             "integrationType": integration_type,
             "hasApiKey": bool(row["api_key"]),
             "apiKeyMasked": safe_mask_secret(row["api_key"]),
-            "hasBearerToken": bool(row["bearer_token"]),
-            "bearerTokenMasked": safe_mask_secret(row["bearer_token"]),
+            "hasBearerToken": bool(row["bearer_token"]) and integration_type != SUPPLIER_INTEGRATION_MKT24,
+            "bearerTokenMasked": "" if integration_type == SUPPLIER_INTEGRATION_MKT24 else safe_mask_secret(row["bearer_token"]),
             "supportsBalanceCheck": supplier_supports_balance_check(integration_type),
             "supportsAutoDispatch": supplier_supports_auto_dispatch(integration_type),
             "isActive": bool(row["is_active"]),
@@ -14574,7 +14575,7 @@ class PanelStore(PanelStoreDatabaseMixin):
         }
         if include_api_key:
             payload["apiKey"] = decrypt_secret_value(row["api_key"])
-            payload["bearerToken"] = decrypt_secret_value(row["bearer_token"])
+            payload["bearerToken"] = "" if integration_type == SUPPLIER_INTEGRATION_MKT24 else decrypt_secret_value(row["bearer_token"])
         return payload
 
     def public_site_settings(self) -> Dict[str, Any]:
