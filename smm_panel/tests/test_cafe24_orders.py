@@ -313,6 +313,161 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM balance_transactions").fetchone()[0], 0)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM wallet_ledger").fetchone()[0], 0)
 
+    def test_cafe24_quantity_option_text_extracts_ordered_count(self):
+        samples = {
+            "50명": 50,
+            "250명 (+35,500원)": 250,
+            "1,000명": 1000,
+            "10000명(10k) (+1,641,000원)": 10000,
+            "10k": 10000,
+        }
+        for text, expected in samples.items():
+            candidates = self.store._cafe24_quantity_candidates_from_text(text, label="팔로워 수")
+            self.assertEqual(candidates[0]["value"], expected)
+
+    def test_cafe24_quantity_option_split_text_extracts_ordered_count(self):
+        item_payload = {
+            "option_value": "계정: instamart_official / 팔로워 수 / 250명 (+35,500원)",
+        }
+        entries = self.store._cafe24_option_entries({}, item_payload)
+        candidates = self.store._cafe24_quantity_candidates_from_options(entries, label="팔로워 수")
+        self.assertEqual(candidates[0]["value"], 250)
+
+    def test_cafe24_ordered_count_can_be_extracted_from_selected_option(self):
+        self.conn.execute(
+            """
+            UPDATE cafe24_supplier_mappings
+            SET field_mapping_json = ?
+            WHERE mall_id = ?
+            """,
+            (
+                json.dumps(
+                    {
+                        "targetValue": "option:계정",
+                        "orderedCount": {
+                            "source": "option",
+                            "label": "팔로워 수",
+                            "extract": "quantity_number",
+                            "fallback": "item.quantity",
+                            "ambiguityPolicy": "needs_manual_review",
+                        },
+                    }
+                ),
+                "instamart",
+            ),
+        )
+        self.conn.commit()
+        order_payload = self._order_payload()
+        order_payload["items"][0]["options"] = [
+            {"name": "계정", "value": "instamart_official"},
+            {"name": "팔로워 수", "value": "250명 (+35,500원)"},
+        ]
+
+        result = self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+
+        self.assertEqual(result["status"], "ready_to_submit")
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        normalized_fields = json.loads(item["normalized_fields_json"])
+        supplier_payload = json.loads(item["supplier_payload_json"])
+        self.assertEqual(normalized_fields["orderedCount"], "250")
+        self.assertEqual(supplier_payload["quantity"], "250")
+
+    def test_cafe24_duplicate_quantity_options_require_manual_review(self):
+        self.conn.execute(
+            """
+            UPDATE cafe24_supplier_mappings
+            SET field_mapping_json = ?
+            WHERE mall_id = ?
+            """,
+            (
+                json.dumps(
+                    {
+                        "targetValue": "option:계정",
+                        "orderedCount": {
+                            "source": "option",
+                            "label": "팔로워 수",
+                            "extract": "quantity_number",
+                            "fallback": "item.quantity",
+                            "ambiguityPolicy": "needs_manual_review",
+                        },
+                    }
+                ),
+                "instamart",
+            ),
+        )
+        self.conn.commit()
+        order_payload = self._order_payload()
+        order_payload["items"][0]["options"] = [
+            {"name": "계정", "value": "instamart_official"},
+            {"name": "팔로워 수", "value": "250명 (+35,500원)"},
+            {"name": "팔로워 수", "value": "500명 (+79,000원)"},
+        ]
+
+        result = self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+
+        self.assertEqual(result["status"], "needs_manual_review")
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.assertIn("수량 후보", item["error_message"])
+        self.assertFalse(json.loads(item["supplier_payload_json"]))
+
+    def test_cafe24_mapping_preview_uses_sample_order_without_dispatch(self):
+        order_payload = self._order_payload()
+        order_payload["items"][0]["options"] = [
+            {"name": "계정", "value": "instamart_official"},
+            {"name": "팔로워 수", "value": "500명 (+79,000원)"},
+        ]
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+        item_id = self.conn.execute("SELECT id FROM cafe24_order_items").fetchone()["id"]
+
+        preview = self.store.preview_cafe24_mapping(
+            {
+                "sampleOrderItemId": item_id,
+                "supplierId": "supplier_test",
+                "supplierServiceId": "supplier_service_test",
+                "fieldMappingJson": json.dumps(
+                    {
+                        "targetValue": "option:계정",
+                        "orderedCount": {
+                            "source": "option",
+                            "label": "팔로워 수",
+                            "extract": "quantity_number",
+                            "fallback": "item.quantity",
+                            "ambiguityPolicy": "needs_manual_review",
+                        },
+                    }
+                ),
+            }
+        )
+
+        self.assertTrue(preview["ok"])
+        self.assertEqual(preview["normalizedFields"]["orderedCount"], "500")
+        self.assertEqual(preview["supplierPayload"]["quantity"], "500")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM supplier_orders").fetchone()[0], 0)
+
     def test_ready_cafe24_item_can_be_manually_dispatched_once(self):
         order_payload = self._order_payload()
         self.store._process_cafe24_item(
