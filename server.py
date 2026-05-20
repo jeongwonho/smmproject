@@ -1690,6 +1690,10 @@ class AppHandler(SimpleHTTPRequestHandler):
     def _post_admin_cafe24_mappings(self, request: RouteRequest) -> None:
         self._write_store_result("save_cafe24_product_mapping", request.payload)
 
+    @route("POST", "/api/admin/cafe24/mappings/preview", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_mappings_preview(self, request: RouteRequest) -> None:
+        self._write_store_result("preview_cafe24_mapping", request.payload)
+
     @route("POST", "/api/admin/cafe24/mappings/delete", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
     def _post_admin_cafe24_mappings_delete(self, request: RouteRequest) -> None:
         self._write_store_result("delete_cafe24_product_mapping", request.payload)

@@ -30,6 +30,35 @@ function escapeOptionText(value) {
   }[char]));
 }
 
+function buildCafe24FieldMappingJson(formData) {
+  const raw = String(formData.get("fieldMappingJson") || "").trim();
+  let mapping = {};
+  if (raw) {
+    try {
+      mapping = JSON.parse(raw);
+    } catch (error) {
+      throw new Error("필드 매핑 JSON 형식이 올바르지 않습니다.");
+    }
+  }
+  const mode = String(formData.get("quantityMappingMode") || "optionQuantity");
+  if (mode === "optionQuantity") {
+    mapping.orderedCount = {
+      source: "option",
+      label: String(formData.get("quantityOptionLabel") || "팔로워 수").trim(),
+      extract: "quantity_number",
+      fallback: "item.quantity",
+      ambiguityPolicy: "needs_manual_review",
+    };
+  } else if (mode === "itemQuantity") {
+    mapping.orderedCount = "quantity";
+  } else if (mode === "fixed") {
+    const value = String(formData.get("quantityFixedValue") || "").trim();
+    if (!value) throw new Error("고정 수량을 입력해 주세요.");
+    mapping.orderedCount = { source: "fixed", value };
+  }
+  return JSON.stringify(mapping);
+}
+
 function applyCafe24ProductToMapping(button) {
   const mappingForm = document.querySelector("[data-admin-cafe24-mapping-form]");
   if (!mappingForm) return false;
@@ -250,6 +279,34 @@ export async function handleCafe24AdminClick(closest) {
     return true;
   }
 
+  const cafe24MappingPreviewButton = closest("[data-admin-cafe24-mapping-preview]");
+  if (cafe24MappingPreviewButton) {
+    const form = cafe24MappingPreviewButton.closest("[data-admin-cafe24-mapping-form]");
+    const formData = form ? new FormData(form) : new FormData();
+    try {
+      const result = await apiPost("/api/admin/cafe24/mappings/preview", {
+        mallId: formData.get("mallId"),
+        shopNo: formData.get("shopNo"),
+        cafe24ProductNo: formData.get("cafe24ProductNo"),
+        cafe24VariantCode: formData.get("cafe24VariantCode"),
+        cafe24CustomProductCode: formData.get("cafe24CustomProductCode"),
+        internalProductId: formData.get("internalProductId"),
+        supplierId: formData.get("supplierId"),
+        supplierServiceId: formData.get("supplierServiceId"),
+        supplierProductUuid: formData.get("supplierProductUuid"),
+        supplierProductCode: formData.get("supplierProductCode"),
+        fieldMappingJson: buildCafe24FieldMappingJson(formData),
+        sampleOrderItemId: formData.get("sampleOrderItemId"),
+      });
+      state.adminCafe24MappingPreview = result;
+      showToast(result.ok ? "Cafe24 매핑 payload를 확인했습니다." : "Cafe24 매핑 검증이 필요합니다.", result.ok ? "success" : "error");
+      renderRoute();
+    } catch (error) {
+      showToast(error.message || "Cafe24 매핑 미리보기에 실패했습니다.", "error");
+    }
+    return true;
+  }
+
   const cafe24RetryButton = closest("[data-admin-cafe24-retry-item]");
   if (cafe24RetryButton) {
     const itemId = cafe24RetryButton.getAttribute("data-admin-cafe24-retry-item") || "";
@@ -370,7 +427,7 @@ export async function handleCafe24AdminSubmit(form, event) {
         supplierServiceId: formData.get("supplierServiceId"),
         supplierProductUuid: formData.get("supplierProductUuid"),
         supplierProductCode: formData.get("supplierProductCode"),
-        fieldMappingJson: formData.get("fieldMappingJson"),
+        fieldMappingJson: buildCafe24FieldMappingJson(formData),
         autoDispatchEnabled: Boolean(formData.get("autoDispatchEnabled")),
         enabled: true,
       });

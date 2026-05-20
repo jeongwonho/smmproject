@@ -9491,6 +9491,162 @@ class PanelStore(PanelStoreDatabaseMixin):
             ).fetchone()
         return {"mapping": self._cafe24_mapping_payload(row)}
 
+    def preview_cafe24_mapping(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        field_mapping_raw = payload.get("fieldMappingJson")
+        field_mapping = parse_json(str(field_mapping_raw or "{}"), {}) if isinstance(field_mapping_raw, str) else payload.get("fieldMapping") or {}
+        sample_item_id = str(payload.get("sampleOrderItemId") or payload.get("itemId") or "").strip()
+        internal_product_id = str(payload.get("internalProductId") or "").strip()
+        supplier_id = str(payload.get("supplierId") or "").strip()
+        supplier_service_id = str(payload.get("supplierServiceId") or "").strip()
+        supplier_product_uuid = sanitize_external_order_reference(payload.get("supplierProductUuid"))
+        supplier_product_code = sanitize_external_order_reference(payload.get("supplierProductCode"))
+
+        errors: List[str] = []
+        normalized_fields: Dict[str, Any] = {}
+        supplier_payload: Dict[str, Any] = {}
+        raw_payload: Dict[str, Any] = {}
+        order_payload: Dict[str, Any] = {}
+        item_payload: Dict[str, Any] = {}
+        buyer: Dict[str, Any] = {}
+        receiver: Dict[str, Any] = {}
+        product: Optional[Dict[str, Any]] = None
+        mapping: Dict[str, Any] = {
+            "id": "preview",
+            "internal_product_id": internal_product_id,
+            "supplier_id": supplier_id,
+            "supplier_service_id": supplier_service_id,
+            "supplier_external_service_id": supplier_product_uuid or supplier_product_code,
+            "supplier_product_uuid": supplier_product_uuid,
+            "supplier_product_code": supplier_product_code,
+            "field_mapping_json": as_json(field_mapping),
+            "supplier_min_amount": 0,
+            "supplier_max_amount": 0,
+            "supplier_service_raw_json": "{}",
+        }
+
+        with self._connect() as conn:
+            if sample_item_id:
+                sample = conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (sample_item_id,)).fetchone()
+                if sample is None:
+                    raise PanelError("샘플 Cafe24 주문상품을 찾을 수 없습니다.", status=404)
+                raw_payload = parse_json(sample["raw_payload_json"], {})
+                order_payload = raw_payload.get("order") if isinstance(raw_payload.get("order"), dict) else {}
+                item_payload = raw_payload.get("item") if isinstance(raw_payload.get("item"), dict) else {}
+                buyer = raw_payload.get("buyer") if isinstance(raw_payload.get("buyer"), dict) else {}
+                receiver = raw_payload.get("receiver") if isinstance(raw_payload.get("receiver"), dict) else {}
+            else:
+                raw_payload = payload.get("rawPayload") if isinstance(payload.get("rawPayload"), dict) else {}
+                order_payload = raw_payload.get("order") if isinstance(raw_payload.get("order"), dict) else {}
+                item_payload = raw_payload.get("item") if isinstance(raw_payload.get("item"), dict) else {
+                    "product_no": payload.get("cafe24ProductNo"),
+                    "variant_code": payload.get("cafe24VariantCode"),
+                    "custom_product_code": payload.get("cafe24CustomProductCode"),
+                }
+                buyer = raw_payload.get("buyer") if isinstance(raw_payload.get("buyer"), dict) else {}
+                receiver = raw_payload.get("receiver") if isinstance(raw_payload.get("receiver"), dict) else {}
+
+            if supplier_id:
+                supplier = conn.execute("SELECT * FROM suppliers WHERE id = ?", (supplier_id,)).fetchone()
+                if supplier is None:
+                    errors.append("공급사를 찾을 수 없습니다.")
+                else:
+                    mapping.update(
+                        {
+                            "api_url": supplier["api_url"],
+                            "integration_type": supplier["integration_type"],
+                            "api_key": supplier["api_key"],
+                            "bearer_token": supplier["bearer_token"],
+                            "supplier_name": supplier["name"],
+                            "supplier_is_active": supplier["is_active"],
+                        }
+                    )
+            if supplier_service_id:
+                supplier_service = conn.execute("SELECT * FROM supplier_services WHERE id = ?", (supplier_service_id,)).fetchone()
+                if supplier_service is None:
+                    errors.append("공급사 서비스를 찾을 수 없습니다.")
+                else:
+                    mapping.update(
+                        {
+                            "supplier_service_id": supplier_service["id"],
+                            "supplier_external_service_id": supplier_service["external_service_id"],
+                            "supplier_product_uuid": supplier_product_uuid or supplier_service["external_service_id"],
+                            "supplier_service_name": supplier_service["name"],
+                            "supplier_service_raw_json": supplier_service["raw_json"] or "{}",
+                            "supplier_min_amount": supplier_service["min_amount"],
+                            "supplier_max_amount": supplier_service["max_amount"],
+                        }
+                    )
+            if internal_product_id:
+                product_row = conn.execute(
+                    """
+                    SELECT
+                        p.*,
+                        pc.id AS category_id,
+                        pc.name AS category_name,
+                        pg.platform_section_id,
+                        ps.slug AS platform_slug,
+                        ps.accent_color AS accent_color
+                    FROM products p
+                    JOIN product_categories pc ON pc.id = p.product_category_id
+                    JOIN platform_groups pg ON pg.id = pc.platform_group_id
+                    JOIN platform_sections ps ON ps.id = pg.platform_section_id
+                    WHERE p.id = ?
+                    """,
+                    (internal_product_id,),
+                ).fetchone()
+                if product_row is None:
+                    errors.append("내부 상품을 찾을 수 없습니다.")
+                else:
+                    product = dict(product_row)
+
+        option_entries = self._cafe24_option_entries(order_payload, item_payload)
+        quantity_candidates = self._cafe24_quantity_candidates_from_options(option_entries)
+        try:
+            if product is not None:
+                normalized_fields = self._normalize_cafe24_item_fields(
+                    product=product,
+                    mapping=mapping,
+                    order_payload=order_payload,
+                    item_payload=item_payload,
+                    buyer=buyer,
+                    receiver=receiver,
+                )
+                form_structure = ensure_request_memo_form_structure(parse_json(product["form_structure_json"], {}), "추가 요청사항")
+                self._validate_fields(normalized_fields, form_structure.get("schema", {}))
+            else:
+                normalized_fields = self._normalize_cafe24_direct_item_fields(
+                    mapping=mapping,
+                    order_payload=order_payload,
+                    item_payload=item_payload,
+                    buyer=buyer,
+                    receiver=receiver,
+                )
+                self._validate_cafe24_direct_fields(normalized_fields, mapping)
+            if supplier_id:
+                supplier_payload = self._build_supplier_order_payload(
+                    product
+                    or {
+                        "product_code": "",
+                        "platform_slug": "",
+                        "price_strategy": "unit",
+                    },
+                    normalized_fields,
+                    mapping,
+                )
+        except PanelError as exc:
+            errors.append(str(exc))
+
+        return {
+            "ok": not errors,
+            "errors": errors,
+            "normalizedFields": normalized_fields,
+            "supplierPayload": supplier_payload,
+            "optionEntries": option_entries,
+            "quantityCandidates": quantity_candidates,
+            "fieldMapping": field_mapping,
+            "sampleOrderItemId": sample_item_id,
+        }
+
     def delete_cafe24_product_mapping(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         mapping_id = str(payload.get("mappingId") or payload.get("id") or "").strip()
         actor = self._admin_actor(payload)
@@ -10041,27 +10197,27 @@ class PanelStore(PanelStoreDatabaseMixin):
             or cafe24_payload_value(order_payload, ("order_status", "status", "order_status_code")),
         }
 
-    def _cafe24_option_pairs(self, order_payload: Dict[str, Any], item_payload: Dict[str, Any]) -> Dict[str, str]:
-        pairs: Dict[str, str] = {}
+    def _cafe24_option_entries(self, order_payload: Dict[str, Any], item_payload: Dict[str, Any]) -> List[Dict[str, str]]:
+        entries: List[Dict[str, str]] = []
 
-        def add_pair(label: Any, value: Any) -> None:
+        def add_entry(label: Any, value: Any, source: str) -> None:
             key = str(label or "").strip()
             text = str(value or "").strip()
             if key and text:
-                pairs[key] = text
+                entries.append({"label": key, "value": text, "source": source})
 
-        def consume(value: Any, prefix: str = "") -> None:
+        def consume(value: Any, prefix: str = "", source: str = "") -> None:
             if isinstance(value, dict):
                 label = value.get("name") or value.get("option_name") or value.get("label") or value.get("key")
                 text = value.get("value") or value.get("option_value") or value.get("text") or value.get("input_value")
                 if label or text:
-                    add_pair(label or prefix or "option", text)
+                    add_entry(label or prefix or "option", text, source or prefix or "option")
                 for nested_key, nested_value in value.items():
                     if isinstance(nested_value, (dict, list)):
-                        consume(nested_value, str(nested_key))
+                        consume(nested_value, str(nested_key), f"{source}.{nested_key}" if source else str(nested_key))
             elif isinstance(value, list):
                 for item in value:
-                    consume(item, prefix)
+                    consume(item, prefix, source or prefix)
             elif isinstance(value, str):
                 for part in re.split(r"[\n\r,|/]+", value):
                     cleaned = part.strip()
@@ -10069,12 +10225,12 @@ class PanelStore(PanelStoreDatabaseMixin):
                         continue
                     if ":" in cleaned:
                         left, right = cleaned.split(":", 1)
-                        add_pair(left, right)
+                        add_entry(left, right, source or prefix or "option")
                     elif "=" in cleaned:
                         left, right = cleaned.split("=", 1)
-                        add_pair(left, right)
+                        add_entry(left, right, source or prefix or "option")
                     else:
-                        add_pair(prefix or "option", cleaned)
+                        add_entry(prefix or "option", cleaned, source or prefix or "option")
 
         for key in (
             "options",
@@ -10082,25 +10238,187 @@ class PanelStore(PanelStoreDatabaseMixin):
             "option_value",
             "option_value_default",
             "option_text",
+            "selected_options",
+            "variant_option",
+            "variant_options",
             "additional_option_values",
             "additional_options",
             "input_options",
             "custom_options",
         ):
-            consume(item_payload.get(key), key)
-        consume(order_payload.get("memo"), "orderMemo")
+            consume(item_payload.get(key), key, f"item.{key}")
+        consume(order_payload.get("memo"), "orderMemo", "order.memo")
+        return entries
+
+    def _cafe24_option_pairs(self, order_payload: Dict[str, Any], item_payload: Dict[str, Any]) -> Dict[str, str]:
+        pairs: Dict[str, str] = {}
+        for entry in self._cafe24_option_entries(order_payload, item_payload):
+            pairs[entry["label"]] = entry["value"]
         return pairs
+
+    @staticmethod
+    def _cafe24_quantity_candidates_from_text(text: Any, *, label: str = "", source: str = "") -> List[Dict[str, Any]]:
+        raw_text = str(text or "").strip()
+        if not raw_text:
+            return []
+        cleaned = re.sub(r"\([^)]*[+-]?\s*\d[\d,]*(?:\.\d+)?\s*원[^)]*\)", " ", raw_text)
+        cleaned = re.sub(r"[+-]\s*\d[\d,]*(?:\.\d+)?\s*원", " ", cleaned)
+        candidates: List[Dict[str, Any]] = []
+
+        def add(value: float, raw: str, unit: str) -> None:
+            parsed = int(value)
+            if parsed > 0:
+                candidates.append({"value": parsed, "raw": raw.strip(), "unit": unit, "label": label, "source": source})
+
+        for match in re.finditer(r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*([kK])\b", cleaned):
+            add(float(match.group(1)) * 1000, match.group(0), match.group(2))
+
+        quantity_units = "명|개|회|건|뷰|팔로워|팔로워수|조회|조회수|좋아요|구독|구독자|댓글|저장|유입"
+        for match in re.finditer(rf"(?<![A-Za-z0-9])(\d[\d,]*(?:\.\d+)?)\s*({quantity_units})", cleaned, re.IGNORECASE):
+            add(float(match.group(1).replace(",", "")), match.group(0), match.group(2))
+
+        label_has_quantity_hint = any(
+            token in str(label or "").lower()
+            for token in ("수량", "팔로워", "조회", "좋아요", "구독", "댓글", "저장", "유입", "quantity", "count")
+        )
+        if label_has_quantity_hint and not candidates:
+            numeric = re.fullmatch(r"\s*(\d[\d,]*(?:\.\d+)?)\s*", cleaned)
+            if numeric:
+                add(float(numeric.group(1).replace(",", "")), numeric.group(0), "")
+        deduped: Dict[int, Dict[str, Any]] = {}
+        for candidate in candidates:
+            deduped.setdefault(int(candidate["value"]), candidate)
+        return list(deduped.values())
+
+    def _cafe24_quantity_candidates_from_options(
+        self,
+        option_entries: List[Dict[str, str]],
+        *,
+        label: str = "",
+    ) -> List[Dict[str, Any]]:
+        needle = str(label or "").strip().lower()
+        matches = [
+            entry
+            for entry in option_entries
+            if not needle or needle in str(entry.get("label") or "").lower()
+        ]
+        candidates: List[Dict[str, Any]] = []
+        for entry in matches:
+            candidates.extend(
+                self._cafe24_quantity_candidates_from_text(
+                    entry.get("value"),
+                    label=str(entry.get("label") or ""),
+                    source=str(entry.get("source") or ""),
+                )
+            )
+        if needle and not candidates:
+            for entry in option_entries:
+                candidates.extend(
+                    self._cafe24_quantity_candidates_from_text(
+                        entry.get("value"),
+                        label=str(entry.get("label") or ""),
+                        source=str(entry.get("source") or ""),
+                    )
+                )
+        deduped: Dict[int, Dict[str, Any]] = {}
+        for candidate in candidates:
+            deduped.setdefault(int(candidate["value"]), candidate)
+        return list(deduped.values())
+
+    def _resolve_cafe24_quantity_candidates(
+        self,
+        candidates: List[Dict[str, Any]],
+        *,
+        ambiguity_policy: str = "needs_manual_review",
+    ) -> str:
+        unique = sorted({int(candidate["value"]) for candidate in candidates if int(candidate.get("value") or 0) > 0})
+        if not unique:
+            return ""
+        if len(unique) == 1:
+            return str(unique[0])
+        policy = str(ambiguity_policy or "needs_manual_review").strip()
+        if policy in {"largest", "max"}:
+            return str(max(unique))
+        if policy in {"first", "first_match"}:
+            return str(int(candidates[0]["value"]))
+        labels = ", ".join(str(value) for value in unique)
+        raise PanelError(f"Cafe24 옵션 수량 후보가 여러 개입니다({labels}). 관리자 검수가 필요합니다.")
+
+    def _coerce_cafe24_ordered_count_mapping_value(self, value: Any, *, label: str = "", source: str = "") -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if re.fullmatch(r"\d[\d,]*", text):
+            return str(int(text.replace(",", "")))
+        candidates = self._cafe24_quantity_candidates_from_text(text, label=label, source=source)
+        if candidates:
+            return self._resolve_cafe24_quantity_candidates(candidates)
+        return text
 
     def _resolve_cafe24_mapping_source(
         self,
         source: Any,
         *,
+        field_key: str = "",
         order_payload: Dict[str, Any],
         item_payload: Dict[str, Any],
         buyer: Dict[str, Any],
         receiver: Dict[str, Any],
         option_pairs: Dict[str, str],
+        option_entries: Optional[List[Dict[str, str]]] = None,
     ) -> str:
+        option_entries = option_entries if option_entries is not None else self._cafe24_option_entries(order_payload, item_payload)
+        if isinstance(source, dict):
+            source_type = str(source.get("source") or source.get("type") or "").strip()
+            extract = str(source.get("extract") or "").strip()
+            fallback = source.get("fallback")
+            value = ""
+            if source_type == "fixed":
+                value = str(source.get("value") if source.get("value") is not None else source.get("defaultValue") or "").strip()
+            elif source_type == "item":
+                field = str(source.get("field") or source.get("path") or "").strip()
+                value = cafe24_payload_value(item_payload, (field,)) if field else ""
+            elif source_type == "order":
+                field = str(source.get("field") or source.get("path") or "").strip()
+                value = cafe24_payload_value(order_payload, (field,)) if field else ""
+            elif source_type == "buyer":
+                field = str(source.get("field") or source.get("path") or "").strip()
+                value = cafe24_payload_value(buyer, (field,)) if field else ""
+            elif source_type == "receiver":
+                field = str(source.get("field") or source.get("path") or "").strip()
+                value = cafe24_payload_value(receiver, (field,)) if field else ""
+            elif source_type == "option":
+                label = str(source.get("label") or source.get("optionLabel") or source.get("name") or source.get("contains") or "").strip()
+                if extract == "quantity_number":
+                    candidates = self._cafe24_quantity_candidates_from_options(option_entries, label=label)
+                    value = self._resolve_cafe24_quantity_candidates(
+                        candidates,
+                        ambiguity_policy=str(source.get("ambiguityPolicy") or "needs_manual_review"),
+                    )
+                else:
+                    lowered = label.lower()
+                    value = next(
+                        (
+                            str(entry.get("value") or "").strip()
+                            for entry in option_entries
+                            if not lowered or lowered in str(entry.get("label") or "").lower()
+                        ),
+                        "",
+                    )
+            if value:
+                return str(value).strip()
+            if fallback:
+                return self._resolve_cafe24_mapping_source(
+                    fallback,
+                    field_key=field_key,
+                    order_payload=order_payload,
+                    item_payload=item_payload,
+                    buyer=buyer,
+                    receiver=receiver,
+                    option_pairs=option_pairs,
+                    option_entries=option_entries,
+                )
+            return ""
         sources = source if isinstance(source, list) else [source]
         for spec in sources:
             text = str(spec or "").strip()
@@ -10122,6 +10440,8 @@ class PanelStore(PanelStoreDatabaseMixin):
             else:
                 value = option_pairs.get(text, "")
             if value:
+                if field_key == "orderedCount":
+                    return self._coerce_cafe24_ordered_count_mapping_value(value, label=text, source=text)
                 return str(value).strip()
         return ""
 
@@ -10196,6 +10516,7 @@ class PanelStore(PanelStoreDatabaseMixin):
         template = form_structure.get("template", {})
         schema = form_structure.get("schema", {})
         field_mapping = parse_json(mapping["field_mapping_json"], {})
+        option_entries = self._cafe24_option_entries(order_payload, item_payload)
         option_pairs = self._cafe24_option_pairs(order_payload, item_payload)
         option_blob = " ".join(option_pairs.values())
         first_url_match = re.search(r"https?://[^\s,|]+", option_blob)
@@ -10210,11 +10531,13 @@ class PanelStore(PanelStoreDatabaseMixin):
         for field_key in template.keys() | schema.keys():
             mapped_value = self._resolve_cafe24_mapping_source(
                 field_mapping.get(field_key),
+                field_key=field_key,
                 order_payload=order_payload,
                 item_payload=item_payload,
                 buyer=buyer,
                 receiver=receiver,
                 option_pairs=option_pairs,
+                option_entries=option_entries,
             )
             if mapped_value:
                 fields[field_key] = mapped_value
@@ -10281,6 +10604,7 @@ class PanelStore(PanelStoreDatabaseMixin):
         receiver: Dict[str, Any],
     ) -> Dict[str, Any]:
         field_mapping = parse_json(mapping.get("field_mapping_json"), {})
+        option_entries = self._cafe24_option_entries(order_payload, item_payload)
         option_pairs = self._cafe24_option_pairs(order_payload, item_payload)
         option_blob = " ".join(option_pairs.values())
         first_url_match = re.search(r"https?://[^\s,|]+", option_blob)
@@ -10311,11 +10635,13 @@ class PanelStore(PanelStoreDatabaseMixin):
         for field_key in field_keys:
             mapped_value = self._resolve_cafe24_mapping_source(
                 field_mapping.get(field_key),
+                field_key=field_key,
                 order_payload=order_payload,
                 item_payload=item_payload,
                 buyer=buyer,
                 receiver=receiver,
                 option_pairs=option_pairs,
+                option_entries=option_entries,
             )
             if mapped_value:
                 fields[field_key] = mapped_value
@@ -10365,6 +10691,8 @@ class PanelStore(PanelStoreDatabaseMixin):
 
     def _cafe24_processing_error_status(self, exc: Exception) -> str:
         message = str(exc)
+        if "후보" in message or "검수" in message:
+            return "needs_manual_review"
         if "수량" in message and "범위" not in message and "최소" not in message and "최대" not in message:
             return "invalid_quantity"
         if "최소" in message or "최대" in message or "범위" in message:

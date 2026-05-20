@@ -2092,6 +2092,12 @@ function renderCafe24QuickControls(activeIntegration = {}) {
 }
 
 function renderCafe24MappingPanel(activeIntegration = {}, products = [], suppliers = [], cafe24SupplierServices = [], selectedCafe24SupplierId = "", mappings = []) {
+  const lookupDetail = state.adminCafe24ProductLookup?.detail || {};
+  const optionLabels = Array.from(new Set((lookupDetail.options || []).map((option) => option.name).filter(Boolean)));
+  const quantityLabel = optionLabels.find((label) => /팔로워|조회|좋아요|구독|수량|유입|댓글|저장/.test(label)) || optionLabels[0] || "팔로워 수";
+  const sampleItems = (state.adminCafe24OrderList?.items || state.adminBootstrap?.cafe24OrderItems || []).slice(0, 30);
+  const sampleOptions = sampleItems.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.orderId || "-")} · ${escapeHtml(item.productNo || "-")} · ${escapeHtml(item.productName || item.buyerName || "")}</option>`).join("");
+  const preview = state.adminCafe24MappingPreview || null;
   return `
     <div class="admin-two-column">
       <form class="admin-panel admin-form" data-admin-cafe24-mapping-form>
@@ -2100,28 +2106,12 @@ function renderCafe24MappingPanel(activeIntegration = {}, products = [], supplie
           <p>Cafe24 상품번호/품목코드를 기존 공급사 서비스에 직접 연결합니다. 내부 상품 참조는 선택값입니다.</p>
         </div>
         <div class="admin-three-column">
-          <label class="form-field">
-            <span class="field-label">상품번호</span>
-            <div class="field-shell"><input class="field-input" name="cafe24ProductNo" placeholder="product_no" /></div>
-          </label>
-          <label class="form-field">
-            <span class="field-label">품목코드</span>
-            <div class="field-shell"><input class="field-input" name="cafe24VariantCode" placeholder="variant_code" /></div>
-          </label>
-          <label class="form-field">
-            <span class="field-label">자체상품코드</span>
-            <div class="field-shell"><input class="field-input" name="cafe24CustomProductCode" placeholder="custom_product_code" /></div>
-          </label>
+          <label class="form-field"><span class="field-label">상품번호</span><div class="field-shell"><input class="field-input" name="cafe24ProductNo" placeholder="product_no" /></div></label>
+          <label class="form-field"><span class="field-label">품목코드</span><div class="field-shell"><input class="field-input" name="cafe24VariantCode" placeholder="variant_code" /></div></label>
+          <label class="form-field"><span class="field-label">자체상품코드</span><div class="field-shell"><input class="field-input" name="cafe24CustomProductCode" placeholder="custom_product_code" /></div></label>
         </div>
         <div class="admin-two-column">
-          <label class="form-field">
-            <span class="field-label">공급사</span>
-            <div class="field-shell">
-              <select class="field-select" name="supplierId" data-admin-cafe24-supplier-select>
-                ${suppliers.map((supplier) => `<option value="${escapeHtml(supplier.id)}" ${supplier.id === selectedCafe24SupplierId ? "selected" : ""}>${escapeHtml(supplier.name)}</option>`).join("")}
-              </select>
-            </div>
-          </label>
+          <label class="form-field"><span class="field-label">공급사</span><div class="field-shell"><select class="field-select" name="supplierId" data-admin-cafe24-supplier-select>${suppliers.map((supplier) => `<option value="${escapeHtml(supplier.id)}" ${supplier.id === selectedCafe24SupplierId ? "selected" : ""}>${escapeHtml(supplier.name)}</option>`).join("")}</select></div></label>
           <label class="form-field">
             <span class="field-label">공급사 서비스</span>
             <div class="field-shell">
@@ -2132,15 +2122,17 @@ function renderCafe24MappingPanel(activeIntegration = {}, products = [], supplie
             </div>
           </label>
         </div>
-        <label class="form-field">
-          <span class="field-label">내부 상품 참조(선택)</span>
-          <div class="field-shell">
-            <select class="field-select" name="internalProductId">
-              <option value="">내부 상품 없이 공급사 서비스 직접 연결</option>
-              ${products.map((product) => `<option value="${escapeHtml(product.id)}">${escapeHtml(product.name)} · ${escapeHtml(product.optionName || "")}</option>`).join("")}
-            </select>
+        <label class="form-field"><span class="field-label">내부 상품 참조(선택)</span><div class="field-shell"><select class="field-select" name="internalProductId"><option value="">내부 상품 없이 공급사 서비스 직접 연결</option>${products.map((product) => `<option value="${escapeHtml(product.id)}">${escapeHtml(product.name)} · ${escapeHtml(product.optionName || "")}</option>`).join("")}</select></div></label>
+        <details class="admin-disclosure" open>
+          <summary>주문 옵션 수량 매핑</summary>
+          <p class="admin-inline-note">선택 옵션값(예: 250명)을 공급사 주문 수량으로 보내며, 후보가 여러 개면 검수 필요 상태로 둡니다.</p>
+          <div class="admin-three-column">
+            <label class="form-field"><span class="field-label">수량 source</span><div class="field-shell"><select class="field-select" name="quantityMappingMode"><option value="optionQuantity" selected>옵션 라벨에서 숫자 추출</option><option value="itemQuantity">Cafe24 상품 수량 사용</option><option value="fixed">고정 수량</option><option value="json">직접 JSON만 사용</option></select></div></label>
+            <label class="form-field"><span class="field-label">옵션 라벨</span><div class="field-shell"><input class="field-input" name="quantityOptionLabel" value="${escapeHtml(quantityLabel)}" list="cafe24-quantity-option-labels" placeholder="예: 팔로워 수" /><datalist id="cafe24-quantity-option-labels">${optionLabels.map((label) => `<option value="${escapeHtml(label)}"></option>`).join("")}</datalist></div></label>
+            <label class="form-field"><span class="field-label">고정 수량</span><div class="field-shell"><input class="field-input" name="quantityFixedValue" inputmode="numeric" placeholder="예: 250" /></div></label>
           </div>
-        </label>
+          <label class="form-field"><span class="field-label">샘플 주문상품</span><div class="field-shell"><select class="field-select" name="sampleOrderItemId"><option value="">샘플 없이 설정 저장</option>${sampleOptions}</select></div></label>
+        </details>
         <details class="admin-disclosure">
           <summary>보조 코드/필드 매핑 설정</summary>
           <div class="admin-two-column">
@@ -2156,14 +2148,17 @@ function renderCafe24MappingPanel(activeIntegration = {}, products = [], supplie
           <label class="form-field">
             <span class="field-label">필드 매핑 JSON</span>
             <div class="field-shell">
-              <textarea class="field-textarea" name="fieldMappingJson" rows="5" placeholder='{"targetUrl":"option:SNS 링크","orderedCount":"quantity"}'></textarea>
+              <textarea class="field-textarea" name="fieldMappingJson" rows="5" placeholder='{"targetUrl":"option:SNS 링크"}'></textarea>
             </div>
           </label>
         </details>
         <label class="admin-toggle"><input type="checkbox" name="autoDispatchEnabled" /><span>이 매핑은 자동 발주 허용(현재 운영 기본값은 OFF)</span></label>
         <input type="hidden" name="mallId" value="${escapeHtml(activeIntegration.mallId || "")}" />
         <input type="hidden" name="shopNo" value="${escapeHtml(String(activeIntegration.shopNo || 1))}" />
-        <button class="admin-primary-button" type="submit" ${activeIntegration.mallId ? "" : "disabled"}>매핑 저장</button>
+        <div class="admin-action-row">
+          <button class="admin-secondary-button" type="button" data-admin-cafe24-mapping-preview ${activeIntegration.mallId ? "" : "disabled"}>payload 미리보기</button>
+          <button class="admin-primary-button" type="submit" ${activeIntegration.mallId ? "" : "disabled"}>매핑 저장</button>
+        </div>
       </form>
 
       <div class="admin-panel">
@@ -2187,6 +2182,7 @@ function renderCafe24MappingPanel(activeIntegration = {}, products = [], supplie
             </tbody>
           </table>
         </div>
+        ${preview ? `<div class="admin-card admin-subcard"><div class="admin-subcard__head"><strong>최근 payload 미리보기</strong><span class="admin-badge ${preview.ok ? "is-success" : "is-error"}">${preview.ok ? "검증 통과" : "검증 필요"}</span></div>${preview.errors?.length ? `<p class="admin-inline-note">${preview.errors.map((error) => escapeHtml(error)).join("<br />")}</p>` : ""}<div class="admin-two-column"><label class="form-field"><span class="field-label">정규화 필드</span><textarea class="field-textarea" rows="8" readonly>${escapeHtml(JSON.stringify(preview.normalizedFields || {}, null, 2))}</textarea></label><label class="form-field"><span class="field-label">공급사 payload</span><textarea class="field-textarea" rows="8" readonly>${escapeHtml(JSON.stringify(preview.supplierPayload || {}, null, 2))}</textarea></label></div><p class="admin-inline-note">수량 후보: ${escapeHtml((preview.quantityCandidates || []).map((candidate) => `${candidate.value}(${candidate.label || candidate.raw})`).join(", ") || "없음")}</p></div>` : ""}
       </div>
     </div>
   `;
