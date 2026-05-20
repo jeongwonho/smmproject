@@ -592,6 +592,9 @@ function handleAdminInput(event, ctx) {
       if (target.value !== "mkt24") {
         state.adminSupplierDraft.bearerToken = "";
       }
+      if (target.value === "fasttraffic" && !String(state.adminSupplierDraft.apiUrl || "").trim()) {
+        state.adminSupplierDraft.apiUrl = "https://fastraffic.co.kr/nblog_api.php";
+      }
       renderRoute();
     }
     return true;

@@ -3701,9 +3701,11 @@ function renderSupplierAdminSection({
   const visibleServices = filteredServices.slice(0, 160);
   const savedSecretSummary = integrationType === "mkt24"
     ? `API Key ${draft.hasApiKey ? draft.apiKeyMasked || "설정됨" : "미설정"} · /v3/panel 방식은 Bearer Token을 사용하지 않음`
-    : draft.hasApiKey
-      ? draft.apiKeyMasked || "설정됨"
-      : "미설정";
+    : integrationType === "fasttraffic"
+      ? `FastTraffic API Key ${draft.hasApiKey ? draft.apiKeyMasked || "설정됨" : "미설정"} · X-Api-Key 헤더 방식`
+      : draft.hasApiKey
+        ? draft.apiKeyMasked || "설정됨"
+        : "미설정";
   const connectionState = activeConnection?.status || activeConnection?.lastTestStatus || "never";
   const syncStatus = activeConnection?.serviceSyncStatus || selectedSupplier?.serviceSyncStatus || "never";
   const inactiveServiceCount = Number(selectedSupplier?.inactiveServiceCount || 0);
@@ -3743,7 +3745,7 @@ function renderSupplierAdminSection({
                           <strong>${escapeHtml(supplier.name)}</strong>
                           ${renderAdminHealthBadge(supplier.lastTestStatus)}
                         </div>
-                        <p class="admin-inline-note">${escapeHtml(supplier.integrationType === "mkt24" ? "MKT24 API 연동" : "기존 SMM API 연동")}</p>
+                        <p class="admin-inline-note">${escapeHtml(supplier.integrationType === "mkt24" ? "MKT24 API 연동" : supplier.integrationType === "fasttraffic" ? "FastTraffic API 연동" : "기존 SMM API 연동")}</p>
                         <p>${escapeHtml(supplier.apiUrl)}</p>
                         <div class="admin-supplier-card__meta">
                           <span>서비스 ${escapeHtml(String(supplier.serviceCount || 0))}</span>
@@ -3762,7 +3764,7 @@ function renderSupplierAdminSection({
         <section class="admin-card">
           <div class="section-head section-head--compact">
             <h2>${draft.id ? "공급사 수정" : "공급사 등록"}</h2>
-            <p>${escapeHtml(integrationType === "mkt24" ? "MKT24 대행사용 API는 https://api.mkt24.co.kr/v3/panel 엔드포인트를 사용합니다." : "/api, /api/v2 형태를 모두 시도하도록 백엔드에서 자동 보정합니다.")}</p>
+            <p>${escapeHtml(integrationType === "mkt24" ? "MKT24 대행사용 API는 https://api.mkt24.co.kr/v3/panel 엔드포인트를 사용합니다." : integrationType === "fasttraffic" ? "FastTraffic은 https://fastraffic.co.kr/nblog_api.php 엔드포인트와 X-Api-Key 헤더를 사용합니다." : "/api, /api/v2 형태를 모두 시도하도록 백엔드에서 자동 보정합니다.")}</p>
           </div>
           <form class="admin-form" data-admin-supplier-form>
             <label class="form-field">
@@ -3771,6 +3773,7 @@ function renderSupplierAdminSection({
                 <select class="field-select" name="integrationType" data-admin-supplier-field="integrationType">
                   <option value="classic" ${integrationType === "classic" ? "selected" : ""}>기존 SMM API</option>
                   <option value="mkt24" ${integrationType === "mkt24" ? "selected" : ""}>MKT24 API</option>
+                  <option value="fasttraffic" ${integrationType === "fasttraffic" ? "selected" : ""}>FastTraffic API</option>
                 </select>
               </div>
             </label>
@@ -3797,6 +3800,8 @@ function renderSupplierAdminSection({
             </label>
             ${integrationType === "mkt24"
               ? `<p class="admin-inline-note">MKT24 대행사용 API는 기존 API Key만 사용합니다. Bearer Token은 저장하거나 갱신할 필요가 없습니다.</p>`
+              : integrationType === "fasttraffic"
+                ? `<p class="admin-inline-note">FastTraffic은 로그인 계정이 아니라 API 페이지에서 발급한 64자 API Key만 저장합니다. 주문 등록은 분당 제한이 있어 자동 발주 시 throttle을 적용합니다.</p>`
               : ""}
             <p class="admin-inline-note">저장된 시크릿 상태: ${escapeHtml(savedSecretSummary)} · 기존 원문은 브라우저로 다시 내려오지 않습니다.</p>
 

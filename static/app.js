@@ -718,10 +718,14 @@ function supplierToDraft(supplier) {
 }
 
 function supplierApiKeyLabel(integrationType) {
+  if (integrationType === "fasttraffic") return "FastTraffic API Key";
   return integrationType === "mkt24" ? "API Key" : "API Key";
 }
 
 function supplierApiKeyPlaceholder(integrationType, hasId) {
+  if (integrationType === "fasttraffic") {
+    return hasId ? "새 FastTraffic API Key 입력 시에만 변경됩니다." : "FastTraffic API 페이지의 64자 API Key";
+  }
   if (hasId) {
     return integrationType === "mkt24" ? "새 API Key 입력 시에만 변경됩니다." : "새 키 입력 시에만 변경됩니다.";
   }
@@ -729,10 +733,18 @@ function supplierApiKeyPlaceholder(integrationType, hasId) {
 }
 
 function supplierUrlPlaceholder(integrationType) {
+  if (integrationType === "fasttraffic") return "https://fastraffic.co.kr/nblog_api.php";
   return integrationType === "mkt24" ? "https://api.mkt24.co.kr/v3/panel" : "https://example.com/api/v2";
 }
 
 function supplierConnectionGuide(integrationType) {
+  if (integrationType === "fasttraffic") {
+    return {
+      status: "FastTraffic은 POST /nblog_api.php + X-Api-Key 헤더 방식으로 연결합니다.",
+      balance: "연결 확인은 check_balance 응답의 포인트 정보를 기준으로 처리합니다.",
+      dispatch: "서비스 목록 API가 없어 정적 카탈로그 8개를 동기화하며, 주문은 action별 필수값 검증 후 발주합니다.",
+    };
+  }
   if (integrationType === "mkt24") {
     return {
       status: "MKT24 대행사용 API는 /v3/panel 엔드포인트에 key + action 방식으로 연결합니다.",

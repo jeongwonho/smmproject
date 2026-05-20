@@ -47,6 +47,8 @@ try:
     from .backend.wallet import balance_transaction_kind_to_ledger_entry_type, generate_charge_order_code
     from .backend.integrations.cafe24 import Cafe24ApiClient, Cafe24ApiError
     from .backend.integrations.suppliers import (
+        FASTTRAFFIC_API_URL,
+        SUPPLIER_INTEGRATION_FASTTRAFFIC,
         SupplierApiClient,
         SupplierApiError,
         supplier_error_is_auth_failure,
@@ -75,6 +77,8 @@ except ImportError:  # pragma: no cover - top-level script runtime
     from backend.wallet import balance_transaction_kind_to_ledger_entry_type, generate_charge_order_code
     from backend.integrations.cafe24 import Cafe24ApiClient, Cafe24ApiError
     from backend.integrations.suppliers import (
+        FASTTRAFFIC_API_URL,
+        SUPPLIER_INTEGRATION_FASTTRAFFIC,
         SupplierApiClient,
         SupplierApiError,
         supplier_error_is_auth_failure,
@@ -2477,6 +2481,32 @@ def normalize_mkt24_candidates(raw_api_url: str) -> List[str]:
     return deduped
 
 
+def normalize_fasttraffic_candidates(raw_api_url: str) -> List[str]:
+    candidate = str(raw_api_url or "").strip()
+    if not candidate:
+        return [FASTTRAFFIC_API_URL]
+    if not candidate.startswith(("http://", "https://")):
+        candidate = f"https://{candidate}"
+    candidate = candidate.rstrip("/")
+    parsed = urlparse(candidate)
+    if not parsed.netloc:
+        return [FASTTRAFFIC_API_URL]
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    candidates: List[str] = []
+    if parsed.netloc.endswith("fastraffic.co.kr"):
+        candidates.append(f"{origin}/nblog_api.php")
+    if parsed.path.rstrip("/").endswith("/nblog_api.php"):
+        candidates.append(candidate)
+    candidates.append(FASTTRAFFIC_API_URL)
+
+    deduped: List[str] = []
+    for item in candidates:
+        normalized = item.rstrip("/")
+        if normalized and normalized not in deduped:
+            deduped.append(normalized)
+    return deduped
+
+
 def looks_like_uuid(value: Any) -> bool:
     return bool(UUID_LIKE_RE.match(str(value or "").strip()))
 
@@ -2485,11 +2515,17 @@ def normalize_supplier_api_candidates(integration_type: str, raw_api_url: str) -
     normalized_type = normalize_supplier_integration_type(integration_type)
     if normalized_type == SUPPLIER_INTEGRATION_MKT24:
         return normalize_mkt24_candidates(raw_api_url)
+    if normalized_type == SUPPLIER_INTEGRATION_FASTTRAFFIC:
+        return normalize_fasttraffic_candidates(raw_api_url)
     return normalize_api_candidates(raw_api_url)
 
 
 def normalize_supplier_services_payload(integration_type: str, payload: Any) -> List[Dict[str, Any]]:
     normalized_type = normalize_supplier_integration_type(integration_type)
+    if normalized_type == SUPPLIER_INTEGRATION_FASTTRAFFIC:
+        if not isinstance(payload, list):
+            raise SupplierApiError("FastTraffic 서비스 카탈로그 형식이 올바르지 않습니다.")
+        return [item for item in payload if isinstance(item, dict)]
     if normalized_type == SUPPLIER_INTEGRATION_MKT24:
         if isinstance(payload, list):
             return [item for item in payload if isinstance(item, dict)]
@@ -2517,6 +2553,23 @@ def normalize_supplier_services_payload(integration_type: str, payload: Any) -> 
 
 def supplier_service_record(integration_type: str, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     normalized_type = normalize_supplier_integration_type(integration_type)
+    if normalized_type == SUPPLIER_INTEGRATION_FASTTRAFFIC:
+        external_service_id = str(item.get("service") or item.get("action") or "").strip()
+        if not external_service_id:
+            return None
+        return {
+            "externalServiceId": external_service_id,
+            "name": str(item.get("name") or f"FastTraffic {external_service_id}").strip(),
+            "category": str(item.get("category") or "FastTraffic").strip(),
+            "type": str(item.get("type") or "").strip(),
+            "rate": safe_float(item.get("rate"), 0.0),
+            "minAmount": int(float(item.get("min") or 0) or 0),
+            "maxAmount": int(float(item.get("max") or 0) or 0),
+            "dripfeed": False,
+            "refill": False,
+            "cancel": False,
+            "rawJson": as_json(item),
+        }
     if normalized_type == SUPPLIER_INTEGRATION_MKT24:
         panel_service_id = str(item.get("service") or item.get("id") or "").strip()
         if panel_service_id:
@@ -2827,9 +2880,30 @@ def supplier_service_request_guide(integration_type: str, service: Dict[str, Any
         notes.append("MKT24 대행사용 /v3/panel 표준 API 기준으로 key + action=add payload를 구성합니다.")
     elif normalized_type == SUPPLIER_INTEGRATION_MKT24:
         notes.append("이 추천은 MKT24 v3 상품 목록 메타데이터 기준 추정값입니다. 실제 발주 API 문서 확인 후 확정하는 것이 안전합니다.")
+    elif normalized_type == SUPPLIER_INTEGRATION_FASTTRAFFIC:
+        notes.append("FastTraffic은 X-Api-Key 헤더와 서비스별 action payload를 사용합니다. API Key는 요청 body에 포함하지 않습니다.")
+        notes.append("등록 API는 분당 제한이 있으므로 자동 발주는 서버에서 throttle과 실패 제한 상태를 확인한 뒤 실행합니다.")
 
     example_payload: Dict[str, Any] = {}
-    if normalized_type == SUPPLIER_INTEGRATION_CLASSIC or panel_like_service:
+    if normalized_type == SUPPLIER_INTEGRATION_FASTTRAFFIC:
+        action = str(service.get("externalServiceId") or raw_payload.get("service") or "").strip()
+        fasttraffic_meta = raw_payload.get("fasttraffic") if isinstance(raw_payload.get("fasttraffic"), dict) else {}
+        example_payload["action"] = action
+        example_payload["service"] = action
+        target_param = str(fasttraffic_meta.get("targetParam") or "target").strip()
+        quantity_param = str(fasttraffic_meta.get("quantityParam") or "count").strip()
+        if "url" in target_param:
+            example_payload[target_param] = supplier_target_placeholder(platform_key, "url").replace("예: ", "")
+        else:
+            example_payload[target_param] = "sample_account"
+        if action in {"nblog_direct", "nclip_direct_c", "ncafe_auto", "ncafe_direct"}:
+            example_payload["title"] = "주문 대상 제목"
+        if action == "nblog_keyword":
+            example_payload["keyword"] = supplier_example_value("googleKeyword")
+        example_payload[quantity_param] = min_amount
+        for key, value in (fasttraffic_meta.get("defaults") if isinstance(fasttraffic_meta.get("defaults"), dict) else {}).items():
+            example_payload.setdefault(str(key), value)
+    elif normalized_type == SUPPLIER_INTEGRATION_CLASSIC or panel_like_service:
         example_payload["service"] = str(service.get("externalServiceId") or "")
         if target_kind == "keyword_url":
             example_payload["link"] = supplier_target_placeholder(platform_key, "url").replace("예: ", "")
@@ -2862,12 +2936,12 @@ def supplier_service_request_guide(integration_type: str, service: Dict[str, Any
             example_payload[field_key] = supplier_example_value(field_key)
 
     return {
-        "confidence": "high" if normalized_type == SUPPLIER_INTEGRATION_CLASSIC or panel_like_service else "medium",
+        "confidence": "high" if normalized_type in {SUPPLIER_INTEGRATION_CLASSIC, SUPPLIER_INTEGRATION_FASTTRAFFIC} or panel_like_service else "medium",
         "notes": notes,
         "formRecommendation": recommendation,
-        "callExampleTitle": "공급사 호출 예시" if normalized_type == SUPPLIER_INTEGRATION_CLASSIC or panel_like_service else "추천 입력 예시",
+        "callExampleTitle": "공급사 호출 예시" if normalized_type in {SUPPLIER_INTEGRATION_CLASSIC, SUPPLIER_INTEGRATION_FASTTRAFFIC} or panel_like_service else "추천 입력 예시",
         "callExamplePayload": example_payload,
-        "callExampleIsEstimated": not (normalized_type == SUPPLIER_INTEGRATION_CLASSIC or panel_like_service),
+        "callExampleIsEstimated": not (normalized_type in {SUPPLIER_INTEGRATION_CLASSIC, SUPPLIER_INTEGRATION_FASTTRAFFIC} or panel_like_service),
     }
 
 
@@ -10193,6 +10267,8 @@ class PanelStore(PanelStoreDatabaseMixin):
             "supplier_service_name": str(mapping.get("supplier_service_name") or ""),
             "supplier_is_active": mapping.get("supplier_is_active"),
             "supplier_service_raw_json": mapping.get("supplier_service_raw_json") or "{}",
+            "supplier_min_amount": mapping.get("supplier_min_amount"),
+            "supplier_max_amount": mapping.get("supplier_max_amount"),
         }
 
     def _normalize_cafe24_direct_item_fields(
@@ -11462,6 +11538,7 @@ class PanelStore(PanelStoreDatabaseMixin):
             if isinstance(response_payload, dict):
                 supplier_external_order_id = str(
                     response_payload.get("order")
+                    or response_payload.get("wr_id")
                     or response_payload.get("id")
                     or response_payload.get("orderUuid")
                     or response_payload.get("order_uuid")
@@ -12074,6 +12151,9 @@ class PanelStore(PanelStoreDatabaseMixin):
         if integration_type == SUPPLIER_INTEGRATION_MKT24:
             candidates = normalize_mkt24_candidates(api_url)
             api_url = candidates[0] if candidates else api_url
+        elif integration_type == SUPPLIER_INTEGRATION_FASTTRAFFIC:
+            candidates = normalize_fasttraffic_candidates(api_url)
+            api_url = candidates[0] if candidates else api_url
 
         timestamp = now_iso()
         with self._connect() as conn:
@@ -12090,6 +12170,10 @@ class PanelStore(PanelStoreDatabaseMixin):
             if integration_type == SUPPLIER_INTEGRATION_MKT24:
                 if not api_key:
                     raise PanelError("MKT24 API Key를 입력해 주세요.")
+                bearer_token = ""
+            elif integration_type == SUPPLIER_INTEGRATION_FASTTRAFFIC:
+                if not api_key:
+                    raise PanelError("FastTraffic API Key를 입력해 주세요.")
                 bearer_token = ""
             else:
                 if not api_key:
@@ -14519,7 +14603,11 @@ class PanelStore(PanelStoreDatabaseMixin):
                     success_message = "서비스 목록 조회가 확인되었습니다. 잔액 API는 제공되지 않습니다."
                 raw_services_payload = client.services()
                 services_payload = normalize_supplier_services_payload(normalized_type, raw_services_payload)
-                persisted_api_url = candidate if normalized_type == SUPPLIER_INTEGRATION_MKT24 else (api_url.strip() or candidate)
+                persisted_api_url = (
+                    candidate
+                    if normalized_type in {SUPPLIER_INTEGRATION_MKT24, SUPPLIER_INTEGRATION_FASTTRAFFIC}
+                    else (api_url.strip() or candidate)
+                )
                 return {
                     "status": "success",
                     "message": success_message,
@@ -15422,6 +15510,7 @@ class PanelStore(PanelStoreDatabaseMixin):
             if isinstance(response_payload, dict):
                 supplier_external_order_id = str(
                     response_payload.get("order")
+                    or response_payload.get("wr_id")
                     or response_payload.get("id")
                     or response_payload.get("orderUuid")
                     or response_payload.get("order_uuid")
@@ -15517,6 +15606,8 @@ class PanelStore(PanelStoreDatabaseMixin):
         mapping: Dict[str, Any],
     ) -> Dict[str, Any]:
         integration_type = normalize_supplier_integration_type(str(mapping.get("integration_type") or ""))
+        if integration_type == SUPPLIER_INTEGRATION_FASTTRAFFIC:
+            return self._build_fasttraffic_supplier_order_payload(product, fields, mapping)
         if integration_type == SUPPLIER_INTEGRATION_MKT24 and not supplier_uses_panel_api(integration_type, str(mapping.get("api_url") or "")):
             return self._build_mkt24_supplier_order_payload(product, fields, mapping)
 
@@ -15579,6 +15670,170 @@ class PanelStore(PanelStoreDatabaseMixin):
             payload["comments"] = request_memo
 
         return payload
+
+    def _build_fasttraffic_supplier_order_payload(
+        self,
+        product: Dict[str, Any],
+        fields: Dict[str, Any],
+        mapping: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        action = str(mapping.get("supplier_external_service_id") or "").strip()
+        if not action:
+            raise PanelError("FastTraffic 서비스 action이 없습니다.")
+
+        raw_service = parse_json(str(mapping.get("supplier_service_raw_json") or ""), {})
+        if not isinstance(raw_service, dict):
+            raw_service = {}
+        fasttraffic_meta = raw_service.get("fasttraffic") if isinstance(raw_service, dict) else {}
+        if not isinstance(fasttraffic_meta, dict):
+            fasttraffic_meta = {}
+
+        payload: Dict[str, Any] = {
+            "service": action,
+            "action": action,
+        }
+        defaults = fasttraffic_meta.get("defaults") if isinstance(fasttraffic_meta.get("defaults"), dict) else {}
+        payload.update(defaults)
+
+        direct_field_keys = {
+            "blog_id",
+            "blog_ids",
+            "blog_url",
+            "cafe_url",
+            "clip_url",
+            "title",
+            "keyword",
+            "private_comment",
+            "work_cycle",
+            "work_speed",
+            "start_date",
+            "end_date",
+            "like_count",
+            "comment_count",
+            "save_count",
+            "scrap_count",
+            "stay_count",
+            "stay_time",
+            "stay_min",
+            "stay_max",
+            "stay_count_min",
+            "stay_count_max",
+            "keyword_inflow",
+            "friend_count",
+            "view_count",
+            "view_min",
+            "view_max",
+            "subscriber_count",
+            "keyword_count",
+            "direct_comments",
+        }
+        for key in direct_field_keys:
+            value = fields.get(key)
+            if value not in (None, ""):
+                payload[key] = value
+
+        target_url = self._first_field_value(fields, ("blog_url", "cafe_url", "clip_url", "targetUrl", "link", "url"))
+        target_value = self._first_field_value(fields, ("blog_id", "blog_ids", "targetValue", "username", "account", "snsValue"))
+        keyword = self._first_field_value(fields, ("keyword", "targetKeyword", "googleKeyword", "google_keyword"))
+        request_memo = self._first_field_value(fields, ("requestMemo", "memo", "comments", "direct_comments"))
+        quantity = self._coerce_positive_int(self._first_field_value(fields, ("orderedCount", "quantity", "count", "qty")))
+        title = self._first_field_value(fields, ("title", "productTitle", "campaignTitle")) or str(
+            product.get("name") or product.get("product_name") or "인스타마트 주문"
+        ).strip()
+
+        if action == "nblog_auto":
+            payload.setdefault("blog_id", target_value.lstrip("@"))
+            if quantity:
+                payload.setdefault("stay_min", max(1, min(quantity, int(payload.get("stay_min") or quantity))))
+                payload["stay_max"] = quantity
+        elif action == "nblog_direct":
+            payload.setdefault("title", title)
+            payload.setdefault("blog_url", normalize_url(target_url) or target_url)
+            if quantity:
+                payload["stay_count"] = quantity
+        elif action == "nblog_daily":
+            payload.setdefault("blog_ids", target_value.lstrip("@"))
+            payload.setdefault("start_date", (dt.date.today() + dt.timedelta(days=1)).isoformat())
+            if quantity:
+                payload.setdefault("stay_count_min", max(1, min(quantity, int(payload.get("stay_count_min") or quantity))))
+                payload["stay_count_max"] = quantity
+        elif action == "nblog_add_friend":
+            payload.setdefault("blog_id", target_value.lstrip("@"))
+            if quantity:
+                payload["friend_count"] = quantity
+        elif action == "nblog_keyword":
+            payload.setdefault("blog_url", normalize_url(target_url) or target_url)
+            payload.setdefault("keyword", keyword or request_memo)
+            if quantity:
+                payload["keyword_inflow"] = quantity
+        elif action == "nclip_direct_c":
+            payload.setdefault("title", title)
+            payload.setdefault("clip_url", normalize_url(target_url) or target_url)
+            if quantity:
+                payload["view_count"] = quantity
+            if request_memo and "direct_comments" not in payload:
+                payload["direct_comments"] = request_memo
+        elif action == "ncafe_auto":
+            payload.setdefault("title", title)
+            payload.setdefault("cafe_url", normalize_url(target_url) or target_url)
+            if quantity:
+                payload.setdefault("view_min", max(1, min(quantity, int(payload.get("view_min") or quantity))))
+                payload["view_max"] = quantity
+        elif action == "ncafe_direct":
+            payload.setdefault("title", title)
+            payload.setdefault("cafe_url", normalize_url(target_url) or target_url)
+            if quantity:
+                payload["view_count"] = quantity
+            if request_memo and "direct_comments" not in payload:
+                payload["direct_comments"] = request_memo
+        else:
+            raise PanelError(f"지원하지 않는 FastTraffic 서비스입니다: {action}")
+
+        required_fields = fasttraffic_meta.get("required") if isinstance(fasttraffic_meta.get("required"), list) else []
+        missing_fields = [
+            str(key)
+            for key in required_fields
+            if str(payload.get(str(key)) or "").strip() == ""
+        ]
+        if missing_fields:
+            raise PanelError(f"FastTraffic 필수값 누락: {', '.join(missing_fields)}")
+
+        quantity_param = str(fasttraffic_meta.get("quantityParam") or "").strip()
+        if quantity_param and payload.get(quantity_param) not in (None, ""):
+            final_quantity = self._coerce_positive_int(payload.get(quantity_param))
+            min_amount = self._coerce_positive_int(mapping.get("supplier_min_amount") or raw_service.get("min") or 1) or 1
+            max_amount = self._coerce_positive_int(mapping.get("supplier_max_amount") or raw_service.get("max") or final_quantity) or final_quantity
+            if final_quantity < min_amount or final_quantity > max_amount:
+                raise PanelError(f"FastTraffic 수량은 {min_amount}~{max_amount} 범위여야 합니다.")
+            allowed_quantities = fasttraffic_meta.get("allowedQuantities")
+            if isinstance(allowed_quantities, list) and allowed_quantities:
+                allowed = {self._coerce_positive_int(value) for value in allowed_quantities}
+                if final_quantity not in allowed:
+                    raise PanelError("FastTraffic 서이추 수량은 50 단위로 50~500 사이에서 선택해야 합니다.")
+            payload[quantity_param] = final_quantity
+
+        cleaned: Dict[str, Any] = {}
+        for key, value in payload.items():
+            if value in (None, ""):
+                continue
+            cleaned[key] = value
+        return cleaned
+
+    @staticmethod
+    def _first_field_value(fields: Dict[str, Any], keys: Iterable[str]) -> str:
+        for key in keys:
+            value = fields.get(key)
+            if value not in (None, ""):
+                return str(value).strip()
+        return ""
+
+    @staticmethod
+    def _coerce_positive_int(value: Any) -> int:
+        try:
+            parsed = int(float(str(value).replace(",", "").strip()))
+        except (TypeError, ValueError):
+            return 0
+        return parsed if parsed > 0 else 0
 
     def _build_mkt24_supplier_order_payload(
         self,

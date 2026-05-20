@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from urllib.error import HTTPError
+from urllib.request import Request
 from unittest.mock import patch
 
 import bootstrap
@@ -336,6 +337,106 @@ class SupplierServiceSyncTest(unittest.TestCase):
         with patch(f"{SupplierApiClient.__module__}.urlopen", side_effect=error):
             with self.assertRaisesRegex(Exception, "인증 정보.*만료"):
                 client.services()
+
+    def test_fasttraffic_balance_uses_x_api_key_header(self):
+        api_key = "a" * 64
+        client = SupplierApiClient(
+            "https://fastraffic.co.kr/bbs/board.php?bo_table=fast_api_manger",
+            api_key,
+            integration_type="fasttraffic",
+        )
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"success": true, "mb_point": 12500}'
+
+        def fake_urlopen(request: Request, timeout=15):
+            captured["url"] = request.full_url
+            captured["headers"] = {key.lower(): value for key, value in request.header_items()}
+            captured["body"] = (request.data or b"").decode("utf-8")
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        with patch(f"{SupplierApiClient.__module__}.urlopen", side_effect=fake_urlopen):
+            payload = client.balance()
+
+        self.assertEqual(captured["url"], "https://fastraffic.co.kr/nblog_api.php")
+        self.assertEqual(captured["headers"].get("x-api-key"), api_key)
+        self.assertIn("action=check_balance", captured["body"])
+        self.assertNotIn("api_key", captured["body"])
+        self.assertEqual(payload["mb_point"], 12500)
+
+    def test_fasttraffic_static_services_syncs_catalog(self):
+        with patch.object(
+            SupplierApiClient,
+            "_request_fasttraffic_form",
+            return_value={"success": True, "mb_point": 50000},
+        ):
+            created = self.store.save_supplier(
+                {
+                    "name": "FastTraffic",
+                    "apiUrl": "https://fastraffic.co.kr",
+                    "integrationType": "fasttraffic",
+                    "apiKey": "b" * 64,
+                    "isActive": True,
+                    "_adminActor": "qa",
+                }
+            )
+            result = self.store.sync_supplier_services(created["supplier"]["id"], actor="qa")
+
+        self.assertEqual(created["supplier"]["apiUrl"], "https://fastraffic.co.kr/nblog_api.php")
+        self.assertEqual(result["serviceCount"], 8)
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM supplier_services
+            WHERE supplier_id = ? AND external_service_id = ?
+            """,
+            (created["supplier"]["id"], "nblog_direct"),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["is_active"], 1)
+        self.assertIn("FastTraffic", row["category"])
+
+    def test_fasttraffic_nblog_direct_payload_transform(self):
+        payload = self.store._build_supplier_order_payload(
+            {"name": "블로그 체류 상품", "price_strategy": "unit"},
+            {
+                "targetUrl": "blog.naver.com/test/123",
+                "orderedCount": "30",
+                "requestMemo": "댓글 샘플",
+            },
+            {
+                "integration_type": "fasttraffic",
+                "supplier_external_service_id": "nblog_direct",
+                "supplier_service_raw_json": '{"min":1,"max":5000,"fasttraffic":{"required":["title","blog_url"],"quantityParam":"stay_count","defaults":{"stay_time":60}}}',
+            },
+        )
+
+        self.assertEqual(payload["action"], "nblog_direct")
+        self.assertEqual(payload["blog_url"], "https://blog.naver.com/test/123")
+        self.assertEqual(payload["stay_count"], 30)
+        self.assertEqual(payload["stay_time"], 60)
+        self.assertEqual(payload["title"], "블로그 체류 상품")
+
+    def test_fasttraffic_missing_required_target_blocks_payload(self):
+        with self.assertRaisesRegex(PanelError, "필수값 누락"):
+            self.store._build_supplier_order_payload(
+                {"name": "클립 상품", "price_strategy": "unit"},
+                {"orderedCount": "20"},
+                {
+                    "integration_type": "fasttraffic",
+                    "supplier_external_service_id": "nclip_direct_c",
+                    "supplier_service_raw_json": '{"min":1,"max":10000,"fasttraffic":{"required":["title","clip_url"],"quantityParam":"view_count"}}',
+                },
+            )
 
 
 if __name__ == "__main__":
