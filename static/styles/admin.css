@@ -30,6 +30,10 @@ body[data-route-surface="admin"] .admin-module-header__row {
   align-items: flex-start;
 }
 
+.admin-passcode-input {
+  -webkit-text-security: disc;
+}
+
 .admin-action-loader {
   position: fixed;
   right: 24px;
