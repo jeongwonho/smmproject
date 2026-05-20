@@ -132,17 +132,17 @@ export function renderAdminAuth() {
                     <h2>관리자 로그인</h2>
                     <p>인증 후에만 고객 상세 정보와 공급사 키 수정 기능이 활성화됩니다.</p>
                   </div>
-                  <form class="admin-form" data-admin-login-form>
+                  <form class="admin-form" autocomplete="off" data-admin-login-form>
                     <label class="form-field">
                       <span class="field-label">관리자 계정</span>
                       <div class="field-shell">
-                        <input class="field-input" type="text" name="username" autocomplete="username" />
+                        <input class="field-input" type="text" name="adminUsername" autocomplete="off" autocapitalize="none" spellcheck="false" />
                       </div>
                     </label>
                     <label class="form-field">
-                      <span class="field-label">관리자 비밀번호</span>
+                      <span class="field-label">관리자 접근코드</span>
                       <div class="field-shell">
-                        <input class="field-input" type="password" name="password" autocomplete="current-password" />
+                        <input class="field-input admin-passcode-input" type="text" name="adminAccessCode" autocomplete="off" autocapitalize="none" spellcheck="false" data-lpignore="true" data-1p-ignore />
                       </div>
                     </label>
                     <button class="admin-primary-button" type="submit">로그인</button>

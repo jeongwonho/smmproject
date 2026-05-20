@@ -945,8 +945,8 @@ async function handleAdminSubmit(event, ctx) {
     const formData = new FormData(form);
     try {
       const result = await apiPost("/api/admin/login", {
-        username: formData.get("username"),
-        password: formData.get("password"),
+        username: formData.get("adminUsername") || formData.get("username"),
+        password: formData.get("adminAccessCode") || formData.get("password"),
       });
       setAdminAnalyticsExclusion(true);
       state.adminSession = {
