@@ -654,6 +654,51 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
 
         order_call.assert_not_called()
 
+    def test_single_cafe24_dispatch_can_persist_fixed_quantity_for_variant_mapping(self):
+        order_payload = self._order_payload()
+        order_payload["items"][0]["options"] = [{"name": "계정", "value": "instamart_official"}]
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        item_id = self.conn.execute("SELECT id FROM cafe24_order_items").fetchone()["id"]
+        self.conn.execute(
+            "UPDATE supplier_services SET min_amount = 5 WHERE id = ?",
+            ("supplier_service_test",),
+        )
+        self.conn.execute(
+            """
+            UPDATE cafe24_order_items
+            SET standard_status = 'supplier_range_error',
+                supplier_payload_json = '{}',
+                error_message = '공급사 최소 수량(5)보다 작습니다.'
+            WHERE id = ?
+            """,
+            (item_id,),
+        )
+        self.conn.commit()
+
+        with patch("core.SupplierApiClient.order", return_value={"order": "SUP-FIXED-50"}) as order_call:
+            result = self.store.dispatch_single_cafe24_order_item(
+                {
+                    "itemId": item_id,
+                    "expectedQuantity": 50,
+                    "allowExpectedQuantityMappingUpdate": True,
+                    "_adminActor": "cron",
+                }
+            )
+
+        self.assertTrue(result["mappingUpdated"])
+        self.assertEqual(result["normalizedQuantity"], 50)
+        supplier_payload = order_call.call_args.args[0]
+        self.assertEqual(supplier_payload["quantity"], "50")
+        mapping = self.conn.execute("SELECT field_mapping_json FROM cafe24_supplier_mappings").fetchone()
+        self.assertEqual(json.loads(mapping["field_mapping_json"])["orderedCount"]["value"], "50")
+
     def test_mkt24_token_expired_dispatch_requires_manual_token_refresh(self):
         order_payload = self._order_payload()
         self.store._process_cafe24_item(
