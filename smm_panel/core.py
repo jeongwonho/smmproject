@@ -2213,6 +2213,16 @@ def account_preview_url(account_value: str, platform_hint: str) -> Optional[str]
 ACCOUNT_STYLE_PLATFORMS = {"instagram", "threads", "youtube", "tiktok", "facebook"}
 
 
+def supplier_supported_hosts(platform_hint: str) -> set[str]:
+    return {
+        "instagram": {"instagram.com", "www.instagram.com"},
+        "threads": {"threads.net", "www.threads.net", "threads.com", "www.threads.com"},
+        "youtube": {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"},
+        "tiktok": {"tiktok.com", "www.tiktok.com"},
+        "facebook": {"facebook.com", "www.facebook.com", "m.facebook.com"},
+    }.get(platform_hint, set())
+
+
 def platform_target_url_matches(platform_hint: str, raw_url: str) -> bool:
     normalized = normalize_url(raw_url)
     if not normalized:
@@ -8847,6 +8857,38 @@ class PanelStore(PanelStoreDatabaseMixin):
 
     def _cafe24_order_item_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
         raw_payload = parse_json(row["raw_payload_json"], {})
+        normalized_fields = parse_json(row["normalized_fields_json"], {})
+        supplier_payload = parse_json(row["supplier_payload_json"], {})
+        supplier_response = parse_json(row.get("supplier_response_json") or "{}", {})
+        target_input = (
+            str(normalized_fields.get("targetUrl") or "")
+            or str(normalized_fields.get("targetValue") or "")
+            or str(normalized_fields.get("snsValue") or "")
+            or str(normalized_fields.get("link") or "")
+        ).strip()
+        supplier_link = (
+            str(supplier_payload.get("link") or "")
+            or str(supplier_payload.get("snsValue") or "")
+            or str(supplier_payload.get("targetUrl") or "")
+        ).strip()
+        response_reason = supplier_response.get("reason") if isinstance(supplier_response, dict) else {}
+        if not isinstance(response_reason, dict):
+            response_reason = {}
+        target_message = str(row["error_message"] or "").strip()
+        response_status = str(supplier_response.get("status") or supplier_response.get("Status") or "").strip() if isinstance(supplier_response, dict) else ""
+        reason_code = str(response_reason.get("code") or "").strip()
+        reason_message = str(response_reason.get("message") or response_reason.get("detail") or "").strip()
+        if not target_message and (reason_code or reason_message):
+            target_message = " / ".join(filter(None, [reason_code, reason_message]))
+        target_status = "ok"
+        if str(row["standard_status"] or "") == "invalid_target":
+            target_status = "invalid"
+        elif response_status.lower() in {"canceled", "cancelled"} or reason_code:
+            target_status = "supplier_rejected"
+        elif target_input and supplier_link and target_input != supplier_link:
+            target_status = "normalized"
+        elif target_input and not supplier_link and str(row["standard_status"] or "") in {"ready_to_submit", "missing_required_field"}:
+            target_status = "missing"
         return {
             "id": row["id"],
             "mallId": row["mall_id"],
@@ -8881,9 +8923,19 @@ class PanelStore(PanelStoreDatabaseMixin):
             "supplierExternalServiceId": row.get("supplier_external_service_id") or "",
             "internalProductName": row.get("internal_product_name") or "",
             "internalOptionName": row.get("internal_option_name") or "",
-            "normalizedFields": parse_json(row["normalized_fields_json"], {}),
-            "supplierPayload": parse_json(row["supplier_payload_json"], {}),
-            "supplierResponse": parse_json(row.get("supplier_response_json") or "{}", {}),
+            "normalizedFields": normalized_fields,
+            "supplierPayload": supplier_payload,
+            "supplierResponse": supplier_response,
+            "targetDiagnostics": {
+                "input": target_input,
+                "supplierLink": supplier_link,
+                "status": target_status,
+                "message": target_message,
+                "supplierStatus": response_status,
+                "supplierReasonCode": reason_code,
+                "supplierReasonMessage": reason_message,
+                "normalized": bool(target_input and supplier_link and target_input != supplier_link),
+            },
             "rawPayloadPreview": redact_external_payload(raw_payload),
             "errorMessage": row["error_message"] or "",
             "retryCount": int(row["retry_count"] or 0),
@@ -16376,6 +16428,9 @@ class PanelStore(PanelStoreDatabaseMixin):
         if request_memo and "comments" not in payload:
             payload["comments"] = request_memo
 
+        if payload.get("link"):
+            self._validate_supplier_panel_target_link(str(payload["link"]), platform_hint)
+
         return payload
 
     def _supplier_panel_target_link(self, raw_value: Any, platform_hint: str) -> str:
@@ -16387,15 +16442,8 @@ class PanelStore(PanelStoreDatabaseMixin):
             if platform_hint in ACCOUNT_STYLE_PLATFORMS:
                 parsed = urlparse(normalized)
                 host = parsed.netloc.lower()
-                platform_hosts = {
-                    "instagram": {"instagram.com", "www.instagram.com"},
-                    "threads": {"threads.net", "www.threads.net", "threads.com", "www.threads.com"},
-                    "youtube": {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"},
-                    "tiktok": {"tiktok.com", "www.tiktok.com"},
-                    "facebook": {"facebook.com", "www.facebook.com", "m.facebook.com"},
-                }
                 has_path_or_query = bool(parsed.path.strip("/")) or bool(parsed.query) or bool(parsed.fragment)
-                if host and host not in platform_hosts.get(platform_hint, set()) and not has_path_or_query:
+                if host and host not in supplier_supported_hosts(platform_hint) and not has_path_or_query:
                     inferred_link = account_preview_url(host, platform_hint)
                     if inferred_link:
                         return inferred_link
@@ -16405,18 +16453,26 @@ class PanelStore(PanelStoreDatabaseMixin):
             if inferred_link:
                 normalized = normalize_url(candidate) if looks_like_url(candidate) else None
                 host = urlparse(normalized).netloc.lower() if normalized else ""
-                platform_hosts = {
-                    "instagram": {"instagram.com", "www.instagram.com"},
-                    "threads": {"threads.net", "www.threads.net", "threads.com", "www.threads.com"},
-                    "youtube": {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"},
-                    "tiktok": {"tiktok.com", "www.tiktok.com"},
-                    "facebook": {"facebook.com", "www.facebook.com", "m.facebook.com"},
-                }
-                if not host or host not in platform_hosts.get(platform_hint, set()):
+                if not host or host not in supplier_supported_hosts(platform_hint):
                     return inferred_link
         if looks_like_url(candidate):
             return normalize_url(candidate) or candidate
         return ""
+
+    def _validate_supplier_panel_target_link(self, link: str, platform_hint: str) -> None:
+        if platform_hint not in ACCOUNT_STYLE_PLATFORMS or not link:
+            return
+        normalized = normalize_url(link) or link
+        parsed = urlparse(normalized)
+        host = parsed.netloc.lower()
+        if not host:
+            raise PanelError("공급사 발주 대상 링크를 확인할 수 없습니다. Cafe24 주문 옵션의 계정 ID 또는 URL을 확인해 주세요.")
+        supported_hosts = supplier_supported_hosts(platform_hint)
+        if supported_hosts and host not in supported_hosts:
+            raise PanelError(
+                f"공급사 발주 대상 링크 도메인이 {platform_hint} 서비스와 맞지 않습니다: {host}. "
+                "Cafe24 주문 옵션에서 계정 ID 또는 올바른 SNS 링크를 확인해 주세요."
+            )
 
     def _build_fasttraffic_supplier_order_payload(
         self,

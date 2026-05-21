@@ -615,6 +615,45 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
 
         self.assertEqual(payload["link"], "https://www.instagram.com/parkk.co.kr/")
 
+    def test_instagram_panel_payload_blocks_wrong_host_with_path(self):
+        with self.assertRaises(PanelError) as context:
+            self.store._build_supplier_order_payload(
+                {"product_code": "", "platform_slug": "", "price_strategy": "unit"},
+                {"targetUrl": "https://wrong.example/post/1", "orderedCount": "50"},
+                {
+                    "supplier_external_service_id": "40000",
+                    "integration_type": "mkt24",
+                    "api_url": "https://api.mkt24.co.kr/v3/panel",
+                    "supplier_service_name": "인스타그램 한국인 팔로워",
+                },
+            )
+
+        self.assertIn("링크 도메인", str(context.exception))
+
+    def test_cafe24_wrong_instagram_link_is_visible_as_invalid_target(self):
+        order_payload = self._order_payload()
+        order_payload["items"][0]["options"] = [
+            {"name": "계정", "value": "https://wrong.example/post/1"},
+            {"name": "팔로워 수", "value": "50명"},
+        ]
+
+        result = self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+
+        self.assertEqual(result["status"], "invalid_target")
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        payload = self.store._cafe24_order_item_payload(dict(item))
+        self.assertEqual(payload["targetDiagnostics"]["input"], "https://wrong.example/post/1")
+        self.assertEqual(payload["targetDiagnostics"]["status"], "invalid")
+        self.assertIn("wrong.example", payload["targetDiagnostics"]["message"])
+
     def test_single_cafe24_supplier_status_check_updates_item(self):
         order_payload = self._order_payload()
         self.store._process_cafe24_item(
