@@ -2228,11 +2228,15 @@ function renderCafe24OrderQueuePanel(orderItems = []) {
                 <article><span>공급사</span><strong>${escapeHtml(item.supplierExternalServiceId || "-")}</strong></article>
                 <article><span>구매자</span><strong>${escapeHtml(item.buyerName || "-")}</strong></article>
                 <article><span>재시도</span><strong>${escapeHtml(String(item.retryCount || 0))}회</strong></article>
+                <article><span>주문 입력값</span><strong>${escapeHtml(item.targetDiagnostics?.input || "-")}</strong></article>
+                <article><span>공급 링크</span><strong>${escapeHtml(item.targetDiagnostics?.supplierLink || "-")}</strong></article>
               </div>
+              ${item.targetDiagnostics?.message ? `<p class="admin-inline-note">대상 확인: ${escapeHtml(item.targetDiagnostics.message)}</p>` : ""}
+              ${item.targetDiagnostics?.normalized ? `<p class="admin-inline-note">입력값을 공급사 전송 형식으로 변환했습니다: ${escapeHtml(item.targetDiagnostics.input || "-")} → ${escapeHtml(item.targetDiagnostics.supplierLink || "-")}</p>` : ""}
               ${item.errorMessage ? `<p class="admin-inline-note">${escapeHtml(item.errorMessage)}</p>` : ""}
               <details class="admin-disclosure">
                 <summary>정규화/공급 payload 보기</summary>
-                <pre>${escapeHtml(JSON.stringify({ fields: item.normalizedFields, supplierPayload: item.supplierPayload, supplierResponse: item.supplierResponse, raw: item.rawPayloadPreview }, null, 2))}</pre>
+                <pre>${escapeHtml(JSON.stringify({ target: item.targetDiagnostics, fields: item.normalizedFields, supplierPayload: item.supplierPayload, supplierResponse: item.supplierResponse, raw: item.rawPayloadPreview }, null, 2))}</pre>
               </details>
               <div class="admin-action-row">
                 <button class="admin-secondary-button" type="button" data-admin-cafe24-resync-item="${escapeHtml(item.id)}">재동기화</button>
