@@ -57,6 +57,19 @@ class FakeCafe24ProductClient:
         }
 
 
+class FakeCafe24VariantQuantityClient(FakeCafe24ProductClient):
+    def product_variants(self, product_no):
+        return {
+            "variants": [
+                {
+                    "variant_code": "P00000AA000A",
+                    "custom_product_code": "IG-FOLLOWER-50",
+                    "option_value": "팔로워 수: 50명",
+                }
+            ]
+        }
+
+
 class FailingCafe24ProductClient:
     def products(self, *, keyword="", product_no="", limit=20, offset=0):
         raise Cafe24ApiError("Cafe24 API 오류 403: scope permission denied")
@@ -356,6 +369,35 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         supplier_payload = json.loads(item["supplier_payload_json"])
         self.assertEqual(normalized_fields["orderedCount"], "250")
         self.assertEqual(supplier_payload["quantity"], "250")
+
+    def test_cafe24_variant_option_lookup_supplies_ordered_count_when_item_quantity_is_one(self):
+        self.conn.execute(
+            "UPDATE supplier_services SET min_amount = 5 WHERE id = ?",
+            ("supplier_service_test",),
+        )
+        self.conn.commit()
+        order_payload = self._order_payload()
+        order_payload["items"][0]["options"] = [{"name": "계정", "value": "instamart_official"}]
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=FakeCafe24VariantQuantityClient()):
+            result = self.store._process_cafe24_item(
+                self.conn,
+                integration=self._integration_row(),
+                order_payload=order_payload,
+                item_payload=order_payload["items"][0],
+                index=0,
+                submit_ready=False,
+            )
+        self.conn.commit()
+
+        self.assertEqual(result["status"], "ready_to_submit")
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        normalized_fields = json.loads(item["normalized_fields_json"])
+        supplier_payload = json.loads(item["supplier_payload_json"])
+        raw_payload = json.loads(item["raw_payload_json"])
+        self.assertEqual(normalized_fields["orderedCount"], "50")
+        self.assertEqual(supplier_payload["quantity"], "50")
+        self.assertEqual(raw_payload["variantOptionEntries"][0]["value"], "50명")
 
     def test_cafe24_ambiguous_option_quantity_without_mapping_requires_review(self):
         order_payload = self._order_payload()
