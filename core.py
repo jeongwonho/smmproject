@@ -11870,6 +11870,7 @@ class PanelStore(PanelStoreDatabaseMixin):
         expected_quantity_raw = payload.get("expectedQuantity") or payload.get("expected_quantity") or ""
         expected_quantity = int(expected_quantity_raw) if str(expected_quantity_raw).strip() else 0
         allow_mapping_update = bool(payload.get("allowExpectedQuantityMappingUpdate") or payload.get("allow_expected_quantity_mapping_update"))
+        allow_cancelled_redispatch = bool(payload.get("allowCanceledSupplierRedispatch") or payload.get("allow_cancelled_supplier_redispatch"))
 
         if not item_id and not (mall_id and order_id and order_item_code):
             raise PanelError("Cafe24 품주 id 또는 mall/order/order_item_code가 필요합니다.")
@@ -11948,6 +11949,23 @@ class PanelStore(PanelStoreDatabaseMixin):
                         f"Cafe24 옵션 수량 검증 실패: 예상 {expected_quantity}명, 변환 {quantity}명입니다. 발주를 중단했습니다.",
                         status=409,
                     )
+            if allow_cancelled_redispatch and str(row["supplier_order_uuid"] or "").strip():
+                current_status = str(row["standard_status"] or "").strip()
+                response_json = parse_json(row["supplier_response_json"], {})
+                response_text = json.dumps(response_json, ensure_ascii=False).lower() if isinstance(response_json, dict) else str(response_json).lower()
+                if current_status not in {"failed", "cancelled"} and "canceled" not in response_text and "cancelled" not in response_text:
+                    raise PanelError("취소/실패로 확인된 공급사 주문만 재발주할 수 있습니다.", status=409)
+                conn.execute(
+                    """
+                    UPDATE cafe24_order_items
+                    SET supplier_order_id = '', supplier_order_uuid = '', standard_status = 'ready_to_submit',
+                        error_message = '', automation_error_code = '', next_retry_at = '', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now_iso(), item_id),
+                )
+                conn.commit()
+                row = conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
             if str(row["payment_gate_status"] or "") != "payment_confirmed":
                 raise PanelError("Cafe24 결제완료가 확인되지 않아 발주할 수 없습니다.")
             if str(row["standard_status"] or "") != "ready_to_submit":
@@ -16294,20 +16312,26 @@ class PanelStore(PanelStoreDatabaseMixin):
         target_value = str(fields.get("targetValue") or "").strip()
         target_keyword = str(fields.get("targetKeyword") or "").strip()
         quantity = str(fields.get("orderedCount") or "").strip()
+        platform_hint = preview_platform_hint(
+            " ".join(
+                [
+                    str(product.get("product_code") or ""),
+                    str(product.get("name") or product.get("product_name") or ""),
+                    str(mapping.get("supplier_service_name") or ""),
+                    str(mapping.get("supplier_external_service_id") or ""),
+                ]
+            ),
+            " ".join([str(product.get("platform_slug") or ""), str(mapping.get("supplier_name") or "")]),
+        )
 
         if target_url:
-            payload["link"] = normalize_url(target_url) or target_url
+            payload["link"] = self._supplier_panel_target_link(target_url, platform_hint)
         elif target_value:
-            if looks_like_url(target_value):
-                payload["link"] = normalize_url(target_value) or target_value
-            else:
+            inferred_link = self._supplier_panel_target_link(target_value, platform_hint)
+            if inferred_link:
+                payload["link"] = inferred_link
+            if not looks_like_url(target_value):
                 payload["username"] = target_value.lstrip("@")
-                inferred_link = account_preview_url(
-                    target_value,
-                    preview_platform_hint(str(product.get("product_code") or ""), str(product.get("platform_slug") or "")),
-                )
-                if inferred_link:
-                    payload["link"] = inferred_link
 
         if quantity and str(product.get("price_strategy") or "") != "fixed":
             payload["quantity"] = quantity
@@ -16345,6 +16369,30 @@ class PanelStore(PanelStoreDatabaseMixin):
             payload["comments"] = request_memo
 
         return payload
+
+    def _supplier_panel_target_link(self, raw_value: Any, platform_hint: str) -> str:
+        candidate = str(raw_value or "").strip()
+        if not candidate:
+            return ""
+        if candidate.startswith(("http://", "https://")):
+            return normalize_url(candidate) or candidate
+        if platform_hint in ACCOUNT_STYLE_PLATFORMS:
+            inferred_link = account_preview_url(candidate, platform_hint)
+            if inferred_link:
+                normalized = normalize_url(candidate) if looks_like_url(candidate) else None
+                host = urlparse(normalized).netloc.lower() if normalized else ""
+                platform_hosts = {
+                    "instagram": {"instagram.com", "www.instagram.com"},
+                    "threads": {"threads.net", "www.threads.net", "threads.com", "www.threads.com"},
+                    "youtube": {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"},
+                    "tiktok": {"tiktok.com", "www.tiktok.com"},
+                    "facebook": {"facebook.com", "www.facebook.com", "m.facebook.com"},
+                }
+                if not host or host not in platform_hosts.get(platform_hint, set()):
+                    return inferred_link
+        if looks_like_url(candidate):
+            return normalize_url(candidate) or candidate
+        return ""
 
     def _build_fasttraffic_supplier_order_payload(
         self,

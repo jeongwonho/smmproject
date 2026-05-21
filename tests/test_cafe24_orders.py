@@ -586,6 +586,20 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders WHERE order_channel = 'cafe24'").fetchone()[0], 0)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM wallet_ledger").fetchone()[0], 0)
 
+    def test_instagram_panel_payload_converts_bare_dotted_account_to_profile_url(self):
+        payload = self.store._build_supplier_order_payload(
+            {"product_code": "instagram-follower", "platform_slug": "instagram", "price_strategy": "unit"},
+            {"targetValue": "parkk.co.kr", "orderedCount": "50"},
+            {
+                "supplier_external_service_id": "40000",
+                "integration_type": "mkt24",
+                "api_url": "https://api.mkt24.co.kr/v3/panel",
+            },
+        )
+
+        self.assertEqual(payload["link"], "https://www.instagram.com/parkk.co.kr/")
+        self.assertEqual(payload["quantity"], "50")
+
     def test_single_cafe24_supplier_status_check_updates_item(self):
         order_payload = self._order_payload()
         self.store._process_cafe24_item(
@@ -625,6 +639,51 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         item = self.conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
         self.assertEqual(item["standard_status"], "completed")
         self.assertEqual(item["cafe24_completion_status"], "pending")
+
+    def test_single_cafe24_dispatch_allows_cancelled_supplier_redispatch(self):
+        order_payload = self._order_payload()
+        order_payload["items"][0]["options"] = [
+            {"name": "계정", "value": "parkk.co.kr"},
+            {"name": "팔로워 수", "value": "50명"},
+        ]
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        item_id = self.conn.execute("SELECT id FROM cafe24_order_items").fetchone()["id"]
+        self.conn.execute(
+            """
+            UPDATE cafe24_order_items
+            SET standard_status = 'failed',
+                supplier_order_uuid = 'SUP-CANCELED',
+                supplier_response_json = ?,
+                error_message = 'bad_request_on_url'
+            WHERE id = ?
+            """,
+            (json.dumps({"lastStatusCheck": {"payload": {"status": "Canceled"}}}), item_id),
+        )
+        self.conn.commit()
+
+        with patch("core.SupplierApiClient.order", return_value={"order": "SUP-REDISPATCH"}) as order_call:
+            result = self.store.dispatch_single_cafe24_order_item(
+                {
+                    "itemId": item_id,
+                    "expectedQuantity": 50,
+                    "allowCanceledSupplierRedispatch": True,
+                    "_adminActor": "cron",
+                }
+            )
+
+        self.assertEqual(result["dispatch"]["status"], "supplier_submitted")
+        self.assertEqual(result["dispatch"]["supplierOrderUuid"], "SUP-REDISPATCH")
+        supplier_payload = order_call.call_args.args[0]
+        self.assertEqual(supplier_payload["link"], "https://www.instagram.com/parkk.co.kr/")
+        item = self.conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
+        self.assertEqual(item["supplier_order_uuid"], "SUP-REDISPATCH")
 
     def test_single_cafe24_dispatch_revalidates_quantity_before_supplier_order(self):
         order_payload = self._order_payload()
