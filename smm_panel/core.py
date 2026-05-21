@@ -11966,6 +11966,161 @@ class PanelStore(PanelStoreDatabaseMixin):
             "mappingUpdated": mapping_updated,
         }
 
+    def check_single_cafe24_supplier_status(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        item_id = str(payload.get("itemId") or payload.get("id") or "").strip()
+        mall_id = str(payload.get("mallId") or payload.get("mall_id") or "").strip()
+        shop_no = int(payload.get("shopNo") or payload.get("shop_no") or CAFE24_DEFAULT_SHOP_NO)
+        order_id = str(payload.get("orderId") or payload.get("order_id") or "").strip()
+        order_item_code = str(payload.get("orderItemCode") or payload.get("order_item_code") or "").strip()
+        actor = self._admin_actor(payload)
+
+        if not item_id:
+            if not (mall_id and order_id and order_item_code):
+                raise PanelError("Cafe24 주문 품주 식별값이 필요합니다.", status=400)
+            with self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT id
+                    FROM cafe24_order_items
+                    WHERE mall_id = ? AND shop_no = ? AND cafe24_order_id = ? AND cafe24_order_item_code = ?
+                    """,
+                    (mall_id, shop_no, order_id, order_item_code),
+                ).fetchone()
+                if row is None:
+                    raise PanelError("지정한 Cafe24 주문 품주를 찾을 수 없습니다.", status=404)
+                item_id = str(row["id"])
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    coi.*,
+                    s.api_url,
+                    s.integration_type,
+                    s.api_key,
+                    s.bearer_token,
+                    s.name AS supplier_name
+                FROM cafe24_order_items coi
+                JOIN suppliers s ON s.id = coi.supplier_id
+                WHERE coi.id = ?
+                """,
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                raise PanelError("Cafe24 주문 품주를 찾을 수 없습니다.", status=404)
+            external_order_id = str(row["supplier_order_uuid"] or "").strip()
+            if not external_order_id:
+                raise PanelError("공급사 주문번호가 없어 상태 조회가 불가합니다.", status=409)
+
+        timestamp = now_iso()
+        try:
+            client = SupplierApiClient(
+                str(row["api_url"]),
+                decrypt_secret_value(row["api_key"]),
+                integration_type=str(row["integration_type"]),
+                bearer_token=decrypt_secret_value(row["bearer_token"]),
+            )
+            status_payload = client.status(external_order_id)
+            supplier_status = normalize_supplier_order_status_payload(status_payload)
+            cafe24_status = self._supplier_status_to_cafe24_status(supplier_status)
+            response_json = parse_json(row["supplier_response_json"], {})
+            response_json["lastStatusCheck"] = {"checkedAt": timestamp, "payload": status_payload}
+            message = ""
+            if isinstance(status_payload, dict):
+                message = str(status_payload.get("error") or status_payload.get("message") or "").strip()
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE cafe24_order_items
+                    SET standard_status = ?, supplier_response_json = ?, error_message = ?,
+                        automation_last_checked_at = ?, automation_error_code = '',
+                        cafe24_completion_status = CASE
+                            WHEN ? = 'completed' AND cafe24_completion_status <> 'done' THEN 'pending'
+                            ELSE cafe24_completion_status
+                        END,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        cafe24_status,
+                        as_json(redact_external_payload(response_json)),
+                        message[:1000],
+                        timestamp,
+                        supplier_status,
+                        timestamp,
+                        item_id,
+                    ),
+                )
+                self._log_cafe24_event(
+                    conn,
+                    mall_id=str(row["mall_id"]),
+                    shop_no=int(row["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                    event_type="supplier.status_single",
+                    status="success",
+                    request_payload={"supplierOrderUuid": external_order_id},
+                    response_payload=redact_external_payload(status_payload),
+                    error_message=message,
+                )
+                self._record_admin_audit(
+                    conn,
+                    actor=actor,
+                    action="cafe24.order_item_supplier_status",
+                    entity_type="cafe24_order_item",
+                    entity_id=item_id,
+                    message=f"Cafe24 품주 공급사 상태 조회: {supplier_status}",
+                    metadata={"supplierOrderUuid": external_order_id, "supplierStatus": supplier_status},
+                )
+                conn.commit()
+            return {
+                "itemId": item_id,
+                "supplierOrderUuid": external_order_id,
+                "supplierStatus": supplier_status,
+                "cafe24Status": cafe24_status,
+                "message": message,
+                "statusPayload": redact_external_payload(status_payload),
+                "checkedAt": timestamp,
+            }
+        except Exception as exc:
+            error_message = str(exc)
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE cafe24_order_items
+                    SET automation_last_checked_at = ?, automation_error_code = ?,
+                        error_message = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (timestamp, "supplier_status_check_failed", error_message[:1000], timestamp, item_id),
+                )
+                self._log_cafe24_event(
+                    conn,
+                    mall_id=str(row["mall_id"]),
+                    shop_no=int(row["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                    event_type="supplier.status_single",
+                    status="failed",
+                    request_payload={"supplierOrderUuid": external_order_id},
+                    response_payload={},
+                    error_message=error_message,
+                )
+                self._record_admin_audit(
+                    conn,
+                    actor=actor,
+                    action="cafe24.order_item_supplier_status_failed",
+                    entity_type="cafe24_order_item",
+                    entity_id=item_id,
+                    message=f"Cafe24 품주 공급사 상태 조회 실패: {error_message[:160]}",
+                    metadata={"supplierOrderUuid": external_order_id},
+                )
+                conn.commit()
+            return {
+                "itemId": item_id,
+                "supplierOrderUuid": external_order_id,
+                "supplierStatus": "check_failed",
+                "cafe24Status": str(row["standard_status"] or ""),
+                "message": error_message,
+                "checkedAt": timestamp,
+            }
+
     def dispatch_cafe24_order_item(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         item_id = str(payload.get("itemId") or payload.get("id") or "").strip()
         actor = self._admin_actor(payload)
