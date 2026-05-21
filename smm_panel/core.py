@@ -11783,6 +11783,72 @@ class PanelStore(PanelStoreDatabaseMixin):
             conn.commit()
         return {"result": result}
 
+    def dispatch_single_cafe24_order_item(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        item_id = str(payload.get("itemId") or payload.get("id") or "").strip()
+        mall_id = str(payload.get("mallId") or payload.get("mall_id") or "").strip()
+        shop_no = int(payload.get("shopNo") or payload.get("shop_no") or CAFE24_DEFAULT_SHOP_NO)
+        order_id = str(payload.get("orderId") or payload.get("order_id") or "").strip()
+        order_item_code = str(payload.get("orderItemCode") or payload.get("order_item_code") or "").strip()
+        expected_quantity_raw = payload.get("expectedQuantity") or payload.get("expected_quantity") or ""
+        expected_quantity = int(expected_quantity_raw) if str(expected_quantity_raw).strip() else 0
+
+        if not item_id and not (mall_id and order_id and order_item_code):
+            raise PanelError("Cafe24 품주 id 또는 mall/order/order_item_code가 필요합니다.")
+
+        with self._connect() as conn:
+            if not item_id:
+                row = conn.execute(
+                    """
+                    SELECT id
+                    FROM cafe24_order_items
+                    WHERE mall_id = ? AND shop_no = ? AND cafe24_order_id = ? AND cafe24_order_item_code = ?
+                    """,
+                    (mall_id, shop_no, order_id, order_item_code),
+                ).fetchone()
+                if row is None:
+                    raise PanelError("지정한 Cafe24 주문 품주를 찾을 수 없습니다.", status=404)
+                item_id = str(row["id"])
+
+        retry_result = self.retry_cafe24_order_item({"itemId": item_id, "_adminActor": self._admin_actor(payload)})
+
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
+            if row is None:
+                raise PanelError("Cafe24 주문 품주를 찾을 수 없습니다.", status=404)
+            normalized_fields = parse_json(row["normalized_fields_json"], {})
+            supplier_payload = parse_json(row["supplier_payload_json"], {})
+            quantity_value = (
+                supplier_payload.get("quantity")
+                or supplier_payload.get("orderedCount")
+                or normalized_fields.get("orderedCount")
+                or normalized_fields.get("quantity")
+            )
+            try:
+                quantity = int(float(str(quantity_value or "0").replace(",", "").strip() or "0"))
+            except (TypeError, ValueError):
+                quantity = 0
+            if expected_quantity and quantity != expected_quantity:
+                raise PanelError(
+                    f"Cafe24 옵션 수량 검증 실패: 예상 {expected_quantity}명, 변환 {quantity}명입니다. 발주를 중단했습니다.",
+                    status=409,
+                )
+            if str(row["payment_gate_status"] or "") != "payment_confirmed":
+                raise PanelError("Cafe24 결제완료가 확인되지 않아 발주할 수 없습니다.")
+            if str(row["standard_status"] or "") != "ready_to_submit":
+                raise PanelError(
+                    f"재검증 후 발주 가능 상태가 아닙니다: {row['standard_status']} · {row['error_message']}",
+                    status=409,
+                )
+
+        dispatch_result = self.dispatch_cafe24_order_item({"itemId": item_id, "_adminActor": self._admin_actor(payload)})
+        return {
+            "itemId": item_id,
+            "retry": retry_result,
+            "dispatch": dispatch_result,
+            "expectedQuantity": expected_quantity,
+            "normalizedQuantity": quantity,
+        }
+
     def dispatch_cafe24_order_item(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         item_id = str(payload.get("itemId") or payload.get("id") or "").strip()
         actor = self._admin_actor(payload)
