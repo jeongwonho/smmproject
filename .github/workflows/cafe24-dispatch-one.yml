@@ -1,0 +1,53 @@
+name: Cafe24 Dispatch One
+
+on:
+  workflow_dispatch:
+    inputs:
+      mall_id:
+        description: Cafe24 mall id
+        required: true
+        default: growit
+      shop_no:
+        description: Cafe24 shop number
+        required: true
+        default: "1"
+      order_id:
+        description: Cafe24 order id
+        required: true
+      order_item_code:
+        description: Cafe24 order item code
+        required: true
+      expected_quantity:
+        description: Expected supplier quantity
+        required: true
+        default: "50"
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch one Cafe24 order item
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          MALL_ID: ${{ inputs.mall_id }}
+          SHOP_NO: ${{ inputs.shop_no }}
+          ORDER_ID: ${{ inputs.order_id }}
+          ORDER_ITEM_CODE: ${{ inputs.order_item_code }}
+          EXPECTED_QUANTITY: ${{ inputs.expected_quantity }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CRON_SECRET:-}" ]; then
+            echo "CRON_SECRET secret is required" >&2
+            exit 1
+          fi
+          curl --fail-with-body --show-error --silent \
+            -X POST "https://smmproject-lime.vercel.app/api/cron/cafe24/order-items/dispatch-one" \
+            -H "Authorization: Bearer ${CRON_SECRET}" \
+            -H "Content-Type: application/json" \
+            --data "$(jq -nc \
+              --arg mallId "$MALL_ID" \
+              --argjson shopNo "$SHOP_NO" \
+              --arg orderId "$ORDER_ID" \
+              --arg orderItemCode "$ORDER_ITEM_CODE" \
+              --argjson expectedQuantity "$EXPECTED_QUANTITY" \
+              '{mallId:$mallId,shopNo:$shopNo,orderId:$orderId,orderItemCode:$orderItemCode,expectedQuantity:$expectedQuantity}')"

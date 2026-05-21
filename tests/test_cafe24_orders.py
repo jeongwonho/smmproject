@@ -544,6 +544,74 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders WHERE order_channel = 'cafe24'").fetchone()[0], 0)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM wallet_ledger").fetchone()[0], 0)
 
+    def test_single_cafe24_dispatch_revalidates_quantity_before_supplier_order(self):
+        order_payload = self._order_payload()
+        order_payload["items"][0]["options"] = [
+            {"name": "계정", "value": "instamart_official"},
+            {"name": "팔로워 수", "value": "50명"},
+        ]
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        item_id = self.conn.execute("SELECT id FROM cafe24_order_items").fetchone()["id"]
+        self.conn.execute(
+            """
+            UPDATE cafe24_order_items
+            SET standard_status = 'supplier_range_error',
+                supplier_payload_json = '{}',
+                error_message = '공급사 최소 수량(5)보다 작습니다.'
+            WHERE id = ?
+            """,
+            (item_id,),
+        )
+        self.conn.commit()
+
+        with patch("core.SupplierApiClient.order", return_value={"order": "SUP-50"}) as order_call:
+            result = self.store.dispatch_single_cafe24_order_item(
+                {
+                    "mallId": "instamart",
+                    "shopNo": 1,
+                    "orderId": "20260426-000001",
+                    "orderItemCode": "20260426-000001-01",
+                    "expectedQuantity": 50,
+                    "_adminActor": "cron",
+                }
+            )
+
+        self.assertEqual(result["normalizedQuantity"], 50)
+        self.assertEqual(result["dispatch"]["status"], "supplier_submitted")
+        supplier_payload = order_call.call_args.args[0]
+        self.assertEqual(supplier_payload["quantity"], "50")
+
+    def test_single_cafe24_dispatch_blocks_expected_quantity_mismatch(self):
+        order_payload = self._order_payload()
+        order_payload["items"][0]["options"] = [
+            {"name": "계정", "value": "instamart_official"},
+            {"name": "팔로워 수", "value": "250명"},
+        ]
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        item_id = self.conn.execute("SELECT id FROM cafe24_order_items").fetchone()["id"]
+
+        with patch("core.SupplierApiClient.order") as order_call:
+            with self.assertRaises(PanelError):
+                self.store.dispatch_single_cafe24_order_item(
+                    {"itemId": item_id, "expectedQuantity": 50, "_adminActor": "cron"}
+                )
+
+        order_call.assert_not_called()
+
     def test_mkt24_token_expired_dispatch_requires_manual_token_refresh(self):
         order_payload = self._order_payload()
         self.store._process_cafe24_item(
