@@ -588,17 +588,32 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
 
     def test_instagram_panel_payload_converts_bare_dotted_account_to_profile_url(self):
         payload = self.store._build_supplier_order_payload(
-            {"product_code": "instagram-follower", "platform_slug": "instagram", "price_strategy": "unit"},
+            {"product_code": "", "platform_slug": "", "price_strategy": "unit"},
             {"targetValue": "parkk.co.kr", "orderedCount": "50"},
             {
                 "supplier_external_service_id": "40000",
                 "integration_type": "mkt24",
                 "api_url": "https://api.mkt24.co.kr/v3/panel",
+                "supplier_service_name": "인스타그램 한국인 팔로워",
             },
         )
 
         self.assertEqual(payload["link"], "https://www.instagram.com/parkk.co.kr/")
         self.assertEqual(payload["quantity"], "50")
+
+    def test_instagram_panel_payload_converts_explicit_unsupported_host_to_profile_url(self):
+        payload = self.store._build_supplier_order_payload(
+            {"product_code": "", "platform_slug": "", "price_strategy": "unit"},
+            {"targetUrl": "https://parkk.co.kr", "orderedCount": "50"},
+            {
+                "supplier_external_service_id": "40000",
+                "integration_type": "mkt24",
+                "api_url": "https://api.mkt24.co.kr/v3/panel",
+                "supplier_service_name": "인스타그램 한국인 팔로워",
+            },
+        )
+
+        self.assertEqual(payload["link"], "https://www.instagram.com/parkk.co.kr/")
 
     def test_single_cafe24_supplier_status_check_updates_item(self):
         order_payload = self._order_payload()

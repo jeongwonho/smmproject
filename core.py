@@ -2168,12 +2168,20 @@ def normalize_image_asset_source(raw: Any, label: str = "이미지") -> str:
 def preview_platform_hint(product_code: str, platform_slug: str) -> str:
     lowered = f"{platform_slug} {product_code}".lower()
     for keyword, resolved in (
+        ("인스타그램", "instagram"),
+        ("인스타", "instagram"),
         ("instagram", "instagram"),
+        ("유튜브", "youtube"),
         ("youtube", "youtube"),
+        ("틱톡", "tiktok"),
         ("tiktok", "tiktok"),
+        ("스레드", "threads"),
         ("threads", "threads"),
+        ("페이스북", "facebook"),
         ("facebook", "facebook"),
+        ("네이버", "nportal"),
         ("naver", "nportal"),
+        ("블로그", "nportal"),
         ("blog", "nportal"),
     ):
         if keyword in lowered:
@@ -16375,7 +16383,23 @@ class PanelStore(PanelStoreDatabaseMixin):
         if not candidate:
             return ""
         if candidate.startswith(("http://", "https://")):
-            return normalize_url(candidate) or candidate
+            normalized = normalize_url(candidate) or candidate
+            if platform_hint in ACCOUNT_STYLE_PLATFORMS:
+                parsed = urlparse(normalized)
+                host = parsed.netloc.lower()
+                platform_hosts = {
+                    "instagram": {"instagram.com", "www.instagram.com"},
+                    "threads": {"threads.net", "www.threads.net", "threads.com", "www.threads.com"},
+                    "youtube": {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"},
+                    "tiktok": {"tiktok.com", "www.tiktok.com"},
+                    "facebook": {"facebook.com", "www.facebook.com", "m.facebook.com"},
+                }
+                has_path_or_query = bool(parsed.path.strip("/")) or bool(parsed.query) or bool(parsed.fragment)
+                if host and host not in platform_hosts.get(platform_hint, set()) and not has_path_or_query:
+                    inferred_link = account_preview_url(host, platform_hint)
+                    if inferred_link:
+                        return inferred_link
+            return normalized
         if platform_hint in ACCOUNT_STYLE_PLATFORMS:
             inferred_link = account_preview_url(candidate, platform_hint)
             if inferred_link:
