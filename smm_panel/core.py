@@ -10355,6 +10355,15 @@ class PanelStore(PanelStoreDatabaseMixin):
             return self._resolve_cafe24_quantity_candidates(candidates)
         return text
 
+    def _default_cafe24_ordered_count(self, item_payload: Dict[str, Any], option_entries: List[Dict[str, str]]) -> str:
+        candidates = self._cafe24_quantity_candidates_from_options(option_entries)
+        if candidates:
+            try:
+                return self._resolve_cafe24_quantity_candidates(candidates)
+            except PanelError as exc:
+                raise PanelError(f"{exc} Cafe24 매핑에서 주문 수량 source를 명시해 주세요.")
+        return cafe24_payload_value(item_payload, ("quantity", "qty", "order_quantity")) or "1"
+
     def _resolve_cafe24_mapping_source(
         self,
         source: Any,
@@ -10543,7 +10552,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                 fields[field_key] = mapped_value
                 continue
             if field_key == "orderedCount":
-                fields[field_key] = cafe24_payload_value(item_payload, ("quantity", "qty", "order_quantity")) or "1"
+                fields[field_key] = self._default_cafe24_ordered_count(item_payload, option_entries)
             elif field_key == "targetUrl" and first_url_match:
                 fields[field_key] = first_url_match.group(0)
             elif field_key == "targetValue":
@@ -10557,7 +10566,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                 fields[field_key] = cafe24_payload_value(order_payload, ("memo", "client_memo", "order_memo")) or option_pairs.get("orderMemo", "")
 
         if "orderedCount" not in fields:
-            fields["orderedCount"] = cafe24_payload_value(item_payload, ("quantity", "qty", "order_quantity")) or "1"
+            fields["orderedCount"] = self._default_cafe24_ordered_count(item_payload, option_entries)
         return fields
 
     def _supplier_mapping_from_cafe24_mapping(
@@ -10647,7 +10656,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                 fields[field_key] = mapped_value
                 continue
             if field_key == "orderedCount":
-                fields[field_key] = cafe24_payload_value(item_payload, ("quantity", "qty", "order_quantity")) or "1"
+                fields[field_key] = self._default_cafe24_ordered_count(item_payload, option_entries)
             elif field_key == "targetUrl" and first_url_match:
                 fields[field_key] = first_url_match.group(0)
             elif field_key == "targetValue":
@@ -11002,15 +11011,15 @@ class PanelStore(PanelStoreDatabaseMixin):
                     error_message = "매핑된 내부 상품 참조가 비활성 또는 삭제 상태입니다."
                 else:
                     product = dict(product_row)
-                    normalized_fields = self._normalize_cafe24_item_fields(
-                        product=product,
-                        mapping=mapping,
-                        order_payload=order_payload,
-                        item_payload=item_payload,
-                        buyer=buyer,
-                        receiver=receiver,
-                    )
                     try:
+                        normalized_fields = self._normalize_cafe24_item_fields(
+                            product=product,
+                            mapping=mapping,
+                            order_payload=order_payload,
+                            item_payload=item_payload,
+                            buyer=buyer,
+                            receiver=receiver,
+                        )
                         form_structure = ensure_request_memo_form_structure(parse_json(product["form_structure_json"], {}), "추가 요청사항")
                         self._validate_fields(normalized_fields, form_structure.get("schema", {}))
                         self._validate_product_target(product, normalized_fields, require_preview=False)

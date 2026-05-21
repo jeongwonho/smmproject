@@ -333,6 +333,53 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         candidates = self.store._cafe24_quantity_candidates_from_options(entries, label="팔로워 수")
         self.assertEqual(candidates[0]["value"], 250)
 
+    def test_cafe24_ordered_count_auto_detects_unique_option_without_mapping(self):
+        order_payload = self._order_payload()
+        order_payload["items"][0]["options"] = [
+            {"name": "계정", "value": "instamart_official"},
+            {"name": "팔로워 수", "value": "250명 (+35,500원)"},
+        ]
+
+        result = self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+
+        self.assertEqual(result["status"], "ready_to_submit")
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        normalized_fields = json.loads(item["normalized_fields_json"])
+        supplier_payload = json.loads(item["supplier_payload_json"])
+        self.assertEqual(normalized_fields["orderedCount"], "250")
+        self.assertEqual(supplier_payload["quantity"], "250")
+
+    def test_cafe24_ambiguous_option_quantity_without_mapping_requires_review(self):
+        order_payload = self._order_payload()
+        order_payload["items"][0]["options"] = [
+            {"name": "계정", "value": "instamart_official"},
+            {"name": "팔로워 수", "value": "250명 (+35,500원)"},
+            {"name": "1일 유입수량", "value": "50명"},
+        ]
+
+        result = self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+
+        self.assertEqual(result["status"], "needs_manual_review")
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.assertIn("수량 후보", item["error_message"])
+        self.assertFalse(json.loads(item["supplier_payload_json"]))
+
     def test_cafe24_ordered_count_can_be_extracted_from_selected_option(self):
         self.conn.execute(
             """
