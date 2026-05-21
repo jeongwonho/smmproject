@@ -59,4 +59,4 @@ jobs:
               --arg orderId "$ORDER_ID" \
               --arg orderItemCode "$ORDER_ITEM_CODE" \
               --argjson expectedQuantity "$EXPECTED_QUANTITY" \
-              '{mallId:$mallId,shopNo:$shopNo,orderId:$orderId,orderItemCode:$orderItemCode,expectedQuantity:$expectedQuantity}')"
+              '{mallId:$mallId,shopNo:$shopNo,orderId:$orderId,orderItemCode:$orderItemCode,expectedQuantity:$expectedQuantity,allowExpectedQuantityMappingUpdate:true}')"

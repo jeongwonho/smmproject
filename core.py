@@ -11869,6 +11869,7 @@ class PanelStore(PanelStoreDatabaseMixin):
         order_item_code = str(payload.get("orderItemCode") or payload.get("order_item_code") or "").strip()
         expected_quantity_raw = payload.get("expectedQuantity") or payload.get("expected_quantity") or ""
         expected_quantity = int(expected_quantity_raw) if str(expected_quantity_raw).strip() else 0
+        allow_mapping_update = bool(payload.get("allowExpectedQuantityMappingUpdate") or payload.get("allow_expected_quantity_mapping_update"))
 
         if not item_id and not (mall_id and order_id and order_item_code):
             raise PanelError("Cafe24 품주 id 또는 mall/order/order_item_code가 필요합니다.")
@@ -11888,6 +11889,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                 item_id = str(row["id"])
 
         retry_result = self.retry_cafe24_order_item({"itemId": item_id, "_adminActor": self._admin_actor(payload)})
+        mapping_updated = False
 
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
@@ -11906,10 +11908,46 @@ class PanelStore(PanelStoreDatabaseMixin):
             except (TypeError, ValueError):
                 quantity = 0
             if expected_quantity and quantity != expected_quantity:
-                raise PanelError(
-                    f"Cafe24 옵션 수량 검증 실패: 예상 {expected_quantity}명, 변환 {quantity}명입니다. 발주를 중단했습니다.",
-                    status=409,
-                )
+                mapping_id = str(row["mapping_id"] or "").strip()
+                if allow_mapping_update and mapping_id:
+                    mapping_row = conn.execute("SELECT * FROM cafe24_supplier_mappings WHERE id = ?", (mapping_id,)).fetchone()
+                    if mapping_row is not None and (
+                        str(mapping_row["cafe24_variant_code"] or "").strip()
+                        or str(mapping_row["cafe24_custom_product_code"] or "").strip()
+                    ):
+                        field_mapping = parse_json(mapping_row["field_mapping_json"], {})
+                        field_mapping["orderedCount"] = {"source": "fixed", "value": str(expected_quantity)}
+                        conn.execute(
+                            "UPDATE cafe24_supplier_mappings SET field_mapping_json = ?, updated_at = ? WHERE id = ?",
+                            (as_json(field_mapping), now_iso(), mapping_id),
+                        )
+                        conn.commit()
+                        mapping_updated = True
+                    else:
+                        raise PanelError(
+                            "Cafe24 옵션 수량 자동 보정은 품목코드 또는 자체상품코드 단위 매핑에서만 허용됩니다.",
+                            status=409,
+                        )
+                if mapping_updated:
+                    retry_result = self.retry_cafe24_order_item({"itemId": item_id, "_adminActor": self._admin_actor(payload)})
+                    row = conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
+                    normalized_fields = parse_json(row["normalized_fields_json"], {}) if row is not None else {}
+                    supplier_payload = parse_json(row["supplier_payload_json"], {}) if row is not None else {}
+                    quantity_value = (
+                        supplier_payload.get("quantity")
+                        or supplier_payload.get("orderedCount")
+                        or normalized_fields.get("orderedCount")
+                        or normalized_fields.get("quantity")
+                    )
+                    try:
+                        quantity = int(float(str(quantity_value or "0").replace(",", "").strip() or "0"))
+                    except (TypeError, ValueError):
+                        quantity = 0
+                if expected_quantity and quantity != expected_quantity:
+                    raise PanelError(
+                        f"Cafe24 옵션 수량 검증 실패: 예상 {expected_quantity}명, 변환 {quantity}명입니다. 발주를 중단했습니다.",
+                        status=409,
+                    )
             if str(row["payment_gate_status"] or "") != "payment_confirmed":
                 raise PanelError("Cafe24 결제완료가 확인되지 않아 발주할 수 없습니다.")
             if str(row["standard_status"] or "") != "ready_to_submit":
@@ -11925,6 +11963,7 @@ class PanelStore(PanelStoreDatabaseMixin):
             "dispatch": dispatch_result,
             "expectedQuantity": expected_quantity,
             "normalizedQuantity": quantity,
+            "mappingUpdated": mapping_updated,
         }
 
     def dispatch_cafe24_order_item(self, payload: Dict[str, Any]) -> Dict[str, Any]:
