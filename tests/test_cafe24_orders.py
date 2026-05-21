@@ -586,6 +586,46 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders WHERE order_channel = 'cafe24'").fetchone()[0], 0)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM wallet_ledger").fetchone()[0], 0)
 
+    def test_single_cafe24_supplier_status_check_updates_item(self):
+        order_payload = self._order_payload()
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        item_id = self.conn.execute("SELECT id FROM cafe24_order_items").fetchone()["id"]
+        self.conn.execute(
+            """
+            UPDATE cafe24_order_items
+            SET standard_status = 'supplier_submitted',
+                supplier_order_uuid = 'SUP-STATUS-1001'
+            WHERE id = ?
+            """,
+            (item_id,),
+        )
+        self.conn.commit()
+
+        with patch("core.SupplierApiClient.status", return_value={"status": "Completed"}) as status_call:
+            result = self.store.check_single_cafe24_supplier_status(
+                {
+                    "mallId": "instamart",
+                    "shopNo": 1,
+                    "orderId": "20260426-000001",
+                    "orderItemCode": "20260426-000001-01",
+                    "_adminActor": "cron",
+                }
+            )
+
+        status_call.assert_called_once_with("SUP-STATUS-1001")
+        self.assertEqual(result["supplierStatus"], "completed")
+        self.assertEqual(result["cafe24Status"], "completed")
+        item = self.conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
+        self.assertEqual(item["standard_status"], "completed")
+        self.assertEqual(item["cafe24_completion_status"], "pending")
+
     def test_single_cafe24_dispatch_revalidates_quantity_before_supplier_order(self):
         order_payload = self._order_payload()
         order_payload["items"][0]["options"] = [
