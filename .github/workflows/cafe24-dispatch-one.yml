@@ -22,6 +22,10 @@ on:
         required: true
         default: "50"
 
+permissions:
+  actions: read
+  contents: read
+
 jobs:
   dispatch:
     runs-on: ubuntu-latest
@@ -29,6 +33,7 @@ jobs:
       - name: Dispatch one Cafe24 order item
         env:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          GITHUB_TOKEN: ${{ github.token }}
           MALL_ID: ${{ inputs.mall_id }}
           SHOP_NO: ${{ inputs.shop_no }}
           ORDER_ID: ${{ inputs.order_id }}
@@ -36,13 +41,17 @@ jobs:
           EXPECTED_QUANTITY: ${{ inputs.expected_quantity }}
         run: |
           set -euo pipefail
-          if [ -z "${CRON_SECRET:-}" ]; then
-            echo "CRON_SECRET secret is required" >&2
+          auth_token="${CRON_SECRET:-${GITHUB_TOKEN:-}}"
+          if [ -z "${auth_token:-}" ]; then
+            echo "CRON_SECRET or GITHUB_TOKEN is required" >&2
             exit 1
           fi
           curl --fail-with-body --show-error --silent \
             -X POST "https://smmproject-lime.vercel.app/api/cron/cafe24/order-items/dispatch-one" \
-            -H "Authorization: Bearer ${CRON_SECRET}" \
+            -H "Authorization: Bearer ${auth_token}" \
+            -H "X-GitHub-Repository: ${GITHUB_REPOSITORY}" \
+            -H "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" \
+            -H "X-GitHub-Workflow: ${GITHUB_WORKFLOW}" \
             -H "Content-Type: application/json" \
             --data "$(jq -nc \
               --arg mallId "$MALL_ID" \
