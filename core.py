@@ -10256,6 +10256,44 @@ class PanelStore(PanelStoreDatabaseMixin):
             pairs[entry["label"]] = entry["value"]
         return pairs
 
+    def _cafe24_variant_option_entries(
+        self,
+        conn: DatabaseConnection,
+        integration: Dict[str, Any],
+        identity: Dict[str, str],
+    ) -> List[Dict[str, str]]:
+        product_no = str(identity.get("productNo") or "").strip()
+        variant_code = str(identity.get("variantCode") or "").strip()
+        custom_code = str(identity.get("customProductCode") or "").strip()
+        if not product_no or not (variant_code or custom_code):
+            return []
+        try:
+            self._require_cafe24_scope(integration, "mall.read_product", "Cafe24 품목 옵션 조회")
+            client = self._cafe24_client_for_row(conn, integration)
+            response = client.product_variants(product_no)
+        except Exception:
+            return []
+        for variant in self._cafe24_product_variants_from_payload(response):
+            payload = self._cafe24_variant_payload(variant)
+            payload_variant_code = str(payload.get("variantCode") or "").strip()
+            payload_custom_code = str(payload.get("customProductCode") or "").strip()
+            if variant_code and payload_variant_code and payload_variant_code != variant_code:
+                continue
+            if custom_code and payload_custom_code and payload_custom_code != custom_code:
+                continue
+            entries = self._cafe24_option_entries(
+                {},
+                {
+                    "option_value": payload.get("optionText") or "",
+                    "option_text": payload.get("optionText") or "",
+                    "variant_option": payload.get("optionText") or "",
+                    "options": variant.get("options") or variant.get("option") or variant.get("option_values") or [],
+                },
+            )
+            if entries:
+                return entries
+        return []
+
     @staticmethod
     def _cafe24_quantity_candidates_from_text(text: Any, *, label: str = "", source: str = "") -> List[Dict[str, Any]]:
         raw_text = str(text or "").strip()
@@ -10520,13 +10558,16 @@ class PanelStore(PanelStoreDatabaseMixin):
         item_payload: Dict[str, Any],
         buyer: Dict[str, Any],
         receiver: Dict[str, Any],
+        extra_option_entries: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         form_structure = ensure_request_memo_form_structure(parse_json(product["form_structure_json"], {}), "추가 요청사항")
         template = form_structure.get("template", {})
         schema = form_structure.get("schema", {})
         field_mapping = parse_json(mapping["field_mapping_json"], {})
-        option_entries = self._cafe24_option_entries(order_payload, item_payload)
+        option_entries = self._cafe24_option_entries(order_payload, item_payload) + list(extra_option_entries or [])
         option_pairs = self._cafe24_option_pairs(order_payload, item_payload)
+        for entry in extra_option_entries or []:
+            option_pairs.setdefault(entry["label"], entry["value"])
         option_blob = " ".join(option_pairs.values())
         first_url_match = re.search(r"https?://[^\s,|]+", option_blob)
         account_candidate = ""
@@ -10611,10 +10652,13 @@ class PanelStore(PanelStoreDatabaseMixin):
         item_payload: Dict[str, Any],
         buyer: Dict[str, Any],
         receiver: Dict[str, Any],
+        extra_option_entries: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         field_mapping = parse_json(mapping.get("field_mapping_json"), {})
-        option_entries = self._cafe24_option_entries(order_payload, item_payload)
+        option_entries = self._cafe24_option_entries(order_payload, item_payload) + list(extra_option_entries or [])
         option_pairs = self._cafe24_option_pairs(order_payload, item_payload)
+        for entry in extra_option_entries or []:
+            option_pairs.setdefault(entry["label"], entry["value"])
         option_blob = " ".join(option_pairs.values())
         first_url_match = re.search(r"https?://[^\s,|]+", option_blob)
         account_candidate = ""
@@ -10989,6 +11033,22 @@ class PanelStore(PanelStoreDatabaseMixin):
                 status = "mapping_error"
                 error_message = "Cafe24 상품에 연결된 공급사 서비스가 비활성 상태입니다. 서비스 동기화 또는 매핑 수정이 필요합니다."
             elif mapping.get("internal_product_id"):
+                base_option_entries = self._cafe24_option_entries(order_payload, item_payload)
+                extra_option_entries: List[Dict[str, str]] = []
+                try:
+                    fallback_quantity = int(str(cafe24_payload_value(item_payload, ("quantity", "qty", "order_quantity")) or "0").replace(",", ""))
+                except ValueError:
+                    fallback_quantity = 0
+                supplier_min_amount = int(mapping.get("supplier_min_amount") or 0)
+                if (
+                    supplier_min_amount
+                    and fallback_quantity
+                    and fallback_quantity < supplier_min_amount
+                    and not self._cafe24_quantity_candidates_from_options(base_option_entries)
+                ):
+                    extra_option_entries = self._cafe24_variant_option_entries(conn, integration, identity)
+                    if extra_option_entries:
+                        raw_payload["variantOptionEntries"] = extra_option_entries
                 product_row = conn.execute(
                     """
                     SELECT
@@ -11019,6 +11079,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                             item_payload=item_payload,
                             buyer=buyer,
                             receiver=receiver,
+                            extra_option_entries=extra_option_entries,
                         )
                         form_structure = ensure_request_memo_form_structure(parse_json(product["form_structure_json"], {}), "추가 요청사항")
                         self._validate_fields(normalized_fields, form_structure.get("schema", {}))
@@ -11029,6 +11090,22 @@ class PanelStore(PanelStoreDatabaseMixin):
                         status = self._cafe24_processing_error_status(exc)
                         error_message = str(exc)
             else:
+                base_option_entries = self._cafe24_option_entries(order_payload, item_payload)
+                extra_option_entries = []
+                try:
+                    fallback_quantity = int(str(cafe24_payload_value(item_payload, ("quantity", "qty", "order_quantity")) or "0").replace(",", ""))
+                except ValueError:
+                    fallback_quantity = 0
+                supplier_min_amount = int(mapping.get("supplier_min_amount") or 0)
+                if (
+                    supplier_min_amount
+                    and fallback_quantity
+                    and fallback_quantity < supplier_min_amount
+                    and not self._cafe24_quantity_candidates_from_options(base_option_entries)
+                ):
+                    extra_option_entries = self._cafe24_variant_option_entries(conn, integration, identity)
+                    if extra_option_entries:
+                        raw_payload["variantOptionEntries"] = extra_option_entries
                 try:
                     normalized_fields = self._normalize_cafe24_direct_item_fields(
                         mapping=mapping,
@@ -11036,6 +11113,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                         item_payload=item_payload,
                         buyer=buyer,
                         receiver=receiver,
+                        extra_option_entries=extra_option_entries,
                     )
                     self._validate_cafe24_direct_fields(normalized_fields, mapping)
                     supplier_payload = self._build_supplier_order_payload(
