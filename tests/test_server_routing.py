@@ -170,6 +170,15 @@ class RouterRegistryTest(unittest.TestCase):
         self.assertEqual(route.auth, "admin")
         self.assertFalse(route.csrf)
 
+    def test_cafe24_mapping_gaps_cron_route_declares_cron_auth(self):
+        matched = ROUTER.match("POST", "/api/cron/cafe24/mapping-gaps")
+
+        self.assertIsNotNone(matched)
+        route, params = matched
+        self.assertEqual(params, {})
+        self.assertEqual(route.auth, "cron")
+        self.assertFalse(route.csrf)
+
     def test_cafe24_operational_audit_cron_route_declares_cron_auth(self):
         matched = ROUTER.match("GET", "/api/cron/cafe24/operational-audit")
 

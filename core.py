@@ -71,6 +71,7 @@ try:
         normalize_cafe24_status,
     )
     from .backend.integrations.cafe24_audit import build_cafe24_operational_audit
+    from .backend.integrations.cafe24_mapping_gaps import summarize_cafe24_mapping_gaps
     from .backend.integrations.cafe24_preflight import build_cafe24_order_item_preflight, cafe24_preflight_quantity
     from .backend.integrations.suppliers import (
         FASTTRAFFIC_API_URL,
@@ -127,6 +128,7 @@ except ImportError:  # pragma: no cover - top-level script runtime
         normalize_cafe24_status,
     )
     from backend.integrations.cafe24_audit import build_cafe24_operational_audit
+    from backend.integrations.cafe24_mapping_gaps import summarize_cafe24_mapping_gaps
     from backend.integrations.cafe24_preflight import build_cafe24_order_item_preflight, cafe24_preflight_quantity
     from backend.integrations.suppliers import (
         FASTTRAFFIC_API_URL,
@@ -8718,6 +8720,168 @@ class PanelStore(PanelStoreDatabaseMixin):
                 token_status_label=self._cafe24_token_status_label,
                 token_status_message=self._cafe24_token_status_message,
             )
+
+    def cafe24_mapping_gap_report(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        integration_id = str(payload.get("integrationId") or payload.get("integration_id") or "").strip()
+        mall_id = str(payload.get("mallId") or payload.get("mall_id") or "").strip()
+        shop_no = normalize_cafe24_shop_no(payload.get("shopNo") or payload.get("shop_no"))
+        include_product_details_raw = payload.get("includeProductDetails", payload.get("include_product_details", True))
+        include_product_details = str(include_product_details_raw).strip().lower() not in {"0", "false", "no", "off"}
+        raw_product_filter = payload.get("productNos") or payload.get("product_nos") or ""
+        if isinstance(raw_product_filter, list):
+            product_filter = {str(item or "").strip() for item in raw_product_filter if str(item or "").strip()}
+        else:
+            product_filter = {item.strip() for item in re.split(r"[\s,]+", str(raw_product_filter or "")) if item.strip()}
+        try:
+            limit = min(max(int(payload.get("limit") or 50), 1), 200)
+        except (TypeError, ValueError):
+            raise PanelError("조회 개수 값이 올바르지 않습니다.", status=400)
+
+        with self._connect() as conn:
+            if integration_id:
+                integration = self._cafe24_integration_row(conn, integration_id)
+            elif mall_id:
+                integration = conn.execute(
+                    """
+                    SELECT *
+                    FROM cafe24_integrations
+                    WHERE mall_id = ? AND shop_no = ?
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    (mall_id, shop_no),
+                ).fetchone()
+                if integration is None:
+                    raise PanelError("Cafe24 연동 정보를 찾을 수 없습니다.", status=404)
+            else:
+                integration = self._cafe24_integration_row(conn, "")
+            mall_id = str(integration["mall_id"])
+            shop_no = int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO)
+
+            where = [
+                "coi.mall_id = ?",
+                "coi.shop_no = ?",
+                "coi.payment_gate_status = 'payment_confirmed'",
+                "(coi.mapping_id = '' OR coi.mapping_id IS NULL)",
+                "(coi.supplier_service_id = '' OR coi.supplier_service_id IS NULL)",
+            ]
+            params: List[Any] = [mall_id, shop_no]
+            if product_filter:
+                placeholders = ", ".join("?" for _ in product_filter)
+                where.append(f"coi.cafe24_product_no IN ({placeholders})")
+                params.extend(sorted(product_filter))
+            rows = conn.execute(
+                f"""
+                SELECT
+                    coi.id, coi.mall_id, coi.shop_no, coi.cafe24_order_id,
+                    coi.cafe24_order_item_code, coi.cafe24_product_no,
+                    coi.cafe24_variant_code, coi.cafe24_custom_product_code,
+                    coi.standard_status, coi.payment_gate_status, coi.error_message,
+                    coi.raw_payload_json, coi.last_synced_at, coi.updated_at, coi.created_at
+                FROM cafe24_order_items coi
+                WHERE {" AND ".join(where)}
+                ORDER BY COALESCE(NULLIF(coi.last_synced_at, ''), coi.updated_at, coi.created_at) DESC
+                LIMIT ?
+                """,
+                [*params, limit],
+            ).fetchall()
+
+            items: List[Dict[str, Any]] = []
+            product_nos: List[str] = []
+            for row in rows:
+                raw_payload = parse_json(row["raw_payload_json"], {})
+                order_payload = raw_payload.get("order") if isinstance(raw_payload.get("order"), dict) else {}
+                item_payload = raw_payload.get("item") if isinstance(raw_payload.get("item"), dict) else {}
+                option_entries = self._cafe24_option_entries(order_payload, item_payload) if item_payload else []
+                quantity_candidates: List[Dict[str, Any]] = []
+                for entry in option_entries:
+                    for candidate in self._cafe24_quantity_candidates_from_text(
+                        entry.get("value"),
+                        label=str(entry.get("label") or ""),
+                        source=str(entry.get("source") or ""),
+                    ):
+                        safe_candidate = {
+                            "value": int(candidate.get("value") or 0),
+                            "unit": str(candidate.get("unit") or ""),
+                            "label": str(candidate.get("label") or ""),
+                            "source": str(candidate.get("source") or ""),
+                        }
+                        if safe_candidate["value"] > 0 and safe_candidate not in quantity_candidates:
+                            quantity_candidates.append(safe_candidate)
+                product_no = str(row["cafe24_product_no"] or "").strip()
+                if product_no and product_no not in product_nos:
+                    product_nos.append(product_no)
+                items.append(
+                    {
+                        "id": row["id"],
+                        "mallId": row["mall_id"],
+                        "shopNo": int(row["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                        "orderId": row["cafe24_order_id"],
+                        "orderItemCode": row["cafe24_order_item_code"],
+                        "productNo": product_no,
+                        "variantCode": row["cafe24_variant_code"] or "",
+                        "customProductCode": row["cafe24_custom_product_code"] or "",
+                        "standardStatus": row["standard_status"] or "",
+                        "paymentGateStatus": row["payment_gate_status"] or "",
+                        "errorMessage": row["error_message"] or "",
+                        "lastSyncedAt": row["last_synced_at"] or "",
+                        "optionLabels": sorted({str(entry.get("label") or "") for entry in option_entries if str(entry.get("label") or "")}),
+                        "quantityCandidates": quantity_candidates,
+                    }
+                )
+
+            product_details: Dict[str, Any] = {}
+            warnings: List[str] = []
+            if include_product_details and product_nos:
+                self._require_cafe24_scope(integration, "mall.read_product", "Cafe24 미매핑 상품 상세 조회")
+                client = self._cafe24_client_for_row(conn, integration)
+                for product_no in product_nos:
+                    try:
+                        product_response = client.product(product_no)
+                        product_rows = self._cafe24_products_from_payload(product_response)
+                        if not product_rows:
+                            warnings.append(f"상품 {product_no}: Cafe24 상품 응답이 비어 있습니다.")
+                            continue
+                        product_payload = self._cafe24_product_payload(product_rows[0])
+                        try:
+                            option_response = client.product_options(product_no)
+                            product_payload["options"] = [
+                                self._cafe24_option_payload(option)
+                                for option in self._cafe24_product_options_from_payload(option_response)
+                            ] or product_payload["options"]
+                        except Exception as exc:
+                            warnings.append(f"상품 {product_no}: 옵션 조회 실패: {exc}")
+                        try:
+                            variant_response = client.product_variants(product_no)
+                            product_payload["variants"] = [
+                                self._cafe24_variant_payload(variant)
+                                for variant in self._cafe24_product_variants_from_payload(variant_response)
+                            ] or product_payload["variants"]
+                        except Exception as exc:
+                            warnings.append(f"상품 {product_no}: 품목 조회 실패: {exc}")
+                        product_details[product_no] = product_payload
+                    except Exception as exc:
+                        warnings.append(f"상품 {product_no}: 상세 조회 실패: {exc}")
+                conn.commit()
+
+        return {
+            "integration": {
+                "id": integration["id"],
+                "mallId": mall_id,
+                "shopNo": shop_no,
+                "tokenStatus": self._cafe24_token_status(integration),
+                "tokenStatusLabel": self._cafe24_token_status_label(integration),
+            },
+            "summary": {
+                "itemCount": len(items),
+                "groupCount": len(summarize_cafe24_mapping_gaps(items)),
+                "productNos": product_nos,
+            },
+            "groups": summarize_cafe24_mapping_gaps(items),
+            "productDetails": product_details,
+            "warnings": warnings,
+            "checkedAt": now_iso(),
+        }
 
     def _log_cafe24_event(
         self,

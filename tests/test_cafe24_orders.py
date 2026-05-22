@@ -70,6 +70,31 @@ class FakeCafe24VariantQuantityClient(FakeCafe24ProductClient):
         }
 
 
+class FakeCafe24GapProductClient(FakeCafe24ProductClient):
+    def product(self, product_no):
+        return {
+            "product": {
+                "product_no": str(product_no),
+                "product_name": f"미매핑 상품 {product_no}",
+                "custom_product_code": f"P{int(product_no):07d}" if str(product_no).isdigit() else str(product_no),
+            }
+        }
+
+    def product_options(self, product_no):
+        return {"options": [{"option_name": "팔로워 수", "option_values": ["100명", "500명"]}]}
+
+    def product_variants(self, product_no):
+        return {
+            "variants": [
+                {
+                    "variant_code": "P00000BG000A",
+                    "custom_product_code": "P00000BG",
+                    "option_value": "팔로워 수: 100명",
+                }
+            ]
+        }
+
+
 class FailingCafe24ProductClient:
     def products(self, *, keyword="", product_no="", limit=20, offset=0):
         raise Cafe24ApiError("Cafe24 API 오류 403: scope permission denied")
@@ -691,6 +716,43 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertNotIn("access-token", rendered)
         self.assertNotIn("refresh-token", rendered)
         self.assertNotIn("api-key", rendered)
+
+    def test_cafe24_mapping_gap_report_groups_unmapped_items_without_targets(self):
+        order_payload = self._order_payload()
+        order_payload["order_id"] = "20260512-0000017"
+        order_payload["items"][0]["order_item_code"] = "20260512-0000017-01"
+        order_payload["items"][0]["product_no"] = "32"
+        order_payload["items"][0]["variant_code"] = "P00000BG000A"
+        order_payload["items"][0]["custom_product_code"] = "P00000BG"
+        order_payload["items"][0]["options"] = [
+            {"name": "계정", "value": "instamart_official"},
+            {"name": "팔로워 수", "value": "100명 (+12,000원)"},
+        ]
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=FakeCafe24GapProductClient()):
+            report = self.store.cafe24_mapping_gap_report(
+                {"integrationId": self.integration["id"], "productNos": "32", "includeProductDetails": True}
+            )
+
+        self.assertEqual(report["summary"]["itemCount"], 1)
+        self.assertEqual(report["summary"]["groupCount"], 1)
+        self.assertEqual(report["groups"][0]["productNo"], "32")
+        self.assertEqual(report["groups"][0]["variantCode"], "P00000BG000A")
+        self.assertIn("계정", report["groups"][0]["optionLabels"])
+        self.assertIn("팔로워 수", report["groups"][0]["optionLabels"])
+        self.assertEqual(report["groups"][0]["quantityCandidates"][0]["value"], 100)
+        self.assertEqual(report["productDetails"]["32"]["productName"], "미매핑 상품 32")
+        rendered = json.dumps(report, ensure_ascii=False)
+        self.assertNotIn("instamart_official", rendered)
 
     def test_ready_cafe24_item_can_be_manually_dispatched_once(self):
         order_payload = self._order_payload()
