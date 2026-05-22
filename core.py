@@ -71,6 +71,7 @@ try:
         normalize_cafe24_status,
     )
     from .backend.integrations.cafe24_audit import build_cafe24_operational_audit
+    from .backend.integrations.cafe24_preflight import build_cafe24_order_item_preflight, cafe24_preflight_quantity
     from .backend.integrations.suppliers import (
         FASTTRAFFIC_API_URL,
         SUPPLIER_INTEGRATION_FASTTRAFFIC,
@@ -126,6 +127,7 @@ except ImportError:  # pragma: no cover - top-level script runtime
         normalize_cafe24_status,
     )
     from backend.integrations.cafe24_audit import build_cafe24_operational_audit
+    from backend.integrations.cafe24_preflight import build_cafe24_order_item_preflight, cafe24_preflight_quantity
     from backend.integrations.suppliers import (
         FASTTRAFFIC_API_URL,
         SUPPLIER_INTEGRATION_FASTTRAFFIC,
@@ -11697,16 +11699,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                 raise PanelError("Cafe24 주문 품주를 찾을 수 없습니다.", status=404)
             normalized_fields = parse_json(row["normalized_fields_json"], {})
             supplier_payload = parse_json(row["supplier_payload_json"], {})
-            quantity_value = (
-                supplier_payload.get("quantity")
-                or supplier_payload.get("orderedCount")
-                or normalized_fields.get("orderedCount")
-                or normalized_fields.get("quantity")
-            )
-            try:
-                quantity = int(float(str(quantity_value or "0").replace(",", "").strip() or "0"))
-            except (TypeError, ValueError):
-                quantity = 0
+            quantity = cafe24_preflight_quantity(normalized_fields, supplier_payload)
             if expected_quantity and quantity != expected_quantity:
                 mapping_id = str(row["mapping_id"] or "").strip()
                 if allow_mapping_update and mapping_id:
@@ -11733,16 +11726,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                     row = conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
                     normalized_fields = parse_json(row["normalized_fields_json"], {}) if row is not None else {}
                     supplier_payload = parse_json(row["supplier_payload_json"], {}) if row is not None else {}
-                    quantity_value = (
-                        supplier_payload.get("quantity")
-                        or supplier_payload.get("orderedCount")
-                        or normalized_fields.get("orderedCount")
-                        or normalized_fields.get("quantity")
-                    )
-                    try:
-                        quantity = int(float(str(quantity_value or "0").replace(",", "").strip() or "0"))
-                    except (TypeError, ValueError):
-                        quantity = 0
+                    quantity = cafe24_preflight_quantity(normalized_fields, supplier_payload)
                 if expected_quantity and quantity != expected_quantity:
                     raise PanelError(
                         f"Cafe24 옵션 수량 검증 실패: 예상 {expected_quantity}명, 변환 {quantity}명입니다. 발주를 중단했습니다.",
@@ -11825,16 +11809,6 @@ class PanelStore(PanelStoreDatabaseMixin):
             item = self._cafe24_order_item_payload(row)
             normalized_fields = parse_json(row["normalized_fields_json"], {})
             supplier_payload = parse_json(row["supplier_payload_json"], {})
-            quantity_value = (
-                supplier_payload.get("quantity")
-                or supplier_payload.get("orderedCount")
-                or normalized_fields.get("orderedCount")
-                or normalized_fields.get("quantity")
-            )
-            try:
-                quantity = int(float(str(quantity_value or "0").replace(",", "").strip() or "0"))
-            except (TypeError, ValueError):
-                quantity = 0
             readiness = {"ok": False, "code": "supplier_missing", "message": "공급사 매핑이 없습니다."}
             if str(row.get("supplier_id") or "").strip():
                 readiness = self._supplier_auto_dispatch_readiness(
@@ -11843,75 +11817,15 @@ class PanelStore(PanelStoreDatabaseMixin):
                     supplier_service_id=str(row.get("supplier_service_id") or ""),
                 )
 
-        blocking_reasons: List[str] = []
-        if item["paymentGateStatus"] != "payment_confirmed":
-            blocking_reasons.append("payment_not_confirmed")
-        if item["standardStatus"] != "ready_to_submit":
-            blocking_reasons.append(f"status_{item['standardStatus'] or 'unknown'}")
-        if not item["mappingId"]:
-            blocking_reasons.append("mapping_missing")
-        if not item["supplierId"] or not item["supplierServiceId"]:
-            blocking_reasons.append("supplier_mapping_missing")
-        if not supplier_payload:
-            blocking_reasons.append("supplier_payload_missing")
-        if item["supplierOrderUuid"]:
-            blocking_reasons.append("supplier_order_already_exists")
-        if expected_quantity and quantity != expected_quantity:
-            blocking_reasons.append("quantity_mismatch")
-        if not readiness.get("ok"):
-            blocking_reasons.append(str(readiness.get("code") or "supplier_not_ready"))
-
-        supplier_payload_keys = sorted(str(key) for key in supplier_payload.keys())
-        target_keys = {"link", "targetUrl", "targetValue", "snsValue", "username", "url"}
-        quantity_keys = {"quantity", "orderedCount", "count", "amount"}
-        return {
-            "itemId": item_id,
-            "identity": {
-                "mallId": item["mallId"],
-                "shopNo": item["shopNo"],
-                "orderId": item["orderId"],
-                "orderItemCode": item["orderItemCode"],
-                "productNo": item["productNo"],
-                "variantCode": item["variantCode"],
-                "customProductCode": item["customProductCode"],
-            },
-            "statuses": {
-                "standardStatus": item["standardStatus"],
-                "paymentGateStatus": item["paymentGateStatus"],
-                "automationErrorCode": item["automationErrorCode"],
-                "errorMessage": item["errorMessage"],
-            },
-            "mapping": {
-                "mappingId": item["mappingId"],
-                "supplierId": item["supplierId"],
-                "supplierServiceId": item["supplierServiceId"],
-                "supplierExternalServiceId": item["supplierExternalServiceId"],
-                "supplierOrderUuid": item["supplierOrderUuid"],
-            },
-            "quantity": {
-                "expected": expected_quantity,
-                "normalized": quantity,
-                "matchesExpected": not expected_quantity or quantity == expected_quantity,
-            },
-            "supplierPayload": {
-                "keys": supplier_payload_keys,
-                "service": str(supplier_payload.get("service") or ""),
-                "hasTarget": any(key in supplier_payload and str(supplier_payload.get(key) or "").strip() for key in target_keys),
-                "hasQuantity": any(key in supplier_payload and str(supplier_payload.get(key) or "").strip() for key in quantity_keys),
-            },
-            "targetDiagnostics": {
-                "status": item["targetDiagnostics"]["status"],
-                "normalized": bool(item["targetDiagnostics"]["normalized"]),
-                "message": item["targetDiagnostics"]["message"],
-                "supplierStatus": item["targetDiagnostics"]["supplierStatus"],
-                "supplierReasonCode": item["targetDiagnostics"]["supplierReasonCode"],
-                "supplierReasonMessage": item["targetDiagnostics"]["supplierReasonMessage"],
-            },
-            "supplierReadiness": readiness,
-            "canDispatch": not blocking_reasons,
-            "blockingReasons": blocking_reasons,
-            "checkedAt": now_iso(),
-        }
+        return build_cafe24_order_item_preflight(
+            item_id=item_id,
+            item=item,
+            normalized_fields=normalized_fields,
+            supplier_payload=supplier_payload,
+            readiness=readiness,
+            expected_quantity=expected_quantity,
+            checked_at=now_iso(),
+        )
 
     def check_single_cafe24_supplier_status(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         item_id = str(payload.get("itemId") or payload.get("id") or "").strip()

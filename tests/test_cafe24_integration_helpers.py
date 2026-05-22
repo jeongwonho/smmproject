@@ -14,6 +14,7 @@ from backend.integrations.cafe24 import (
     normalize_cafe24_shop_no,
     normalize_cafe24_status,
 )
+from backend.integrations.cafe24_preflight import build_cafe24_order_item_preflight, cafe24_preflight_quantity
 
 
 class Cafe24IntegrationHelperTest(unittest.TestCase):
@@ -58,6 +59,56 @@ class Cafe24IntegrationHelperTest(unittest.TestCase):
         self.assertTrue(cafe24_refresh_token_expired(expired_at))
         self.assertTrue(cafe24_refresh_error_requires_reconnect("invalid_grant: expired refresh token"))
         self.assertFalse(cafe24_refresh_error_requires_reconnect("temporary upstream timeout"))
+
+    def test_preflight_helper_reports_conditions_without_target_values(self):
+        item = {
+            "mallId": "growit",
+            "shopNo": 1,
+            "orderId": "20260506-0000024",
+            "orderItemCode": "20260506-0000024-01",
+            "productNo": "12",
+            "variantCode": "P000000M000D",
+            "customProductCode": "P000000M",
+            "standardStatus": "ready_to_submit",
+            "paymentGateStatus": "payment_confirmed",
+            "automationErrorCode": "",
+            "errorMessage": "",
+            "mappingId": "mapping-1",
+            "supplierId": "supplier-1",
+            "supplierServiceId": "service-1",
+            "supplierExternalServiceId": "40000",
+            "supplierOrderUuid": "",
+            "targetDiagnostics": {
+                "status": "normalized",
+                "normalized": True,
+                "message": "",
+                "supplierStatus": "",
+                "supplierReasonCode": "",
+                "supplierReasonMessage": "",
+            },
+        }
+        supplier_payload = {
+            "service": "40000",
+            "link": "https://www.instagram.com/instamart_official/",
+            "quantity": "50",
+        }
+
+        preflight = build_cafe24_order_item_preflight(
+            item_id="item-1",
+            item=item,
+            normalized_fields={},
+            supplier_payload=supplier_payload,
+            readiness={"ok": True, "code": "ok", "message": "발주 가능"},
+            expected_quantity=50,
+            checked_at="2026-05-22T10:00:00+00:00",
+        )
+
+        self.assertEqual(cafe24_preflight_quantity({}, supplier_payload), 50)
+        self.assertTrue(preflight["canDispatch"])
+        self.assertEqual(preflight["supplierPayload"]["keys"], ["link", "quantity", "service"])
+        self.assertTrue(preflight["supplierPayload"]["hasTarget"])
+        self.assertTrue(preflight["supplierPayload"]["hasQuantity"])
+        self.assertNotIn("instamart_official", str(preflight))
 
 
 if __name__ == "__main__":

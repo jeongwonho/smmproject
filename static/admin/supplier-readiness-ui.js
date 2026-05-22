@@ -75,9 +75,88 @@ function supplierServicePayloadHint(integrationType, selectedService) {
   const example = guide.callExamplePayload || {};
   const keys = Object.keys(example).filter((key) => key !== "key").slice(0, 5);
   const keyText = keys.length ? `전송 키: ${keys.join(", ")}` : "공급사 payload 예시를 확인하세요.";
-  if (integrationType === "mkt24") return `${keyText}. MKT24 panel은 service, link/username, quantity 조합을 확인합니다.`;
+  if (integrationType === "mkt24") return `${keyText}. MKT24 panel은 service, link 또는 username 중 하나, quantity 조합을 확인합니다.`;
   if (integrationType === "fasttraffic") return `${keyText}. FastTraffic은 action별 필수값과 quantityParam이 다릅니다.`;
   return `${keyText}. classic은 service, link 또는 username, quantity 조합을 확인합니다.`;
+}
+
+function supplierDispatchContractCards(selectedSupplier, selectedService) {
+  const integrationType = selectedSupplier?.integrationType || "classic";
+  const externalServiceId = String(selectedService?.externalServiceId || "").trim();
+  const guide = selectedService?.requestGuide || {};
+  const example = guide.callExamplePayload || {};
+  const keys = Object.keys(example).filter((key) => key !== "key");
+  if (integrationType === "mkt24") {
+    const panelApi = supplierUsesMkt24PanelApi(selectedSupplier);
+    return [
+      {
+        label: "Endpoint",
+        value: panelApi ? "/v3/panel" : "legacy v3",
+        description: panelApi ? "form key + action=add로 전송" : "JSON /order/sns 직접 주문 설정 확인 필요",
+      },
+      {
+        label: "인증",
+        value: "API Key",
+        description: "Bearer Token 없이 key 파라미터만 사용",
+      },
+      {
+        label: "서비스",
+        value: externalServiceId || "미선택",
+        description: panelApi ? "숫자형 panel service ID 필요" : "상품 UUID와 optionInfo 설정 필요",
+      },
+      {
+        label: "대상/수량",
+        value: "link 또는 username + quantity",
+        description: "link로 정규화되면 username을 같이 보내지 않음",
+      },
+    ];
+  }
+  if (integrationType === "fasttraffic") {
+    return [
+      {
+        label: "Endpoint",
+        value: "nblog_api.php",
+        description: "FastTraffic 전용 form endpoint",
+      },
+      {
+        label: "인증",
+        value: "X-Api-Key",
+        description: "API Key는 헤더로만 전송",
+      },
+      {
+        label: "Action",
+        value: externalServiceId || "미선택",
+        description: "정적 카탈로그의 action과 상태 조회 action 사용",
+      },
+      {
+        label: "필수값",
+        value: keys.length ? keys.join(", ") : "서비스 선택 필요",
+        description: "서비스별 targetParam/quantityParam 기준",
+      },
+    ];
+  }
+  return [
+    {
+      label: "Endpoint",
+      value: "classic API",
+      description: "key + action form API",
+    },
+    {
+      label: "인증",
+      value: "key",
+      description: "요청 body에 공급사 key 포함",
+    },
+    {
+      label: "서비스",
+      value: externalServiceId || "미선택",
+      description: "action=add의 service 값",
+    },
+    {
+      label: "대상/수량",
+      value: "link/username + quantity",
+      description: "서비스 타입에 맞는 target 필드와 수량 필요",
+    },
+  ];
 }
 
 function supplierDispatchReadinessChecks({
@@ -94,6 +173,7 @@ function supplierDispatchReadinessChecks({
   const healthStatus = String(selectedSupplier?.healthStatus || "unknown");
   const balanceStatus = String(selectedSupplier?.balanceStatus || "unknown");
   const selectedExternalServiceId = String(selectedService?.externalServiceId || "").trim();
+  const selectedServiceActive = !selectedService || selectedService.isActive !== false;
   const endpointCheck = supplierApiEndpointCheck(selectedSupplier);
   const checks = [
     {
@@ -140,9 +220,11 @@ function supplierDispatchReadinessChecks({
     {
       label: "서비스 선택",
       value: selectedService ? `#${selectedExternalServiceId || selectedService.id}` : "미선택",
-      ok: Boolean(selectedService?.id && selectedExternalServiceId),
+      ok: Boolean(selectedService?.id && selectedExternalServiceId && selectedServiceActive),
       blocking: true,
-      description: supplierServicePayloadHint(integrationType, selectedService),
+      description: selectedService && !selectedServiceActive
+        ? "비활성 공급사 서비스는 매핑과 발주 전에 service sync 또는 서비스 교체가 필요합니다."
+        : supplierServicePayloadHint(integrationType, selectedService),
     },
     {
       label: "잔액 확인",
@@ -165,7 +247,7 @@ function supplierDispatchReadinessChecks({
       label: "MKT24 발주 ID",
       value: !selectedService ? "서비스 필요" : panelApi && uuidLike ? "UUID 매핑 차단" : panelApi && !numericId ? "ID 형식 확인" : "panel ID 준비",
       ok: Boolean(selectedService) && (!panelApi || (numericId && !uuidLike)),
-      blocking: Boolean(selectedService) && panelApi && uuidLike,
+      blocking: Boolean(selectedService) && panelApi && (!numericId || uuidLike),
       description: panelApi
         ? "MKT24 /v3/panel 발주는 상품 UUID가 아니라 숫자형 panel 서비스 ID로 매핑해야 합니다."
         : "현재 URL은 /v3/panel 모드가 아니므로 MKT24 설정을 다시 확인하세요.",
@@ -230,6 +312,7 @@ export function renderSupplierDispatchReadinessPanel({
   const blockingChecks = checks.filter((check) => !check.ok && check.blocking);
   const reviewChecks = checks.filter((check) => !check.ok && !check.blocking);
   const integrationType = selectedSupplier.integrationType || "classic";
+  const contractCards = supplierDispatchContractCards(selectedSupplier, selectedService);
   const statusValue = blockingChecks.length
     ? `${blockingChecks.length}개 차단`
     : reviewChecks.length
@@ -273,6 +356,20 @@ export function renderSupplierDispatchReadinessPanel({
         ],
         "admin-insight-grid--compact"
       )}
+
+      <div class="admin-mapping-preview">
+        ${contractCards
+          .map(
+            (card) => `
+              <article class="admin-mini-card">
+                <span>${escapeHtml(card.label)}</span>
+                <strong>${escapeHtml(card.value)}</strong>
+                <p>${escapeHtml(card.description)}</p>
+              </article>
+            `
+          )
+          .join("")}
+      </div>
 
       <div class="admin-mapping-preview">
         ${checks
