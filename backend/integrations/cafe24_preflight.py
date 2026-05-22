@@ -5,6 +5,21 @@ from typing import Any, Dict, List
 
 CAFE24_PREFLIGHT_TARGET_KEYS = {"link", "targetUrl", "targetValue", "snsValue", "username", "url"}
 CAFE24_PREFLIGHT_QUANTITY_KEYS = {"quantity", "orderedCount", "count", "amount"}
+CAFE24_PREVIEW_REDACT_KEYS = {
+    "account",
+    "comments",
+    "contactPhone",
+    "link",
+    "memo",
+    "phone",
+    "requestMemo",
+    "snsValue",
+    "target",
+    "targetUrl",
+    "targetValue",
+    "url",
+    "username",
+}
 
 
 def cafe24_preflight_quantity(normalized_fields: Dict[str, Any], supplier_payload: Dict[str, Any]) -> int:
@@ -18,6 +33,74 @@ def cafe24_preflight_quantity(normalized_fields: Dict[str, Any], supplier_payloa
         return int(float(str(quantity_value or "0").replace(",", "").strip() or "0"))
     except (TypeError, ValueError):
         return 0
+
+
+def redact_cafe24_preview_value(value: Any, *, key: str = "") -> Any:
+    if isinstance(value, dict):
+        return {
+            item_key: redact_cafe24_preview_value(item_value, key=str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_cafe24_preview_value(item, key=key) for item in value]
+    normalized_key = str(key or "").strip()
+    lower_key = normalized_key.lower()
+    if normalized_key in CAFE24_PREVIEW_REDACT_KEYS or any(
+        token in lower_key
+        for token in ("authorization", "bearer", "email", "link", "memo", "password", "phone", "secret", "target", "token", "url", "username")
+    ):
+        return "<redacted>"
+    return value
+
+
+def build_cafe24_mapping_preview_report(
+    preview: Dict[str, Any],
+    *,
+    expected_quantity: int = 0,
+) -> Dict[str, Any]:
+    normalized_fields = preview.get("normalizedFields") if isinstance(preview.get("normalizedFields"), dict) else {}
+    supplier_payload = preview.get("supplierPayload") if isinstance(preview.get("supplierPayload"), dict) else {}
+    quantity = cafe24_preflight_quantity(normalized_fields, supplier_payload)
+    quantity_candidates = []
+    for candidate in preview.get("quantityCandidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        quantity_candidates.append(
+            {
+                "value": candidate.get("value"),
+                "unit": candidate.get("unit") or "",
+                "label": candidate.get("label") or "",
+                "source": candidate.get("source") or "",
+            }
+        )
+    return {
+        "ok": bool(preview.get("ok")),
+        "errors": list(preview.get("errors") or []),
+        "sampleOrderItemId": str(preview.get("sampleOrderItemId") or ""),
+        "normalizedFieldKeys": sorted(str(key) for key in normalized_fields.keys()),
+        "supplierPayloadKeys": sorted(str(key) for key in supplier_payload.keys()),
+        "normalizedFields": redact_cafe24_preview_value(normalized_fields),
+        "supplierPayload": redact_cafe24_preview_value(supplier_payload),
+        "supplierPayloadDiagnostics": {
+            "service": str(supplier_payload.get("service") or ""),
+            "hasTarget": any(
+                key in supplier_payload and str(supplier_payload.get(key) or "").strip()
+                for key in CAFE24_PREFLIGHT_TARGET_KEYS
+            ),
+            "hasQuantity": any(
+                key in supplier_payload and str(supplier_payload.get(key) or "").strip()
+                for key in CAFE24_PREFLIGHT_QUANTITY_KEYS
+            ),
+        },
+        "quantity": {
+            "expected": expected_quantity,
+            "normalized": quantity,
+            "matchesExpected": not expected_quantity or quantity == expected_quantity,
+        },
+        "optionEntryCount": len(preview.get("optionEntries") or []),
+        "quantityCandidates": quantity_candidates,
+        "fieldMapping": redact_cafe24_preview_value(preview.get("fieldMapping") or {}),
+    }
 
 
 def cafe24_preflight_blocking_reasons(

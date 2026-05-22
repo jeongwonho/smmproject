@@ -646,6 +646,14 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(preview["supplierPayload"]["service"], "svc-1001")
         self.assertEqual(preview["supplierPayload"]["quantity"], "500")
 
+        preview_one = self.store.preview_single_cafe24_order_item({"itemId": item["id"], "expectedQuantity": 500})
+        self.assertTrue(preview_one["preview"]["ok"])
+        self.assertEqual(preview_one["preview"]["supplierPayload"]["service"], "svc-1001")
+        self.assertEqual(preview_one["preview"]["supplierPayload"]["quantity"], "500")
+        self.assertEqual(preview_one["preview"]["quantity"]["normalized"], 500)
+        self.assertTrue(preview_one["preview"]["quantity"]["matchesExpected"])
+        self.assertNotIn("instamart_official", json.dumps(preview_one, ensure_ascii=False))
+
         self._enable_auto_submit_and_supplier_ready()
         with patch("core.SupplierApiClient.order", return_value={"order": "SUP-WORKFLOW-1"}) as order_call:
             dispatch = self.store.dispatch_cafe24_order_item({"itemId": item["id"], "_adminActor": "qa"})

@@ -1467,6 +1467,13 @@ class AppHandler(SimpleHTTPRequestHandler):
         result = self._server().store.preflight_single_cafe24_order_item(payload)
         write_json(self, 200, {"ok": True, **result})
 
+    @route("POST", "/api/cron/cafe24/order-items/preview", auth="cron", read_json_body=True)
+    def _post_cron_cafe24_order_items_preview(self, request: RouteRequest) -> None:
+        payload = dict(request.payload or {})
+        payload["_adminActor"] = "cron"
+        result = self._server().store.preview_single_cafe24_order_item(payload)
+        write_json(self, 200, {"ok": True, **result})
+
     @route("POST", "/api/cron/cafe24/order-items/check-supplier-status", auth="cron", read_json_body=True)
     def _post_cron_cafe24_order_items_check_supplier_status(self, request: RouteRequest) -> None:
         payload = dict(request.payload or {})
