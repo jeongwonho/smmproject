@@ -1,0 +1,30 @@
+name: Cafe24 Operational Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read Cafe24 operational audit
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          auth_token="${CRON_SECRET:-${GITHUB_TOKEN:-}}"
+          if [ -z "${auth_token:-}" ]; then
+            echo "CRON_SECRET or GITHUB_TOKEN is required" >&2
+            exit 1
+          fi
+          curl --fail-with-body --show-error --silent \
+            "https://smmproject-lime.vercel.app/api/cron/cafe24/operational-audit" \
+            -H "Authorization: Bearer ${auth_token}" \
+            -H "X-GitHub-Repository: ${GITHUB_REPOSITORY}" \
+            -H "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" \
+            -H "X-GitHub-Workflow: ${GITHUB_WORKFLOW}"

@@ -36,6 +36,50 @@ function supplierUsesMkt24PanelApi(supplier) {
   return String(supplier?.apiUrl || "").includes("/v3/panel");
 }
 
+function supplierApiEndpointCheck(selectedSupplier) {
+  const integrationType = selectedSupplier?.integrationType || "classic";
+  const apiUrl = String(selectedSupplier?.apiUrl || "").trim();
+  if (integrationType === "mkt24") {
+    const usesPanelApi = supplierUsesMkt24PanelApi(selectedSupplier);
+    return {
+      value: usesPanelApi ? "/v3/panel" : "legacy URL",
+      ok: usesPanelApi,
+      blocking: false,
+      description: usesPanelApi
+        ? "MKT24 대행사용 표준 endpoint로 service sync와 panel 발주를 실행합니다."
+        : "legacy MKT24 URL은 직접 주문 모드입니다. 신규 매핑은 /v3/panel 전환 여부를 먼저 확인하세요.",
+    };
+  }
+  if (integrationType === "fasttraffic") {
+    const normalized = apiUrl.includes("fastraffic.co.kr/nblog_api.php") || apiUrl.includes("fasttraffic.co.kr/nblog_api.php");
+    return {
+      value: normalized ? "전용 endpoint" : "URL 확인",
+      ok: normalized,
+      blocking: false,
+      description: normalized
+        ? "FastTraffic 전용 endpoint와 X-Api-Key 헤더 조건으로 발주합니다."
+        : "FastTraffic은 https://fastraffic.co.kr/nblog_api.php endpoint를 사용해야 합니다.",
+    };
+  }
+  return {
+    value: apiUrl ? "classic API" : "URL 없음",
+    ok: Boolean(apiUrl),
+    blocking: true,
+    description: apiUrl ? "classic SMM API는 services/add/status action을 사용합니다." : "classic 공급사는 API URL이 필요합니다.",
+  };
+}
+
+function supplierServicePayloadHint(integrationType, selectedService) {
+  if (!selectedService) return "서비스 하나를 선택해야 payload preview와 발주가 가능합니다.";
+  const guide = selectedService.requestGuide || {};
+  const example = guide.callExamplePayload || {};
+  const keys = Object.keys(example).filter((key) => key !== "key").slice(0, 5);
+  const keyText = keys.length ? `전송 키: ${keys.join(", ")}` : "공급사 payload 예시를 확인하세요.";
+  if (integrationType === "mkt24") return `${keyText}. MKT24 panel은 service, link/username, quantity 조합을 확인합니다.`;
+  if (integrationType === "fasttraffic") return `${keyText}. FastTraffic은 action별 필수값과 quantityParam이 다릅니다.`;
+  return `${keyText}. classic은 service, link 또는 username, quantity 조합을 확인합니다.`;
+}
+
 function supplierDispatchReadinessChecks({
   selectedSupplier,
   selectedService,
@@ -50,6 +94,7 @@ function supplierDispatchReadinessChecks({
   const healthStatus = String(selectedSupplier?.healthStatus || "unknown");
   const balanceStatus = String(selectedSupplier?.balanceStatus || "unknown");
   const selectedExternalServiceId = String(selectedService?.externalServiceId || "").trim();
+  const endpointCheck = supplierApiEndpointCheck(selectedSupplier);
   const checks = [
     {
       label: "공급사 활성",
@@ -68,6 +113,13 @@ function supplierDispatchReadinessChecks({
         : integrationType === "mkt24"
           ? "MKT24 /v3/panel은 key 파라미터만 사용합니다."
           : "classic SMM API는 key 파라미터로 services/add/status를 호출합니다.",
+    },
+    {
+      label: "API endpoint",
+      value: endpointCheck.value,
+      ok: endpointCheck.ok,
+      blocking: endpointCheck.blocking,
+      description: endpointCheck.description,
     },
     {
       label: "Health check",
@@ -90,7 +142,7 @@ function supplierDispatchReadinessChecks({
       value: selectedService ? `#${selectedExternalServiceId || selectedService.id}` : "미선택",
       ok: Boolean(selectedService?.id && selectedExternalServiceId),
       blocking: true,
-      description: selectedService ? "이 서비스 ID가 Cafe24/내부 상품 매핑의 발주 대상입니다." : "공급사 서비스 하나를 선택해야 payload preview와 발주가 가능합니다.",
+      description: supplierServicePayloadHint(integrationType, selectedService),
     },
     {
       label: "잔액 확인",

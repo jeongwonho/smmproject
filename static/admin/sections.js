@@ -1,5 +1,6 @@
 import { renderCafe24OperationalAuditPanel } from "./cafe24-audit-ui.js";
 import { renderCafe24AutoPollCards, renderCafe24Pagination, renderCafe24QueueToolbar, renderCafe24SchedulerNotice } from "./cafe24-queue-ui.js";
+import { renderCafe24MappingWorkflowChecklist } from "./cafe24-workflow-ui.js";
 import { renderSupplierDispatchReadinessPanel } from "./supplier-readiness-ui.js";
 import { supplierSyncInsight } from "./supplier-sync-ui.js";
 let runtime = {};
@@ -2097,6 +2098,7 @@ function renderCafe24MappingPanel(activeIntegration = {}, products = [], supplie
   const sampleOptions = sampleItems.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.orderId || "-")} · ${escapeHtml(item.productNo || "-")} · ${escapeHtml(item.productName || item.buyerName || "")}</option>`).join("");
   const preview = state.adminCafe24MappingPreview || null;
   return `
+    ${renderCafe24MappingWorkflowChecklist({ activeIntegration, lookupDetail, serviceCount: cafe24SupplierServices.length, preview, orderItems: sampleItems, escapeHtml, canDispatchItem: cafe24CanDispatchItem })}
     <div class="admin-two-column">
       <form class="admin-panel admin-form" data-admin-cafe24-mapping-form>
         <div class="section-head section-head--compact">
