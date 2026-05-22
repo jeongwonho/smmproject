@@ -16259,7 +16259,7 @@ class PanelStore(PanelStoreDatabaseMixin):
             inferred_link = self._supplier_panel_target_link(target_value, platform_hint)
             if inferred_link:
                 payload["link"] = inferred_link
-            if not looks_like_url(target_value):
+            if not inferred_link and not looks_like_url(target_value):
                 payload["username"] = target_value.lstrip("@")
 
         if quantity and str(product.get("price_strategy") or "") != "fixed":

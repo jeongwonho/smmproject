@@ -204,7 +204,8 @@ class Mkt24OrderOptionTest(unittest.TestCase):
 
         self.assertEqual(payload["service"], "12")
         self.assertEqual(payload["quantity"], "25")
-        self.assertEqual(payload["username"], "instamart_official")
+        self.assertEqual(payload["link"], "https://www.instagram.com/instamart_official/")
+        self.assertNotIn("username", payload)
         self.assertNotIn("productUuid", payload)
         self.assertNotIn("value", payload)
 

@@ -322,7 +322,8 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(item["supplier_service_id"], "supplier_service_test")
         supplier_payload = json.loads(item["supplier_payload_json"])
         self.assertEqual(supplier_payload["service"], "svc-1001")
-        self.assertEqual(supplier_payload["username"], "instamart_official")
+        self.assertEqual(supplier_payload["link"], "https://www.instagram.com/instamart_official/")
+        self.assertNotIn("username", supplier_payload)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM balance_transactions").fetchone()[0], 0)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM wallet_ledger").fetchone()[0], 0)
 
