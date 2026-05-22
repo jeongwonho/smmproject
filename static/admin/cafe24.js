@@ -107,6 +107,16 @@ export async function refreshCafe24OrderItems({ force = false } = {}) {
   return data;
 }
 
+export async function refreshCafe24OperationalAudit({ force = false } = {}) {
+  if (!force && state.adminCafe24OperationalAudit) return state.adminCafe24OperationalAudit;
+  const data = await apiGet("/api/admin/cafe24/operational-audit");
+  state.adminCafe24OperationalAudit = {
+    ...data,
+    fetchedAt: new Date().toISOString(),
+  };
+  return state.adminCafe24OperationalAudit;
+}
+
 export async function handleCafe24AdminChange(target) {
   if (!(target instanceof Element)) return false;
   if (target.matches("[data-admin-cafe24-filter]")) {
@@ -151,7 +161,22 @@ export async function handleCafe24AdminClick(closest) {
     if (state.ui.adminCafe24Tab === "queue" || state.ui.adminCafe24Tab === "monitor") {
       await refreshCafe24OrderItems({ force: true });
     }
+    if (state.ui.adminCafe24Tab === "audit") {
+      await refreshCafe24OperationalAudit();
+    }
     renderRoute();
+    return true;
+  }
+
+  const cafe24OperationalAuditButton = closest("[data-admin-cafe24-operational-audit-refresh]");
+  if (cafe24OperationalAuditButton) {
+    try {
+      await refreshCafe24OperationalAudit({ force: true });
+      showToast("Cafe24 운영 상태를 조회했습니다.");
+      renderRoute();
+    } catch (error) {
+      showToast(error.message || "Cafe24 운영 상태 조회에 실패했습니다.", "error");
+    }
     return true;
   }
 

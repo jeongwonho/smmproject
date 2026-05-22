@@ -32,7 +32,7 @@ import {
   updateAdminPlatformSectionPreview,
   updateAdminSiteSettingsPreview,
 } from "./admin/sections.js";
-import { configureCafe24AdminActions, cafe24OrderItemsQueryKey, refreshCafe24OrderItems } from "./admin/cafe24.js";
+import { configureCafe24AdminActions, cafe24OrderItemsQueryKey, refreshCafe24OperationalAudit, refreshCafe24OrderItems } from "./admin/cafe24.js";
 import { registerAdminEvents } from "./admin/events.js";
 import { registerPublicEvents } from "./public/events.js";
 import { parseRoute } from "./shared/routes.js";
@@ -63,6 +63,7 @@ const state = {
   adminCsrfToken: "",
   adminSupplierServices: {},
   adminMkt24ProductSettings: {},
+  adminCafe24OperationalAudit: null,
   adminCafe24ProductLookup: { products: [], detail: null, query: {}, warnings: [] },
   adminCustomerDetails: {},
   adminSiteSettingsDraft: null,
@@ -1482,6 +1483,7 @@ function resetAdminState({ preserveSession = false } = {}) {
   state.adminBootstrap = null;
   state.adminSupplierServices = {};
   state.adminMkt24ProductSettings = {};
+  state.adminCafe24OperationalAudit = null;
   state.adminCafe24ProductLookup = { products: [], detail: null, query: {}, warnings: [] };
   state.adminCustomerDetails = {};
   state.adminSiteSettingsDraft = null;
@@ -3039,6 +3041,10 @@ async function renderRoute() {
         if (!state.adminCafe24OrderList || state.adminCafe24OrderListKey !== nextCafe24OrderListKey) {
           showLoading("Cafe24 주문 1개월 목록을 불러오는 중...");
           await refreshCafe24OrderItems();
+        }
+        if (state.ui.adminCafe24Tab === "audit" && !state.adminCafe24OperationalAudit) {
+          showLoading("Cafe24 운영 상태를 점검하는 중...");
+          await refreshCafe24OperationalAudit();
         }
       }
     }

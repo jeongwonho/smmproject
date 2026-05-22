@@ -1,3 +1,4 @@
+import { renderCafe24OperationalAuditPanel } from "./cafe24-audit-ui.js";
 import { renderCafe24AutoPollCards, renderCafe24Pagination, renderCafe24QueueToolbar, renderCafe24SchedulerNotice } from "./cafe24-queue-ui.js";
 import { renderSupplierDispatchReadinessPanel } from "./supplier-readiness-ui.js";
 import { supplierSyncInsight } from "./supplier-sync-ui.js";
@@ -2315,21 +2316,18 @@ function renderCafe24AdminSection() {
   const activeIntegration = integrations[0] || {};
   const selectedCafe24SupplierId = state.ui.adminCafe24SelectedSupplierId || suppliers[0]?.id || "";
   const cafe24SupplierServices = selectedCafe24SupplierId ? state.adminSupplierServices[selectedCafe24SupplierId]?.services || [] : [];
-  const allowedTabs = new Set(["queue", "mapping", "lookup", "monitor", "settings"]);
+  const allowedTabs = new Set(["queue", "mapping", "lookup", "monitor", "audit", "settings"]);
   const activeCafe24Tab = allowedTabs.has(state.ui.adminCafe24Tab) ? state.ui.adminCafe24Tab : "queue";
   const lastCollectionResult = state.adminCafe24LastPollResult || null;
-
   return `
     <section class="admin-card">
       <div class="section-head section-head--compact">
         <h2>Cafe24 주문 처리 콘솔</h2>
         <p>주문 수집, 상품 매핑, 검수, 공급사 발주, 예외 상태를 한 화면 흐름으로 확인합니다.</p>
       </div>
-
       ${renderCafe24OpsBoard(orderItems, mappings, activeIntegration)}
       ${renderCafe24QuickControls(activeIntegration)}
       ${renderCafe24CollectionResult(lastCollectionResult)}
-
       <nav class="admin-analytics-subnav">
         <button class="admin-analytics-subnav__item ${activeCafe24Tab === "queue" ? "is-active" : ""}" type="button" data-admin-cafe24-tab="queue">
           <strong>주문 처리</strong><small>수집/검수/발주</small>
@@ -2343,20 +2341,22 @@ function renderCafe24AdminSection() {
         <button class="admin-analytics-subnav__item ${activeCafe24Tab === "monitor" ? "is-active" : ""}" type="button" data-admin-cafe24-tab="monitor">
           <strong>흐름 점검</strong><small>결제/미매핑/예외</small>
         </button>
+        <button class="admin-analytics-subnav__item ${activeCafe24Tab === "audit" ? "is-active" : ""}" type="button" data-admin-cafe24-tab="audit">
+          <strong>운영 Audit</strong><small>DB/토큰/최근 상태</small>
+        </button>
         <button class="admin-analytics-subnav__item ${activeCafe24Tab === "settings" ? "is-active" : ""}" type="button" data-admin-cafe24-tab="settings">
           <strong>연결</strong><small>OAuth/Redirect</small>
         </button>
       </nav>
-
       ${activeCafe24Tab === "queue" ? renderCafe24OrderQueuePanel(orderItems) : ""}
       ${activeCafe24Tab === "mapping" ? renderCafe24MappingPanel(activeIntegration, products, suppliers, cafe24SupplierServices, selectedCafe24SupplierId, mappings) : ""}
       ${activeCafe24Tab === "lookup" ? renderCafe24ProductLookupPanel(activeIntegration) : ""}
       ${activeCafe24Tab === "monitor" ? renderCafe24PaymentAuditPanel(orderItems) : ""}
+      ${activeCafe24Tab === "audit" ? renderCafe24OperationalAuditPanel({ audit: state.adminCafe24OperationalAudit, escapeHtml }) : ""}
       ${activeCafe24Tab === "settings" ? renderCafe24ConnectionPanel(activeIntegration, cafe24OAuthRedirectUri) : ""}
     </section>
   `;
 }
-
 function renderAdminChargesSection() {
   const chargeOrders = getAdminChargeOrders();
   const activeFilter = state.ui.adminChargeFilter;
@@ -4075,8 +4075,6 @@ function renderSupplierAdminSection({
     </div>
   `;
 }
-
-
 export {
   formatAnalyticsTooltipValue,
   renderAnalyticsAdminSection,
