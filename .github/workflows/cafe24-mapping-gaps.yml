@@ -23,6 +23,14 @@ on:
         description: Max order items to inspect
         required: true
         default: "50"
+      detail_fetch_limit:
+        description: Max Cafe24 products to enrich with options/variants
+        required: true
+        default: "5"
+      detail_api_timeout_seconds:
+        description: Per Cafe24 product API call timeout
+        required: true
+        default: "4"
 
 permissions:
   actions: read
@@ -31,6 +39,7 @@ permissions:
 jobs:
   gaps:
     runs-on: ubuntu-latest
+    timeout-minutes: 7
     steps:
       - name: Read Cafe24 mapping gaps
         env:
@@ -41,6 +50,8 @@ jobs:
           PRODUCT_NOS: ${{ inputs.product_nos }}
           INCLUDE_PRODUCT_DETAILS: ${{ inputs.include_product_details }}
           LIMIT: ${{ inputs.limit }}
+          DETAIL_FETCH_LIMIT: ${{ inputs.detail_fetch_limit }}
+          DETAIL_API_TIMEOUT_SECONDS: ${{ inputs.detail_api_timeout_seconds }}
         run: |
           set -euo pipefail
           auth_token="${CRON_SECRET:-${GITHUB_TOKEN:-}}"
@@ -48,7 +59,7 @@ jobs:
             echo "CRON_SECRET or GITHUB_TOKEN is required" >&2
             exit 1
           fi
-          curl --fail-with-body --show-error --silent \
+          curl --fail-with-body --show-error --silent --connect-timeout 10 --max-time 240 \
             -X POST "https://smmproject-lime.vercel.app/api/cron/cafe24/mapping-gaps" \
             -H "Authorization: Bearer ${auth_token}" \
             -H "X-GitHub-Repository: ${GITHUB_REPOSITORY}" \
@@ -61,4 +72,6 @@ jobs:
               --arg productNos "$PRODUCT_NOS" \
               --argjson includeProductDetails "$INCLUDE_PRODUCT_DETAILS" \
               --argjson limit "$LIMIT" \
-              '{mallId:$mallId,shopNo:$shopNo,productNos:$productNos,includeProductDetails:$includeProductDetails,limit:$limit}')"
+              --argjson detailFetchLimit "$DETAIL_FETCH_LIMIT" \
+              --argjson detailApiTimeoutSeconds "$DETAIL_API_TIMEOUT_SECONDS" \
+              '{mallId:$mallId,shopNo:$shopNo,productNos:$productNos,includeProductDetails:$includeProductDetails,limit:$limit,detailFetchLimit:$detailFetchLimit,detailApiTimeoutSeconds:$detailApiTimeoutSeconds}')"

@@ -369,10 +369,20 @@ def cafe24_payment_status_with_source(order_payload: Dict[str, Any], item_payloa
 
 
 class Cafe24ApiClient:
-    def __init__(self, mall_id: str, access_token: str, *, shop_no: int = CAFE24_DEFAULT_SHOP_NO) -> None:
+    def __init__(
+        self,
+        mall_id: str,
+        access_token: str,
+        *,
+        shop_no: int = CAFE24_DEFAULT_SHOP_NO,
+        request_timeout_seconds: float = 15,
+        max_attempts: int = 3,
+    ) -> None:
         self.mall_id = str(mall_id or "").strip()
         self.access_token = str(access_token or "").strip()
         self.shop_no = int(shop_no or CAFE24_DEFAULT_SHOP_NO)
+        self.request_timeout_seconds = max(float(request_timeout_seconds or 15), 1.0)
+        self.max_attempts = max(int(max_attempts or 3), 1)
         if not self.mall_id:
             raise Cafe24ApiError("Cafe24 mall_id가 필요합니다.")
         if not self.access_token:
@@ -401,15 +411,15 @@ class Cafe24ApiClient:
         }
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         raw = ""
-        for attempt in range(3):
+        for attempt in range(self.max_attempts):
             request = Request(url, data=data, headers=headers, method=method.upper())
             try:
-                with urlopen(request, timeout=15) as response:
+                with urlopen(request, timeout=self.request_timeout_seconds) as response:
                     raw = response.read().decode("utf-8", errors="replace")
                 break
             except HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
-                if exc.code in {429, 500, 502, 503, 504} and attempt < 2:
+                if exc.code in {429, 500, 502, 503, 504} and attempt < self.max_attempts - 1:
                     retry_after = str(exc.headers.get("Retry-After") or "").strip() if exc.headers else ""
                     try:
                         delay = min(max(float(retry_after), 0.5), 3.0) if retry_after else 0.5 * (attempt + 1)
@@ -419,7 +429,7 @@ class Cafe24ApiClient:
                     continue
                 raise Cafe24ApiError(f"Cafe24 API 오류 {exc.code}: {body or exc.reason}") from exc
             except (URLError, TimeoutError, ValueError) as exc:
-                if attempt < 2:
+                if attempt < self.max_attempts - 1:
                     time.sleep(0.5 * (attempt + 1))
                     continue
                 raise Cafe24ApiError(str(exc)) from exc

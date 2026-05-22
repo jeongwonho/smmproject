@@ -738,13 +738,19 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         )
         self.conn.commit()
 
-        with patch.object(self.store, "_cafe24_client_for_row", return_value=FakeCafe24GapProductClient()):
+        cafe24_client = FakeCafe24GapProductClient()
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=cafe24_client):
             report = self.store.cafe24_mapping_gap_report(
                 {"integrationId": self.integration["id"], "productNos": "32", "includeProductDetails": True}
             )
 
         self.assertEqual(report["summary"]["itemCount"], 1)
         self.assertEqual(report["summary"]["groupCount"], 1)
+        self.assertEqual(report["summary"]["detailProductNos"], ["32"])
+        self.assertEqual(report["summary"]["detailApiTimeoutSeconds"], 4.0)
+        self.assertEqual(report["summary"]["detailApiMaxAttempts"], 1)
+        self.assertEqual(cafe24_client.request_timeout_seconds, 4.0)
+        self.assertEqual(cafe24_client.max_attempts, 1)
         self.assertEqual(report["groups"][0]["productNo"], "32")
         self.assertEqual(report["groups"][0]["variantCode"], "P00000BG000A")
         self.assertIn("계정", report["groups"][0]["optionLabels"])

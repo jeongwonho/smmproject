@@ -8736,6 +8736,24 @@ class PanelStore(PanelStoreDatabaseMixin):
             limit = min(max(int(payload.get("limit") or 50), 1), 200)
         except (TypeError, ValueError):
             raise PanelError("조회 개수 값이 올바르지 않습니다.", status=400)
+        try:
+            detail_fetch_limit = min(max(int(payload.get("detailFetchLimit") or payload.get("detail_fetch_limit") or 5), 0), 20)
+        except (TypeError, ValueError):
+            raise PanelError("상품 상세 조회 개수 값이 올바르지 않습니다.", status=400)
+        try:
+            detail_api_timeout_seconds = min(
+                max(float(payload.get("detailApiTimeoutSeconds") or payload.get("detail_api_timeout_seconds") or 4), 1.0),
+                10.0,
+            )
+        except (TypeError, ValueError):
+            raise PanelError("상품 상세 API timeout 값이 올바르지 않습니다.", status=400)
+        try:
+            detail_api_max_attempts = min(
+                max(int(payload.get("detailApiMaxAttempts") or payload.get("detail_api_max_attempts") or 1), 1),
+                3,
+            )
+        except (TypeError, ValueError):
+            raise PanelError("상품 상세 API 재시도 값이 올바르지 않습니다.", status=400)
 
         with self._connect() as conn:
             if integration_id:
@@ -8832,10 +8850,16 @@ class PanelStore(PanelStoreDatabaseMixin):
 
             product_details: Dict[str, Any] = {}
             warnings: List[str] = []
+            detail_product_nos: List[str] = []
             if include_product_details and product_nos:
                 self._require_cafe24_scope(integration, "mall.read_product", "Cafe24 미매핑 상품 상세 조회")
                 client = self._cafe24_client_for_row(conn, integration)
-                for product_no in product_nos:
+                client.request_timeout_seconds = detail_api_timeout_seconds
+                client.max_attempts = detail_api_max_attempts
+                detail_product_nos = product_nos[:detail_fetch_limit]
+                if len(product_nos) > detail_fetch_limit:
+                    warnings.append(f"상품 상세 조회는 {detail_fetch_limit}개로 제한했습니다. 나머지는 productNos를 좁혀 다시 조회하세요.")
+                for product_no in detail_product_nos:
                     try:
                         product_response = client.product(product_no)
                         product_rows = self._cafe24_products_from_payload(product_response)
@@ -8876,6 +8900,10 @@ class PanelStore(PanelStoreDatabaseMixin):
                 "itemCount": len(items),
                 "groupCount": len(summarize_cafe24_mapping_gaps(items)),
                 "productNos": product_nos,
+                "detailProductNos": detail_product_nos,
+                "detailFetchLimit": detail_fetch_limit,
+                "detailApiTimeoutSeconds": detail_api_timeout_seconds,
+                "detailApiMaxAttempts": detail_api_max_attempts,
             },
             "groups": summarize_cafe24_mapping_gaps(items),
             "productDetails": product_details,
