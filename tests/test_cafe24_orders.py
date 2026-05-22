@@ -631,6 +631,38 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(supplier_payload["service"], "svc-1001")
         self.assertEqual(supplier_payload["quantity"], "500")
 
+    def test_cafe24_single_preflight_reports_dispatch_conditions_without_sensitive_values(self):
+        order_payload = self._order_payload()
+        order_payload["items"][0]["options"] = [
+            {"name": "계정", "value": "instamart_official"},
+            {"name": "팔로워 수", "value": "500명 (+79,000원)"},
+        ]
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+        self._enable_auto_submit_and_supplier_ready()
+        item_id = self.conn.execute("SELECT id FROM cafe24_order_items").fetchone()["id"]
+
+        preflight = self.store.preflight_single_cafe24_order_item(
+            {"itemId": item_id, "expectedQuantity": 500, "_adminActor": "cron"}
+        )
+
+        self.assertTrue(preflight["canDispatch"])
+        self.assertEqual(preflight["quantity"]["normalized"], 500)
+        self.assertTrue(preflight["quantity"]["matchesExpected"])
+        self.assertEqual(preflight["supplierPayload"]["service"], "svc-1001")
+        self.assertTrue(preflight["supplierPayload"]["hasTarget"])
+        self.assertTrue(preflight["supplierPayload"]["hasQuantity"])
+        self.assertEqual(preflight["supplierReadiness"]["code"], "ok")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM supplier_orders").fetchone()[0], 0)
+        self.assertNotIn("instamart_official", json.dumps(preflight, ensure_ascii=False))
+
     def test_cafe24_operational_audit_summarizes_state_without_secrets(self):
         order_payload = self._order_payload()
         self.store._process_cafe24_item(

@@ -11783,6 +11783,136 @@ class PanelStore(PanelStoreDatabaseMixin):
             "mappingUpdated": mapping_updated,
         }
 
+    def preflight_single_cafe24_order_item(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        item_id = str(payload.get("itemId") or payload.get("id") or "").strip()
+        mall_id = str(payload.get("mallId") or payload.get("mall_id") or "").strip()
+        shop_no = int(payload.get("shopNo") or payload.get("shop_no") or CAFE24_DEFAULT_SHOP_NO)
+        order_id = str(payload.get("orderId") or payload.get("order_id") or "").strip()
+        order_item_code = str(payload.get("orderItemCode") or payload.get("order_item_code") or "").strip()
+        expected_quantity_raw = payload.get("expectedQuantity") or payload.get("expected_quantity") or ""
+        expected_quantity = int(expected_quantity_raw) if str(expected_quantity_raw).strip() else 0
+
+        if not item_id and not (mall_id and order_id and order_item_code):
+            raise PanelError("Cafe24 품주 id 또는 mall/order/order_item_code가 필요합니다.")
+
+        with self._connect() as conn:
+            if not item_id:
+                row = conn.execute(
+                    """
+                    SELECT id
+                    FROM cafe24_order_items
+                    WHERE mall_id = ? AND shop_no = ? AND cafe24_order_id = ? AND cafe24_order_item_code = ?
+                    """,
+                    (mall_id, shop_no, order_id, order_item_code),
+                ).fetchone()
+                if row is None:
+                    raise PanelError("지정한 Cafe24 주문 품주를 찾을 수 없습니다.", status=404)
+                item_id = str(row["id"])
+            row = conn.execute(
+                """
+                SELECT
+                    coi.*,
+                    p.name AS internal_product_name,
+                    p.option_name AS internal_option_name
+                FROM cafe24_order_items coi
+                LEFT JOIN products p ON p.id = coi.product_id
+                WHERE coi.id = ?
+                """,
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                raise PanelError("Cafe24 주문 품주를 찾을 수 없습니다.", status=404)
+            item = self._cafe24_order_item_payload(row)
+            normalized_fields = parse_json(row["normalized_fields_json"], {})
+            supplier_payload = parse_json(row["supplier_payload_json"], {})
+            quantity_value = (
+                supplier_payload.get("quantity")
+                or supplier_payload.get("orderedCount")
+                or normalized_fields.get("orderedCount")
+                or normalized_fields.get("quantity")
+            )
+            try:
+                quantity = int(float(str(quantity_value or "0").replace(",", "").strip() or "0"))
+            except (TypeError, ValueError):
+                quantity = 0
+            readiness = {"ok": False, "code": "supplier_missing", "message": "공급사 매핑이 없습니다."}
+            if str(row.get("supplier_id") or "").strip():
+                readiness = self._supplier_auto_dispatch_readiness(
+                    conn,
+                    supplier_id=str(row["supplier_id"]),
+                    supplier_service_id=str(row.get("supplier_service_id") or ""),
+                )
+
+        blocking_reasons: List[str] = []
+        if item["paymentGateStatus"] != "payment_confirmed":
+            blocking_reasons.append("payment_not_confirmed")
+        if item["standardStatus"] != "ready_to_submit":
+            blocking_reasons.append(f"status_{item['standardStatus'] or 'unknown'}")
+        if not item["mappingId"]:
+            blocking_reasons.append("mapping_missing")
+        if not item["supplierId"] or not item["supplierServiceId"]:
+            blocking_reasons.append("supplier_mapping_missing")
+        if not supplier_payload:
+            blocking_reasons.append("supplier_payload_missing")
+        if item["supplierOrderUuid"]:
+            blocking_reasons.append("supplier_order_already_exists")
+        if expected_quantity and quantity != expected_quantity:
+            blocking_reasons.append("quantity_mismatch")
+        if not readiness.get("ok"):
+            blocking_reasons.append(str(readiness.get("code") or "supplier_not_ready"))
+
+        supplier_payload_keys = sorted(str(key) for key in supplier_payload.keys())
+        target_keys = {"link", "targetUrl", "targetValue", "snsValue", "username", "url"}
+        quantity_keys = {"quantity", "orderedCount", "count", "amount"}
+        return {
+            "itemId": item_id,
+            "identity": {
+                "mallId": item["mallId"],
+                "shopNo": item["shopNo"],
+                "orderId": item["orderId"],
+                "orderItemCode": item["orderItemCode"],
+                "productNo": item["productNo"],
+                "variantCode": item["variantCode"],
+                "customProductCode": item["customProductCode"],
+            },
+            "statuses": {
+                "standardStatus": item["standardStatus"],
+                "paymentGateStatus": item["paymentGateStatus"],
+                "automationErrorCode": item["automationErrorCode"],
+                "errorMessage": item["errorMessage"],
+            },
+            "mapping": {
+                "mappingId": item["mappingId"],
+                "supplierId": item["supplierId"],
+                "supplierServiceId": item["supplierServiceId"],
+                "supplierExternalServiceId": item["supplierExternalServiceId"],
+                "supplierOrderUuid": item["supplierOrderUuid"],
+            },
+            "quantity": {
+                "expected": expected_quantity,
+                "normalized": quantity,
+                "matchesExpected": not expected_quantity or quantity == expected_quantity,
+            },
+            "supplierPayload": {
+                "keys": supplier_payload_keys,
+                "service": str(supplier_payload.get("service") or ""),
+                "hasTarget": any(key in supplier_payload and str(supplier_payload.get(key) or "").strip() for key in target_keys),
+                "hasQuantity": any(key in supplier_payload and str(supplier_payload.get(key) or "").strip() for key in quantity_keys),
+            },
+            "targetDiagnostics": {
+                "status": item["targetDiagnostics"]["status"],
+                "normalized": bool(item["targetDiagnostics"]["normalized"]),
+                "message": item["targetDiagnostics"]["message"],
+                "supplierStatus": item["targetDiagnostics"]["supplierStatus"],
+                "supplierReasonCode": item["targetDiagnostics"]["supplierReasonCode"],
+                "supplierReasonMessage": item["targetDiagnostics"]["supplierReasonMessage"],
+            },
+            "supplierReadiness": readiness,
+            "canDispatch": not blocking_reasons,
+            "blockingReasons": blocking_reasons,
+            "checkedAt": now_iso(),
+        }
+
     def check_single_cafe24_supplier_status(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         item_id = str(payload.get("itemId") or payload.get("id") or "").strip()
         mall_id = str(payload.get("mallId") or payload.get("mall_id") or "").strip()

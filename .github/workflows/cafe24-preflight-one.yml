@@ -1,0 +1,62 @@
+name: Cafe24 Preflight One
+
+on:
+  workflow_dispatch:
+    inputs:
+      mall_id:
+        description: Cafe24 mall id
+        required: true
+        default: growit
+      shop_no:
+        description: Cafe24 shop number
+        required: true
+        default: "1"
+      order_id:
+        description: Cafe24 order id
+        required: true
+      order_item_code:
+        description: Cafe24 order item code
+        required: true
+      expected_quantity:
+        description: Expected supplier quantity, optional
+        required: false
+        default: ""
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read Cafe24 order item preflight
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          GITHUB_TOKEN: ${{ github.token }}
+          MALL_ID: ${{ inputs.mall_id }}
+          SHOP_NO: ${{ inputs.shop_no }}
+          ORDER_ID: ${{ inputs.order_id }}
+          ORDER_ITEM_CODE: ${{ inputs.order_item_code }}
+          EXPECTED_QUANTITY: ${{ inputs.expected_quantity }}
+        run: |
+          set -euo pipefail
+          auth_token="${CRON_SECRET:-${GITHUB_TOKEN:-}}"
+          if [ -z "${auth_token:-}" ]; then
+            echo "CRON_SECRET or GITHUB_TOKEN is required" >&2
+            exit 1
+          fi
+          curl --fail-with-body --show-error --silent \
+            -X POST "https://smmproject-lime.vercel.app/api/cron/cafe24/order-items/preflight" \
+            -H "Authorization: Bearer ${auth_token}" \
+            -H "X-GitHub-Repository: ${GITHUB_REPOSITORY}" \
+            -H "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" \
+            -H "X-GitHub-Workflow: ${GITHUB_WORKFLOW}" \
+            -H "Content-Type: application/json" \
+            --data "$(jq -nc \
+              --arg mallId "$MALL_ID" \
+              --argjson shopNo "$SHOP_NO" \
+              --arg orderId "$ORDER_ID" \
+              --arg orderItemCode "$ORDER_ITEM_CODE" \
+              --arg expectedQuantity "$EXPECTED_QUANTITY" \
+              '{mallId:$mallId,shopNo:$shopNo,orderId:$orderId,orderItemCode:$orderItemCode,expectedQuantity:$expectedQuantity}')"
