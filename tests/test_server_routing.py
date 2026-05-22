@@ -152,6 +152,15 @@ class RouterRegistryTest(unittest.TestCase):
         self.assertEqual(route.auth, "cron")
         self.assertFalse(route.csrf)
 
+    def test_cafe24_operational_audit_route_requires_admin_auth(self):
+        matched = ROUTER.match("GET", "/api/admin/cafe24/operational-audit")
+
+        self.assertIsNotNone(matched)
+        route, params = matched
+        self.assertEqual(params, {})
+        self.assertEqual(route.auth, "admin")
+        self.assertFalse(route.csrf)
+
     def test_unknown_api_route_does_not_match(self):
         self.assertIsNone(ROUTER.match("GET", "/api/does-not-exist"))
 

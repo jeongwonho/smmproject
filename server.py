@@ -1199,6 +1199,10 @@ class AppHandler(SimpleHTTPRequestHandler):
             },
         )
 
+    @route("GET", "/api/admin/cafe24/operational-audit", auth="admin")
+    def _get_admin_cafe24_operational_audit(self, request: RouteRequest) -> None:
+        write_json(self, 200, {"ok": True, **self._server().store.cafe24_operational_audit()})
+
     @route("GET", "/api/admin/customers/<customer_id>", auth="admin")
     def _get_admin_customer_detail(self, request: RouteRequest) -> None:
         write_json(self, 200, {"ok": True, **self._server().store.get_customer_detail(request.params["customer_id"])})

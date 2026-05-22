@@ -748,8 +748,8 @@ function supplierConnectionGuide(integrationType) {
   if (integrationType === "mkt24") {
     return {
       status: "MKT24 대행사용 API는 /v3/panel 엔드포인트에 key + action 방식으로 연결합니다.",
-      balance: "표준 SMM panel 방식의 services/add/status 응답을 기준으로 상태를 확인합니다.",
-      dispatch: "API URL은 https://api.mkt24.co.kr/v3/panel, API Key는 공급사에서 발급받은 key 값을 사용하세요.",
+      balance: "잔액 조회는 readiness 차단 조건으로 쓰지 않고 services/add/status 응답과 health check를 기준으로 확인합니다.",
+      dispatch: "API URL은 https://api.mkt24.co.kr/v3/panel, API Key는 공급사 key 값, 서비스 매핑은 숫자형 panel 서비스 ID를 사용하세요.",
     };
   }
   return {

@@ -45,7 +45,31 @@ try:
     from .backend.orders import derive_order_idempotency_key, sanitize_idempotency_key
     from .backend.payments import normalize_webhook_signature, verify_payment_webhook_signature
     from .backend.wallet import balance_transaction_kind_to_ledger_entry_type, generate_charge_order_code
-    from .backend.integrations.cafe24 import Cafe24ApiClient, Cafe24ApiError
+    from .backend.integrations.cafe24 import (
+        Cafe24ApiClient,
+        Cafe24ApiError,
+        cafe24_api_base_url,
+        cafe24_client_id,
+        cafe24_client_secret,
+        cafe24_normalize_datetime_text,
+        cafe24_oauth_timestamp_from_response,
+        cafe24_order_date_from_payload,
+        cafe24_payload_value,
+        cafe24_payment_gate_status,
+        cafe24_payment_snapshot_from_payload,
+        cafe24_payment_status_from_payload,
+        cafe24_payment_status_with_source,
+        cafe24_refresh_error_requires_reconnect,
+        cafe24_refresh_token_expired,
+        cafe24_refresh_token_expiring_soon,
+        cafe24_redirect_uri,
+        cafe24_status_is_cancelled,
+        cafe24_status_is_supply_eligible,
+        normalize_cafe24_payment_status,
+        normalize_cafe24_scopes,
+        normalize_cafe24_shop_no,
+        normalize_cafe24_status,
+    )
     from .backend.integrations.suppliers import (
         FASTTRAFFIC_API_URL,
         SUPPLIER_INTEGRATION_FASTTRAFFIC,
@@ -75,7 +99,31 @@ except ImportError:  # pragma: no cover - top-level script runtime
     from backend.orders import derive_order_idempotency_key, sanitize_idempotency_key
     from backend.payments import normalize_webhook_signature, verify_payment_webhook_signature
     from backend.wallet import balance_transaction_kind_to_ledger_entry_type, generate_charge_order_code
-    from backend.integrations.cafe24 import Cafe24ApiClient, Cafe24ApiError
+    from backend.integrations.cafe24 import (
+        Cafe24ApiClient,
+        Cafe24ApiError,
+        cafe24_api_base_url,
+        cafe24_client_id,
+        cafe24_client_secret,
+        cafe24_normalize_datetime_text,
+        cafe24_oauth_timestamp_from_response,
+        cafe24_order_date_from_payload,
+        cafe24_payload_value,
+        cafe24_payment_gate_status,
+        cafe24_payment_snapshot_from_payload,
+        cafe24_payment_status_from_payload,
+        cafe24_payment_status_with_source,
+        cafe24_refresh_error_requires_reconnect,
+        cafe24_refresh_token_expired,
+        cafe24_refresh_token_expiring_soon,
+        cafe24_redirect_uri,
+        cafe24_status_is_cancelled,
+        cafe24_status_is_supply_eligible,
+        normalize_cafe24_payment_status,
+        normalize_cafe24_scopes,
+        normalize_cafe24_shop_no,
+        normalize_cafe24_status,
+    )
     from backend.integrations.suppliers import (
         FASTTRAFFIC_API_URL,
         SUPPLIER_INTEGRATION_FASTTRAFFIC,
@@ -214,6 +262,21 @@ CAFE24_ORDER_CANCELLED_PREFIXES = ("C", "R", "E")
 CAFE24_PAYMENT_PAID_STATUSES = {"paid", "payment_confirmed", "confirmed", "complete", "completed", "done", "y", "true", "p", "a", "t"}
 CAFE24_PAYMENT_PENDING_STATUSES = {"unpaid", "awaiting_payment", "pending", "ready", "waiting", "n", "false", "f"}
 CAFE24_PAYMENT_CANCELLED_STATUSES = {"canceled", "cancelled", "cancel", "refunded", "refund", "void"}
+CAFE24_OPERATIONAL_AUDIT_ENV_KEYS = (
+    "SMM_PANEL_DATABASE_URL",
+    "SMM_PANEL_SUPABASE_DB_URL",
+    "SMM_PANEL_ENV",
+    "APP_ENV",
+    "NODE_ENV",
+    "VERCEL",
+    "SMM_PANEL_CAFE24_CLIENT_ID",
+    "SMM_PANEL_CAFE24_CLIENT_SECRET",
+    "SMM_PANEL_CAFE24_REDIRECT_URI",
+    "SMM_PANEL_SECRET_ENCRYPTION_KEY",
+    "SMM_PANEL_SESSION_SECRET",
+    "CRON_SECRET",
+    "SMM_PANEL_CRON_SECRET",
+)
 CAFE24_STANDARD_STATUSES = {
     "received",
     "payment_pending",
@@ -294,22 +357,6 @@ def demo_seed_enabled() -> bool:
 
 def payment_provider_name() -> str:
     return str(os.environ.get("SMM_PANEL_PAYMENT_PROVIDER") or "").strip().lower()
-
-
-def cafe24_client_id() -> str:
-    return str(os.environ.get("SMM_PANEL_CAFE24_CLIENT_ID") or "").strip()
-
-
-def cafe24_client_secret() -> str:
-    return str(os.environ.get("SMM_PANEL_CAFE24_CLIENT_SECRET") or "").strip()
-
-
-def cafe24_redirect_uri() -> str:
-    return str(os.environ.get("SMM_PANEL_CAFE24_REDIRECT_URI") or "").strip()
-
-
-def cafe24_api_base_url(mall_id: str) -> str:
-    return f"https://{str(mall_id or '').strip()}.cafe24api.com/api/v2"
 
 
 def payment_public_key() -> str:
@@ -1665,40 +1712,6 @@ def order_channel_label(raw: Any) -> str:
     }.get(channel, channel)
 
 
-def normalize_cafe24_shop_no(raw: Any) -> int:
-    try:
-        value = int(raw or CAFE24_DEFAULT_SHOP_NO)
-    except (TypeError, ValueError):
-        value = CAFE24_DEFAULT_SHOP_NO
-    return max(value, 1)
-
-
-def normalize_cafe24_scopes(raw: Any) -> List[str]:
-    if isinstance(raw, list):
-        values = raw
-    else:
-        values = re.split(r"[\s,]+", str(raw or "").strip())
-    scopes = []
-    for value in values:
-        scope = str(value or "").strip()
-        if scope and scope not in scopes:
-            scopes.append(scope)
-    return scopes or list(CAFE24_DEFAULT_SCOPES)
-
-
-def cafe24_oauth_timestamp_from_response(payload: Dict[str, Any], absolute_key: str, seconds_key: str) -> str:
-    absolute_value = str(payload.get(absolute_key) or "").strip()
-    if absolute_value:
-        return absolute_value
-    try:
-        seconds = int(payload.get(seconds_key) or 0)
-    except (TypeError, ValueError):
-        seconds = 0
-    if seconds <= 0:
-        return ""
-    return (dt.datetime.now().astimezone() + dt.timedelta(seconds=seconds)).isoformat()
-
-
 def parse_iso_datetime(value: Any) -> Optional[dt.datetime]:
     raw = str(value or "").strip()
     if not raw:
@@ -1712,19 +1725,6 @@ def parse_iso_datetime(value: Any) -> Optional[dt.datetime]:
     return parsed
 
 
-def cafe24_refresh_token_expired(expires_at: Any) -> bool:
-    parsed = parse_iso_datetime(expires_at)
-    return bool(parsed and parsed <= dt.datetime.now().astimezone())
-
-
-def cafe24_refresh_token_expiring_soon(expires_at: Any) -> bool:
-    parsed = parse_iso_datetime(expires_at)
-    if not parsed:
-        return False
-    threshold = dt.datetime.now().astimezone() + dt.timedelta(days=CAFE24_REFRESH_TOKEN_EXPIRY_WARNING_DAYS)
-    return parsed <= threshold
-
-
 def automation_paused() -> bool:
     return str(os.environ.get("SMM_PANEL_AUTOMATION_PAUSED") or "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -1736,258 +1736,6 @@ def automation_retry_at(attempts: int) -> str:
         dt.datetime.now().astimezone()
         + dt.timedelta(minutes=AUTOMATION_RETRY_BACKOFF_MINUTES[index])
     ).isoformat(timespec="seconds")
-
-
-def cafe24_refresh_error_requires_reconnect(error_message: Any) -> bool:
-    message = str(error_message or "").lower()
-    return any(
-        token in message
-        for token in (
-            "invalid_grant",
-            "invalid refresh",
-            "expired",
-            "unauthorized",
-            "401",
-            "400",
-            "access_denied",
-            "invalid token",
-        )
-    )
-
-
-def normalize_cafe24_status(raw: Any) -> str:
-    value = str(raw or "").strip()
-    if not value:
-        return "received"
-    if value in CAFE24_ORDER_UNPAID_STATUSES:
-        return "received"
-    if value.startswith(CAFE24_ORDER_CANCELLED_PREFIXES):
-        return "cancelled"
-    if value in CAFE24_ORDER_ELIGIBLE_STATUSES:
-        return "validated"
-    return "received"
-
-
-def normalize_cafe24_payment_status(raw: Any) -> str:
-    if isinstance(raw, bool):
-        return "paid" if raw else "unpaid"
-    value = str(raw or "").strip().lower()
-    if value in CAFE24_PAYMENT_PAID_STATUSES:
-        return "paid"
-    if value in CAFE24_PAYMENT_CANCELLED_STATUSES:
-        return "canceled"
-    if value in CAFE24_PAYMENT_PENDING_STATUSES:
-        return "unpaid"
-    return value
-
-
-def cafe24_payment_status_from_payload(order_payload: Dict[str, Any], item_payload: Dict[str, Any]) -> str:
-    for payload in (item_payload, order_payload):
-        if not isinstance(payload, dict):
-            continue
-        direct = cafe24_payload_value(
-            payload,
-            ("payment_status", "paymentStatus", "payment_state", "paymentState", "paid_status", "paidStatus"),
-        )
-        if direct:
-            return normalize_cafe24_payment_status(direct)
-        paid_value = payload.get("paid")
-        if isinstance(paid_value, bool):
-            return normalize_cafe24_payment_status(paid_value)
-        payment = payload.get("payment")
-        if isinstance(payment, dict):
-            nested = cafe24_payload_value(payment, ("status", "payment_status", "state", "paid_status"))
-            if nested:
-                return normalize_cafe24_payment_status(nested)
-            nested_paid = payment.get("paid")
-            if isinstance(nested_paid, bool):
-                return normalize_cafe24_payment_status(nested_paid)
-    return ""
-
-
-def cafe24_payment_amount_value(value: Any) -> int:
-    if value in (None, ""):
-        return 0
-    try:
-        return int(float(str(value).replace(",", "").strip()))
-    except (TypeError, ValueError):
-        return 0
-
-
-def cafe24_payment_snapshot_from_payload(order_payload: Dict[str, Any], item_payload: Dict[str, Any]) -> Dict[str, Any]:
-    candidates: List[Dict[str, Any]] = []
-    for payload in (item_payload, order_payload):
-        if not isinstance(payload, dict):
-            continue
-        candidates.append(payload)
-        for nested_key in ("payment", "payment_info", "paymentInfo", "payment_detail", "paymentDetail"):
-            nested = payload.get(nested_key)
-            if isinstance(nested, dict):
-                candidates.append(nested)
-            elif isinstance(nested, list):
-                candidates.extend(item for item in nested if isinstance(item, dict))
-    method = ""
-    amount = 0
-    paid_at = ""
-    reference = ""
-    for candidate in candidates:
-        if not method:
-            method = str(
-                cafe24_payload_value(
-                    candidate,
-                    (
-                        "payment_method",
-                        "paymentMethod",
-                        "payment_method_name",
-                        "paymentMethodName",
-                        "pay_method",
-                        "payMethod",
-                        "paymethod",
-                        "payment_gateway",
-                        "paymentGateway",
-                    ),
-                )
-                or ""
-            ).strip()
-        if not amount:
-            amount = cafe24_payment_amount_value(
-                cafe24_payload_value(
-                    candidate,
-                    (
-                        "payment_amount",
-                        "paymentAmount",
-                        "paid_amount",
-                        "paidAmount",
-                        "actual_payment_amount",
-                        "actualPaymentAmount",
-                        "order_price_amount",
-                        "orderPriceAmount",
-                        "total_amount",
-                        "totalAmount",
-                        "amount",
-                    ),
-                )
-            )
-        if not paid_at:
-            paid_at = str(
-                cafe24_payload_value(
-                    candidate,
-                    (
-                        "paid_at",
-                        "paidAt",
-                        "payment_date",
-                        "paymentDate",
-                        "payment_complete_date",
-                        "paymentCompleteDate",
-                        "payment_confirmed_at",
-                        "paymentConfirmedAt",
-                        "paid_date",
-                        "paidDate",
-                    ),
-                )
-                or ""
-            ).strip()
-        if not reference:
-            reference = str(
-                cafe24_payload_value(
-                    candidate,
-                    (
-                        "pg_tid",
-                        "pgTid",
-                        "transaction_id",
-                        "transactionId",
-                        "payment_id",
-                        "paymentId",
-                        "approval_no",
-                        "approvalNo",
-                        "receipt_id",
-                        "receiptId",
-                    ),
-                )
-                or ""
-            ).strip()
-    return {
-        "method": method,
-        "amount": amount,
-        "paidAt": paid_at,
-        "reference": reference,
-    }
-
-
-def cafe24_normalize_datetime_text(value: Any) -> str:
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    normalized = raw.replace("T", " ")
-    if normalized.endswith("Z"):
-        normalized = f"{normalized[:-1]}+00:00"
-    try:
-        parsed = dt.datetime.fromisoformat(normalized)
-        if parsed.tzinfo is not None:
-            parsed = parsed.astimezone()
-        return parsed.strftime("%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        if re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
-            return f"{raw} 00:00:00"
-        if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", normalized):
-            return normalized[:19]
-    return raw[:19]
-
-
-def cafe24_order_date_from_payload(order_payload: Dict[str, Any], item_payload: Dict[str, Any]) -> str:
-    candidates: List[Dict[str, Any]] = []
-    for payload in (item_payload, order_payload):
-        if isinstance(payload, dict):
-            candidates.append(payload)
-    keys = (
-        "order_date",
-        "orderDate",
-        "ordered_date",
-        "orderedDate",
-        "created_date",
-        "createdDate",
-        "created_at",
-        "createdAt",
-        "order_datetime",
-        "orderDatetime",
-        "date",
-    )
-    for candidate in candidates:
-        value = cafe24_payload_value(candidate, keys)
-        if value:
-            return cafe24_normalize_datetime_text(value)
-    payment_snapshot = cafe24_payment_snapshot_from_payload(order_payload, item_payload)
-    return cafe24_normalize_datetime_text(payment_snapshot.get("paidAt"))
-
-
-def cafe24_payment_gate_status(order_status: Any, payment_status: Any) -> str:
-    order_value = str(order_status or "").strip()
-    normalized_payment = normalize_cafe24_payment_status(payment_status)
-    if cafe24_status_is_cancelled(order_value) or normalized_payment == "canceled":
-        return "cancelled"
-    if order_value in CAFE24_ORDER_UNPAID_STATUSES or normalized_payment == "unpaid":
-        return "payment_pending"
-    if order_value in CAFE24_ORDER_ELIGIBLE_STATUSES and normalized_payment == "paid":
-        return "payment_confirmed"
-    return "payment_review_required"
-
-
-def cafe24_payment_status_with_source(order_payload: Dict[str, Any], item_payload: Dict[str, Any], order_status: Any) -> Tuple[str, str]:
-    payment_status = cafe24_payment_status_from_payload(order_payload, item_payload)
-    if payment_status:
-        return payment_status, "payload"
-    if cafe24_status_is_supply_eligible(order_status):
-        return "paid", "order_status"
-    return "", "missing"
-
-
-def cafe24_status_is_supply_eligible(raw: Any) -> bool:
-    return str(raw or "").strip() in CAFE24_ORDER_ELIGIBLE_STATUSES
-
-
-def cafe24_status_is_cancelled(raw: Any) -> bool:
-    value = str(raw or "").strip()
-    return bool(value) and value.startswith(CAFE24_ORDER_CANCELLED_PREFIXES)
 
 
 def cafe24_poll_datetime_window(
@@ -2051,14 +1799,6 @@ def cafe24_poll_datetime_window(
 
 def cafe24_default_poll_window(last_poll_at: str = "", overlap_minutes: int = CAFE24_ORDER_OVERLAP_MINUTES) -> Dict[str, str]:
     return cafe24_poll_datetime_window(last_poll_at=last_poll_at, use_cursor=False, overlap_minutes=overlap_minutes)
-
-
-def cafe24_payload_value(payload: Dict[str, Any], keys: Iterable[str]) -> str:
-    for key in keys:
-        value = payload.get(key)
-        if value not in (None, ""):
-            return str(value).strip()
-    return ""
 
 
 def redact_external_payload(value: Any) -> Any:
@@ -8976,6 +8716,178 @@ class PanelStore(PanelStoreDatabaseMixin):
                     ],
                 )
             ).lower(),
+        }
+
+    def cafe24_operational_audit(self) -> Dict[str, Any]:
+        database_url_configured = bool(os.environ.get("SMM_PANEL_DATABASE_URL") or os.environ.get("SMM_PANEL_SUPABASE_DB_URL"))
+        with self._connect() as conn:
+            integration_rows = conn.execute("SELECT * FROM cafe24_integrations ORDER BY updated_at DESC").fetchall()
+            mapping_rows = conn.execute(
+                """
+                SELECT
+                    cm.id, cm.mall_id, cm.shop_no, cm.cafe24_product_no, cm.cafe24_variant_code,
+                    cm.cafe24_custom_product_code, cm.supplier_id, s.name AS supplier_name,
+                    cm.supplier_service_id, ss.name AS supplier_service_name,
+                    cm.supplier_external_service_id, cm.supplier_product_uuid,
+                    cm.auto_dispatch_enabled, cm.enabled, cm.updated_at
+                FROM cafe24_supplier_mappings cm
+                LEFT JOIN suppliers s ON s.id = cm.supplier_id
+                LEFT JOIN supplier_services ss ON ss.id = cm.supplier_service_id
+                ORDER BY cm.updated_at DESC
+                LIMIT 50
+                """
+            ).fetchall()
+            order_item_rows = conn.execute(
+                """
+                SELECT
+                    id, mall_id, shop_no, cafe24_order_id, cafe24_order_item_code,
+                    cafe24_product_no, cafe24_variant_code, cafe24_custom_product_code,
+                    standard_status, payment_gate_status, payment_status,
+                    mapping_id, supplier_id, supplier_service_id, supplier_external_service_id,
+                    supplier_order_uuid, automation_error_code, error_message,
+                    last_synced_at, last_submitted_at, updated_at
+                FROM cafe24_order_items
+                ORDER BY COALESCE(NULLIF(last_synced_at, ''), updated_at, created_at) DESC
+                LIMIT 50
+                """
+            ).fetchall()
+            supplier_rows = conn.execute(
+                """
+                SELECT
+                    s.id, s.name, s.integration_type, s.is_active,
+                    s.last_test_status, s.service_sync_status, s.service_sync_message,
+                    s.health_status, s.health_message, s.balance_status,
+                    COUNT(CASE WHEN ss.is_active = 1 THEN ss.id END) AS active_service_count,
+                    COUNT(CASE WHEN ss.is_active = 0 THEN ss.id END) AS inactive_service_count
+                FROM suppliers s
+                LEFT JOIN supplier_services ss ON ss.supplier_id = s.id
+                GROUP BY s.id
+                ORDER BY s.updated_at DESC
+                """
+            ).fetchall()
+            counts = {
+                table: int(conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()["count"] or 0)
+                for table in (
+                    "cafe24_integrations",
+                    "cafe24_supplier_mappings",
+                    "cafe24_order_items",
+                    "suppliers",
+                    "supplier_services",
+                    "supplier_orders",
+                )
+            }
+
+        integration_payloads = [
+            {
+                "id": row["id"],
+                "mallId": row["mall_id"],
+                "shopNo": int(row["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                "isActive": bool(row["is_active"]),
+                "tokenStatus": self._cafe24_token_status(row),
+                "tokenStatusLabel": self._cafe24_token_status_label(row),
+                "tokenStatusMessage": self._cafe24_token_status_message(row),
+                "hasAccessToken": bool(row.get("access_token")),
+                "hasRefreshToken": bool(row.get("refresh_token")),
+                "expiresAt": row.get("expires_at") or "",
+                "refreshTokenExpiresAt": row.get("refresh_token_expires_at") or "",
+                "lastPollAt": row.get("last_poll_at") or "",
+                "pollCursor": row.get("poll_cursor") or "",
+                "autoSubmit": bool(row.get("auto_submit")),
+                "completionPolicy": row.get("completion_policy") or "memo_only",
+                "lastSyncStatus": row.get("last_sync_status") or "never",
+                "lastSyncMessage": row.get("last_sync_message") or "",
+                "lastAutoPollAt": row.get("last_auto_poll_at") or "",
+                "lastAutoPollStatus": row.get("last_auto_poll_status") or "never",
+                "lastAutoPollMessage": row.get("last_auto_poll_message") or "",
+                "updatedAt": row.get("updated_at") or "",
+            }
+            for row in integration_rows
+        ]
+        mapping_payloads = [
+            {
+                "id": row["id"],
+                "mallId": row["mall_id"],
+                "shopNo": int(row["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                "cafe24ProductNo": row["cafe24_product_no"] or "",
+                "cafe24VariantCode": row["cafe24_variant_code"] or "",
+                "cafe24CustomProductCode": row["cafe24_custom_product_code"] or "",
+                "supplierId": row["supplier_id"] or "",
+                "supplierName": row.get("supplier_name") or "",
+                "supplierServiceId": row.get("supplier_service_id") or "",
+                "supplierServiceName": row.get("supplier_service_name") or "",
+                "supplierExternalServiceId": row.get("supplier_external_service_id") or "",
+                "supplierProductUuid": row.get("supplier_product_uuid") or "",
+                "autoDispatchEnabled": bool(row.get("auto_dispatch_enabled")),
+                "enabled": bool(row.get("enabled")),
+                "updatedAt": row.get("updated_at") or "",
+            }
+            for row in mapping_rows
+        ]
+        order_item_payloads = [
+            {
+                "id": row["id"],
+                "mallId": row["mall_id"],
+                "shopNo": int(row["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                "orderId": row["cafe24_order_id"],
+                "orderItemCode": row["cafe24_order_item_code"],
+                "productNo": row["cafe24_product_no"],
+                "variantCode": row["cafe24_variant_code"],
+                "customProductCode": row["cafe24_custom_product_code"],
+                "standardStatus": row["standard_status"],
+                "paymentGateStatus": row.get("payment_gate_status") or "",
+                "paymentStatus": row.get("payment_status") or "",
+                "mappingId": row.get("mapping_id") or "",
+                "supplierId": row.get("supplier_id") or "",
+                "supplierServiceId": row.get("supplier_service_id") or "",
+                "supplierExternalServiceId": row.get("supplier_external_service_id") or "",
+                "supplierOrderUuid": row.get("supplier_order_uuid") or "",
+                "automationErrorCode": row.get("automation_error_code") or "",
+                "errorMessage": row.get("error_message") or "",
+                "lastSyncedAt": row.get("last_synced_at") or "",
+                "lastSubmittedAt": row.get("last_submitted_at") or "",
+                "updatedAt": row.get("updated_at") or "",
+            }
+            for row in order_item_rows
+        ]
+        supplier_payloads = [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "integrationType": normalize_supplier_integration_type(row.get("integration_type")),
+                "isActive": bool(row.get("is_active")),
+                "lastTestStatus": row.get("last_test_status") or "never",
+                "serviceSyncStatus": row.get("service_sync_status") or "never",
+                "serviceSyncMessage": row.get("service_sync_message") or "",
+                "healthStatus": row.get("health_status") or "unknown",
+                "healthMessage": row.get("health_message") or "",
+                "balanceStatus": row.get("balance_status") or "unknown",
+                "activeServiceCount": int(row.get("active_service_count") or 0),
+                "inactiveServiceCount": int(row.get("inactive_service_count") or 0),
+            }
+            for row in supplier_rows
+        ]
+
+        return {
+            "environment": {
+                "runtimeMode": runtime_mode() or "local",
+                "productionRuntime": is_production_runtime(),
+                "databaseBackend": "postgres" if database_url_configured else "sqlite",
+                "sqlitePath": "" if database_url_configured else str(DB_PATH),
+                "env": {key: "set" if os.environ.get(key) else "unset" for key in CAFE24_OPERATIONAL_AUDIT_ENV_KEYS},
+            },
+            "counts": counts,
+            "cafe24Integrations": integration_payloads,
+            "cafe24Mappings": {
+                "enabled": sum(1 for row in mapping_payloads if row["enabled"]),
+                "autoDispatchEnabled": sum(1 for row in mapping_payloads if row["autoDispatchEnabled"]),
+                "recent": mapping_payloads,
+            },
+            "cafe24OrderItems": {
+                "standardStatusCounts": dict(Counter(row["standardStatus"] or "unknown" for row in order_item_payloads)),
+                "paymentGateStatusCounts": dict(Counter(row["paymentGateStatus"] or "unknown" for row in order_item_payloads)),
+                "recent": order_item_payloads,
+            },
+            "suppliers": supplier_payloads,
         }
 
     def _log_cafe24_event(

@@ -557,6 +557,108 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(preview["supplierPayload"]["quantity"], "500")
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM supplier_orders").fetchone()[0], 0)
 
+    def test_cafe24_mapping_workflow_from_product_lookup_to_single_dispatch(self):
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=FakeCafe24ProductClient()):
+            lookup = self.store.list_cafe24_products(
+                {"integrationId": self.integration["id"], "q": "인스타", "limit": 20, "offset": 0}
+            )
+            detail = self.store.get_cafe24_product_detail(
+                {"integrationId": self.integration["id"], "productNo": lookup["products"][0]["productNo"]}
+            )
+
+        product = detail["product"]
+        variant = product["variants"][0]
+        field_mapping = {
+            "targetValue": "option:계정",
+            "orderedCount": {
+                "source": "option",
+                "label": "팔로워 수",
+                "extract": "quantity_number",
+                "fallback": "item.quantity",
+                "ambiguityPolicy": "needs_manual_review",
+            },
+        }
+        mapping = self.store.save_cafe24_product_mapping(
+            {
+                "mallId": "instamart",
+                "shopNo": 1,
+                "cafe24ProductNo": product["productNo"],
+                "cafe24VariantCode": variant["variantCode"],
+                "cafe24CustomProductCode": variant["customProductCode"],
+                "supplierId": "supplier_test",
+                "supplierServiceId": "supplier_service_test",
+                "fieldMappingJson": json.dumps(field_mapping, ensure_ascii=False),
+                "autoDispatchEnabled": False,
+                "_adminActor": "qa",
+            }
+        )["mapping"]
+
+        order_payload = self._order_payload()
+        order_payload["items"][0]["custom_product_code"] = variant["customProductCode"]
+        order_payload["items"][0]["options"] = [
+            {"name": "계정", "value": "instamart_official"},
+            {"name": "팔로워 수", "value": "500명 (+79,000원)"},
+        ]
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=FakeCafe24OrderClient(order_payload)):
+            poll = self.store.poll_cafe24_orders({"integrationId": self.integration["id"], "submitReady": False})
+
+        self.assertEqual(poll["processed"], 1)
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.assertEqual(item["mapping_id"], mapping["id"])
+        self.assertEqual(item["standard_status"], "ready_to_submit")
+
+        preview = self.store.preview_cafe24_mapping(
+            {
+                "sampleOrderItemId": item["id"],
+                "supplierId": "supplier_test",
+                "supplierServiceId": "supplier_service_test",
+                "fieldMappingJson": json.dumps(field_mapping, ensure_ascii=False),
+            }
+        )
+        self.assertTrue(preview["ok"])
+        self.assertEqual(preview["normalizedFields"]["targetValue"], "instamart_official")
+        self.assertEqual(preview["supplierPayload"]["service"], "svc-1001")
+        self.assertEqual(preview["supplierPayload"]["quantity"], "500")
+
+        self._enable_auto_submit_and_supplier_ready()
+        with patch("core.SupplierApiClient.order", return_value={"order": "SUP-WORKFLOW-1"}) as order_call:
+            dispatch = self.store.dispatch_cafe24_order_item({"itemId": item["id"], "_adminActor": "qa"})
+
+        self.assertEqual(dispatch["status"], "supplier_submitted")
+        self.assertEqual(dispatch["supplierOrderUuid"], "SUP-WORKFLOW-1")
+        order_call.assert_called_once()
+        supplier_payload = order_call.call_args.args[0]
+        self.assertEqual(supplier_payload["service"], "svc-1001")
+        self.assertEqual(supplier_payload["quantity"], "500")
+
+    def test_cafe24_operational_audit_summarizes_state_without_secrets(self):
+        order_payload = self._order_payload()
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+
+        audit = self.store.cafe24_operational_audit()
+
+        self.assertEqual(audit["counts"]["cafe24_integrations"], 1)
+        self.assertEqual(audit["counts"]["cafe24_supplier_mappings"], 1)
+        self.assertEqual(audit["counts"]["cafe24_order_items"], 1)
+        self.assertEqual(audit["cafe24Integrations"][0]["mallId"], "instamart")
+        self.assertEqual(audit["cafe24Integrations"][0]["tokenStatus"], "connected")
+        self.assertTrue(audit["cafe24Integrations"][0]["hasAccessToken"])
+        self.assertEqual(audit["cafe24Mappings"]["enabled"], 1)
+        self.assertEqual(audit["cafe24OrderItems"]["standardStatusCounts"], {"ready_to_submit": 1})
+        self.assertEqual(audit["cafe24OrderItems"]["paymentGateStatusCounts"], {"payment_confirmed": 1})
+        rendered = json.dumps(audit, ensure_ascii=False)
+        self.assertNotIn("access-token", rendered)
+        self.assertNotIn("refresh-token", rendered)
+        self.assertNotIn("api-key", rendered)
+
     def test_ready_cafe24_item_can_be_manually_dispatched_once(self):
         order_payload = self._order_payload()
         self.store._process_cafe24_item(

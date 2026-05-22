@@ -1,4 +1,5 @@
 import { renderCafe24AutoPollCards, renderCafe24Pagination, renderCafe24QueueToolbar, renderCafe24SchedulerNotice } from "./cafe24-queue-ui.js";
+import { renderSupplierDispatchReadinessPanel } from "./supplier-readiness-ui.js";
 import { supplierSyncInsight } from "./supplier-sync-ui.js";
 let runtime = {};
 let state = {};
@@ -101,7 +102,6 @@ function renderAdminHealthBadge(status) {
   const normalized = String(status || "never").toLowerCase();
   let label = "미확인";
   let className = "is-neutral";
-
   if (normalized === "success" || normalized === "submitted" || normalized === "accepted") {
     label = "정상";
     className = "is-success";
@@ -112,10 +112,8 @@ function renderAdminHealthBadge(status) {
     label = "진행 중";
     className = "is-warn";
   }
-
   return `<span class="admin-badge ${className}">${escapeHtml(label)}</span>`;
 }
-
 function renderCafe24ProductUseButton(product, variant = {}) {
   const productNo = product.productNo || "";
   const variantCode = variant.variantCode || "";
@@ -130,7 +128,6 @@ function renderCafe24ProductUseButton(product, variant = {}) {
     >매핑폼에 적용</button>
   `;
 }
-
 function renderCafe24ProductLookupPanel(activeIntegration = {}) {
   const lookup = state.adminCafe24ProductLookup || {};
   const products = lookup.products || [];
@@ -3684,6 +3681,7 @@ function renderMkt24FieldConfigRow(fieldKey, config = {}) {
     </div>
   `;
 }
+
 function renderSupplierAdminSection({
   suppliers,
   draft,
@@ -3822,7 +3820,6 @@ function renderSupplierAdminSection({
           </form>
         </section>
       </aside>
-
       <main class="admin-main">
         <section class="admin-card">
           <div class="admin-step-strip">
@@ -3844,13 +3841,11 @@ function renderSupplierAdminSection({
             .join("")}
           </div>
         </section>
-
         <section class="admin-card">
           <div class="section-head section-head--compact">
             <h2>API 연결 상태</h2>
             <p>${escapeHtml(integrationGuide.status)}</p>
           </div>
-
           ${renderAdminInsightStrip(
             [
               {
@@ -3878,9 +3873,7 @@ function renderSupplierAdminSection({
             ],
             "admin-insight-grid--compact"
           )}
-
           ${integrationGuide.dispatch ? `<p class="admin-inline-note">${escapeHtml(integrationGuide.dispatch)}</p>` : ""}
-
           <div class="admin-action-row admin-action-row--top">
             <button class="admin-secondary-button" type="button" data-admin-test-connection>API 연결 재확인</button>
             <button class="admin-primary-button" type="button" data-admin-sync-services ${selectedSupplier?.id ? "" : "disabled"}>
@@ -3888,13 +3881,21 @@ function renderSupplierAdminSection({
             </button>
           </div>
         </section>
-
+        ${renderSupplierDispatchReadinessPanel({
+          selectedSupplier,
+          selectedService,
+          allServices,
+          activeConnection,
+          connectionState,
+          syncStatus,
+          escapeHtml,
+          renderAdminInsightStrip,
+        })}
         <section class="admin-card">
           <div class="section-head section-head--compact">
             <h2>공급사 서비스 목록</h2>
             <p>${escapeHtml(selectedSupplier ? `${selectedSupplier.name}에서 불러온 서비스입니다.` : "공급사를 선택하면 서비스 목록이 표시됩니다.")}</p>
           </div>
-
           <div class="admin-supplier-explorer">
             <div class="admin-card admin-subcard admin-pane">
               <div class="admin-toolbar admin-toolbar--stack">
