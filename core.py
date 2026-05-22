@@ -72,7 +72,11 @@ try:
     )
     from .backend.integrations.cafe24_audit import build_cafe24_operational_audit
     from .backend.integrations.cafe24_mapping_gaps import summarize_cafe24_mapping_gaps
-    from .backend.integrations.cafe24_preflight import build_cafe24_order_item_preflight, cafe24_preflight_quantity
+    from .backend.integrations.cafe24_preflight import (
+        build_cafe24_mapping_preview_report,
+        build_cafe24_order_item_preflight,
+        cafe24_preflight_quantity,
+    )
     from .backend.integrations.suppliers import (
         FASTTRAFFIC_API_URL,
         SUPPLIER_INTEGRATION_FASTTRAFFIC,
@@ -129,7 +133,11 @@ except ImportError:  # pragma: no cover - top-level script runtime
     )
     from backend.integrations.cafe24_audit import build_cafe24_operational_audit
     from backend.integrations.cafe24_mapping_gaps import summarize_cafe24_mapping_gaps
-    from backend.integrations.cafe24_preflight import build_cafe24_order_item_preflight, cafe24_preflight_quantity
+    from backend.integrations.cafe24_preflight import (
+        build_cafe24_mapping_preview_report,
+        build_cafe24_order_item_preflight,
+        cafe24_preflight_quantity,
+    )
     from backend.integrations.suppliers import (
         FASTTRAFFIC_API_URL,
         SUPPLIER_INTEGRATION_FASTTRAFFIC,
@@ -9638,6 +9646,85 @@ class PanelStore(PanelStoreDatabaseMixin):
             "quantityCandidates": quantity_candidates,
             "fieldMapping": field_mapping,
             "sampleOrderItemId": sample_item_id,
+        }
+
+    def preview_single_cafe24_order_item(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        item_id = str(payload.get("itemId") or payload.get("id") or "").strip()
+        mall_id = str(payload.get("mallId") or payload.get("mall_id") or "").strip()
+        shop_no = int(payload.get("shopNo") or payload.get("shop_no") or CAFE24_DEFAULT_SHOP_NO)
+        order_id = str(payload.get("orderId") or payload.get("order_id") or "").strip()
+        order_item_code = str(payload.get("orderItemCode") or payload.get("order_item_code") or "").strip()
+        expected_quantity_raw = payload.get("expectedQuantity") or payload.get("expected_quantity") or ""
+        expected_quantity = int(expected_quantity_raw) if str(expected_quantity_raw).strip() else 0
+
+        if not item_id and not (mall_id and order_id and order_item_code):
+            raise PanelError("Cafe24 품주 id 또는 mall/order/order_item_code가 필요합니다.")
+
+        with self._connect() as conn:
+            if not item_id:
+                item_row = conn.execute(
+                    """
+                    SELECT *
+                    FROM cafe24_order_items
+                    WHERE mall_id = ? AND shop_no = ? AND cafe24_order_id = ? AND cafe24_order_item_code = ?
+                    """,
+                    (mall_id, shop_no, order_id, order_item_code),
+                ).fetchone()
+            else:
+                item_row = conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
+            if item_row is None:
+                raise PanelError("Cafe24 주문 품주를 찾을 수 없습니다.", status=404)
+            item_id = str(item_row["id"])
+            mapping_id = str(item_row.get("mapping_id") or "").strip()
+            mapping_row = None
+            if mapping_id:
+                mapping_row = conn.execute("SELECT * FROM cafe24_supplier_mappings WHERE id = ?", (mapping_id,)).fetchone()
+
+        if mapping_row is not None:
+            preview = self.preview_cafe24_mapping(
+                {
+                    "sampleOrderItemId": item_id,
+                    "internalProductId": mapping_row.get("internal_product_id") or "",
+                    "supplierId": mapping_row.get("supplier_id") or "",
+                    "supplierServiceId": mapping_row.get("supplier_service_id") or "",
+                    "supplierProductUuid": mapping_row.get("supplier_product_uuid") or "",
+                    "supplierProductCode": mapping_row.get("supplier_product_code") or "",
+                    "fieldMappingJson": mapping_row.get("field_mapping_json") or "{}",
+                }
+            )
+        else:
+            normalized_fields = parse_json(item_row["normalized_fields_json"], {})
+            supplier_payload = parse_json(item_row["supplier_payload_json"], {})
+            if not supplier_payload:
+                raise PanelError("Cafe24 매핑 또는 수동 보정 payload가 없어 preview할 수 없습니다.", status=409)
+            preview = {
+                "ok": True,
+                "errors": [],
+                "normalizedFields": normalized_fields,
+                "supplierPayload": supplier_payload,
+                "optionEntries": [],
+                "quantityCandidates": [],
+                "fieldMapping": {},
+                "sampleOrderItemId": item_id,
+            }
+
+        item_payload = self._cafe24_order_item_payload(item_row)
+        report = build_cafe24_mapping_preview_report(preview, expected_quantity=expected_quantity)
+        return {
+            "itemId": item_id,
+            "identity": {
+                "mallId": item_payload["mallId"],
+                "shopNo": item_payload["shopNo"],
+                "orderId": item_payload["orderId"],
+                "orderItemCode": item_payload["orderItemCode"],
+                "productNo": item_payload["productNo"],
+                "variantCode": item_payload["variantCode"],
+                "customProductCode": item_payload["customProductCode"],
+            },
+            "mappingId": mapping_id,
+            "standardStatus": item_payload["standardStatus"],
+            "paymentGateStatus": item_payload["paymentGateStatus"],
+            "preview": report,
         }
 
     def delete_cafe24_product_mapping(self, payload: Dict[str, Any]) -> Dict[str, Any]:
