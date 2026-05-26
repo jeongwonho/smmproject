@@ -126,6 +126,7 @@ try:
         SupplierApiClient,
         SupplierApiError,
         supplier_auto_dispatch_readiness,
+        supplier_auto_dispatch_readiness_payload,
         supplier_error_is_auth_failure,
         normalize_supplier_integration_type,
         normalize_supplier_order_status_payload,
@@ -231,6 +232,7 @@ except ImportError:  # pragma: no cover - top-level script runtime
         SupplierApiClient,
         SupplierApiError,
         supplier_auto_dispatch_readiness,
+        supplier_auto_dispatch_readiness_payload,
         supplier_error_is_auth_failure,
         normalize_supplier_integration_type,
         normalize_supplier_order_status_payload,
@@ -7991,30 +7993,6 @@ class PanelStore(PanelStoreDatabaseMixin):
                 """
             ).fetchall()
 
-            def supplier_readiness_payload(row: Dict[str, Any]) -> Dict[str, Any]:
-                readiness = supplier_auto_dispatch_readiness(
-                    {
-                        "is_active": row["is_active"],
-                        "api_url": row["api_url"],
-                        "api_key": row["api_key"],
-                        "integration_type": row["integration_type"],
-                        "active_service_count": row["service_count"] or 0,
-                        "service_sync_status": row["service_sync_status"] or "never",
-                        "service_sync_message": row["service_sync_message"] or "",
-                        "health_status": row.get("health_status") or "unknown",
-                        "health_message": row.get("health_message") or "",
-                        "balance_status": row.get("balance_status") or "unknown",
-                    },
-                    supplier_service_id="",
-                )
-                return {
-                    "ok": bool(readiness.get("ok")),
-                    "retryable": bool(readiness.get("retryable")),
-                    "code": readiness.get("code") or "unknown",
-                    "message": readiness.get("message") or "",
-                    "requirements": readiness.get("requirements") if isinstance(readiness.get("requirements"), list) else [],
-                }
-
             suppliers = [
                 {
                     "id": row["id"],
@@ -8050,7 +8028,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                     "serviceCount": row["service_count"],
                     "inactiveServiceCount": row["inactive_service_count"],
                     "mappingCount": row["mapping_count"],
-                    "autoDispatchReadiness": supplier_readiness_payload(row),
+                    "autoDispatchReadiness": supplier_auto_dispatch_readiness_payload(row),
                     "createdAt": row["created_at"],
                     "updatedAt": row["updated_at"],
                 }

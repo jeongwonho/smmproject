@@ -317,6 +317,114 @@ class Cafe24AdminManualInputHandlerTest(unittest.TestCase):
         self.assertEqual(body["supplierPayload"]["service"], "svc-1")
         self.assertTrue(body["supplierPayload"]["hasTarget"])
         self.assertTrue(body["preflight"]["canDispatch"])
+        self.assertFalse(body["dispatchAfterSave"])
+        self.assertNotIn("dispatch", body)
+
+    def test_cron_manual_input_can_dispatch_after_successful_preflight(self):
+        class FakeStore:
+            def save_cafe24_order_item_manual_input(self, payload):
+                self.saved_payload = payload
+                return {
+                    "item": {"id": "cafe24_item_1", "standardStatus": "ready_to_submit"},
+                    "normalizedFields": {"orderedCount": "50"},
+                    "supplierPayload": {
+                        "link": "https://instagram.com/private_account",
+                        "quantity": "50",
+                        "service": "svc-1",
+                    },
+                }
+
+            def preflight_single_cafe24_order_item(self, payload):
+                self.preflight_payload = payload
+                return {"canDispatch": True, "blockingReasons": [], "quantity": {"normalized": 50}}
+
+            def dispatch_cafe24_order_item(self, payload):
+                self.dispatch_payload = payload
+                return {
+                    "id": "cafe24_item_1",
+                    "status": "supplier_submitted",
+                    "submitted": True,
+                    "supplierOrderUuid": "SUP-1001",
+                }
+
+        class FakeHandler:
+            def __init__(self):
+                self.store = FakeStore()
+
+            def _server(self):
+                return SimpleNamespace(store=self.store)
+
+        handler = FakeHandler()
+        request = RouteRequest(
+            path="/api/cron/cafe24/order-items/manual-input",
+            parsed=None,
+            query={},
+            params={},
+            payload={
+                "itemId": "cafe24_item_1",
+                "supplierId": "supplier_1",
+                "supplierServiceId": "service_1",
+                "targetValue": "private_account",
+                "orderedCount": "50",
+                "dispatchAfterSave": True,
+                "confirmManualInput": True,
+            },
+        )
+
+        with patch("server.write_json") as write_json_mock:
+            AppHandler._post_cron_cafe24_order_items_manual_input(handler, request)
+
+        self.assertEqual(handler.store.dispatch_payload, {"itemId": "cafe24_item_1", "_adminActor": "cron"})
+        _, status, body = write_json_mock.call_args.args
+        self.assertEqual(status, 200)
+        self.assertTrue(body["dispatchAfterSave"])
+        self.assertTrue(body["dispatch"]["submitted"])
+        rendered = json.dumps(body, ensure_ascii=False)
+        self.assertNotIn("private_account", rendered)
+        self.assertNotIn("instagram.com/private_account", rendered)
+
+    def test_cron_manual_input_blocks_dispatch_when_preflight_fails(self):
+        class FakeStore:
+            def save_cafe24_order_item_manual_input(self, payload):
+                self.saved_payload = payload
+                return {
+                    "item": {"id": "cafe24_item_1", "standardStatus": "ready_to_submit"},
+                    "normalizedFields": {"orderedCount": "50"},
+                    "supplierPayload": {"quantity": "50", "service": "svc-1"},
+                }
+
+            def preflight_single_cafe24_order_item(self, payload):
+                self.preflight_payload = payload
+                return {"canDispatch": False, "blockingReasons": ["supplier_missing"]}
+
+            def dispatch_cafe24_order_item(self, payload):  # pragma: no cover - should never be called
+                raise AssertionError("dispatch should not run when preflight fails")
+
+        class FakeHandler:
+            def __init__(self):
+                self.store = FakeStore()
+
+            def _server(self):
+                return SimpleNamespace(store=self.store)
+
+        request = RouteRequest(
+            path="/api/cron/cafe24/order-items/manual-input",
+            parsed=None,
+            query={},
+            params={},
+            payload={
+                "itemId": "cafe24_item_1",
+                "orderedCount": "50",
+                "dispatchAfterSave": True,
+                "confirmManualInput": True,
+            },
+        )
+
+        with self.assertRaises(PanelError) as context:
+            AppHandler._post_cron_cafe24_order_items_manual_input(FakeHandler(), request)
+
+        self.assertEqual(context.exception.status, 409)
+        self.assertIn("preflight", str(context.exception))
 
 
 class CronAuthorizationTest(unittest.TestCase):
@@ -500,8 +608,15 @@ class WorkflowConfigurationTest(unittest.TestCase):
         workflow = (APP_ROOT / ".github" / "workflows" / "cafe24-manual-input-one.yml").read_text()
 
         self.assertIn("target_secret_name:", workflow)
-        self.assertIn("TARGET_VALUE: ${{ secrets[inputs.target_secret_name] }}", workflow)
+        self.assertIn("dispatch_after_save:", workflow)
+        self.assertIn("DISPATCH_AFTER_SAVE", workflow)
+        self.assertIn("dispatchAfterSave:$dispatchAfterSave", workflow)
+        self.assertIn("supplier dispatch did not submit", workflow)
+        self.assertIn("TARGET_VALUE_CAFE24_MANUAL: ${{ secrets.CAFE24_MANUAL_TARGET_VALUE }}", workflow)
+        self.assertIn('case "$TARGET_SECRET_NAME" in', workflow)
+        self.assertIn("Unsupported target secret", workflow)
         self.assertIn("::add-mask::${TARGET_VALUE}", workflow)
+        self.assertNotIn("secrets[inputs.target_secret_name]", workflow)
         self.assertNotIn("target_value:", workflow)
         self.assertNotIn("TARGET_VALUE: ${{ inputs.", workflow)
 
@@ -509,8 +624,11 @@ class WorkflowConfigurationTest(unittest.TestCase):
         workflow = (APP_ROOT / ".github" / "workflows" / "cafe24-manual-input-preview-one.yml").read_text()
 
         self.assertIn("target_secret_name:", workflow)
-        self.assertIn("TARGET_VALUE: ${{ secrets[inputs.target_secret_name] }}", workflow)
+        self.assertIn("TARGET_VALUE_CAFE24_MANUAL: ${{ secrets.CAFE24_MANUAL_TARGET_VALUE }}", workflow)
+        self.assertIn('case "$TARGET_SECRET_NAME" in', workflow)
+        self.assertIn("Unsupported target secret", workflow)
         self.assertIn("::add-mask::${TARGET_VALUE}", workflow)
+        self.assertNotIn("secrets[inputs.target_secret_name]", workflow)
         self.assertIn("/api/cron/cafe24/order-items/manual-input/preview", workflow)
         self.assertIn("confirmManualInputPreview:true", workflow)
         self.assertNotIn("target_value:", workflow)

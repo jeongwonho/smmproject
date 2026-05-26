@@ -750,6 +750,8 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(audit["cafe24OrderItems"]["summary"]["manualInputRequiredCount"], 0)
         self.assertEqual(audit["cafe24OrderItems"]["standardStatusCounts"], {"ready_to_submit": 1})
         self.assertEqual(audit["cafe24OrderItems"]["paymentGateStatusCounts"], {"payment_confirmed": 1})
+        self.assertIsInstance(audit["suppliers"][0]["autoDispatchReadiness"]["requirements"], list)
+        self.assertTrue(audit["suppliers"][0]["autoDispatchReadiness"]["requirements"])
         rendered = json.dumps(audit, ensure_ascii=False)
         self.assertNotIn("access-token", rendered)
         self.assertNotIn("refresh-token", rendered)
