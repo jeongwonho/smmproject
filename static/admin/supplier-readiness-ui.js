@@ -32,6 +32,32 @@ function supplierServiceIdLooksNumeric(value) {
   return /^\d+$/.test(String(value || "").trim());
 }
 
+function firstNumberValue(values, fallback = 0) {
+  for (const value of values) {
+    if (value === undefined || value === null || value === "") continue;
+    const numberValue = Number(value);
+    if (Number.isFinite(numberValue)) return numberValue;
+  }
+  return fallback;
+}
+
+function supplierActiveServiceCount({ selectedSupplier, allServices, activeConnection }) {
+  const services = Array.isArray(allServices) ? allServices : [];
+  const loadedActiveCount = services.filter((service) => service?.isActive !== false).length;
+  return firstNumberValue([
+    activeConnection?.serviceCount,
+    selectedSupplier?.serviceCount,
+    services.length ? loadedActiveCount : undefined,
+    selectedSupplier?.lastServiceCount,
+  ]);
+}
+
+function supplierInactiveServiceCount({ selectedSupplier, allServices }) {
+  const services = Array.isArray(allServices) ? allServices : [];
+  if (services.length) return services.filter((service) => service?.isActive === false).length;
+  return firstNumberValue([selectedSupplier?.inactiveServiceCount], 0);
+}
+
 function supplierUsesMkt24PanelApi(supplier) {
   return String(supplier?.apiUrl || "").includes("/v3/panel");
 }
@@ -168,8 +194,8 @@ function supplierDispatchReadinessChecks({
   syncStatus,
 }) {
   const integrationType = selectedSupplier?.integrationType || "classic";
-  const services = Array.isArray(allServices) ? allServices : [];
-  const serviceCount = Number(activeConnection?.serviceCount || selectedSupplier?.serviceCount || selectedSupplier?.lastServiceCount || services.length || 0);
+  const serviceCount = supplierActiveServiceCount({ selectedSupplier, allServices, activeConnection });
+  const inactiveServiceCount = supplierInactiveServiceCount({ selectedSupplier, allServices });
   const healthStatus = String(selectedSupplier?.healthStatus || "unknown");
   const balanceStatus = String(selectedSupplier?.balanceStatus || "unknown");
   const selectedExternalServiceId = String(selectedService?.externalServiceId || "").trim();
@@ -209,13 +235,24 @@ function supplierDispatchReadinessChecks({
       description: selectedSupplier?.healthMessage || (connectionState === "success" ? "최근 연결 확인은 성공했지만 자동 발주 health 상태를 확인해야 합니다." : "상태 점검이 ok여야 자동 발주가 진행됩니다."),
     },
     {
+      label: "활성 서비스",
+      value: `${String(serviceCount)}개`,
+      ok: serviceCount > 0,
+      blocking: true,
+      description: serviceCount > 0
+        ? `발주 후보 서비스 ${String(serviceCount)}개${inactiveServiceCount ? ` · 비활성 ${String(inactiveServiceCount)}개` : ""}`
+        : "동기화된 활성 공급사 서비스가 없으면 자동/수동 발주가 차단됩니다.",
+    },
+    {
       label: "서비스 동기화",
       value: supplierSyncReadinessLabel(syncStatus),
-      ok: serviceCount > 0 && syncStatus !== "failed",
-      blocking: true,
+      ok: syncStatus !== "failed",
+      blocking: syncStatus === "failed",
       description: syncStatus === "failed"
         ? selectedSupplier?.serviceSyncMessage || "최근 서비스 동기화 실패를 먼저 해소해야 합니다."
-        : `활성 서비스 후보 ${String(serviceCount)}개`,
+        : syncStatus === "success"
+          ? selectedSupplier?.serviceSyncCompletedAt || "최근 서비스 동기화가 성공했습니다."
+          : "동기화 이력이 없거나 진행 전이면 먼저 service sync를 실행하세요.",
     },
     {
       label: "서비스 선택",

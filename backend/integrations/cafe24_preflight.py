@@ -22,6 +22,45 @@ CAFE24_PREVIEW_REDACT_KEYS = {
 }
 
 
+def cafe24_order_item_selector_from_payload(
+    payload: Dict[str, Any],
+    *,
+    default_shop_no: int = 1,
+) -> Dict[str, Any]:
+    try:
+        shop_no = int(payload.get("shopNo") or payload.get("shop_no") or default_shop_no)
+    except (TypeError, ValueError):
+        shop_no = default_shop_no
+    return {
+        "itemId": str(payload.get("itemId") or payload.get("id") or "").strip(),
+        "mallId": str(payload.get("mallId") or payload.get("mall_id") or "").strip(),
+        "shopNo": max(shop_no, 1),
+        "orderId": str(payload.get("orderId") or payload.get("order_id") or "").strip(),
+        "orderItemCode": str(payload.get("orderItemCode") or payload.get("order_item_code") or "").strip(),
+    }
+
+
+def cafe24_order_item_selector_has_lookup(selector: Dict[str, Any]) -> bool:
+    return bool(
+        selector.get("itemId")
+        or (selector.get("mallId") and selector.get("orderId") and selector.get("orderItemCode"))
+    )
+
+
+def cafe24_expected_quantity_from_payload(payload: Dict[str, Any]) -> int:
+    raw_value = payload.get("expectedQuantity") or payload.get("expected_quantity") or ""
+    text = str(raw_value or "").strip()
+    if not text:
+        return 0
+    try:
+        quantity = int(float(text.replace(",", "")))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Cafe24 예상 수량은 숫자로 입력해 주세요.") from exc
+    if quantity < 0:
+        raise ValueError("Cafe24 예상 수량은 0 이상이어야 합니다.")
+    return quantity
+
+
 def cafe24_preflight_quantity(normalized_fields: Dict[str, Any], supplier_payload: Dict[str, Any]) -> int:
     quantity_value = (
         supplier_payload.get("quantity")
@@ -61,6 +100,8 @@ def build_cafe24_mapping_preview_report(
     normalized_fields = preview.get("normalizedFields") if isinstance(preview.get("normalizedFields"), dict) else {}
     supplier_payload = preview.get("supplierPayload") if isinstance(preview.get("supplierPayload"), dict) else {}
     quantity = cafe24_preflight_quantity(normalized_fields, supplier_payload)
+    supplier_payload_keys = sorted(str(key) for key in supplier_payload.keys())
+    normalized_field_keys = sorted(str(key) for key in normalized_fields.keys())
     quantity_candidates = []
     for candidate in preview.get("quantityCandidates") or []:
         if not isinstance(candidate, dict):
@@ -77,8 +118,8 @@ def build_cafe24_mapping_preview_report(
         "ok": bool(preview.get("ok")),
         "errors": list(preview.get("errors") or []),
         "sampleOrderItemId": str(preview.get("sampleOrderItemId") or ""),
-        "normalizedFieldKeys": sorted(str(key) for key in normalized_fields.keys()),
-        "supplierPayloadKeys": sorted(str(key) for key in supplier_payload.keys()),
+        "normalizedFieldKeys": normalized_field_keys,
+        "supplierPayloadKeys": supplier_payload_keys,
         "normalizedFields": redact_cafe24_preview_value(normalized_fields),
         "supplierPayload": redact_cafe24_preview_value(supplier_payload),
         "supplierPayloadDiagnostics": {
@@ -112,11 +153,12 @@ def cafe24_preflight_blocking_reasons(
     expected_quantity: int,
 ) -> List[str]:
     blocking_reasons: List[str] = []
+    has_item_level_supplier_payload = bool(item["supplierId"] and item["supplierServiceId"] and supplier_payload)
     if item["paymentGateStatus"] != "payment_confirmed":
         blocking_reasons.append("payment_not_confirmed")
     if item["standardStatus"] != "ready_to_submit":
         blocking_reasons.append(f"status_{item['standardStatus'] or 'unknown'}")
-    if not item["mappingId"]:
+    if not item["mappingId"] and not has_item_level_supplier_payload:
         blocking_reasons.append("mapping_missing")
     if not item["supplierId"] or not item["supplierServiceId"]:
         blocking_reasons.append("supplier_mapping_missing")

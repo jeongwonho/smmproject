@@ -40,7 +40,7 @@ flowchart LR
 
 ### GitHub Actions
 
-- `smm_panel/.github/workflows/cafe24-order-poll.yml`
+- `.github/workflows/automation-tick.yml`
   - 10분마다 `/api/cron/automation/tick` 호출
   - 운영 payload:
     - `lookbackDays=30`
@@ -52,9 +52,21 @@ flowchart LR
     - `dispatchLimit=25`
     - `statusLimit=50`
     - `completionLimit=25`
-- `smm_panel/.github/workflows/supplier-service-sync.yml`
+- `.github/workflows/supplier-service-sync.yml`
   - 30분마다 `/api/cron/suppliers/sync` 호출
   - supplier sync limit은 `10`
+- `.github/workflows/cafe24-operational-audit.yml`
+  - 운영 DB, Cafe24 token, mapping, order item, supplier 상태를 read-only로 점검한다.
+- `.github/workflows/cafe24-mapping-gaps.yml`
+  - 매핑 누락 품목을 product/variant/custom product code 단위로 묶고 Cafe24 상품 상세를 조회한다.
+- `.github/workflows/cafe24-preflight-one.yml`
+  - 특정 `order_id + order_item_code`가 발주 가능한지 read-only로 검증한다.
+- `.github/workflows/cafe24-manual-input-one.yml`
+  - 개인결제처럼 옵션에서 수량/대상을 자동 추출할 수 없는 품목에 공급사, 서비스, 대상, 수량을 저장하고 preflight를 다시 실행한다.
+  - 대상 URL/계정은 workflow input에 직접 넣지 않고 `target_secret_name`이 가리키는 GitHub Secret에서 읽는다.
+  - 이 workflow는 발주를 호출하지 않는다.
+- `.github/workflows/cafe24-dispatch-one.yml`
+  - 먼저 preflight를 실행하고 `canDispatch=true`인 경우에만 단건 발주 endpoint를 호출한다.
 
 ### 인증
 
@@ -104,15 +116,47 @@ flowchart LR
 
 ## 현재 검증된 상태
 
-- MKT24 `/v3/panel` `action=services` 호출이 성공했고 서비스 231개가 동기화되었다.
-- Cafe24 최근 30일 주문 수집에서 주문 8건, 주문상품 8개가 저장되었다.
-- 현재 자동 발주 대상은 0건이며, 8건은 검수 필요 상태다.
-- 검수 필요의 주된 원인은 Cafe24 상품/옵션과 MKT24 panel 숫자형 service ID 재매핑 필요로 본다.
+- 2026-05-26 `Cafe24 Operational Audit` run `26446788786` 기준:
+  - 운영 runtime은 production, DB backend는 Postgres다.
+  - Cafe24 integration은 1개이며 token status는 `connected`다.
+  - Cafe24 mapping은 12개가 enabled/auto dispatch enabled 상태다.
+  - Cafe24 order item은 10개이며 `waiting_input=8`, `ready_to_submit=1`, `completed=1`이다.
+  - 공급사는 3개, supplier service는 4161개다.
+- 2026-05-26 `Cafe24 Mapping Gaps` run `26446788793` 기준:
+  - product `32`, `33`, `34` 개인결제 품목 8건이 매핑 없음 상태다.
+  - 세 상품 모두 단일 variant code만 확인되며 수량 후보는 없다.
+  - detail lookup warning은 없다.
+- 2026-05-26 `Cafe24 Preflight One` run `26446788675` 기준:
+  - `20260512-0000017` / `20260512-0000017-01`은 `canDispatch=false`다.
+  - 차단 사유는 `status_waiting_input`, `mapping_missing`, `supplier_mapping_missing`, `supplier_payload_missing`, `quantity_mismatch`, `supplier_missing`이다.
+- 현재 신규 발주 가능 대상은 아직 없다.
+  - product `12`의 최근 ready/completed 품목은 이미 `supplierOrderUuid`가 있어 재발주하면 안 된다.
+  - product `32`, `33`, `34`는 수동 보정 또는 명시적 매핑이 먼저 필요하다.
+
+## 단건 운영 발주 절차
+
+개인결제 품목을 발주하려면 아래 순서를 지킨다. 이 절차는 고객 대상값과 수량이 운영자가 확인된 경우에만 진행한다.
+
+1. `Cafe24 Mapping Gaps`를 실행해 대상 `product_no`, `variantCode`, `customProductCode`, `orderId`, `orderItemCode`를 확인한다.
+2. 관리자 Cafe24 상품 조회 또는 mapping gap 상세에서 Cafe24 상품이 개인결제인지, 자동 수량 후보가 없는지 확인한다.
+3. 공급사 상태에서 사용할 `supplierId`와 active `supplierServiceId`를 선택한다.
+4. 대상 URL/계정은 GitHub Secret에 저장하고, secret 이름만 `Cafe24 Manual Input One`의 `target_secret_name`에 입력한다.
+5. `Cafe24 Manual Input One`을 실행한다.
+   - 필수 입력: `mall_id`, `shop_no`, `order_id`, `order_item_code`, `supplier_id`, `supplier_service_id`, `target_secret_name`, `ordered_count`.
+   - `expected_quantity`는 비워두면 `ordered_count`를 사용한다.
+   - 결과의 `preflight.canDispatch`가 `true`가 아니면 발주하지 않는다.
+6. `Cafe24 Preflight One`을 같은 품목과 수량으로 다시 실행한다.
+   - `canDispatch=true`
+   - `paymentGateStatus=payment_confirmed`
+   - `mapping.supplierId`, `mapping.supplierServiceId`, `supplierPayload.hasTarget`, `supplierPayload.hasQuantity`가 모두 확인되어야 한다.
+7. `Cafe24 Dispatch One`을 실행한다.
+   - workflow는 내부에서 preflight를 한 번 더 실행하고 실패 시 발주 endpoint를 호출하지 않는다.
+   - 발주 성공 후 supplier order uuid가 저장됐는지 `Cafe24 Operational Audit` 또는 관리자 Cafe24 큐에서 확인한다.
 
 ## 다음 운영 액션
 
-1. 관리자 Cafe24 탭에서 검수 필요 주문 8건의 상품/옵션을 확인한다.
-2. Cafe24 상품/옵션을 새로 동기화된 MKT24 panel service ID에 직접 매핑한다.
-3. 정규화/공급 payload preview에서 `service`, `link`, `quantity` 값이 생성되는지 확인한다.
-4. 단건 수동 발주로 공급사 주문 ID가 반환되는지 확인한다.
-5. 동일 매핑의 다음 주문부터 자동 발주 대상이 되는지 GitHub Actions tick 결과로 확인한다.
+1. PR `#2`를 배포해 `Cafe24 Manual Input One`과 강화된 readiness UI/API를 운영에 반영한다.
+2. product `32`, `33`, `34` 중 실제 고객 대상값과 수량이 확인된 품목 1개를 선택한다.
+3. 선택한 품목에 대해 `Cafe24 Manual Input One`을 실행하고 preflight가 `canDispatch=true`가 되는지 확인한다.
+4. 같은 품목을 `Cafe24 Dispatch One`으로 단건 발주한다.
+5. 단건 발주 후 supplier order uuid, 공급사 상태 조회, Cafe24 완료 처리 큐를 순서대로 확인한다.

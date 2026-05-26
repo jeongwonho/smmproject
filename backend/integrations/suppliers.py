@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
@@ -27,6 +28,10 @@ SUPPLIER_SERVICE_SYNC_RETRY_MAX_MINUTES = 60
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+)
+UUID_LIKE_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
 )
 
 
@@ -255,6 +260,185 @@ def supplier_uses_panel_api(integration_type: str, api_url: str) -> bool:
         return False
     parsed = urlparse(str(api_url or ""))
     return normalized_type == SUPPLIER_INTEGRATION_MKT24 and parsed.path.rstrip("/").endswith("/panel")
+
+
+def supplier_auto_dispatch_readiness(
+    row: Dict[str, Any],
+    *,
+    supplier_service_id: str = "",
+) -> Dict[str, Any]:
+    integration_type = normalize_supplier_integration_type(row.get("integration_type"))
+    api_url = str(row.get("api_url") or "")
+    service_external_id = str(row.get("service_external_id") or "").strip()
+    active_service_count = int(row.get("active_service_count") or 0)
+    service_sync_status = str(row.get("service_sync_status") or "never")
+    health_status = str(row.get("health_status") or "unknown")
+    balance_status = str(row.get("balance_status") or "unknown")
+    supplier_is_active = bool(row.get("is_active"))
+    api_key_present = bool(str(row.get("api_key") or "").strip())
+    service_is_missing = bool(supplier_service_id and row.get("service_is_active") is None)
+    service_is_inactive = bool(supplier_service_id and row.get("service_is_active") is not None and not bool(row.get("service_is_active")))
+    service_external_id_missing = bool(
+        supplier_service_id
+        and not service_is_missing
+        and not service_is_inactive
+        and not service_external_id
+    )
+    uses_panel_api = supplier_uses_panel_api(integration_type, api_url)
+    mkt24_panel_service_id_invalid = bool(
+        supplier_service_id
+        and integration_type == SUPPLIER_INTEGRATION_MKT24
+        and uses_panel_api
+        and (
+            UUID_LIKE_RE.match(service_external_id)
+            or (service_external_id and not service_external_id.isdigit())
+        )
+    )
+    supports_balance_check = supplier_supports_balance_check(integration_type)
+    requirements = [
+        {
+            "key": "supplier_active",
+            "label": "공급사 활성",
+            "value": "활성" if supplier_is_active else "비활성",
+            "ok": supplier_is_active,
+            "blocking": not supplier_is_active,
+            "code": "ok" if supplier_is_active else "supplier_inactive",
+            "message": "자동/수동 발주 대상입니다." if supplier_is_active else "공급사가 비활성 상태입니다.",
+        },
+        {
+            "key": "api_auth",
+            "label": "API 인증",
+            "value": "Key 저장됨" if api_key_present else "Key 없음",
+            "ok": api_key_present,
+            "blocking": not api_key_present,
+            "code": "ok" if api_key_present else "supplier_api_key_missing",
+            "message": (
+                "FastTraffic은 API Key를 X-Api-Key 헤더로 전송합니다."
+                if integration_type == SUPPLIER_INTEGRATION_FASTTRAFFIC
+                else "MKT24 /v3/panel은 Bearer Token 없이 API Key를 key 파라미터로 사용합니다."
+                if integration_type == SUPPLIER_INTEGRATION_MKT24
+                else "classic SMM API는 API Key를 key 파라미터로 전송합니다."
+            )
+            if api_key_present
+            else "공급사 API Key가 저장되어 있지 않습니다.",
+        },
+        {
+            "key": "active_services",
+            "label": "활성 서비스",
+            "value": f"{active_service_count}개",
+            "ok": active_service_count > 0,
+            "blocking": active_service_count <= 0,
+            "code": "ok" if active_service_count > 0 else "supplier_services_empty",
+            "message": "활성 공급사 서비스가 있습니다." if active_service_count > 0 else "동기화된 활성 공급사 서비스가 없습니다.",
+        },
+        {
+            "key": "service_sync",
+            "label": "서비스 동기화",
+            "value": service_sync_status,
+            "ok": service_sync_status != "failed",
+            "blocking": service_sync_status == "failed",
+            "code": "ok" if service_sync_status != "failed" else "supplier_sync_failed",
+            "message": row.get("service_sync_message") or ("최근 서비스 동기화가 실패했습니다." if service_sync_status == "failed" else "서비스 동기화 실패 상태가 아닙니다."),
+        },
+        {
+            "key": "health_check",
+            "label": "Health check",
+            "value": health_status,
+            "ok": health_status == "ok",
+            "blocking": health_status != "ok",
+            "code": "ok" if health_status == "ok" else "supplier_health_not_ok",
+            "message": row.get("health_message") or ("공급사 상태 점검이 정상입니다." if health_status == "ok" else "공급사 상태 점검이 필요합니다."),
+        },
+        {
+            "key": "balance_check",
+            "label": "잔액 확인",
+            "value": balance_status,
+            "ok": balance_status != "failed",
+            "blocking": balance_status == "failed",
+            "code": "ok" if balance_status != "failed" else "supplier_balance_failed",
+            "message": (
+                "이 공급사는 잔액 조회 없이 health/service 조건으로 판단합니다."
+                if not supports_balance_check
+                else "공급사 잔액 확인에 실패했습니다."
+                if balance_status == "failed"
+                else "잔액 실패 상태가 아닙니다."
+            ),
+        },
+    ]
+    if supplier_service_id:
+        service_ok = not service_is_missing and not service_is_inactive and not service_external_id_missing
+        requirements.append(
+            {
+                "key": "supplier_service",
+                "label": "공급사 서비스",
+                "value": "활성" if service_ok else "누락/비활성",
+                "ok": service_ok,
+                "blocking": not service_ok,
+                "code": (
+                    "ok"
+                    if service_ok
+                    else "supplier_service_missing"
+                    if service_is_missing
+                    else "supplier_service_inactive"
+                    if service_is_inactive
+                    else "supplier_service_external_id_missing"
+                ),
+                "message": "선택한 공급사 서비스를 발주에 사용할 수 있습니다." if service_ok else "선택한 공급사 서비스를 발주에 사용할 수 없습니다.",
+            }
+        )
+    if supplier_service_id and integration_type == SUPPLIER_INTEGRATION_MKT24 and uses_panel_api:
+        requirements.append(
+            {
+                "key": "mkt24_panel_service_id",
+                "label": "MKT24 발주 ID",
+                "value": service_external_id or "없음",
+                "ok": bool(service_external_id) and not mkt24_panel_service_id_invalid,
+                "blocking": mkt24_panel_service_id_invalid or not bool(service_external_id),
+                "code": "ok" if service_external_id and not mkt24_panel_service_id_invalid else "mkt24_panel_service_id_invalid",
+                "message": "MKT24 /v3/panel 발주는 숫자형 panel 서비스 ID가 필요합니다.",
+            }
+        )
+
+    def result(ok: bool, retryable: bool, code: str, message: str) -> Dict[str, Any]:
+        return {
+            "ok": ok,
+            "retryable": retryable,
+            "code": code,
+            "message": message,
+            "requirements": requirements,
+        }
+
+    if not supplier_is_active:
+        return result(False, False, "supplier_inactive", "공급사가 비활성 상태입니다.")
+    if not api_key_present:
+        return result(False, False, "supplier_api_key_missing", "공급사 API Key가 저장되어 있지 않습니다.")
+    if service_is_missing:
+        return result(False, False, "supplier_service_missing", "공급사 서비스를 찾을 수 없습니다.")
+    if service_is_inactive:
+        return result(False, False, "supplier_service_inactive", "공급사 서비스가 비활성 상태입니다.")
+    if service_external_id_missing:
+        return result(False, False, "supplier_service_external_id_missing", "공급사 서비스 외부 ID가 없습니다.")
+    if (
+        supplier_service_id
+        and integration_type == SUPPLIER_INTEGRATION_MKT24
+        and uses_panel_api
+        and mkt24_panel_service_id_invalid
+    ):
+        return result(
+            False,
+            False,
+            "mkt24_panel_service_id_invalid",
+            "MKT24 /v3/panel 발주는 숫자형 panel 서비스 ID 매핑이 필요합니다. 기존 v3 상품 UUID 매핑을 새로 동기화된 panel 서비스로 재매핑해 주세요.",
+        )
+    if active_service_count <= 0:
+        return result(False, True, "supplier_services_empty", "동기화된 활성 공급사 서비스가 없습니다.")
+    if service_sync_status == "failed":
+        return result(False, True, "supplier_sync_failed", row.get("service_sync_message") or "공급사 서비스 동기화가 실패 상태입니다.")
+    if health_status != "ok":
+        return result(False, True, "supplier_health_not_ok", row.get("health_message") or "공급사 상태 점검이 필요합니다.")
+    if balance_status == "failed":
+        return result(False, True, "supplier_balance_failed", "공급사 잔액 확인에 실패했습니다.")
+    return result(True, False, "ok", "발주 가능")
 
 
 def normalize_fasttraffic_api_url(api_url: str) -> str:

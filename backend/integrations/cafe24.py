@@ -22,6 +22,33 @@ CAFE24_ORDER_CANCELLED_PREFIXES = ("C", "R", "E")
 CAFE24_PAYMENT_PAID_STATUSES = {"paid", "payment_confirmed", "confirmed", "complete", "completed", "done", "y", "true", "p", "a", "t"}
 CAFE24_PAYMENT_PENDING_STATUSES = {"unpaid", "awaiting_payment", "pending", "ready", "waiting", "n", "false", "f"}
 CAFE24_PAYMENT_CANCELLED_STATUSES = {"canceled", "cancelled", "cancel", "refunded", "refund", "void"}
+CAFE24_MANUAL_INPUT_REQUIRED_STATUSES = {
+    "waiting_input",
+    "mapping_error",
+    "missing_required_field",
+    "invalid_quantity",
+    "invalid_target",
+    "supplier_range_error",
+    "needs_manual_review",
+}
+CAFE24_REVIEW_REQUIRED_STATUSES = CAFE24_MANUAL_INPUT_REQUIRED_STATUSES | {
+    "field_extract_failed",
+    "payment_review_required",
+}
+CAFE24_IN_PROGRESS_STATUSES = {"submitting", "supplier_submitted", "supplier_progress"}
+CAFE24_STANDARD_STATUSES = {
+    "received",
+    "payment_pending",
+    "payment_review_required",
+    "validated",
+    "field_extract_failed",
+    "ready_to_submit",
+    "completed",
+    "failed",
+    "cancelled",
+    *CAFE24_MANUAL_INPUT_REQUIRED_STATUSES,
+    *CAFE24_IN_PROGRESS_STATUSES,
+}
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
@@ -123,6 +150,14 @@ def cafe24_refresh_error_requires_reconnect(error_message: Any) -> bool:
             "invalid token",
         )
     )
+
+
+def cafe24_access_token_error(error: Any) -> bool:
+    message = str(error or "").strip().lower()
+    if not message:
+        return False
+    token_markers = ("invalid_token", "invalid token", "access_token", "access token", "unauthorized")
+    return "401" in message and any(marker in message for marker in token_markers)
 
 
 def normalize_cafe24_status(raw: Any) -> str:

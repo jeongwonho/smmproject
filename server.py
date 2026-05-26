@@ -1474,6 +1474,47 @@ class AppHandler(SimpleHTTPRequestHandler):
         result = self._server().store.preview_single_cafe24_order_item(payload)
         write_json(self, 200, {"ok": True, **result})
 
+    @route("POST", "/api/cron/cafe24/order-items/manual-input", auth="cron", read_json_body=True)
+    def _post_cron_cafe24_order_items_manual_input(self, request: RouteRequest) -> None:
+        payload = dict(request.payload or {})
+        if not env_flag(payload.get("confirmManualInput")):
+            raise PanelError("Cron 수동 보정은 confirmManualInput=true가 필요합니다.", status=400)
+        payload["_adminActor"] = "cron"
+        result = self._server().store.save_cafe24_order_item_manual_input(payload)
+        item = result.get("item") or {}
+        item_id = str(item.get("id") or payload.get("itemId") or payload.get("id") or "")
+        expected_quantity = payload.get("expectedQuantity") or payload.get("expected_quantity") or payload.get("orderedCount")
+        preflight = self._server().store.preflight_single_cafe24_order_item(
+            {"itemId": item_id, "expectedQuantity": expected_quantity, "_adminActor": "cron"}
+        )
+        supplier_payload = result.get("supplierPayload") if isinstance(result.get("supplierPayload"), dict) else {}
+        normalized_fields = result.get("normalizedFields") if isinstance(result.get("normalizedFields"), dict) else {}
+        target_keys = {"link", "targetUrl", "targetValue", "snsValue", "username", "url"}
+        quantity_keys = {"quantity", "orderedCount", "count", "amount"}
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                "itemId": item_id,
+                "identity": preflight.get("identity", {}),
+                "statuses": preflight.get("statuses", {}),
+                "mapping": preflight.get("mapping", {}),
+                "quantity": preflight.get("quantity", {}),
+                "normalizedFields": {
+                    "keys": sorted(str(key) for key in normalized_fields.keys()),
+                    "orderedCount": str(normalized_fields.get("orderedCount") or ""),
+                },
+                "supplierPayload": {
+                    "keys": sorted(str(key) for key in supplier_payload.keys()),
+                    "service": str(supplier_payload.get("service") or ""),
+                    "hasTarget": any(str(supplier_payload.get(key) or "").strip() for key in target_keys),
+                    "hasQuantity": any(str(supplier_payload.get(key) or "").strip() for key in quantity_keys),
+                },
+                "preflight": preflight,
+            },
+        )
+
     @route("POST", "/api/cron/cafe24/order-items/check-supplier-status", auth="cron", read_json_body=True)
     def _post_cron_cafe24_order_items_check_supplier_status(self, request: RouteRequest) -> None:
         payload = dict(request.payload or {})
@@ -1759,6 +1800,22 @@ class AppHandler(SimpleHTTPRequestHandler):
     @route("POST", "/api/admin/cafe24/order-items/resync", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
     def _post_admin_cafe24_order_items_resync(self, request: RouteRequest) -> None:
         self._write_store_result("resync_cafe24_order_item", request.payload)
+
+    @route("POST", "/api/admin/cafe24/order-items/manual-input", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_order_items_manual_input(self, request: RouteRequest) -> None:
+        payload = dict(request.payload or {})
+        result = self._server().store.save_cafe24_order_item_manual_input(payload)
+        item = result.get("item") or {}
+        item_id = str(item.get("id") or payload.get("itemId") or payload.get("id") or "")
+        expected_quantity = payload.get("expectedQuantity") or payload.get("expected_quantity") or payload.get("orderedCount")
+        preflight = self._server().store.preflight_single_cafe24_order_item(
+            {
+                "itemId": item_id,
+                "expectedQuantity": expected_quantity,
+                "_adminActor": payload.get("_adminActor") or "admin",
+            }
+        )
+        write_json(self, 200, {"ok": True, **result, "preflight": preflight})
 
     @route("POST", "/api/admin/cafe24/order-items/status", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
     def _post_admin_cafe24_order_items_status(self, request: RouteRequest) -> None:

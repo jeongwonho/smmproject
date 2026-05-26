@@ -1,3 +1,9 @@
+function cafe24ManualInputCandidate(item = {}) {
+  return item.paymentGateStatus === "payment_confirmed"
+    && !item.supplierOrderUuid
+    && ["waiting_input", "mapping_error", "missing_required_field", "invalid_quantity", "invalid_target", "supplier_range_error", "needs_manual_review"].includes(item.standardStatus);
+}
+
 export function renderCafe24MappingWorkflowChecklist({
   activeIntegration = {},
   lookupDetail = {},
@@ -13,6 +19,7 @@ export function renderCafe24MappingWorkflowChecklist({
   const hasSupplierServices = Number(serviceCount || 0) > 0;
   const hasPreview = Boolean(preview);
   const hasReadyDispatchCandidate = orderItems.some((item) => canDispatchItem(item));
+  const manualInputCount = orderItems.filter(cafe24ManualInputCandidate).length;
   const steps = [
     {
       label: "1. Cafe24 연동",
@@ -40,9 +47,13 @@ export function renderCafe24MappingWorkflowChecklist({
     },
     {
       label: "5. 단건 발주 후보",
-      value: hasReadyDispatchCandidate ? "발주 가능 품주 있음" : "대기",
+      value: hasReadyDispatchCandidate ? "발주 가능 품주 있음" : manualInputCount ? `수동 보정 ${manualInputCount}건` : "대기",
       ok: hasReadyDispatchCandidate,
-      description: "결제완료, 매핑완료, 필드검증 통과 품주만 주문 처리 큐에서 발주 버튼이 활성화됩니다.",
+      description: hasReadyDispatchCandidate
+        ? "결제완료, 매핑완료, 필드검증 통과 품주만 주문 처리 큐에서 발주 버튼이 활성화됩니다."
+        : manualInputCount
+          ? "개인결제처럼 옵션/수량 후보가 없는 품주는 주문 처리 탭에서 수동 보정 저장 후 preflight와 단건 발주를 확인합니다."
+          : "결제완료, 매핑완료, 필드검증 통과 품주가 생기면 주문 처리 큐에서 발주 버튼이 활성화됩니다.",
     },
   ];
   return `

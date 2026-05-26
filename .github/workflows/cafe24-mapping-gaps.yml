@@ -31,6 +31,14 @@ on:
         description: Per Cafe24 product API call timeout
         required: true
         default: "4"
+      detail_api_max_attempts:
+        description: Per Cafe24 product API retry attempts
+        required: true
+        default: "2"
+      fail_on_warnings:
+        description: Fail when mapping gap detail lookup returns warnings
+        required: true
+        default: "true"
 
 permissions:
   actions: read
@@ -52,6 +60,8 @@ jobs:
           LIMIT: ${{ inputs.limit }}
           DETAIL_FETCH_LIMIT: ${{ inputs.detail_fetch_limit }}
           DETAIL_API_TIMEOUT_SECONDS: ${{ inputs.detail_api_timeout_seconds }}
+          DETAIL_API_MAX_ATTEMPTS: ${{ inputs.detail_api_max_attempts }}
+          FAIL_ON_WARNINGS: ${{ inputs.fail_on_warnings }}
         run: |
           set -euo pipefail
           auth_token="${CRON_SECRET:-${GITHUB_TOKEN:-}}"
@@ -59,6 +69,7 @@ jobs:
             echo "CRON_SECRET or GITHUB_TOKEN is required" >&2
             exit 1
           fi
+          response_file="$(mktemp)"
           curl --fail-with-body --show-error --silent --connect-timeout 10 --max-time 240 \
             -X POST "https://smmproject-lime.vercel.app/api/cron/cafe24/mapping-gaps" \
             -H "Authorization: Bearer ${auth_token}" \
@@ -74,4 +85,12 @@ jobs:
               --argjson limit "$LIMIT" \
               --argjson detailFetchLimit "$DETAIL_FETCH_LIMIT" \
               --argjson detailApiTimeoutSeconds "$DETAIL_API_TIMEOUT_SECONDS" \
-              '{mallId:$mallId,shopNo:$shopNo,productNos:$productNos,includeProductDetails:$includeProductDetails,limit:$limit,detailFetchLimit:$detailFetchLimit,detailApiTimeoutSeconds:$detailApiTimeoutSeconds}')"
+              --argjson detailApiMaxAttempts "$DETAIL_API_MAX_ATTEMPTS" \
+              '{mallId:$mallId,shopNo:$shopNo,productNos:$productNos,includeProductDetails:$includeProductDetails,limit:$limit,detailFetchLimit:$detailFetchLimit,detailApiTimeoutSeconds:$detailApiTimeoutSeconds,detailApiMaxAttempts:$detailApiMaxAttempts}')" > "$response_file"
+          jq '{integration,summary,warnings,groups}' "$response_file"
+          warning_count="$(jq -r '(.warnings // []) | length' "$response_file")"
+          if [ "$FAIL_ON_WARNINGS" = "true" ] && [ "$warning_count" -gt 0 ]; then
+            echo "Cafe24 mapping gap detail lookup returned ${warning_count} warning(s)." >&2
+            jq -r '.warnings[]' "$response_file" >&2
+            exit 1
+          fi

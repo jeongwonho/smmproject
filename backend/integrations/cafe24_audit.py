@@ -5,7 +5,12 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Dict
 
-from .cafe24 import CAFE24_DEFAULT_SHOP_NO
+from .cafe24 import (
+    CAFE24_DEFAULT_SHOP_NO,
+    CAFE24_IN_PROGRESS_STATUSES,
+    CAFE24_MANUAL_INPUT_REQUIRED_STATUSES,
+    CAFE24_REVIEW_REQUIRED_STATUSES,
+)
 from .suppliers import normalize_supplier_integration_type
 
 
@@ -149,6 +154,99 @@ def _supplier_payloads(rows: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
     ]
 
 
+def _scalar_count(row: Any) -> int:
+    if row is None:
+        return 0
+    return int(row["count"] or 0)
+
+
+def _order_item_summary(order_items: list[Dict[str, Any]]) -> Dict[str, int]:
+    return {
+        "readyToSubmitCount": sum(
+            1
+            for item in order_items
+            if item["standardStatus"] == "ready_to_submit"
+            and item["paymentGateStatus"] == "payment_confirmed"
+            and not item["supplierOrderUuid"]
+        ),
+        "manualInputRequiredCount": sum(
+            1
+            for item in order_items
+            if item["paymentGateStatus"] == "payment_confirmed"
+            and not item["supplierOrderUuid"]
+            and item["standardStatus"] in CAFE24_MANUAL_INPUT_REQUIRED_STATUSES
+        ),
+        "reviewRequiredCount": sum(1 for item in order_items if item["standardStatus"] in CAFE24_REVIEW_REQUIRED_STATUSES),
+        "inProgressCount": sum(
+            1
+            for item in order_items
+            if item["standardStatus"] in CAFE24_IN_PROGRESS_STATUSES
+        ),
+        "completedCount": sum(1 for item in order_items if item["standardStatus"] == "completed"),
+        "failedCount": sum(1 for item in order_items if item["standardStatus"] == "failed"),
+    }
+
+
+def _dispatch_policy_payload(
+    conn: Any,
+    *,
+    integration_payloads: list[Dict[str, Any]],
+) -> Dict[str, Any]:
+    active_integrations = [item for item in integration_payloads if item["isActive"]]
+    auto_submit_integrations = [item for item in active_integrations if item["autoSubmit"]]
+    auto_dispatch_mapping_count = _scalar_count(
+        conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM cafe24_supplier_mappings
+            WHERE enabled = 1 AND auto_dispatch_enabled = 1
+            """
+        ).fetchone()
+    )
+    ready_filter = """
+        FROM cafe24_order_items coi
+        JOIN cafe24_integrations ci ON ci.mall_id = coi.mall_id AND ci.shop_no = coi.shop_no
+        WHERE ci.is_active = 1
+          AND coi.payment_gate_status = 'payment_confirmed'
+          AND coi.standard_status IN ('ready_to_submit', 'failed')
+          AND coi.supplier_order_uuid = ''
+          AND coi.supplier_id <> ''
+          AND coi.supplier_external_service_id <> ''
+    """
+    ready_item_count = _scalar_count(conn.execute(f"SELECT COUNT(*) AS count {ready_filter}").fetchone())
+    auto_submit_ready_item_count = _scalar_count(
+        conn.execute(f"SELECT COUNT(*) AS count {ready_filter} AND ci.auto_submit = 1").fetchone()
+    )
+    manual_ready_item_count = _scalar_count(
+        conn.execute(f"SELECT COUNT(*) AS count {ready_filter} AND ci.auto_submit <> 1").fetchone()
+    )
+
+    if not active_integrations:
+        status = "no_active_integration"
+        message = "활성 Cafe24 연동이 없어 자동 발주가 실행되지 않습니다."
+    elif auto_submit_integrations:
+        status = "auto_submit_enabled"
+        message = "활성 Cafe24 연동의 autoSubmit이 켜져 있어 준비된 품주는 자동 발주 대상입니다."
+    elif auto_dispatch_mapping_count:
+        status = "manual_approval_mode"
+        message = "매핑은 자동 발주 허용 상태지만 Cafe24 연동 autoSubmit이 꺼져 있어 품주는 수동 승인/단건 발주로 처리됩니다."
+    else:
+        status = "manual_mapping_mode"
+        message = "Cafe24 연동 autoSubmit과 매핑 자동 발주가 모두 꺼져 있어 운영자가 수동으로 발주해야 합니다."
+
+    return {
+        "status": status,
+        "message": message,
+        "activeIntegrationCount": len(active_integrations),
+        "autoSubmitIntegrationCount": len(auto_submit_integrations),
+        "autoDispatchMappingCount": auto_dispatch_mapping_count,
+        "readyItemCount": ready_item_count,
+        "autoSubmitReadyItemCount": auto_submit_ready_item_count,
+        "manualReadyItemCount": manual_ready_item_count,
+        "canAutoDispatchNow": bool(auto_submit_integrations),
+    }
+
+
 def build_cafe24_operational_audit(
     conn: Any,
     *,
@@ -214,6 +312,7 @@ def build_cafe24_operational_audit(
     mapping_payloads = _mapping_payloads(mapping_rows)
     order_item_payloads = _order_item_payloads(order_item_rows)
     supplier_payloads = _supplier_payloads(supplier_rows)
+    dispatch_policy = _dispatch_policy_payload(conn, integration_payloads=integration_payloads)
     database_backend = str(
         getattr(conn, "backend", "")
         or (
@@ -241,7 +340,9 @@ def build_cafe24_operational_audit(
             "autoDispatchEnabled": sum(1 for row in mapping_payloads if row["autoDispatchEnabled"]),
             "recent": mapping_payloads,
         },
+        "cafe24DispatchPolicy": dispatch_policy,
         "cafe24OrderItems": {
+            "summary": _order_item_summary(order_item_payloads),
             "standardStatusCounts": dict(
                 Counter(row["standardStatus"] or "unknown" for row in order_item_payloads)
             ),
