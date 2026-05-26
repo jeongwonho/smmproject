@@ -1496,32 +1496,42 @@ class AppHandler(SimpleHTTPRequestHandler):
         preflight = self._server().store.preflight_single_cafe24_order_item(
             {"itemId": item_id, "expectedQuantity": expected_quantity, "_adminActor": "cron"}
         )
+        dispatch_after_save = env_flag(payload.get("dispatchAfterSave") or payload.get("dispatch_after_save"))
+        dispatch = None
+        if dispatch_after_save:
+            if not bool(preflight.get("canDispatch")):
+                raise PanelError("수동 보정 후 preflight가 발주 가능하지 않아 dispatch를 중단했습니다.", status=409)
+            dispatch = self._server().store.dispatch_cafe24_order_item({"itemId": item_id, "_adminActor": "cron"})
         supplier_payload = result.get("supplierPayload") if isinstance(result.get("supplierPayload"), dict) else {}
         normalized_fields = result.get("normalizedFields") if isinstance(result.get("normalizedFields"), dict) else {}
         target_keys = {"link", "targetUrl", "targetValue", "snsValue", "username", "url"}
         quantity_keys = {"quantity", "orderedCount", "count", "amount"}
+        response_payload = {
+            "ok": True,
+            "itemId": item_id,
+            "identity": preflight.get("identity", {}),
+            "statuses": preflight.get("statuses", {}),
+            "mapping": preflight.get("mapping", {}),
+            "quantity": preflight.get("quantity", {}),
+            "normalizedFields": {
+                "keys": sorted(str(key) for key in normalized_fields.keys()),
+                "orderedCount": str(normalized_fields.get("orderedCount") or ""),
+            },
+            "supplierPayload": {
+                "keys": sorted(str(key) for key in supplier_payload.keys()),
+                "service": str(supplier_payload.get("service") or ""),
+                "hasTarget": any(str(supplier_payload.get(key) or "").strip() for key in target_keys),
+                "hasQuantity": any(str(supplier_payload.get(key) or "").strip() for key in quantity_keys),
+            },
+            "preflight": preflight,
+            "dispatchAfterSave": dispatch_after_save,
+        }
+        if dispatch is not None:
+            response_payload["dispatch"] = dispatch
         write_json(
             self,
             200,
-            {
-                "ok": True,
-                "itemId": item_id,
-                "identity": preflight.get("identity", {}),
-                "statuses": preflight.get("statuses", {}),
-                "mapping": preflight.get("mapping", {}),
-                "quantity": preflight.get("quantity", {}),
-                "normalizedFields": {
-                    "keys": sorted(str(key) for key in normalized_fields.keys()),
-                    "orderedCount": str(normalized_fields.get("orderedCount") or ""),
-                },
-                "supplierPayload": {
-                    "keys": sorted(str(key) for key in supplier_payload.keys()),
-                    "service": str(supplier_payload.get("service") or ""),
-                    "hasTarget": any(str(supplier_payload.get(key) or "").strip() for key in target_keys),
-                    "hasQuantity": any(str(supplier_payload.get(key) or "").strip() for key in quantity_keys),
-                },
-                "preflight": preflight,
-            },
+            response_payload,
         )
 
     @route("POST", "/api/cron/cafe24/order-items/check-supplier-status", auth="cron", read_json_body=True)
