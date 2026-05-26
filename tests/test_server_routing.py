@@ -500,8 +500,11 @@ class WorkflowConfigurationTest(unittest.TestCase):
         workflow = (APP_ROOT / ".github" / "workflows" / "cafe24-manual-input-one.yml").read_text()
 
         self.assertIn("target_secret_name:", workflow)
-        self.assertIn("TARGET_VALUE: ${{ secrets[inputs.target_secret_name] }}", workflow)
+        self.assertIn("TARGET_VALUE_CAFE24_MANUAL: ${{ secrets.CAFE24_MANUAL_TARGET_VALUE }}", workflow)
+        self.assertIn('case "$TARGET_SECRET_NAME" in', workflow)
+        self.assertIn("Unsupported target secret", workflow)
         self.assertIn("::add-mask::${TARGET_VALUE}", workflow)
+        self.assertNotIn("secrets[inputs.target_secret_name]", workflow)
         self.assertNotIn("target_value:", workflow)
         self.assertNotIn("TARGET_VALUE: ${{ inputs.", workflow)
 
@@ -509,8 +512,11 @@ class WorkflowConfigurationTest(unittest.TestCase):
         workflow = (APP_ROOT / ".github" / "workflows" / "cafe24-manual-input-preview-one.yml").read_text()
 
         self.assertIn("target_secret_name:", workflow)
-        self.assertIn("TARGET_VALUE: ${{ secrets[inputs.target_secret_name] }}", workflow)
+        self.assertIn("TARGET_VALUE_CAFE24_MANUAL: ${{ secrets.CAFE24_MANUAL_TARGET_VALUE }}", workflow)
+        self.assertIn('case "$TARGET_SECRET_NAME" in', workflow)
+        self.assertIn("Unsupported target secret", workflow)
         self.assertIn("::add-mask::${TARGET_VALUE}", workflow)
+        self.assertNotIn("secrets[inputs.target_secret_name]", workflow)
         self.assertIn("/api/cron/cafe24/order-items/manual-input/preview", workflow)
         self.assertIn("confirmManualInputPreview:true", workflow)
         self.assertNotIn("target_value:", workflow)

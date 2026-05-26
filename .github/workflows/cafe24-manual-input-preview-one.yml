@@ -58,7 +58,9 @@ jobs:
           SUPPLIER_ID: ${{ inputs.supplier_id }}
           SUPPLIER_SERVICE_ID: ${{ inputs.supplier_service_id }}
           TARGET_SECRET_NAME: ${{ inputs.target_secret_name }}
-          TARGET_VALUE: ${{ secrets[inputs.target_secret_name] }}
+          TARGET_VALUE_CAFE24_MANUAL: ${{ secrets.CAFE24_MANUAL_TARGET_VALUE }}
+          TARGET_VALUE_CAFE24_MANUAL_2: ${{ secrets.CAFE24_MANUAL_TARGET_VALUE_2 }}
+          TARGET_VALUE_CAFE24_MANUAL_3: ${{ secrets.CAFE24_MANUAL_TARGET_VALUE_3 }}
           ORDERED_COUNT: ${{ inputs.ordered_count }}
           REQUEST_MEMO: ${{ inputs.request_memo }}
           EXPECTED_QUANTITY: ${{ inputs.expected_quantity }}
@@ -69,6 +71,21 @@ jobs:
             echo "CRON_SECRET or GITHUB_TOKEN is required" >&2
             exit 1
           fi
+          case "$TARGET_SECRET_NAME" in
+            CAFE24_MANUAL_TARGET_VALUE)
+              TARGET_VALUE="${TARGET_VALUE_CAFE24_MANUAL:-}"
+              ;;
+            CAFE24_MANUAL_TARGET_VALUE_2)
+              TARGET_VALUE="${TARGET_VALUE_CAFE24_MANUAL_2:-}"
+              ;;
+            CAFE24_MANUAL_TARGET_VALUE_3)
+              TARGET_VALUE="${TARGET_VALUE_CAFE24_MANUAL_3:-}"
+              ;;
+            *)
+              echo "Unsupported target secret ${TARGET_SECRET_NAME}. Add it to the workflow allow-list before dispatching." >&2
+              exit 1
+              ;;
+          esac
           if [ -z "${TARGET_VALUE:-}" ]; then
             echo "Target secret ${TARGET_SECRET_NAME} is required" >&2
             exit 1
