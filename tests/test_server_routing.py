@@ -73,6 +73,44 @@ class OrderIdempotencyTest(unittest.TestCase):
 
 
 class Cafe24AdminManualInputHandlerTest(unittest.TestCase):
+    def test_admin_manual_input_preview_does_not_save(self):
+        class FakeStore:
+            def preview_cafe24_order_item_manual_input(self, payload):
+                self.preview_payload = payload
+                return {
+                    "itemId": "cafe24_item_1",
+                    "dryRun": True,
+                    "normalizedFields": {"keys": ["orderedCount", "targetValue"], "orderedCount": "50"},
+                    "supplierPayload": {"keys": ["link", "quantity", "service"], "service": "svc-1", "hasTarget": True, "hasQuantity": True},
+                    "preflight": {"canDispatch": True, "blockingReasons": []},
+                }
+
+        class FakeHandler:
+            def __init__(self):
+                self.store = FakeStore()
+
+            def _server(self):
+                return SimpleNamespace(store=self.store)
+
+        handler = FakeHandler()
+        request = RouteRequest(
+            path="/api/admin/cafe24/order-items/manual-input/preview",
+            parsed=None,
+            query={},
+            params={},
+            payload={"itemId": "cafe24_item_1", "orderedCount": "50"},
+        )
+
+        with patch("server.write_json") as write_json_mock:
+            AppHandler._post_admin_cafe24_order_items_manual_input_preview(handler, request)
+
+        self.assertEqual(handler.store.preview_payload["itemId"], "cafe24_item_1")
+        _, status, body = write_json_mock.call_args.args
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["dryRun"])
+        self.assertTrue(body["preflight"]["canDispatch"])
+
     def test_admin_manual_input_runs_preflight_after_save(self):
         class FakeStore:
             def save_cafe24_order_item_manual_input(self, payload):
@@ -141,6 +179,79 @@ class Cafe24AdminManualInputHandlerTest(unittest.TestCase):
 
         self.assertEqual(context.exception.status, 400)
         self.assertIn("confirmManualInput=true", str(context.exception))
+
+    def test_cron_manual_input_preview_requires_confirmation(self):
+        class FakeHandler:
+            def _server(self):
+                return SimpleNamespace(store=SimpleNamespace())
+
+        request = RouteRequest(
+            path="/api/cron/cafe24/order-items/manual-input/preview",
+            parsed=None,
+            query={},
+            params={},
+            payload={"itemId": "cafe24_item_1"},
+        )
+
+        with self.assertRaises(PanelError) as context:
+            AppHandler._post_cron_cafe24_order_items_manual_input_preview(FakeHandler(), request)
+
+        self.assertEqual(context.exception.status, 400)
+        self.assertIn("confirmManualInputPreview=true", str(context.exception))
+
+    def test_cron_manual_input_preview_response_does_not_expose_target_values(self):
+        class FakeStore:
+            def preview_cafe24_order_item_manual_input(self, payload):
+                self.preview_payload = payload
+                return {
+                    "itemId": "cafe24_item_1",
+                    "dryRun": True,
+                    "normalizedFields": {
+                        "keys": ["orderedCount", "targetValue"],
+                        "orderedCount": "50",
+                        "redacted": {"orderedCount": "50", "targetValue": "<redacted>"},
+                    },
+                    "supplierPayload": {
+                        "keys": ["link", "quantity", "service"],
+                        "service": "svc-1",
+                        "hasTarget": True,
+                        "hasQuantity": True,
+                        "redacted": {"link": "<redacted>", "quantity": "50", "service": "svc-1"},
+                    },
+                    "preflight": {"canDispatch": True, "blockingReasons": []},
+                }
+
+        class FakeHandler:
+            def __init__(self):
+                self.store = FakeStore()
+
+            def _server(self):
+                return SimpleNamespace(store=self.store)
+
+        handler = FakeHandler()
+        request = RouteRequest(
+            path="/api/cron/cafe24/order-items/manual-input/preview",
+            parsed=None,
+            query={},
+            params={},
+            payload={
+                "itemId": "cafe24_item_1",
+                "targetValue": "private_account",
+                "orderedCount": "50",
+                "confirmManualInputPreview": True,
+            },
+        )
+
+        with patch("server.write_json") as write_json_mock:
+            AppHandler._post_cron_cafe24_order_items_manual_input_preview(handler, request)
+
+        self.assertEqual(handler.store.preview_payload["_adminActor"], "cron")
+        _, status, body = write_json_mock.call_args.args
+        self.assertEqual(status, 200)
+        rendered = json.dumps(body, ensure_ascii=False)
+        self.assertNotIn("private_account", rendered)
+        self.assertTrue(body["dryRun"])
+        self.assertTrue(body["preflight"]["canDispatch"])
 
     def test_cron_manual_input_response_does_not_expose_target_values(self):
         class FakeStore:
@@ -307,6 +418,15 @@ class RouterRegistryTest(unittest.TestCase):
         self.assertEqual(route.auth, "cron")
         self.assertFalse(route.csrf)
 
+    def test_cafe24_manual_input_preview_cron_route_declares_cron_auth(self):
+        matched = ROUTER.match("POST", "/api/cron/cafe24/order-items/manual-input/preview")
+
+        self.assertIsNotNone(matched)
+        route, params = matched
+        self.assertEqual(params, {})
+        self.assertEqual(route.auth, "cron")
+        self.assertFalse(route.csrf)
+
     def test_cafe24_single_supplier_status_cron_route_declares_cron_auth(self):
         matched = ROUTER.match("POST", "/api/cron/cafe24/order-items/check-supplier-status")
 
@@ -336,6 +456,15 @@ class RouterRegistryTest(unittest.TestCase):
 
     def test_cafe24_manual_input_admin_route_declares_admin_auth_and_csrf(self):
         matched = ROUTER.match("POST", "/api/admin/cafe24/order-items/manual-input")
+
+        self.assertIsNotNone(matched)
+        route, params = matched
+        self.assertEqual(params, {})
+        self.assertEqual(route.auth, "admin")
+        self.assertTrue(route.csrf)
+
+    def test_cafe24_manual_input_preview_admin_route_declares_admin_auth_and_csrf(self):
+        matched = ROUTER.match("POST", "/api/admin/cafe24/order-items/manual-input/preview")
 
         self.assertIsNotNone(matched)
         route, params = matched
@@ -373,6 +502,17 @@ class WorkflowConfigurationTest(unittest.TestCase):
         self.assertIn("target_secret_name:", workflow)
         self.assertIn("TARGET_VALUE: ${{ secrets[inputs.target_secret_name] }}", workflow)
         self.assertIn("::add-mask::${TARGET_VALUE}", workflow)
+        self.assertNotIn("target_value:", workflow)
+        self.assertNotIn("TARGET_VALUE: ${{ inputs.", workflow)
+
+    def test_cafe24_manual_input_preview_workflow_is_dry_run_and_reads_target_from_secret(self):
+        workflow = (APP_ROOT / ".github" / "workflows" / "cafe24-manual-input-preview-one.yml").read_text()
+
+        self.assertIn("target_secret_name:", workflow)
+        self.assertIn("TARGET_VALUE: ${{ secrets[inputs.target_secret_name] }}", workflow)
+        self.assertIn("::add-mask::${TARGET_VALUE}", workflow)
+        self.assertIn("/api/cron/cafe24/order-items/manual-input/preview", workflow)
+        self.assertIn("confirmManualInputPreview:true", workflow)
         self.assertNotIn("target_value:", workflow)
         self.assertNotIn("TARGET_VALUE: ${{ inputs.", workflow)
 

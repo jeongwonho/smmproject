@@ -1466,6 +1466,50 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(dispatched["supplierOrderUuid"], "SUP-MANUAL-1")
         order_call.assert_called_once()
 
+    def test_cafe24_manual_input_preview_does_not_persist_fields_or_payload(self):
+        order_payload = self._order_payload()
+        order_payload["items"][0]["product_no"] = "9999"
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+        item_id = self.conn.execute("SELECT id FROM cafe24_order_items").fetchone()["id"]
+        self._enable_auto_submit_and_supplier_ready()
+
+        preview = self.store.preview_cafe24_order_item_manual_input(
+            {
+                "itemId": item_id,
+                "supplierId": "supplier_test",
+                "supplierServiceId": "supplier_service_test",
+                "targetValue": "parkk.co.kr",
+                "orderedCount": "50",
+                "expectedQuantity": "50",
+                "_adminActor": "qa",
+            }
+        )
+
+        self.assertTrue(preview["dryRun"])
+        self.assertEqual(preview["wouldUpdate"]["standardStatus"], "ready_to_submit")
+        self.assertEqual(preview["supplierPayload"]["service"], "svc-1001")
+        self.assertTrue(preview["supplierPayload"]["hasTarget"])
+        self.assertTrue(preview["supplierPayload"]["hasQuantity"])
+        self.assertTrue(preview["preflight"]["canDispatch"])
+        rendered = json.dumps(preview, ensure_ascii=False)
+        self.assertNotIn("parkk.co.kr", rendered)
+
+        item = self.conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
+        self.assertEqual(item["standard_status"], "waiting_input")
+        self.assertEqual(item["supplier_id"], "")
+        self.assertEqual(item["supplier_service_id"], "")
+        self.assertEqual(json.loads(item["normalized_fields_json"] or "{}"), {})
+        self.assertEqual(json.loads(item["supplier_payload_json"] or "{}"), {})
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM wallet_ledger").fetchone()[0], 0)
+
     def test_cafe24_manual_input_accepts_order_item_selector(self):
         order_payload = self._order_payload()
         order_payload["items"][0]["product_no"] = "9999"

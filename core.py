@@ -110,6 +110,7 @@ try:
         cafe24_order_item_selector_from_payload,
         cafe24_order_item_selector_has_lookup,
         cafe24_preflight_quantity,
+        redact_cafe24_preview_value,
     )
     from .backend.integrations.cafe24_quantity import (
         Cafe24QuantityAmbiguousError,
@@ -214,6 +215,7 @@ except ImportError:  # pragma: no cover - top-level script runtime
         cafe24_order_item_selector_from_payload,
         cafe24_order_item_selector_has_lookup,
         cafe24_preflight_quantity,
+        redact_cafe24_preview_value,
     )
     from backend.integrations.cafe24_quantity import (
         Cafe24QuantityAmbiguousError,
@@ -12511,12 +12513,11 @@ class PanelStore(PanelStoreDatabaseMixin):
             conn.commit()
         return {"result": result}
 
-    def save_cafe24_order_item_manual_input(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _cafe24_manual_input_plan(self, conn: DatabaseConnection, payload: Dict[str, Any]) -> Dict[str, Any]:
         selector = cafe24_order_item_selector_from_payload(payload, default_shop_no=CAFE24_DEFAULT_SHOP_NO)
         item_id = str(selector["itemId"])
         supplier_id = str(payload.get("supplierId") or "").strip()
         supplier_service_id = str(payload.get("supplierServiceId") or "").strip()
-        actor = self._admin_actor(payload)
         if not item_id and not cafe24_order_item_selector_has_lookup(selector):
             raise PanelError("수동 보정할 Cafe24 주문 품주 id 또는 mall/order/order_item_code를 입력해 주세요.")
         if not supplier_id:
@@ -12525,99 +12526,204 @@ class PanelStore(PanelStoreDatabaseMixin):
             raise PanelError("수동 보정에 사용할 공급사 서비스를 선택해 주세요.")
 
         fields = cafe24_manual_order_fields_for_panel(payload)
+        if not item_id:
+            selector_row = conn.execute(
+                """
+                SELECT id
+                FROM cafe24_order_items
+                WHERE mall_id = ? AND shop_no = ? AND cafe24_order_id = ? AND cafe24_order_item_code = ?
+                """,
+                (selector["mallId"], selector["shopNo"], selector["orderId"], selector["orderItemCode"]),
+            ).fetchone()
+            if selector_row is None:
+                raise PanelError("지정한 Cafe24 주문 품주를 찾을 수 없습니다.", status=404)
+            item_id = str(selector_row["id"])
+        row = conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
+        if row is None:
+            raise PanelError("Cafe24 주문 품주를 찾을 수 없습니다.", status=404)
+        if str(row["payment_gate_status"] or "") != "payment_confirmed":
+            raise PanelError("Cafe24 결제완료가 확인되지 않아 수동 보정할 수 없습니다.")
+        if str(row["supplier_order_uuid"] or "").strip() or str(row["standard_status"] or "") in {
+            "submitting",
+            "supplier_submitted",
+            "supplier_progress",
+            "completed",
+        }:
+            raise PanelError("이미 공급사 발주가 진행된 품주는 수동 보정할 수 없습니다.", status=409)
+
+        supplier_row = conn.execute(
+            "SELECT * FROM suppliers WHERE id = ?",
+            (supplier_id,),
+        ).fetchone()
+        if supplier_row is None:
+            raise PanelError("공급사를 찾을 수 없습니다.", status=404)
+        if not bool(supplier_row["is_active"]):
+            raise PanelError("비활성 공급사는 수동 보정에 사용할 수 없습니다.")
+        service_row = conn.execute(
+            """
+            SELECT *
+            FROM supplier_services
+            WHERE id = ? AND supplier_id = ?
+            """,
+            (supplier_service_id, supplier_id),
+        ).fetchone()
+        if service_row is None:
+            raise PanelError("공급사 서비스를 찾을 수 없습니다.", status=404)
+        if not bool(service_row["is_active"]):
+            raise PanelError("비활성 공급사 서비스는 수동 보정에 사용할 수 없습니다.")
+
+        product_payload: Dict[str, Any] = {
+            "product_code": "",
+            "name": "",
+            "platform_slug": "",
+            "price_strategy": "unit",
+        }
+        if str(row.get("product_id") or "").strip():
+            product_row = conn.execute(
+                """
+                SELECT p.product_code, p.name, ps.slug AS platform_slug
+                FROM products p
+                JOIN product_categories pc ON pc.id = p.product_category_id
+                JOIN platform_groups pg ON pg.id = pc.platform_group_id
+                JOIN platform_sections ps ON ps.id = pg.platform_section_id
+                WHERE p.id = ?
+                """,
+                (row["product_id"],),
+            ).fetchone()
+            if product_row is not None:
+                product_payload.update(
+                    {
+                        "product_code": product_row.get("product_code") or "",
+                        "name": product_row.get("name") or "",
+                        "platform_slug": product_row.get("platform_slug") or "",
+                    }
+                )
+
+        supplier_mapping = {
+            "id": str(row.get("mapping_id") or "manual"),
+            "product_id": str(row.get("product_id") or ""),
+            "supplier_id": supplier_id,
+            "supplier_service_id": supplier_service_id,
+            "supplier_external_service_id": str(service_row["external_service_id"] or ""),
+            "api_url": str(supplier_row["api_url"] or ""),
+            "integration_type": str(supplier_row["integration_type"] or SUPPLIER_INTEGRATION_CLASSIC),
+            "api_key": supplier_row["api_key"],
+            "bearer_token": supplier_row.get("bearer_token") or "",
+            "supplier_name": str(supplier_row["name"] or ""),
+            "supplier_service_name": str(service_row["name"] or ""),
+            "supplier_service_raw_json": service_row.get("raw_json") or "{}",
+            "supplier_min_amount": service_row.get("min_amount"),
+            "supplier_max_amount": service_row.get("max_amount"),
+        }
+        self._validate_cafe24_direct_fields(fields, supplier_mapping)
+        supplier_payload = self._build_supplier_order_payload(product_payload, fields, supplier_mapping)
+        readiness = self._supplier_auto_dispatch_readiness(
+            conn,
+            supplier_id=supplier_id,
+            supplier_service_id=supplier_service_id,
+        )
+        item = self._cafe24_order_item_payload(row)
+        target_input = (
+            str(fields.get("targetUrl") or "")
+            or str(fields.get("targetValue") or "")
+            or str(fields.get("snsValue") or "")
+            or str(fields.get("link") or "")
+        ).strip()
+        supplier_link = (
+            str(supplier_payload.get("link") or "")
+            or str(supplier_payload.get("snsValue") or "")
+            or str(supplier_payload.get("targetUrl") or "")
+        ).strip()
+        item.update(
+            {
+                "standardStatus": "ready_to_submit",
+                "supplierId": supplier_id,
+                "supplierServiceId": supplier_service_id,
+                "supplierExternalServiceId": str(service_row["external_service_id"] or ""),
+                "normalizedFields": fields,
+                "supplierPayload": supplier_payload,
+                "errorMessage": "",
+                "automationErrorCode": "",
+                "targetDiagnostics": {
+                    "input": target_input,
+                    "supplierLink": supplier_link,
+                    "status": "normalized" if target_input and supplier_link and target_input != supplier_link else "ok",
+                    "message": "",
+                    "supplierStatus": "",
+                    "supplierReasonCode": "",
+                    "supplierReasonMessage": "",
+                    "normalized": bool(target_input and supplier_link and target_input != supplier_link),
+                },
+            }
+        )
+        return {
+            "itemId": item_id,
+            "row": row,
+            "item": item,
+            "fields": fields,
+            "supplierPayload": supplier_payload,
+            "supplierReadiness": readiness,
+            "supplierId": supplier_id,
+            "supplierServiceId": supplier_service_id,
+            "supplierExternalServiceId": str(service_row["external_service_id"] or ""),
+        }
+
+    def preview_cafe24_order_item_manual_input(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            expected_quantity = cafe24_expected_quantity_from_payload(payload)
+        except ValueError as exc:
+            raise PanelError(str(exc), status=400) from exc
+        with self._connect() as conn:
+            plan = self._cafe24_manual_input_plan(conn, payload)
+        preflight = build_cafe24_order_item_preflight(
+            item_id=str(plan["itemId"]),
+            item=plan["item"],
+            normalized_fields=plan["fields"],
+            supplier_payload=plan["supplierPayload"],
+            readiness=plan["supplierReadiness"],
+            expected_quantity=expected_quantity or cafe24_preflight_quantity(plan["fields"], plan["supplierPayload"]),
+            checked_at=now_iso(),
+        )
+        normalized_fields = plan["fields"]
+        supplier_payload = plan["supplierPayload"]
+        return {
+            "itemId": str(plan["itemId"]),
+            "dryRun": True,
+            "wouldUpdate": {
+                "standardStatus": "ready_to_submit",
+                "supplierId": plan["supplierId"],
+                "supplierServiceId": plan["supplierServiceId"],
+                "supplierExternalServiceId": plan["supplierExternalServiceId"],
+            },
+            "normalizedFields": {
+                "keys": sorted(str(key) for key in normalized_fields.keys()),
+                "orderedCount": str(normalized_fields.get("orderedCount") or ""),
+                "redacted": redact_cafe24_preview_value(normalized_fields),
+            },
+            "supplierPayload": {
+                "keys": sorted(str(key) for key in supplier_payload.keys()),
+                "service": str(supplier_payload.get("service") or ""),
+                "hasTarget": any(
+                    str(supplier_payload.get(key) or "").strip()
+                    for key in ("link", "targetUrl", "targetValue", "snsValue", "username", "url")
+                ),
+                "hasQuantity": any(
+                    str(supplier_payload.get(key) or "").strip()
+                    for key in ("quantity", "orderedCount", "count", "amount")
+                ),
+                "redacted": redact_cafe24_preview_value(supplier_payload),
+            },
+            "preflight": preflight,
+        }
+
+    def save_cafe24_order_item_manual_input(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        actor = self._admin_actor(payload)
         timestamp = now_iso()
         with self._connect() as conn:
-            if not item_id:
-                selector_row = conn.execute(
-                    """
-                    SELECT id
-                    FROM cafe24_order_items
-                    WHERE mall_id = ? AND shop_no = ? AND cafe24_order_id = ? AND cafe24_order_item_code = ?
-                    """,
-                    (selector["mallId"], selector["shopNo"], selector["orderId"], selector["orderItemCode"]),
-                ).fetchone()
-                if selector_row is None:
-                    raise PanelError("지정한 Cafe24 주문 품주를 찾을 수 없습니다.", status=404)
-                item_id = str(selector_row["id"])
-            row = conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
-            if row is None:
-                raise PanelError("Cafe24 주문 품주를 찾을 수 없습니다.", status=404)
-            if str(row["payment_gate_status"] or "") != "payment_confirmed":
-                raise PanelError("Cafe24 결제완료가 확인되지 않아 수동 보정할 수 없습니다.")
-            if str(row["supplier_order_uuid"] or "").strip() or str(row["standard_status"] or "") in {
-                "submitting",
-                "supplier_submitted",
-                "supplier_progress",
-                "completed",
-            }:
-                raise PanelError("이미 공급사 발주가 진행된 품주는 수동 보정할 수 없습니다.", status=409)
-
-            supplier_row = conn.execute(
-                "SELECT * FROM suppliers WHERE id = ?",
-                (supplier_id,),
-            ).fetchone()
-            if supplier_row is None:
-                raise PanelError("공급사를 찾을 수 없습니다.", status=404)
-            if not bool(supplier_row["is_active"]):
-                raise PanelError("비활성 공급사는 수동 보정에 사용할 수 없습니다.")
-            service_row = conn.execute(
-                """
-                SELECT *
-                FROM supplier_services
-                WHERE id = ? AND supplier_id = ?
-                """,
-                (supplier_service_id, supplier_id),
-            ).fetchone()
-            if service_row is None:
-                raise PanelError("공급사 서비스를 찾을 수 없습니다.", status=404)
-            if not bool(service_row["is_active"]):
-                raise PanelError("비활성 공급사 서비스는 수동 보정에 사용할 수 없습니다.")
-
-            product_payload: Dict[str, Any] = {
-                "product_code": "",
-                "name": "",
-                "platform_slug": "",
-                "price_strategy": "unit",
-            }
-            if str(row.get("product_id") or "").strip():
-                product_row = conn.execute(
-                    """
-                    SELECT p.product_code, p.name, ps.slug AS platform_slug
-                    FROM products p
-                    JOIN product_categories pc ON pc.id = p.product_category_id
-                    JOIN platform_groups pg ON pg.id = pc.platform_group_id
-                    JOIN platform_sections ps ON ps.id = pg.platform_section_id
-                    WHERE p.id = ?
-                    """,
-                    (row["product_id"],),
-                ).fetchone()
-                if product_row is not None:
-                    product_payload.update(
-                        {
-                            "product_code": product_row.get("product_code") or "",
-                            "name": product_row.get("name") or "",
-                            "platform_slug": product_row.get("platform_slug") or "",
-                        }
-                    )
-
-            supplier_mapping = {
-                "id": str(row.get("mapping_id") or "manual"),
-                "product_id": str(row.get("product_id") or ""),
-                "supplier_id": supplier_id,
-                "supplier_service_id": supplier_service_id,
-                "supplier_external_service_id": str(service_row["external_service_id"] or ""),
-                "api_url": str(supplier_row["api_url"] or ""),
-                "integration_type": str(supplier_row["integration_type"] or SUPPLIER_INTEGRATION_CLASSIC),
-                "api_key": supplier_row["api_key"],
-                "bearer_token": supplier_row.get("bearer_token") or "",
-                "supplier_name": str(supplier_row["name"] or ""),
-                "supplier_service_name": str(service_row["name"] or ""),
-                "supplier_service_raw_json": service_row.get("raw_json") or "{}",
-                "supplier_min_amount": service_row.get("min_amount"),
-                "supplier_max_amount": service_row.get("max_amount"),
-            }
-            self._validate_cafe24_direct_fields(fields, supplier_mapping)
-            supplier_payload = self._build_supplier_order_payload(product_payload, fields, supplier_mapping)
+            plan = self._cafe24_manual_input_plan(conn, payload)
+            item_id = str(plan["itemId"])
+            fields = plan["fields"]
+            supplier_payload = plan["supplierPayload"]
 
             conn.execute(
                 """
@@ -12629,9 +12735,9 @@ class PanelStore(PanelStoreDatabaseMixin):
                 WHERE id = ?
                 """,
                 (
-                    supplier_id,
-                    supplier_service_id,
-                    str(service_row["external_service_id"] or ""),
+                    plan["supplierId"],
+                    plan["supplierServiceId"],
+                    plan["supplierExternalServiceId"],
                     as_json(fields),
                     as_json(supplier_payload),
                     timestamp,
@@ -12646,8 +12752,8 @@ class PanelStore(PanelStoreDatabaseMixin):
                 entity_id=item_id,
                 message="Cafe24 주문 품주 수동 보정 저장",
                 metadata={
-                    "supplierId": supplier_id,
-                    "supplierServiceId": supplier_service_id,
+                    "supplierId": plan["supplierId"],
+                    "supplierServiceId": plan["supplierServiceId"],
                     "payloadKeys": sorted(str(key) for key in supplier_payload.keys()),
                 },
             )
