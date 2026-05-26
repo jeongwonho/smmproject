@@ -1474,6 +1474,15 @@ class AppHandler(SimpleHTTPRequestHandler):
         result = self._server().store.preview_single_cafe24_order_item(payload)
         write_json(self, 200, {"ok": True, **result})
 
+    @route("POST", "/api/cron/cafe24/order-items/manual-input/preview", auth="cron", read_json_body=True)
+    def _post_cron_cafe24_order_items_manual_input_preview(self, request: RouteRequest) -> None:
+        payload = dict(request.payload or {})
+        if not env_flag(payload.get("confirmManualInputPreview")):
+            raise PanelError("Cron 수동 보정 preview는 confirmManualInputPreview=true가 필요합니다.", status=400)
+        payload["_adminActor"] = "cron"
+        result = self._server().store.preview_cafe24_order_item_manual_input(payload)
+        write_json(self, 200, {"ok": True, **result})
+
     @route("POST", "/api/cron/cafe24/order-items/manual-input", auth="cron", read_json_body=True)
     def _post_cron_cafe24_order_items_manual_input(self, request: RouteRequest) -> None:
         payload = dict(request.payload or {})
@@ -1800,6 +1809,12 @@ class AppHandler(SimpleHTTPRequestHandler):
     @route("POST", "/api/admin/cafe24/order-items/resync", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
     def _post_admin_cafe24_order_items_resync(self, request: RouteRequest) -> None:
         self._write_store_result("resync_cafe24_order_item", request.payload)
+
+    @route("POST", "/api/admin/cafe24/order-items/manual-input/preview", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_order_items_manual_input_preview(self, request: RouteRequest) -> None:
+        payload = dict(request.payload or {})
+        result = self._server().store.preview_cafe24_order_item_manual_input(payload)
+        write_json(self, 200, {"ok": True, **result})
 
     @route("POST", "/api/admin/cafe24/order-items/manual-input", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
     def _post_admin_cafe24_order_items_manual_input(self, request: RouteRequest) -> None:

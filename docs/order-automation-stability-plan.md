@@ -65,6 +65,10 @@ flowchart LR
   - 개인결제처럼 옵션에서 수량/대상을 자동 추출할 수 없는 품목에 공급사, 서비스, 대상, 수량을 저장하고 preflight를 다시 실행한다.
   - 대상 URL/계정은 workflow input에 직접 넣지 않고 `target_secret_name`이 가리키는 GitHub Secret에서 읽는다.
   - 이 workflow는 발주를 호출하지 않는다.
+- `.github/workflows/cafe24-manual-input-preview-one.yml`
+  - 수동 보정과 같은 입력으로 공급사 payload와 preflight 결과를 preview한다.
+  - DB를 수정하지 않으며 대상 URL/계정 원문은 응답에 노출하지 않는다.
+  - 결과의 `preflight.canDispatch`가 `true`가 아니면 저장/발주 단계로 진행하지 않는다.
 - `.github/workflows/cafe24-dispatch-one.yml`
   - 먼저 preflight를 실행하고 `canDispatch=true`인 경우에만 단건 발주 endpoint를 호출한다.
 
@@ -141,22 +145,27 @@ flowchart LR
 2. 관리자 Cafe24 상품 조회 또는 mapping gap 상세에서 Cafe24 상품이 개인결제인지, 자동 수량 후보가 없는지 확인한다.
 3. 공급사 상태에서 사용할 `supplierId`와 active `supplierServiceId`를 선택한다.
 4. 대상 URL/계정은 GitHub Secret에 저장하고, secret 이름만 `Cafe24 Manual Input One`의 `target_secret_name`에 입력한다.
-5. `Cafe24 Manual Input One`을 실행한다.
+5. `Cafe24 Manual Input Preview One`을 실행한다.
+   - 필수 입력은 `Cafe24 Manual Input One`과 동일하다.
+   - 이 단계는 DB를 변경하지 않는다.
+   - 결과의 `supplierPayload.hasTarget`, `supplierPayload.hasQuantity`, `quantity.matchesExpected`, `preflight.canDispatch`를 확인한다.
+6. `Cafe24 Manual Input One`을 실행한다.
    - 필수 입력: `mall_id`, `shop_no`, `order_id`, `order_item_code`, `supplier_id`, `supplier_service_id`, `target_secret_name`, `ordered_count`.
    - `expected_quantity`는 비워두면 `ordered_count`를 사용한다.
    - 결과의 `preflight.canDispatch`가 `true`가 아니면 발주하지 않는다.
-6. `Cafe24 Preflight One`을 같은 품목과 수량으로 다시 실행한다.
+7. `Cafe24 Preflight One`을 같은 품목과 수량으로 다시 실행한다.
    - `canDispatch=true`
    - `paymentGateStatus=payment_confirmed`
    - `mapping.supplierId`, `mapping.supplierServiceId`, `supplierPayload.hasTarget`, `supplierPayload.hasQuantity`가 모두 확인되어야 한다.
-7. `Cafe24 Dispatch One`을 실행한다.
+8. `Cafe24 Dispatch One`을 실행한다.
    - workflow는 내부에서 preflight를 한 번 더 실행하고 실패 시 발주 endpoint를 호출하지 않는다.
    - 발주 성공 후 supplier order uuid가 저장됐는지 `Cafe24 Operational Audit` 또는 관리자 Cafe24 큐에서 확인한다.
 
 ## 다음 운영 액션
 
-1. PR `#2`를 배포해 `Cafe24 Manual Input One`과 강화된 readiness UI/API를 운영에 반영한다.
+1. `Cafe24 Manual Input Preview One`을 운영에 반영한다.
 2. product `32`, `33`, `34` 중 실제 고객 대상값과 수량이 확인된 품목 1개를 선택한다.
-3. 선택한 품목에 대해 `Cafe24 Manual Input One`을 실행하고 preflight가 `canDispatch=true`가 되는지 확인한다.
-4. 같은 품목을 `Cafe24 Dispatch One`으로 단건 발주한다.
-5. 단건 발주 후 supplier order uuid, 공급사 상태 조회, Cafe24 완료 처리 큐를 순서대로 확인한다.
+3. 선택한 품목에 대해 `Cafe24 Manual Input Preview One`을 실행하고 DB 변경 없이 `canDispatch=true`가 되는지 확인한다.
+4. 같은 입력으로 `Cafe24 Manual Input One`을 실행해 수동 보정을 저장한다.
+5. 같은 품목을 `Cafe24 Dispatch One`으로 단건 발주한다.
+6. 단건 발주 후 supplier order uuid, 공급사 상태 조회, Cafe24 완료 처리 큐를 순서대로 확인한다.
