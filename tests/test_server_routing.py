@@ -3,6 +3,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -11,8 +12,8 @@ if str(APP_ROOT) in sys.path:
     sys.path.remove(str(APP_ROOT))
 sys.path.insert(0, str(APP_ROOT))
 
-from server import AppHandler, ROUTER, cron_authorization_valid
-from core import derive_order_idempotency_key
+from server import AppHandler, ROUTER, RouteRequest, cron_authorization_valid
+from core import PanelError, derive_order_idempotency_key
 
 
 class FakeGithubResponse:
@@ -69,6 +70,142 @@ class OrderIdempotencyTest(unittest.TestCase):
         second = derive_order_idempotency_key("user_1", "product_1", {"targetValue": "instamart"}, now_seconds=120)
 
         self.assertNotEqual(first, second)
+
+
+class Cafe24AdminManualInputHandlerTest(unittest.TestCase):
+    def test_admin_manual_input_runs_preflight_after_save(self):
+        class FakeStore:
+            def save_cafe24_order_item_manual_input(self, payload):
+                self.saved_payload = payload
+                return {
+                    "item": {"id": "cafe24_item_1", "standardStatus": "ready_to_submit"},
+                    "normalizedFields": {"orderedCount": "50"},
+                    "supplierPayload": {"link": "https://example.com/target", "quantity": "50", "service": "svc-1"},
+                }
+
+            def preflight_single_cafe24_order_item(self, payload):
+                self.preflight_payload = payload
+                return {"canDispatch": True, "blockingReasons": [], "quantity": {"normalized": 50}}
+
+        class FakeHandler:
+            def __init__(self):
+                self.store = FakeStore()
+
+            def _server(self):
+                return SimpleNamespace(store=self.store)
+
+        handler = FakeHandler()
+        request = RouteRequest(
+            path="/api/admin/cafe24/order-items/manual-input",
+            parsed=None,
+            query={},
+            params={},
+            payload={
+                "itemId": "cafe24_item_1",
+                "supplierId": "supplier_1",
+                "supplierServiceId": "service_1",
+                "orderedCount": "50",
+                "_adminActor": "operator",
+            },
+        )
+
+        with patch("server.write_json") as write_json_mock:
+            AppHandler._post_admin_cafe24_order_items_manual_input(handler, request)
+
+        self.assertEqual(handler.store.saved_payload["_adminActor"], "operator")
+        self.assertEqual(
+            handler.store.preflight_payload,
+            {"itemId": "cafe24_item_1", "expectedQuantity": "50", "_adminActor": "operator"},
+        )
+        write_json_mock.assert_called_once()
+        _, status, body = write_json_mock.call_args.args
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["preflight"]["canDispatch"])
+
+    def test_cron_manual_input_requires_confirmation(self):
+        class FakeHandler:
+            def _server(self):
+                return SimpleNamespace(store=SimpleNamespace())
+
+        request = RouteRequest(
+            path="/api/cron/cafe24/order-items/manual-input",
+            parsed=None,
+            query={},
+            params={},
+            payload={"itemId": "cafe24_item_1"},
+        )
+
+        with self.assertRaises(PanelError) as context:
+            AppHandler._post_cron_cafe24_order_items_manual_input(FakeHandler(), request)
+
+        self.assertEqual(context.exception.status, 400)
+        self.assertIn("confirmManualInput=true", str(context.exception))
+
+    def test_cron_manual_input_response_does_not_expose_target_values(self):
+        class FakeStore:
+            def save_cafe24_order_item_manual_input(self, payload):
+                self.saved_payload = payload
+                return {
+                    "item": {"id": "cafe24_item_1", "standardStatus": "ready_to_submit"},
+                    "normalizedFields": {"orderedCount": "50", "targetValue": "private_account"},
+                    "supplierPayload": {
+                        "link": "https://instagram.com/private_account",
+                        "quantity": "50",
+                        "service": "svc-1",
+                    },
+                }
+
+            def preflight_single_cafe24_order_item(self, payload):
+                self.preflight_payload = payload
+                return {
+                    "canDispatch": True,
+                    "blockingReasons": [],
+                    "quantity": {"normalized": 50},
+                    "supplierPayload": {"keys": ["link", "quantity", "service"], "service": "svc-1", "hasTarget": True, "hasQuantity": True},
+                }
+
+        class FakeHandler:
+            def __init__(self):
+                self.store = FakeStore()
+
+            def _server(self):
+                return SimpleNamespace(store=self.store)
+
+        handler = FakeHandler()
+        request = RouteRequest(
+            path="/api/cron/cafe24/order-items/manual-input",
+            parsed=None,
+            query={},
+            params={},
+            payload={
+                "itemId": "cafe24_item_1",
+                "supplierId": "supplier_1",
+                "supplierServiceId": "service_1",
+                "targetValue": "private_account",
+                "orderedCount": "50",
+                "confirmManualInput": True,
+            },
+        )
+
+        with patch("server.write_json") as write_json_mock:
+            AppHandler._post_cron_cafe24_order_items_manual_input(handler, request)
+
+        self.assertEqual(handler.store.saved_payload["_adminActor"], "cron")
+        self.assertEqual(
+            handler.store.preflight_payload,
+            {"itemId": "cafe24_item_1", "expectedQuantity": "50", "_adminActor": "cron"},
+        )
+        _, status, body = write_json_mock.call_args.args
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        rendered = json.dumps(body, ensure_ascii=False)
+        self.assertNotIn("private_account", rendered)
+        self.assertNotIn("instagram.com/private_account", rendered)
+        self.assertEqual(body["normalizedFields"], {"keys": ["orderedCount", "targetValue"], "orderedCount": "50"})
+        self.assertEqual(body["supplierPayload"]["service"], "svc-1")
+        self.assertTrue(body["supplierPayload"]["hasTarget"])
+        self.assertTrue(body["preflight"]["canDispatch"])
 
 
 class CronAuthorizationTest(unittest.TestCase):
@@ -161,6 +298,15 @@ class RouterRegistryTest(unittest.TestCase):
         self.assertEqual(route.auth, "cron")
         self.assertFalse(route.csrf)
 
+    def test_cafe24_manual_input_cron_route_declares_cron_auth(self):
+        matched = ROUTER.match("POST", "/api/cron/cafe24/order-items/manual-input")
+
+        self.assertIsNotNone(matched)
+        route, params = matched
+        self.assertEqual(params, {})
+        self.assertEqual(route.auth, "cron")
+        self.assertFalse(route.csrf)
+
     def test_cafe24_single_supplier_status_cron_route_declares_cron_auth(self):
         matched = ROUTER.match("POST", "/api/cron/cafe24/order-items/check-supplier-status")
 
@@ -188,6 +334,15 @@ class RouterRegistryTest(unittest.TestCase):
         self.assertEqual(route.auth, "cron")
         self.assertFalse(route.csrf)
 
+    def test_cafe24_manual_input_admin_route_declares_admin_auth_and_csrf(self):
+        matched = ROUTER.match("POST", "/api/admin/cafe24/order-items/manual-input")
+
+        self.assertIsNotNone(matched)
+        route, params = matched
+        self.assertEqual(params, {})
+        self.assertEqual(route.auth, "admin")
+        self.assertTrue(route.csrf)
+
     def test_cafe24_operational_audit_cron_route_declares_cron_auth(self):
         matched = ROUTER.match("GET", "/api/cron/cafe24/operational-audit")
 
@@ -199,6 +354,36 @@ class RouterRegistryTest(unittest.TestCase):
 
     def test_unknown_api_route_does_not_match(self):
         self.assertIsNone(ROUTER.match("GET", "/api/does-not-exist"))
+
+
+class WorkflowConfigurationTest(unittest.TestCase):
+    def test_cafe24_mapping_gaps_workflow_sends_detail_retry_attempts(self):
+        workflow = (APP_ROOT / ".github" / "workflows" / "cafe24-mapping-gaps.yml").read_text()
+
+        self.assertIn("detail_api_max_attempts:", workflow)
+        self.assertIn("DETAIL_API_MAX_ATTEMPTS", workflow)
+        self.assertIn("detailApiMaxAttempts:$detailApiMaxAttempts", workflow)
+        self.assertIn("fail_on_warnings:", workflow)
+        self.assertIn("warning_count", workflow)
+        self.assertIn("mapping gap detail lookup returned", workflow)
+
+    def test_cafe24_manual_input_workflow_reads_target_from_secret(self):
+        workflow = (APP_ROOT / ".github" / "workflows" / "cafe24-manual-input-one.yml").read_text()
+
+        self.assertIn("target_secret_name:", workflow)
+        self.assertIn("TARGET_VALUE: ${{ secrets[inputs.target_secret_name] }}", workflow)
+        self.assertIn("::add-mask::${TARGET_VALUE}", workflow)
+        self.assertNotIn("target_value:", workflow)
+        self.assertNotIn("TARGET_VALUE: ${{ inputs.", workflow)
+
+    def test_cafe24_dispatch_workflow_requires_preflight_before_dispatch(self):
+        workflow = (APP_ROOT / ".github" / "workflows" / "cafe24-dispatch-one.yml").read_text()
+
+        self.assertIn("/api/cron/cafe24/order-items/preflight", workflow)
+        self.assertIn("Preflight summary", workflow)
+        self.assertIn(".canDispatch // false", workflow)
+        self.assertIn("refusing to call dispatch-one", workflow)
+        self.assertIn("/api/cron/cafe24/order-items/dispatch-one", workflow)
 
 
 if __name__ == "__main__":

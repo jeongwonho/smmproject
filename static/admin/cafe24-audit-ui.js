@@ -41,9 +41,13 @@ function renderAuditSummary(audit, escapeHtml) {
   const counts = audit.counts || {};
   const mappings = audit.cafe24Mappings || {};
   const orderItems = audit.cafe24OrderItems || {};
+  const dispatchPolicy = audit.cafe24DispatchPolicy || {};
   const integrations = audit.cafe24Integrations || [];
   const reconnectCount = integrations.filter((item) => ["reconnect_required", "failed"].includes(item.tokenStatus)).length;
-  const readyCount = Number(orderItems.standardStatusCounts?.ready_to_submit || 0);
+  const orderSummary = orderItems.summary || {};
+  const readyCount = Number(orderSummary.readyToSubmitCount ?? orderItems.standardStatusCounts?.ready_to_submit ?? 0);
+  const manualInputCount = Number(orderSummary.manualInputRequiredCount || 0);
+  const policyOk = dispatchPolicy.canAutoDispatchNow || dispatchPolicy.status === "manual_mapping_mode";
   return `
     <div class="admin-insight-grid admin-insight-grid--compact">
       <article class="admin-insight-card">
@@ -61,10 +65,20 @@ function renderAuditSummary(audit, escapeHtml) {
         <strong>${escapeHtml(String(mappings.enabled || 0))}</strong>
         <p>자동 발주 ${escapeHtml(String(mappings.autoDispatchEnabled || 0))}개</p>
       </article>
+      <article class="admin-insight-card ${policyOk ? "is-success" : "is-warning"}">
+        <span>자동 발주 정책</span>
+        <strong>${escapeHtml(dispatchPolicy.canAutoDispatchNow ? "autoSubmit ON" : "autoSubmit OFF")}</strong>
+        <p>${escapeHtml(dispatchPolicy.message || "Cafe24 autoSubmit과 매핑 자동발주 상태를 확인합니다.")}</p>
+      </article>
       <article class="admin-insight-card ${readyCount ? "is-success" : ""}">
         <span>최근 품주</span>
         <strong>${escapeHtml(String(counts.cafe24_order_items || 0))}</strong>
         <p>발주 대기 ${escapeHtml(String(readyCount))}개</p>
+      </article>
+      <article class="admin-insight-card ${manualInputCount ? "is-warning" : "is-success"}">
+        <span>수동 보정</span>
+        <strong>${escapeHtml(String(manualInputCount))}</strong>
+        <p>개인결제/필드 보정 필요</p>
       </article>
     </div>
   `;
@@ -93,25 +107,39 @@ function renderEnvironment(audit, escapeHtml) {
 
 function renderIntegrations(audit, escapeHtml) {
   const integrations = audit.cafe24Integrations || [];
+  const dispatchPolicy = audit.cafe24DispatchPolicy || {};
   return `
     <div class="admin-panel">
       <div class="section-head section-head--compact">
         <h3>Cafe24 연동/Tokens</h3>
-        <p>토큰 원문 없이 저장 여부, 만료, 재연결 필요 여부만 표시합니다.</p>
+        <p>토큰 원문 없이 저장 여부, 만료, 재연결 필요 여부와 autoSubmit 정책을 표시합니다.</p>
+      </div>
+      <div class="admin-mapping-preview">
+        <article class="admin-mini-card ${dispatchPolicy.canAutoDispatchNow ? "" : "is-risk"}">
+          <span>운영 발주 모드</span>
+          <strong>${escapeHtml(dispatchPolicy.status || "unknown")}</strong>
+          <p>${escapeHtml(dispatchPolicy.message || "")}</p>
+        </article>
+        <article class="admin-mini-card">
+          <span>자동 발주 후보</span>
+          <strong>${escapeHtml(String(dispatchPolicy.autoSubmitReadyItemCount || 0))}건</strong>
+          <p>수동 승인 대기 ${escapeHtml(String(dispatchPolicy.manualReadyItemCount || 0))}건 · 자동매핑 ${escapeHtml(String(dispatchPolicy.autoDispatchMappingCount || 0))}개</p>
+        </article>
       </div>
       <div class="admin-table-wrap">
         <table class="admin-table">
-          <thead><tr><th>Mall</th><th>Token</th><th>저장 상태</th><th>Poll</th><th>Sync</th></tr></thead>
+          <thead><tr><th>Mall</th><th>Token</th><th>저장 상태</th><th>Auto submit</th><th>Poll</th><th>Sync</th></tr></thead>
           <tbody>
             ${integrations.length ? integrations.map((item) => `
               <tr>
                 <td>${escapeHtml(item.mallId || "-")} / ${escapeHtml(String(item.shopNo || 1))}</td>
                 <td>${statusBadge(item.tokenStatus, escapeHtml)}<br />${escapeHtml(item.tokenStatusMessage || "")}</td>
                 <td>Access ${escapeHtml(item.hasAccessToken ? "set" : "unset")} · Refresh ${escapeHtml(item.hasRefreshToken ? "set" : "unset")}<br />Refresh 만료 ${escapeHtml(item.refreshTokenExpiresAt || "-")}</td>
+                <td>${renderBadge(item.autoSubmit ? "ON" : "OFF", item.autoSubmit ? "is-success" : "is-warn", escapeHtml)}<br />${escapeHtml(item.autoSubmit ? "자동 발주 후보 포함" : "수동 승인/단건 발주 모드")}</td>
                 <td>${escapeHtml(item.lastPollAt || "-")}<br />${escapeHtml(item.pollCursor || "")}</td>
                 <td>${statusBadge(item.lastSyncStatus, escapeHtml)}<br />${escapeHtml(item.lastSyncMessage || item.updatedAt || "")}</td>
               </tr>
-            `).join("") : `<tr><td colspan="5">Cafe24 연동이 없습니다.</td></tr>`}
+            `).join("") : `<tr><td colspan="6">Cafe24 연동이 없습니다.</td></tr>`}
           </tbody>
         </table>
       </div>

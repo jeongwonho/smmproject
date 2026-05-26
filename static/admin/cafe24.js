@@ -131,13 +131,14 @@ export async function handleCafe24AdminChange(target) {
     renderRoute();
     return true;
   }
-  if (!target.matches("[data-admin-cafe24-supplier-select]")) return false;
+  if (!target.matches("[data-admin-cafe24-supplier-select], [data-admin-cafe24-manual-supplier-select]")) return false;
   const supplierId = target.value || "";
   state.ui = state.ui || {};
   state.ui.adminCafe24SelectedSupplierId = supplierId;
   try {
     const data = await loadCafe24SupplierServices(supplierId);
-    const serviceSelect = document.querySelector("[data-admin-cafe24-service-select]");
+    const serviceSelect = target.closest("form")?.querySelector("[data-admin-cafe24-service-select], [data-admin-cafe24-manual-service-select]")
+      || document.querySelector("[data-admin-cafe24-service-select]");
     if (serviceSelect && data?.services) {
       serviceSelect.innerHTML = [
         `<option value="">공급사 서비스를 선택하세요</option>`,
@@ -158,6 +159,11 @@ export async function handleCafe24AdminClick(closest) {
   if (cafe24TabButton) {
     state.ui = state.ui || {};
     state.ui.adminCafe24Tab = cafe24TabButton.getAttribute("data-admin-cafe24-tab") || "queue";
+    const defaultSupplierId = state.ui.adminCafe24SelectedSupplierId || state.adminBootstrap?.suppliers?.[0]?.id || "";
+    if ((state.ui.adminCafe24Tab === "queue" || state.ui.adminCafe24Tab === "mapping") && defaultSupplierId) {
+      state.ui.adminCafe24SelectedSupplierId = defaultSupplierId;
+      await loadCafe24SupplierServices(defaultSupplierId);
+    }
     if (state.ui.adminCafe24Tab === "queue" || state.ui.adminCafe24Tab === "monitor") {
       await refreshCafe24OrderItems({ force: true });
     }
@@ -482,6 +488,28 @@ export async function handleCafe24AdminSubmit(form, event) {
       renderRoute();
     } catch (error) {
       showToast(error.message || "Cafe24 품주 상태 저장에 실패했습니다.", "error");
+    }
+    return true;
+  }
+
+  if (form.matches("[data-admin-cafe24-item-manual-form]")) {
+    event.preventDefault();
+    const formData = new FormData(form);
+    try {
+      const result = await apiPost("/api/admin/cafe24/order-items/manual-input", {
+        itemId: formData.get("itemId"),
+        supplierId: formData.get("supplierId"),
+        supplierServiceId: formData.get("supplierServiceId"),
+        targetValue: formData.get("targetValue"),
+        orderedCount: formData.get("orderedCount"),
+        requestMemo: formData.get("requestMemo"),
+      });
+      await refreshAdminData({ preserveDraft: true });
+      await refreshCafe24OrderItems({ force: true });
+      showToast(`Cafe24 수동 보정 저장: ${result.item?.standardStatus || "ready_to_submit"}`);
+      renderRoute();
+    } catch (error) {
+      showToast(error.message || "Cafe24 수동 보정 저장에 실패했습니다.", "error");
     }
     return true;
   }

@@ -3,6 +3,10 @@ import unittest
 
 import bootstrap
 from backend.integrations.cafe24 import (
+    CAFE24_MANUAL_INPUT_REQUIRED_STATUSES,
+    CAFE24_REVIEW_REQUIRED_STATUSES,
+    CAFE24_STANDARD_STATUSES,
+    cafe24_access_token_error,
     cafe24_normalize_datetime_text,
     cafe24_payment_gate_status,
     cafe24_payment_snapshot_from_payload,
@@ -14,7 +18,15 @@ from backend.integrations.cafe24 import (
     normalize_cafe24_shop_no,
     normalize_cafe24_status,
 )
-from backend.integrations.cafe24_preflight import build_cafe24_order_item_preflight, cafe24_preflight_quantity
+from backend.integrations.cafe24_mapping_gaps import annotate_cafe24_mapping_gap_groups
+from backend.integrations.cafe24_preflight import (
+    build_cafe24_order_item_preflight,
+    build_cafe24_mapping_preview_report,
+    cafe24_expected_quantity_from_payload,
+    cafe24_order_item_selector_from_payload,
+    cafe24_order_item_selector_has_lookup,
+    cafe24_preflight_quantity,
+)
 
 
 class Cafe24IntegrationHelperTest(unittest.TestCase):
@@ -26,6 +38,13 @@ class Cafe24IntegrationHelperTest(unittest.TestCase):
         self.assertEqual(normalize_cafe24_status("C10"), "cancelled")
         self.assertEqual(normalize_cafe24_payment_status("P"), "paid")
         self.assertEqual(normalize_cafe24_payment_status(False), "unpaid")
+
+    def test_cafe24_status_groups_are_exposed_from_domain_module(self):
+        self.assertIn("ready_to_submit", CAFE24_STANDARD_STATUSES)
+        self.assertIn("waiting_input", CAFE24_STANDARD_STATUSES)
+        self.assertIn("waiting_input", CAFE24_MANUAL_INPUT_REQUIRED_STATUSES)
+        self.assertIn("payment_review_required", CAFE24_REVIEW_REQUIRED_STATUSES)
+        self.assertNotIn("payment_review_required", CAFE24_MANUAL_INPUT_REQUIRED_STATUSES)
 
     def test_payment_snapshot_and_gate_status(self):
         order_payload = {
@@ -59,6 +78,13 @@ class Cafe24IntegrationHelperTest(unittest.TestCase):
         self.assertTrue(cafe24_refresh_token_expired(expired_at))
         self.assertTrue(cafe24_refresh_error_requires_reconnect("invalid_grant: expired refresh token"))
         self.assertFalse(cafe24_refresh_error_requires_reconnect("temporary upstream timeout"))
+        self.assertTrue(
+            cafe24_access_token_error(
+                'Cafe24 API 오류 401: {"error":{"code":401,"message":"access_token time expired. (invalid_token)"}}'
+            )
+        )
+        self.assertTrue(cafe24_access_token_error("401 Unauthorized: invalid token"))
+        self.assertFalse(cafe24_access_token_error("403 scope permission denied"))
 
     def test_preflight_helper_reports_conditions_without_target_values(self):
         item = {
@@ -109,6 +135,89 @@ class Cafe24IntegrationHelperTest(unittest.TestCase):
         self.assertTrue(preflight["supplierPayload"]["hasTarget"])
         self.assertTrue(preflight["supplierPayload"]["hasQuantity"])
         self.assertNotIn("instamart_official", str(preflight))
+
+    def test_order_item_selector_supports_item_id_or_cafe24_identity(self):
+        item_selector = cafe24_order_item_selector_from_payload({"itemId": " item-1 "}, default_shop_no=1)
+        lookup_selector = cafe24_order_item_selector_from_payload(
+            {
+                "mall_id": "growit",
+                "shop_no": "2",
+                "order_id": "20260506-0000024",
+                "order_item_code": "20260506-0000024-01",
+            },
+            default_shop_no=1,
+        )
+        missing_selector = cafe24_order_item_selector_from_payload({"mallId": "growit"}, default_shop_no=1)
+
+        self.assertEqual(item_selector["itemId"], "item-1")
+        self.assertTrue(cafe24_order_item_selector_has_lookup(item_selector))
+        self.assertEqual(lookup_selector["shopNo"], 2)
+        self.assertEqual(lookup_selector["orderItemCode"], "20260506-0000024-01")
+        self.assertTrue(cafe24_order_item_selector_has_lookup(lookup_selector))
+        self.assertFalse(cafe24_order_item_selector_has_lookup(missing_selector))
+
+    def test_expected_quantity_parser_accepts_commas_and_rejects_invalid_values(self):
+        self.assertEqual(cafe24_expected_quantity_from_payload({"expectedQuantity": "1,500"}), 1500)
+        self.assertEqual(cafe24_expected_quantity_from_payload({"expected_quantity": ""}), 0)
+        with self.assertRaises(ValueError):
+            cafe24_expected_quantity_from_payload({"expectedQuantity": "many"})
+        with self.assertRaises(ValueError):
+            cafe24_expected_quantity_from_payload({"expectedQuantity": "-1"})
+
+    def test_mapping_preview_report_redacts_target_values_but_keeps_payload_shape(self):
+        report = build_cafe24_mapping_preview_report(
+            {
+                "ok": True,
+                "errors": [],
+                "sampleOrderItemId": "item-1",
+                "normalizedFields": {"targetValue": "instamart_official", "orderedCount": "50"},
+                "supplierPayload": {"service": "40000", "link": "https://instagram.com/instamart_official", "quantity": "50"},
+                "optionEntries": [{"name": "수량", "value": "50명"}],
+                "quantityCandidates": [{"value": 50, "raw": "50명", "label": "수량", "source": "option"}],
+                "fieldMapping": {"targetValue": {"source": "option", "optionName": "계정"}},
+            },
+            expected_quantity=50,
+        )
+
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["supplierPayloadKeys"], ["link", "quantity", "service"])
+        self.assertEqual(report["supplierPayload"]["service"], "40000")
+        self.assertEqual(report["supplierPayload"]["quantity"], "50")
+        self.assertEqual(report["supplierPayload"]["link"], "<redacted>")
+        self.assertEqual(report["normalizedFields"]["targetValue"], "<redacted>")
+        self.assertEqual(report["quantity"]["normalized"], 50)
+        self.assertTrue(report["supplierPayloadDiagnostics"]["hasTarget"])
+        self.assertTrue(report["supplierPayloadDiagnostics"]["hasQuantity"])
+        self.assertNotIn("instamart_official", str(report))
+
+    def test_mapping_gap_diagnostics_marks_personal_payment_as_manual_input_required(self):
+        groups = [
+            {
+                "productNo": "32",
+                "variantCode": "P00000BG000A",
+                "customProductCode": "P00000BG",
+                "count": 2,
+                "optionLabels": [],
+                "quantityCandidates": [],
+            }
+        ]
+        details = {
+            "32": {
+                "productName": "개인결제",
+                "options": [{"name": "", "value": "", "values": []}],
+                "variants": [{"variantCode": "P00000BG000A"}],
+            }
+        }
+
+        annotated = annotate_cafe24_mapping_gap_groups(groups, details)
+
+        self.assertEqual(annotated[0]["diagnostics"]["status"], "manual_input_required")
+        self.assertTrue(annotated[0]["diagnostics"]["manualInputRequired"])
+        self.assertFalse(annotated[0]["diagnostics"]["mappingCandidate"])
+        self.assertTrue(annotated[0]["diagnostics"]["personalPaymentLike"])
+        self.assertTrue(annotated[0]["diagnostics"]["hasVariantMatch"])
+        self.assertEqual(annotated[0]["diagnostics"]["matchedVariant"]["variantCode"], "P00000BG000A")
+        self.assertIn("수동 보정", annotated[0]["diagnostics"]["nextAction"])
 
 
 if __name__ == "__main__":
