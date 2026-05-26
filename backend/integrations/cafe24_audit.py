@@ -11,7 +11,7 @@ from .cafe24 import (
     CAFE24_MANUAL_INPUT_REQUIRED_STATUSES,
     CAFE24_REVIEW_REQUIRED_STATUSES,
 )
-from .suppliers import normalize_supplier_integration_type
+from .suppliers import normalize_supplier_integration_type, supplier_auto_dispatch_readiness_payload
 
 
 CAFE24_OPERATIONAL_AUDIT_ENV_KEYS = (
@@ -149,6 +149,7 @@ def _supplier_payloads(rows: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
             "balanceStatus": row.get("balance_status") or "unknown",
             "activeServiceCount": int(row.get("active_service_count") or 0),
             "inactiveServiceCount": int(row.get("inactive_service_count") or 0),
+            "autoDispatchReadiness": supplier_auto_dispatch_readiness_payload(row),
         }
         for row in rows
     ]
@@ -290,7 +291,7 @@ def build_cafe24_operational_audit(
     supplier_rows = conn.execute(
         """
         SELECT
-            s.id, s.name, s.integration_type, s.is_active,
+            s.id, s.name, s.api_url, s.api_key, s.integration_type, s.is_active,
             s.last_test_status, s.service_sync_status, s.service_sync_message,
             s.health_status, s.health_message, s.balance_status,
             COUNT(CASE WHEN ss.is_active = 1 THEN ss.id END) AS active_service_count,

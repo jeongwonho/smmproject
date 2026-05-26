@@ -9,7 +9,7 @@ from urllib.request import Request
 from unittest.mock import patch
 
 import bootstrap
-from backend.integrations.suppliers import supplier_auto_dispatch_readiness
+from backend.integrations.suppliers import supplier_auto_dispatch_readiness, supplier_auto_dispatch_readiness_payload
 from core import (
     PanelError,
     PanelStore,
@@ -329,6 +329,21 @@ class SupplierServiceSyncTest(unittest.TestCase):
         self.assertIn("ok", requirement_codes)
         blocking_labels = [item["label"] for item in readiness["requirements"] if item["blocking"] and not item["ok"]]
         self.assertIn("서비스 동기화", blocking_labels)
+
+    def test_supplier_auto_dispatch_readiness_payload_accepts_admin_count_alias(self):
+        payload = supplier_auto_dispatch_readiness_payload(
+            {
+                **self._ready_supplier_row(),
+                "active_service_count": None,
+                "service_count": 3,
+            }
+        )
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["code"], "ok")
+        self.assertIsInstance(payload["requirements"], list)
+        service_requirement = next(item for item in payload["requirements"] if item["key"] == "active_services")
+        self.assertEqual(service_requirement["value"], "3개")
 
     def test_admin_bootstrap_includes_supplier_readiness_requirements(self):
         payload = self.store.admin_bootstrap()

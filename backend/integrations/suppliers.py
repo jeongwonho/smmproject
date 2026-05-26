@@ -441,6 +441,30 @@ def supplier_auto_dispatch_readiness(
     return result(True, False, "ok", "발주 가능")
 
 
+def supplier_auto_dispatch_readiness_payload(
+    row: Dict[str, Any],
+    *,
+    supplier_service_id: str = "",
+    include_requirements: bool = True,
+) -> Dict[str, Any]:
+    try:
+        row_map = dict(row or {})
+    except (TypeError, ValueError):
+        row_map = {}
+    if row_map.get("active_service_count") in (None, "") and "service_count" in row_map:
+        row_map["active_service_count"] = row_map.get("service_count") or 0
+    readiness = supplier_auto_dispatch_readiness(row_map, supplier_service_id=supplier_service_id)
+    payload = {
+        "ok": bool(readiness.get("ok")),
+        "retryable": bool(readiness.get("retryable")),
+        "code": readiness.get("code") or "unknown",
+        "message": readiness.get("message") or "",
+    }
+    if include_requirements:
+        payload["requirements"] = readiness.get("requirements") if isinstance(readiness.get("requirements"), list) else []
+    return payload
+
+
 def normalize_fasttraffic_api_url(api_url: str) -> str:
     raw = str(api_url or "").strip()
     if not raw:
