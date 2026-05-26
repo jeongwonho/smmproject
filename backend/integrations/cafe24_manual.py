@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, Optional
 
 
 class Cafe24ManualInputError(ValueError):
@@ -23,6 +23,8 @@ _ADVANCED_FIELD_KEYS = {
     "googleKeyword",
     "answerNumber",
 }
+CAFE24_MANUAL_TARGET_KEYS = {"link", "targetUrl", "targetValue", "snsValue", "username", "url"}
+CAFE24_MANUAL_QUANTITY_KEYS = {"quantity", "orderedCount", "count", "amount"}
 
 
 def _first_text(payload: Dict[str, Any], keys: Iterable[str]) -> str:
@@ -80,3 +82,38 @@ def cafe24_manual_order_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not fields.get("targetUrl") and not fields.get("targetValue") and not fields.get("comments"):
         raise Cafe24ManualInputError("공급사 발주 대상 링크, 계정 또는 댓글 입력값을 입력해 주세요.")
     return fields
+
+
+def build_cafe24_manual_input_cron_response(
+    *,
+    item_id: str,
+    result: Dict[str, Any],
+    preflight: Dict[str, Any],
+    dispatch_after_save: bool = False,
+    dispatch: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    supplier_payload = result.get("supplierPayload") if isinstance(result.get("supplierPayload"), dict) else {}
+    normalized_fields = result.get("normalizedFields") if isinstance(result.get("normalizedFields"), dict) else {}
+    response = {
+        "ok": True,
+        "itemId": str(item_id or ""),
+        "identity": preflight.get("identity", {}),
+        "statuses": preflight.get("statuses", {}),
+        "mapping": preflight.get("mapping", {}),
+        "quantity": preflight.get("quantity", {}),
+        "normalizedFields": {
+            "keys": sorted(str(key) for key in normalized_fields.keys()),
+            "orderedCount": str(normalized_fields.get("orderedCount") or ""),
+        },
+        "supplierPayload": {
+            "keys": sorted(str(key) for key in supplier_payload.keys()),
+            "service": str(supplier_payload.get("service") or ""),
+            "hasTarget": any(str(supplier_payload.get(key) or "").strip() for key in CAFE24_MANUAL_TARGET_KEYS),
+            "hasQuantity": any(str(supplier_payload.get(key) or "").strip() for key in CAFE24_MANUAL_QUANTITY_KEYS),
+        },
+        "preflight": preflight,
+        "dispatchAfterSave": bool(dispatch_after_save),
+    }
+    if dispatch is not None:
+        response["dispatch"] = dispatch
+    return response

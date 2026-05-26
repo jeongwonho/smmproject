@@ -19,6 +19,7 @@ from backend.integrations.cafe24 import (
     normalize_cafe24_status,
 )
 from backend.integrations.cafe24_mapping_gaps import annotate_cafe24_mapping_gap_groups
+from backend.integrations.cafe24_manual import build_cafe24_manual_input_cron_response
 from backend.integrations.cafe24_preflight import (
     build_cafe24_order_item_preflight,
     build_cafe24_mapping_preview_report,
@@ -135,6 +136,36 @@ class Cafe24IntegrationHelperTest(unittest.TestCase):
         self.assertTrue(preflight["supplierPayload"]["hasTarget"])
         self.assertTrue(preflight["supplierPayload"]["hasQuantity"])
         self.assertNotIn("instamart_official", str(preflight))
+
+    def test_manual_input_cron_response_redacts_target_values(self):
+        response = build_cafe24_manual_input_cron_response(
+            item_id="item-1",
+            result={
+                "normalizedFields": {"orderedCount": "50", "targetValue": "private_account"},
+                "supplierPayload": {
+                    "service": "40000",
+                    "link": "https://www.instagram.com/private_account/",
+                    "quantity": "50",
+                },
+            },
+            preflight={
+                "canDispatch": True,
+                "blockingReasons": [],
+                "quantity": {"normalized": 50},
+            },
+            dispatch_after_save=True,
+            dispatch={"submitted": True, "supplierOrderUuid": "SUP-1001"},
+        )
+
+        self.assertTrue(response["dispatchAfterSave"])
+        self.assertEqual(response["normalizedFields"], {"keys": ["orderedCount", "targetValue"], "orderedCount": "50"})
+        self.assertEqual(response["supplierPayload"]["service"], "40000")
+        self.assertTrue(response["supplierPayload"]["hasTarget"])
+        self.assertTrue(response["supplierPayload"]["hasQuantity"])
+        self.assertTrue(response["dispatch"]["submitted"])
+        rendered = str(response)
+        self.assertNotIn("private_account", rendered)
+        self.assertNotIn("instagram.com/private_account", rendered)
 
     def test_order_item_selector_supports_item_id_or_cafe24_identity(self):
         item_selector = cafe24_order_item_selector_from_payload({"itemId": " item-1 "}, default_shop_no=1)
