@@ -41,6 +41,7 @@ flowchart LR
 
 - `smm_panel/.github/workflows/cafe24-order-poll.yml`
   - 5분마다 `/api/cron/cafe24/flow-tick` 호출
+  - GitHub Actions schedule 지연/drop 가능성을 줄이기 위해 정각 혼잡 구간을 피한 `2-59/5 * * * *` offset cron을 사용한다.
   - 운영 payload:
     - `lookbackMinutes=180`
     - `useCursor=true`
