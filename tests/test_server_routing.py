@@ -501,7 +501,7 @@ class WorkflowConfigurationTest(unittest.TestCase):
     def test_cafe24_order_poll_workflow_runs_flow_tick_every_five_minutes(self):
         workflow = (APP_ROOT / ".github" / "workflows" / "cafe24-order-poll.yml").read_text()
 
-        self.assertIn('cron: "3,8,13,18,23,28,33,38,43,48,53,58 * * * *"', workflow)
+        self.assertIn('cron: "17,47 * * * *"', workflow)
         self.assertIn("/api/cron/cafe24/flow-tick", workflow)
         self.assertIn("--argjson lookbackMinutes 180", workflow)
         self.assertIn("--argjson useCursor true", workflow)
@@ -514,6 +514,9 @@ class WorkflowConfigurationTest(unittest.TestCase):
         self.assertIn("chain_runs_remaining:", workflow)
         self.assertIn("MANUAL_LIVE_DISPATCH", workflow)
         self.assertIn("CHAIN_RUNS_REMAINING", workflow)
+        self.assertIn('SCHEDULE_CHAIN_RUNS: "6"', workflow)
+        self.assertIn('if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then', workflow)
+        self.assertIn("allow_live_dispatch=true", workflow)
         self.assertIn("actions: write", workflow)
         self.assertIn("timeout-minutes: 8", workflow)
         self.assertIn("dispatch_limit=50", workflow)

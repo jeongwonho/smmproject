@@ -2,7 +2,7 @@ name: Cafe24 Flow Tick
 
 on:
   schedule:
-    - cron: "3,8,13,18,23,28,33,38,43,48,53,58 * * * *"
+    - cron: "17,47 * * * *"
   workflow_dispatch:
     inputs:
       live_dispatch:
@@ -35,6 +35,7 @@ jobs:
           TICK_URL: https://smmproject-lime.vercel.app/api/cron/cafe24/flow-tick
           MANUAL_LIVE_DISPATCH: ${{ github.event_name == 'workflow_dispatch' && inputs.live_dispatch == true }}
           CHAIN_RUNS_REMAINING: ${{ inputs.chain_runs_remaining || '0' }}
+          SCHEDULE_CHAIN_RUNS: "6"
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -54,7 +55,11 @@ jobs:
           dispatch_limit=50
           status_limit=75
           completion_limit=50
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ "${MANUAL_LIVE_DISPATCH}" != "true" ]; then
+          allow_live_dispatch=false
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ] || [ "${MANUAL_LIVE_DISPATCH}" = "true" ]; then
+            allow_live_dispatch=true
+          fi
+          if [ "${allow_live_dispatch}" != "true" ]; then
             dispatch_limit=0
             completion_limit=0
           fi
@@ -111,6 +116,9 @@ jobs:
           fi
 
           chain_runs_remaining="${CHAIN_RUNS_REMAINING:-0}"
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            chain_runs_remaining="${SCHEDULE_CHAIN_RUNS:-6}"
+          fi
           if ! [[ "$chain_runs_remaining" =~ ^[0-9]+$ ]]; then
             chain_runs_remaining=0
           fi
@@ -123,14 +131,10 @@ jobs:
             fi
 
             next_remaining=$((chain_runs_remaining - 1))
-            live_dispatch=false
-            if [ "${MANUAL_LIVE_DISPATCH}" = "true" ]; then
-              live_dispatch=true
-            fi
             next_payload="$(
               jq -nc \
                 --arg ref "${GITHUB_REF_NAME:-main}" \
-                --argjson liveDispatch "$live_dispatch" \
+                --argjson liveDispatch "$allow_live_dispatch" \
                 --arg remaining "$next_remaining" \
                 '{ref: $ref, inputs: {live_dispatch: $liveDispatch, chain_runs_remaining: $remaining}}'
             )"
