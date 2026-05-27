@@ -2077,6 +2077,30 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
         self.assertEqual(item["standard_status"], "ready_to_submit")
 
+    def test_cron_poll_advances_cursor_after_empty_success(self):
+        previous_poll_at = (dt.datetime.now().astimezone() - dt.timedelta(hours=2)).replace(microsecond=0)
+        self.conn.execute(
+            "UPDATE cafe24_integrations SET last_poll_at = ?, last_auto_poll_at = '' WHERE id = ?",
+            (previous_poll_at.isoformat(timespec="seconds"), self.integration["id"]),
+        )
+        self.conn.commit()
+        fake_client = FakeCafe24OrderClient(self._order_payload())
+        fake_client.order_pages = {("order_date", 0): [], ("pay_date", 0): []}
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client):
+            result = self.store.poll_due_cafe24_orders(
+                {"actor": "cron", "force": True, "lookbackMinutes": 180, "useCursor": True, "overlapMinutes": 20}
+            )
+
+        self.assertEqual(result["processedIntegrations"], 1)
+        self.assertEqual(result["storedOrderItemCount"], 0)
+        self.assertEqual(result["responseOrderCount"], 0)
+        row = self._integration_row()
+        self.assertEqual(row["last_auto_poll_status"], "success")
+        self.assertGreater(dt.datetime.fromisoformat(row["last_poll_at"]), previous_poll_at)
+        expected_start = (previous_poll_at - dt.timedelta(minutes=20)).strftime("%Y-%m-%d %H:%M:%S")
+        self.assertEqual(fake_client.orders_calls[0]["start_date"], expected_start)
+
     def test_cafe24_flow_tick_uses_cursor_window_and_dispatches_ready_item(self):
         self._enable_auto_submit_and_supplier_ready()
         last_poll_at = (dt.datetime.now().astimezone() - dt.timedelta(minutes=30)).replace(microsecond=0)

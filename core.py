@@ -9143,11 +9143,12 @@ class PanelStore(PanelStoreDatabaseMixin):
             """
             UPDATE cafe24_integrations
             SET cafe24_poll_lock_owner = ?, cafe24_poll_lock_until = ?,
+                last_poll_at = CASE WHEN ? = 'success' THEN ? ELSE last_poll_at END,
                 last_auto_poll_at = ?, last_auto_poll_status = ?,
                 last_auto_poll_message = ?, updated_at = ?
             WHERE id = ? AND cafe24_poll_lock_owner = ?
             """,
-            ("", "", timestamp, status, str(message or "")[:1000], timestamp, integration_id, owner),
+            ("", "", status, timestamp, timestamp, status, str(message or "")[:1000], timestamp, integration_id, owner),
         )
 
     def _cafe24_client_for_row(
