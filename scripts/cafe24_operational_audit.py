@@ -131,6 +131,7 @@ def _print_summary(audit: dict) -> None:
                 f"{active_label} "
                 f"token={integration.get('tokenStatus') or '-'} "
                 f"autoSubmit={bool(integration.get('autoSubmit'))} "
+                f"completionPolicy={integration.get('completionPolicy') or '-'} "
                 f"lastPoll={integration.get('lastPollAt') or '-'} "
                 f"lastAutoPoll={integration.get('lastAutoPollStatus') or '-'}"
             )
