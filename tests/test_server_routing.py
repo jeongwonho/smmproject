@@ -501,7 +501,7 @@ class WorkflowConfigurationTest(unittest.TestCase):
     def test_cafe24_order_poll_workflow_runs_flow_tick_every_five_minutes(self):
         workflow = (APP_ROOT / ".github" / "workflows" / "cafe24-order-poll.yml").read_text()
 
-        self.assertIn('cron: "2-59/5 * * * *"', workflow)
+        self.assertIn('cron: "7/5 * * * *"', workflow)
         self.assertIn("/api/cron/cafe24/flow-tick", workflow)
         self.assertIn("--argjson lookbackMinutes 180", workflow)
         self.assertIn("--argjson useCursor true", workflow)

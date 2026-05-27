@@ -2,7 +2,7 @@ name: Cafe24 Flow Tick
 
 on:
   schedule:
-    - cron: "2-59/5 * * * *"
+    - cron: "7/5 * * * *"
   workflow_dispatch:
     inputs:
       live_dispatch:
