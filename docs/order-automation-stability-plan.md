@@ -54,6 +54,8 @@ flowchart LR
     - `completionLimit=50`
     - `requestTimeoutSeconds=5`
     - `maxAttempts=1`
+  - 수동 `workflow_dispatch`는 기본적으로 검증 모드로 실행되어 `dispatchLimit=0`, `completionLimit=0`을 보낸다.
+  - 운영자가 실제 수동 발주/완료 처리를 의도할 때만 `live_dispatch=true`로 실행한다.
 - `smm_panel/.github/workflows/supplier-service-sync.yml`
   - 30분마다 `/api/cron/suppliers/sync` 호출
   - supplier sync limit은 `10`
