@@ -105,6 +105,7 @@ const state = {
     adminSelectedPlatformSectionId: "",
     adminSelectedSupplierId: "",
     adminCafe24SelectedSupplierId: "",
+    adminCafe24SelectedSupplierServiceId: "",
     adminCafe24Tab: "queue",
     adminCafe24PaymentFilter: "all",
     adminCafe24MappingFilter: "all",
@@ -1504,6 +1505,7 @@ function resetAdminState({ preserveSession = false } = {}) {
   state.ui.adminSupplierMode = "edit";
   state.ui.adminSelectedSupplierId = "";
   state.ui.adminCafe24SelectedSupplierId = "";
+  state.ui.adminCafe24SelectedSupplierServiceId = "";
   state.ui.adminCafe24Tab = "queue";
   state.ui.adminCafe24PaymentFilter = "all";
   state.ui.adminCafe24MappingFilter = "all";

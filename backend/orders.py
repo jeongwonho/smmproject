@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
 import re
 import secrets
 import time
@@ -12,6 +13,7 @@ from typing import Any, Dict, Optional
 ORDER_IDEMPOTENCY_KEY_MAX_LENGTH = 120
 ORDER_AUTO_IDEMPOTENCY_WINDOW_SECONDS = 2 * 60
 ORDER_EXTERNAL_REFERENCE_MAX_LENGTH = 160
+ORDER_AUTOMATION_RETRY_BACKOFF_MINUTES = (10, 30, 120)
 ORDER_CHANNEL_WEB = "web"
 ORDER_CHANNEL_CAFE24 = "cafe24"
 ORDER_CHANNEL_MANUAL = "manual"
@@ -40,6 +42,38 @@ ORDER_DISPATCH_STATUSES = {
 
 def generate_public_order_number() -> str:
     return f"SMM-{dt.datetime.now().strftime('%Y%m%d')}-{secrets.token_hex(4).upper()}"
+
+
+def parse_iso_datetime(value: Any) -> Optional[dt.datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.datetime.now().astimezone().tzinfo)
+    return parsed
+
+
+def automation_paused(env: Optional[Dict[str, Any]] = None) -> bool:
+    source = env if env is not None else os.environ
+    return str(source.get("SMM_PANEL_AUTOMATION_PAUSED") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def automation_retry_at(
+    attempts: int,
+    *,
+    now: Optional[dt.datetime] = None,
+    backoff_minutes: tuple[int, ...] = ORDER_AUTOMATION_RETRY_BACKOFF_MINUTES,
+) -> str:
+    safe_attempts = max(int(attempts or 1), 1)
+    index = min(safe_attempts - 1, len(backoff_minutes) - 1)
+    base_time = now if now is not None else dt.datetime.now().astimezone()
+    if base_time.tzinfo is None:
+        base_time = base_time.replace(tzinfo=dt.datetime.now().astimezone().tzinfo)
+    return (base_time + dt.timedelta(minutes=backoff_minutes[index])).isoformat(timespec="seconds")
 
 
 def sanitize_idempotency_key(raw: Any) -> str:
@@ -82,6 +116,40 @@ def order_channel_label(raw: Any) -> str:
         ORDER_CHANNEL_CAFE24: "카페24",
         ORDER_CHANNEL_MANUAL: "수동등록",
     }.get(channel, channel)
+
+
+def order_money_label(value: Any) -> str:
+    try:
+        amount = int(value or 0)
+    except (TypeError, ValueError):
+        amount = 0
+    return f"{amount:,}원"
+
+
+def order_submission_payload(
+    order_row: Dict[str, Any],
+    *,
+    available_balance: Any,
+    duplicate: bool = False,
+) -> Dict[str, Any]:
+    total_price = int(order_row["total_price"])
+    balance_after = int(available_balance or 0)
+    payload = {
+        "ok": True,
+        "orderId": order_row["id"],
+        "orderNumber": order_row["order_number"],
+        "orderChannel": order_row.get("order_channel") or ORDER_CHANNEL_WEB,
+        "externalOrderId": order_row.get("external_order_id") or "",
+        "externalOrderItemId": order_row.get("external_order_item_id") or "",
+        "dispatchStatus": order_row.get("dispatch_status") or ORDER_DISPATCH_UNMAPPED,
+        "totalPrice": total_price,
+        "totalPriceLabel": order_money_label(total_price),
+        "balanceAfter": balance_after,
+        "balanceAfterLabel": order_money_label(balance_after),
+    }
+    if duplicate:
+        payload["duplicate"] = True
+    return payload
 
 
 def normalize_order_dispatch_status(raw: Any) -> str:

@@ -39,22 +39,23 @@ on:
         required: false
         default: ""
       dispatch_after_save:
-        description: Dispatch to supplier after manual input and successful preflight
-        required: true
-        default: "false"
+        description: Dispatch the order item after manual input if preflight passes
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   actions: read
   contents: read
+  id-token: write
 
 jobs:
   manual-input:
     runs-on: ubuntu-latest
     steps:
-      - name: Save manual input and run preflight
+      - name: Save manual input, run preflight, and optionally dispatch
         env:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
-          GITHUB_TOKEN: ${{ github.token }}
           MALL_ID: ${{ inputs.mall_id }}
           SHOP_NO: ${{ inputs.shop_no }}
           ORDER_ID: ${{ inputs.order_id }}
@@ -71,19 +72,17 @@ jobs:
           DISPATCH_AFTER_SAVE: ${{ inputs.dispatch_after_save }}
         run: |
           set -euo pipefail
-          auth_token="${CRON_SECRET:-${GITHUB_TOKEN:-}}"
+          oidc_token=""
+          if [ -z "${CRON_SECRET:-}" ]; then
+            oidc_token="$(curl --fail-with-body --show-error --silent \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=instamart-cron" | jq -r '.value // empty')"
+          fi
+          auth_token="${CRON_SECRET:-${oidc_token:-}}"
           if [ -z "${auth_token:-}" ]; then
-            echo "CRON_SECRET or GITHUB_TOKEN is required" >&2
+            echo "Repository secret CRON_SECRET or GitHub Actions OIDC token is required for production cron auth." >&2
             exit 1
           fi
-          case "$DISPATCH_AFTER_SAVE" in
-            true|false)
-              ;;
-            *)
-              echo "dispatch_after_save must be true or false" >&2
-              exit 1
-              ;;
-          esac
           case "$TARGET_SECRET_NAME" in
             CAFE24_MANUAL_TARGET_VALUE)
               TARGET_VALUE="${TARGET_VALUE_CAFE24_MANUAL:-}"
@@ -124,8 +123,8 @@ jobs:
                 --arg orderedCount "$ORDERED_COUNT" \
                 --arg requestMemo "$REQUEST_MEMO" \
                 --arg expectedQuantity "${EXPECTED_QUANTITY:-$ORDERED_COUNT}" \
-                --argjson dispatchAfterSave "$DISPATCH_AFTER_SAVE" \
-                '{mallId:$mallId,shopNo:$shopNo,orderId:$orderId,orderItemCode:$orderItemCode,supplierId:$supplierId,supplierServiceId:$supplierServiceId,targetValue:$targetValue,orderedCount:$orderedCount,requestMemo:$requestMemo,expectedQuantity:$expectedQuantity,dispatchAfterSave:$dispatchAfterSave,confirmManualInput:true}')" \
+                --arg dispatchAfterSave "${DISPATCH_AFTER_SAVE:-false}" \
+                '{mallId:$mallId,shopNo:$shopNo,orderId:$orderId,orderItemCode:$orderItemCode,supplierId:$supplierId,supplierServiceId:$supplierServiceId,targetValue:$targetValue,orderedCount:$orderedCount,requestMemo:$requestMemo,expectedQuantity:$expectedQuantity,dispatchAfterSave:($dispatchAfterSave == "true"),confirmManualInput:true}')" \
               -o "$response_file" \
               -w "%{http_code}"
           )"
@@ -143,10 +142,11 @@ jobs:
             echo "Manual input saved, but preflight is not dispatchable." >&2
             exit 1
           fi
-          if [ "$DISPATCH_AFTER_SAVE" = "true" ]; then
-            submitted="$(jq -r '.dispatch.submitted // false' "$response_file")"
-            if [ "$submitted" != "true" ]; then
-              echo "Manual input saved, but supplier dispatch did not submit." >&2
+          if [ "${DISPATCH_AFTER_SAVE:-false}" = "true" ]; then
+            dispatch_submitted="$(jq -r '.dispatch.submitted // false' "$response_file")"
+            dispatch_status="$(jq -r '.dispatch.status // ""' "$response_file")"
+            if [ "$dispatch_submitted" != "true" ]; then
+              echo "Manual input dispatch did not submit supplier order: ${dispatch_status}" >&2
               exit 1
             fi
           fi

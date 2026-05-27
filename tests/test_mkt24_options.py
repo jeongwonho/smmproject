@@ -5,6 +5,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 import bootstrap
+from backend.integrations.mkt24_settings import (
+    Mkt24SettingsError,
+    build_mkt24_order_payload_from_setting,
+    default_mkt24_field_config,
+    default_mkt24_option_config,
+    mkt24_detail_data,
+    validate_mkt24_option_config,
+)
 from core import PanelError, PanelStore, now_iso
 
 
@@ -132,6 +140,52 @@ class Mkt24OrderOptionTest(unittest.TestCase):
             "api_key": "test-api-key",
             "bearer_token": "test-bearer-token",
         }
+
+    def test_mkt24_setting_helpers_live_in_backend_domain(self):
+        detail = mkt24_detail_data(MKT24_DETAIL)
+        existing_fields = {
+            "orderedCount": {
+                "enabled": False,
+                "inputMode": "admin_default",
+                "defaultValue": "25",
+                "min": 10,
+                "max": 1000,
+                "step": 10,
+            }
+        }
+
+        field_config = default_mkt24_field_config(detail, existing_fields)
+        option_config = default_mkt24_option_config(
+            detail,
+            {"enabled": True, "defaults": {"followerOption": {"value": {"radio": "none"}}}},
+        )
+
+        self.assertEqual(field_config["snsValue"]["label"], "계정(ID)")
+        self.assertTrue(field_config["snsValue"]["required"])
+        self.assertFalse(field_config["orderedCount"]["enabled"])
+        self.assertEqual(field_config["orderedCount"]["inputMode"], "admin_default")
+        self.assertEqual(field_config["orderedCount"]["min"], 10)
+        self.assertTrue(option_config["supportsOrderOptions"])
+        self.assertEqual(option_config["defaults"]["followerOption"]["value"]["radio"], "none")
+
+        payload_field_config = default_mkt24_field_config(
+            detail,
+            {"orderedCount": {"inputMode": "admin_default", "defaultValue": "25"}},
+        )
+        payload = build_mkt24_order_payload_from_setting(
+            detail,
+            payload_field_config,
+            option_config,
+            {"snsValue": "instamart_official"},
+        )
+
+        self.assertEqual(payload["productUuid"], "01811868-0f05-4000-8000-000000000018")
+        self.assertEqual(payload["value"]["orderedCount"], 25)
+        self.assertEqual(payload["value"]["orderInfo"]["snsValue"], "instamart_official")
+        self.assertIn("optionInfo", payload["value"])
+
+        with self.assertRaisesRegex(Mkt24SettingsError, "JSON 객체"):
+            validate_mkt24_option_config({"enabled": True, "defaults": ["invalid"]}, supports_order_options=True)
 
     def test_product_detail_sync_and_setting_save(self):
         setting = self._sync_default_setting()

@@ -6,25 +6,31 @@ on:
 permissions:
   actions: read
   contents: read
+  id-token: write
 
 jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - name: Read Cafe24 operational audit
         env:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          auth_token="${CRON_SECRET:-${GITHUB_TOKEN:-}}"
+          oidc_token=""
+          if [ -z "${CRON_SECRET:-}" ]; then
+            oidc_token="$(curl --fail-with-body --show-error --silent \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=instamart-cron" | jq -r '.value // empty')"
+          fi
+          auth_token="${CRON_SECRET:-${oidc_token:-}}"
           if [ -z "${auth_token:-}" ]; then
-            echo "CRON_SECRET or GITHUB_TOKEN is required" >&2
+            echo "Repository secret CRON_SECRET or GitHub Actions OIDC token is required for production cron auth." >&2
             exit 1
           fi
-          curl --fail-with-body --show-error --silent \
-            "https://smmproject-lime.vercel.app/api/cron/cafe24/operational-audit" \
-            -H "Authorization: Bearer ${auth_token}" \
-            -H "X-GitHub-Repository: ${GITHUB_REPOSITORY}" \
-            -H "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" \
-            -H "X-GitHub-Workflow: ${GITHUB_WORKFLOW}"
+          export SMM_PANEL_AUDIT_BEARER_TOKEN="${auth_token}"
+          python3 scripts/cafe24_operational_audit.py \
+            --source remote \
+            --base-url "https://smmproject-lime.vercel.app" \
+            --format summary

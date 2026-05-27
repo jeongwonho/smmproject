@@ -19,12 +19,13 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence
-from urllib import error as urllib_error
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse
-from urllib import request as urllib_request
 
 from backend.auth import hash_password, verify_password
-from core import APP_ROOT, DEFAULT_SITE_NAME, PanelError, PanelStore
+from backend.cron_auth import cron_authorization_valid, cron_secret
+from backend.errors import PanelError
+from backend.integrations.cafe24_manual import build_cafe24_manual_input_cron_response
+from core import APP_ROOT, DEFAULT_SITE_NAME, PanelStore
 
 
 STATIC_ROOT = APP_ROOT / "static"
@@ -44,6 +45,16 @@ VERCEL_REWRITE_PATH_QUERY_KEY = "__path"
 
 def env_flag(value: str) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def bounded_timeout_seconds(value: Any, default_seconds: float = 6.0) -> float:
+    try:
+        timeout = float(value or 0)
+    except (TypeError, ValueError):
+        timeout = 0.0
+    if timeout <= 0:
+        timeout = default_seconds
+    return max(2.0, min(timeout, 30.0))
 
 
 def normalize_origin(value: str) -> str:
@@ -83,56 +94,6 @@ def is_dev_runtime() -> bool:
     if mode in {"prod", "production", "live"}:
         return False
     return not bool(os.environ.get("VERCEL"))
-
-
-def cron_secret() -> str:
-    return str(os.environ.get("CRON_SECRET") or os.environ.get("SMM_PANEL_CRON_SECRET") or "").strip()
-
-
-def github_actions_cron_authorization_valid(headers: Any) -> bool:
-    auth_header = str(headers.get("Authorization", "") if headers else "").strip()
-    if not auth_header.startswith("Bearer "):
-        return False
-    repository = str(headers.get("X-GitHub-Repository", "") if headers else "").strip()
-    run_id = str(headers.get("X-GitHub-Run-Id", "") if headers else "").strip()
-    expected_repository = str(
-        os.environ.get("SMM_PANEL_GITHUB_CRON_REPOSITORY") or "jeongwonho/smmproject"
-    ).strip()
-    if repository != expected_repository or not run_id.isdigit():
-        return False
-
-    request = urllib_request.Request(
-        f"https://api.github.com/repos/{expected_repository}/actions/runs/{run_id}",
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": auth_header,
-            "User-Agent": "instamart-cafe24-cron-verifier",
-        },
-        method="GET",
-    )
-    try:
-        with urllib_request.urlopen(request, timeout=5) as response:
-            if int(getattr(response, "status", 0) or 0) != 200:
-                return False
-            payload = json.load(response)
-    except (urllib_error.URLError, TimeoutError, ValueError, json.JSONDecodeError):
-        return False
-
-    run_repository = str((payload.get("repository") or {}).get("full_name") or "")
-    run_event = str(payload.get("event") or "")
-    return (
-        str(payload.get("id") or "") == run_id
-        and run_repository == expected_repository
-        and run_event in {"schedule", "workflow_dispatch"}
-    )
-
-
-def cron_authorization_valid(header_value: str, headers: Any = None) -> bool:
-    expected = cron_secret()
-    provided = str(header_value or "").strip()
-    if expected and provided and hmac.compare_digest(provided, f"Bearer {expected}"):
-        return True
-    return github_actions_cron_authorization_valid(headers)
 
 
 def parse_origins(raw_value: str) -> tuple[str, ...]:
@@ -1091,7 +1052,19 @@ class AppHandler(SimpleHTTPRequestHandler):
     @route("GET", "/api/cron/suppliers/sync", auth="cron")
     def _get_cron_supplier_sync(self, request: RouteRequest) -> None:
         limit = int(self._query_value(request, "limit", "10") or 10)
-        write_json(self, 200, {"ok": True, **self._server().store.sync_due_supplier_services(actor="cron", limit=limit)})
+        request_timeout_seconds = bounded_timeout_seconds(self._query_value(request, "requestTimeoutSeconds", "6"))
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                **self._server().store.sync_due_supplier_services(
+                    actor="cron",
+                    limit=limit,
+                    request_timeout_seconds=request_timeout_seconds,
+                ),
+            },
+        )
 
     @route("GET", "/robots.txt")
     def _get_robots(self, request: RouteRequest) -> None:
@@ -1206,6 +1179,10 @@ class AppHandler(SimpleHTTPRequestHandler):
     @route("GET", "/api/cron/cafe24/operational-audit", auth="cron")
     def _get_cron_cafe24_operational_audit(self, request: RouteRequest) -> None:
         write_json(self, 200, {"ok": True, **self._server().store.cafe24_operational_audit()})
+
+    @route("POST", "/api/admin/cafe24/mapping-gaps", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_mapping_gaps(self, request: RouteRequest) -> None:
+        write_json(self, 200, {"ok": True, **self._server().store.cafe24_mapping_gap_report(request.payload)})
 
     @route("POST", "/api/cron/cafe24/mapping-gaps", auth="cron", read_json_body=True)
     def _post_cron_cafe24_mapping_gaps(self, request: RouteRequest) -> None:
@@ -1414,6 +1391,11 @@ class AppHandler(SimpleHTTPRequestHandler):
 
     @route("POST", "/api/cron/suppliers/sync", auth="cron", read_json_body=True)
     def _post_cron_supplier_sync(self, request: RouteRequest) -> None:
+        request_timeout_seconds = bounded_timeout_seconds(
+            request.payload.get("requestTimeoutSeconds")
+            or request.payload.get("request_timeout_seconds")
+            or 6
+        )
         write_json(
             self,
             200,
@@ -1422,6 +1404,7 @@ class AppHandler(SimpleHTTPRequestHandler):
                 **self._server().store.sync_due_supplier_services(
                     actor="cron",
                     limit=int(request.payload.get("limit") or 10),
+                    request_timeout_seconds=request_timeout_seconds,
                 ),
             },
         )
@@ -1444,6 +1427,20 @@ class AppHandler(SimpleHTTPRequestHandler):
         payload = dict(request.payload or {})
         payload["_adminActor"] = "cron"
         result = self._server().store.run_automation_tick(payload)
+        write_json(
+            self,
+            500 if result.get("status") == "failed" else 200,
+            {
+                "ok": result.get("status") != "failed",
+                **result,
+            },
+        )
+
+    @route("POST", "/api/cron/cafe24/flow-tick", auth="cron", read_json_body=True)
+    def _post_cron_cafe24_flow_tick(self, request: RouteRequest) -> None:
+        payload = dict(request.payload or {})
+        payload["_adminActor"] = "cron"
+        result = self._server().store.run_cafe24_flow_tick(payload)
         write_json(
             self,
             500 if result.get("status") == "failed" else 200,
@@ -1478,7 +1475,7 @@ class AppHandler(SimpleHTTPRequestHandler):
     def _post_cron_cafe24_order_items_manual_input_preview(self, request: RouteRequest) -> None:
         payload = dict(request.payload or {})
         if not env_flag(payload.get("confirmManualInputPreview")):
-            raise PanelError("Cron 수동 보정 preview는 confirmManualInputPreview=true가 필요합니다.", status=400)
+            raise PanelError("Cron 수동 보정 미리보기는 confirmManualInputPreview=true가 필요합니다.", status=400)
         payload["_adminActor"] = "cron"
         result = self._server().store.preview_cafe24_order_item_manual_input(payload)
         write_json(self, 200, {"ok": True, **result})
@@ -1497,41 +1494,23 @@ class AppHandler(SimpleHTTPRequestHandler):
             {"itemId": item_id, "expectedQuantity": expected_quantity, "_adminActor": "cron"}
         )
         dispatch_after_save = env_flag(payload.get("dispatchAfterSave") or payload.get("dispatch_after_save"))
-        dispatch = None
+        dispatch_result = None
         if dispatch_after_save:
             if not bool(preflight.get("canDispatch")):
-                raise PanelError("수동 보정 후 preflight가 발주 가능하지 않아 dispatch를 중단했습니다.", status=409)
-            dispatch = self._server().store.dispatch_cafe24_order_item({"itemId": item_id, "_adminActor": "cron"})
-        supplier_payload = result.get("supplierPayload") if isinstance(result.get("supplierPayload"), dict) else {}
-        normalized_fields = result.get("normalizedFields") if isinstance(result.get("normalizedFields"), dict) else {}
-        target_keys = {"link", "targetUrl", "targetValue", "snsValue", "username", "url"}
-        quantity_keys = {"quantity", "orderedCount", "count", "amount"}
-        response_payload = {
-            "ok": True,
-            "itemId": item_id,
-            "identity": preflight.get("identity", {}),
-            "statuses": preflight.get("statuses", {}),
-            "mapping": preflight.get("mapping", {}),
-            "quantity": preflight.get("quantity", {}),
-            "normalizedFields": {
-                "keys": sorted(str(key) for key in normalized_fields.keys()),
-                "orderedCount": str(normalized_fields.get("orderedCount") or ""),
-            },
-            "supplierPayload": {
-                "keys": sorted(str(key) for key in supplier_payload.keys()),
-                "service": str(supplier_payload.get("service") or ""),
-                "hasTarget": any(str(supplier_payload.get(key) or "").strip() for key in target_keys),
-                "hasQuantity": any(str(supplier_payload.get(key) or "").strip() for key in quantity_keys),
-            },
-            "preflight": preflight,
-            "dispatchAfterSave": dispatch_after_save,
-        }
-        if dispatch is not None:
-            response_payload["dispatch"] = dispatch
+                raise PanelError("수동 보정 preflight가 발주 가능 상태가 아니므로 단건 발주를 실행하지 않았습니다.", status=409)
+            dispatch_result = self._server().store.dispatch_cafe24_order_item(
+                {"itemId": item_id, "_adminActor": "cron"}
+            )
         write_json(
             self,
             200,
-            response_payload,
+            build_cafe24_manual_input_cron_response(
+                item_id=item_id,
+                result=result,
+                preflight=preflight,
+                dispatch_after_save=dispatch_after_save,
+                dispatch=dispatch_result,
+            ),
         )
 
     @route("POST", "/api/cron/cafe24/order-items/check-supplier-status", auth="cron", read_json_body=True)
@@ -1812,6 +1791,10 @@ class AppHandler(SimpleHTTPRequestHandler):
     def _post_admin_cafe24_order_items_retry(self, request: RouteRequest) -> None:
         self._write_store_result("retry_cafe24_order_item", request.payload)
 
+    @route("POST", "/api/admin/cafe24/order-items/preflight", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_order_items_preflight(self, request: RouteRequest) -> None:
+        self._write_store_result("preflight_single_cafe24_order_item", request.payload)
+
     @route("POST", "/api/admin/cafe24/order-items/dispatch", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
     def _post_admin_cafe24_order_items_dispatch(self, request: RouteRequest) -> None:
         self._write_store_result("dispatch_cafe24_order_item", request.payload)
@@ -1822,9 +1805,7 @@ class AppHandler(SimpleHTTPRequestHandler):
 
     @route("POST", "/api/admin/cafe24/order-items/manual-input/preview", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
     def _post_admin_cafe24_order_items_manual_input_preview(self, request: RouteRequest) -> None:
-        payload = dict(request.payload or {})
-        result = self._server().store.preview_cafe24_order_item_manual_input(payload)
-        write_json(self, 200, {"ok": True, **result})
+        self._write_store_result("preview_cafe24_order_item_manual_input", request.payload)
 
     @route("POST", "/api/admin/cafe24/order-items/manual-input", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
     def _post_admin_cafe24_order_items_manual_input(self, request: RouteRequest) -> None:

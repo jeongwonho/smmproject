@@ -6,14 +6,12 @@
 
 ```mermaid
 flowchart LR
-    A["GitHub Actions 10분 Tick"] --> B["/api/cron/automation/tick"]
-    B --> C["공급사 서비스 동기화"]
-    B --> D["공급사 health 점검"]
-    B --> E["Cafe24 최근 30일 주문 수집"]
-    E --> F["결제/취소/매핑/필드 검증"]
-    F --> G["발주 가능 주문 자동 발주"]
-    G --> H["공급사 상태 조회"]
-    H --> I["공급사 완료 후 Cafe24 완료 처리"]
+    A["GitHub Actions 5분 Cafe24 Flow Tick"] --> B["/api/cron/cafe24/flow-tick"]
+    B --> C["Cafe24 cursor 기반 증분 수집"]
+    C --> D["결제/취소/매핑/필드 검증"]
+    D --> E["preflight 통과 주문 자동 발주"]
+    E --> F["공급사 상태 조회"]
+    F --> G["공급사 완료 후 Cafe24 완료 처리"]
 ```
 
 ## MKT24 Panel API 기준
@@ -31,7 +29,8 @@ flowchart LR
 - Cafe24 access token은 만료 임박 또는 만료 시 refresh token으로 자동 갱신한다.
 - refresh token 만료, 폐기, 앱 권한 철회는 OAuth 정책상 서버가 무인 복구할 수 없다.
 - refresh token 복구 불가 상태는 `reconnect_required`로 저장하고 관리자 Cafe24 탭에서 재연결 액션을 요구한다.
-- 주문 수집은 최근 30일, `order_date` 기준, `limit=1000`, `maxPages=30`으로 조회한다.
+- 실시간 주문 수집은 마지막 수집 시각 cursor와 20분 overlap을 사용하며, 첫 실행 fallback은 최근 180분으로 제한한다.
+- 30일 전체 재수집은 관리자 수동 조회/백필 경로에서만 실행한다.
 - 주문 상태는 최대한 수집하고 내부에서 결제완료, 결제대기, 취소/환불, 검수필요로 분리한다.
 - 주문 처리 단위는 Cafe24 `order_id`가 아니라 `order_item_code`다.
 - 중복 키는 `mall_id + shop_no + order_id + order_item_code`다.
@@ -40,42 +39,35 @@ flowchart LR
 
 ### GitHub Actions
 
-- `.github/workflows/automation-tick.yml`
-  - 10분마다 `/api/cron/automation/tick` 호출
+- `smm_panel/.github/workflows/cafe24-order-poll.yml`
+  - 5분마다 `/api/cron/cafe24/flow-tick` 호출
   - 운영 payload:
-    - `lookbackDays=30`
-    - `supplierSyncLimit=10`
-    - `supplierHealthLimit=10`
-    - `cafe24PageLimit=1000`
-    - `cafe24MaxPages=30`
-    - `cafe24DetailFetchLimit=200`
-    - `dispatchLimit=25`
-    - `statusLimit=50`
-    - `completionLimit=25`
-- `.github/workflows/supplier-service-sync.yml`
+    - `lookbackMinutes=180`
+    - `useCursor=true`
+    - `overlapMinutes=20`
+    - `pageLimit=200`
+    - `maxPages=3`
+    - `detailFetchLimit=50`
+    - `dispatchLimit=50`
+    - `statusLimit=75`
+    - `completionLimit=50`
+    - `requestTimeoutSeconds=5`
+    - `maxAttempts=1`
+- `smm_panel/.github/workflows/supplier-service-sync.yml`
   - 30분마다 `/api/cron/suppliers/sync` 호출
   - supplier sync limit은 `10`
-- `.github/workflows/cafe24-operational-audit.yml`
-  - 운영 DB, Cafe24 token, mapping, order item, supplier 상태를 read-only로 점검한다.
-- `.github/workflows/cafe24-mapping-gaps.yml`
-  - 매핑 누락 품목을 product/variant/custom product code 단위로 묶고 Cafe24 상품 상세를 조회한다.
-- `.github/workflows/cafe24-preflight-one.yml`
-  - 특정 `order_id + order_item_code`가 발주 가능한지 read-only로 검증한다.
-- `.github/workflows/cafe24-manual-input-one.yml`
-  - 개인결제처럼 옵션에서 수량/대상을 자동 추출할 수 없는 품목에 공급사, 서비스, 대상, 수량을 저장하고 preflight를 다시 실행한다.
-  - 대상 URL/계정은 workflow input에 직접 넣지 않고 `target_secret_name`이 가리키는 GitHub Secret에서 읽는다.
-  - 이 workflow는 발주를 호출하지 않는다.
-- `.github/workflows/cafe24-manual-input-preview-one.yml`
-  - 수동 보정과 같은 입력으로 공급사 payload와 preflight 결과를 preview한다.
-  - DB를 수정하지 않으며 대상 URL/계정 원문은 응답에 노출하지 않는다.
-  - 결과의 `preflight.canDispatch`가 `true`가 아니면 저장/발주 단계로 진행하지 않는다.
-- `.github/workflows/cafe24-dispatch-one.yml`
-  - 먼저 preflight를 실행하고 `canDispatch=true`인 경우에만 단건 발주 endpoint를 호출한다.
+- `smm_panel/.github/workflows/cafe24-manual-input-preview-one.yml`
+  - 운영자가 입력한 secret 기반 대상값/수량으로 `/api/cron/cafe24/order-items/manual-input/preview`를 호출한다.
+  - DB를 업데이트하지 않고 수동 보정 결과와 preflight를 확인한다.
+- `smm_panel/.github/workflows/cafe24-manual-input-one.yml`
+  - preview 통과 후에만 사용한다.
+  - secret 기반 대상값/수량을 저장하고 preflight가 발주 가능 상태인지 확인한다.
+  - `dispatch_after_save=true`로 실행하면 같은 요청에서 preflight 통과 후 단건 공급사 발주까지 이어서 실행한다.
 
 ### 인증
 
 - 권장 인증은 GitHub Secret `CRON_SECRET`과 Vercel `CRON_SECRET`을 같은 값으로 맞추는 방식이다.
-- 현재 서버는 GitHub Actions 헤더 검증 fallback도 지원한다.
+- GitHub Actions에는 `id-token: write` 권한을 부여하고, repo secret이 없을 때는 GitHub가 서명한 OIDC 토큰을 `Authorization: Bearer ...`로 보내 서버가 issuer/audience/repository/run id를 검증한다.
 - `SMM_PANEL_AUTOMATION_PAUSED=1`이면 수집은 허용하고 발주/완료 처리는 중단한다.
 
 ## 자동 발주 안전 조건
@@ -85,6 +77,7 @@ flowchart LR
 - Cafe24 주문상품이 결제완료 상태다.
 - 취소, 환불, 교환, 반품 상태가 아니다.
 - Cafe24 상품/옵션이 공급사 서비스에 매핑되어 있다.
+- 매핑의 `auto_dispatch_enabled`가 켜져 있거나, 수동 보정 건이 `approveAutoDispatch=true` 또는 `dispatchAfterSave=true`로 승인되었다.
 - 필수 입력값 추출이 성공했다.
 - 공급사와 공급사 서비스가 active 상태다.
 - 공급사 service sync가 성공 상태다.
@@ -105,14 +98,16 @@ flowchart LR
 - MKT24 v3 UUID 매핑: `mkt24_panel_service_id_invalid`
 - 공급사 timeout 또는 supplier order ID 누락: 중복 발주 방지를 위해 관리자 확인 필요
 - 공급사 완료 전 Cafe24 완료 처리 금지
+- Cafe24 완료 처리는 연동의 `completion_policy`가 `purchase_confirm`일 때만 실행한다.
+- `memo_only` 정책에서는 공급사 완료 상태만 기록하고 Cafe24 구매확정 API를 호출하지 않는다.
 - Cafe24 완료 처리 실패는 발주 재시도가 아니라 완료 처리 재시도 큐에 남긴다.
 
 ## 운영 점검 체크리스트
 
 - `/api/health`가 HTTP 200을 반환한다.
-- GitHub Actions `Instamart Automation Tick` 최근 실행이 success다.
-- 관리자 Cafe24 탭의 마지막 자동 수집 시각이 10분 단위로 갱신된다.
-- Cafe24 최근 30일 주문 수집 결과의 `responseOrderCount`, `storedOrderItemCount`가 실제 주문과 일치한다.
+- GitHub Actions `Cafe24 Flow Tick` 최근 실행이 success다.
+- 관리자 Cafe24 탭의 마지막 자동 수집 시각이 5분 단위로 갱신된다.
+- Cafe24 flow tick의 증분 수집 결과 `responseOrderCount`, `storedOrderItemCount`가 실제 신규 주문과 일치한다.
 - `reviewRequiredCount`가 존재하면 매핑/필드/서비스 ID를 우선 점검한다.
 - MKT24 공급사 서비스 동기화 결과가 service count `0`이 아니다.
 - MKT24 공급사 카드에 Bearer token 보유 표시가 없어야 한다.
@@ -120,52 +115,16 @@ flowchart LR
 
 ## 현재 검증된 상태
 
-- 2026-05-26 `Cafe24 Operational Audit` run `26446788786` 기준:
-  - 운영 runtime은 production, DB backend는 Postgres다.
-  - Cafe24 integration은 1개이며 token status는 `connected`다.
-  - Cafe24 mapping은 12개가 enabled/auto dispatch enabled 상태다.
-  - Cafe24 order item은 10개이며 `waiting_input=8`, `ready_to_submit=1`, `completed=1`이다.
-  - 공급사는 3개, supplier service는 4161개다.
-- 2026-05-26 `Cafe24 Mapping Gaps` run `26446788793` 기준:
-  - product `32`, `33`, `34` 개인결제 품목 8건이 매핑 없음 상태다.
-  - 세 상품 모두 단일 variant code만 확인되며 수량 후보는 없다.
-  - detail lookup warning은 없다.
-- 2026-05-26 `Cafe24 Preflight One` run `26446788675` 기준:
-  - `20260512-0000017` / `20260512-0000017-01`은 `canDispatch=false`다.
-  - 차단 사유는 `status_waiting_input`, `mapping_missing`, `supplier_mapping_missing`, `supplier_payload_missing`, `quantity_mismatch`, `supplier_missing`이다.
-- 현재 신규 발주 가능 대상은 아직 없다.
-  - product `12`의 최근 ready/completed 품목은 이미 `supplierOrderUuid`가 있어 재발주하면 안 된다.
-  - product `32`, `33`, `34`는 수동 보정 또는 명시적 매핑이 먼저 필요하다.
-
-## 단건 운영 발주 절차
-
-개인결제 품목을 발주하려면 아래 순서를 지킨다. 이 절차는 고객 대상값과 수량이 운영자가 확인된 경우에만 진행한다.
-
-1. `Cafe24 Mapping Gaps`를 실행해 대상 `product_no`, `variantCode`, `customProductCode`, `orderId`, `orderItemCode`를 확인한다.
-2. 관리자 Cafe24 상품 조회 또는 mapping gap 상세에서 Cafe24 상품이 개인결제인지, 자동 수량 후보가 없는지 확인한다.
-3. 공급사 상태에서 사용할 `supplierId`와 active `supplierServiceId`를 선택한다.
-4. 대상 URL/계정은 GitHub Secret에 저장하고, secret 이름만 `Cafe24 Manual Input One`의 `target_secret_name`에 입력한다.
-5. `Cafe24 Manual Input Preview One`을 실행한다.
-   - 필수 입력은 `Cafe24 Manual Input One`과 동일하다.
-   - 이 단계는 DB를 변경하지 않는다.
-   - 결과의 `supplierPayload.hasTarget`, `supplierPayload.hasQuantity`, `quantity.matchesExpected`, `preflight.canDispatch`를 확인한다.
-6. `Cafe24 Manual Input One`을 실행한다.
-   - 필수 입력: `mall_id`, `shop_no`, `order_id`, `order_item_code`, `supplier_id`, `supplier_service_id`, `target_secret_name`, `ordered_count`.
-   - `expected_quantity`는 비워두면 `ordered_count`를 사용한다.
-   - 결과의 `preflight.canDispatch`가 `true`가 아니면 발주하지 않는다.
-7. `Cafe24 Preflight One`을 같은 품목과 수량으로 다시 실행한다.
-   - `canDispatch=true`
-   - `paymentGateStatus=payment_confirmed`
-   - `mapping.supplierId`, `mapping.supplierServiceId`, `supplierPayload.hasTarget`, `supplierPayload.hasQuantity`가 모두 확인되어야 한다.
-8. `Cafe24 Dispatch One`을 실행한다.
-   - workflow는 내부에서 preflight를 한 번 더 실행하고 실패 시 발주 endpoint를 호출하지 않는다.
-   - 발주 성공 후 supplier order uuid가 저장됐는지 `Cafe24 Operational Audit` 또는 관리자 Cafe24 큐에서 확인한다.
+- MKT24 `/v3/panel` `action=services` 호출이 성공했고 서비스 231개가 동기화되었다.
+- Cafe24 최근 30일 주문 수집에서 주문 8건, 주문상품 8개가 저장되었다.
+- 현재 자동 발주 대상은 0건이며, 8건은 검수 필요 상태다.
+- 검수 필요의 주된 원인은 Cafe24 상품/옵션과 MKT24 panel 숫자형 service ID 재매핑 필요로 본다.
 
 ## 다음 운영 액션
 
-1. `Cafe24 Manual Input Preview One`을 운영에 반영한다.
-2. product `32`, `33`, `34` 중 실제 고객 대상값과 수량이 확인된 품목 1개를 선택한다.
-3. 선택한 품목에 대해 `Cafe24 Manual Input Preview One`을 실행하고 DB 변경 없이 `canDispatch=true`가 되는지 확인한다.
-4. 같은 입력으로 `Cafe24 Manual Input One`을 실행해 수동 보정을 저장한다.
-5. 같은 품목을 `Cafe24 Dispatch One`으로 단건 발주한다.
-6. 단건 발주 후 supplier order uuid, 공급사 상태 조회, Cafe24 완료 처리 큐를 순서대로 확인한다.
+1. 관리자 Cafe24 탭에서 검수 필요 주문 8건의 상품/옵션을 확인한다.
+2. Cafe24 상품/옵션을 새로 동기화된 MKT24 panel service ID에 직접 매핑한다.
+3. `Cafe24 Manual Input Preview One`으로 정규화/공급 payload에서 `service`, `link`, `quantity` 값이 생성되고 preflight가 통과하는지 확인한다.
+4. preview 통과 후 `Cafe24 Manual Input One`으로 수동 보정을 저장한다.
+5. 즉시 발주까지 검증할 때는 `dispatch_after_save=true`로 실행해 공급사 주문 ID가 반환되는지 확인한다.
+6. 동일 매핑의 다음 주문부터 자동 발주 대상이 되는지 GitHub Actions tick 결과로 확인한다.

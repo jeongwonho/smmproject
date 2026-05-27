@@ -7,6 +7,8 @@ function cafe24ManualInputCandidate(item = {}) {
 export function renderCafe24MappingWorkflowChecklist({
   activeIntegration = {},
   lookupDetail = {},
+  lookupWarnings = [],
+  mappingGapReport = null,
   serviceCount = 0,
   preview = null,
   orderItems = [],
@@ -20,6 +22,8 @@ export function renderCafe24MappingWorkflowChecklist({
   const hasPreview = Boolean(preview);
   const hasReadyDispatchCandidate = orderItems.some((item) => canDispatchItem(item));
   const manualInputCount = orderItems.filter(cafe24ManualInputCandidate).length;
+  const warningCount = Array.isArray(lookupWarnings) ? lookupWarnings.length : 0;
+  const mappingGapWarningCount = Array.isArray(mappingGapReport?.warnings) ? mappingGapReport.warnings.length : 0;
   const steps = [
     {
       label: "1. Cafe24 연동",
@@ -29,9 +33,11 @@ export function renderCafe24MappingWorkflowChecklist({
     },
     {
       label: "2. 상품/옵션 조회",
-      value: hasLookupSelection ? "조회됨" : "대기",
-      ok: hasLookupSelection,
-      description: "상품 조회 탭에서 상품번호, 품목코드, 자체상품코드를 확인한 뒤 매핑폼에 적용합니다.",
+      value: hasLookupSelection ? warningCount ? `부분 조회 · warning ${warningCount}` : "조회됨" : "대기",
+      ok: hasLookupSelection && !warningCount,
+      description: warningCount
+        ? "상품 조회는 완료됐지만 옵션/품목코드 조회 warning이 있습니다. 상세 warning을 확인한 뒤 매핑폼에 적용하세요."
+        : "상품 조회 탭에서 상품번호, 품목코드, 자체상품코드를 확인한 뒤 매핑폼에 적용합니다.",
     },
     {
       label: "3. 공급사 서비스",
@@ -71,6 +77,78 @@ export function renderCafe24MappingWorkflowChecklist({
             <span class="admin-badge ${step.ok ? "is-success" : "is-warn"}">${step.ok ? "완료" : "확인 필요"}</span>
           </article>
         `).join("")}
+        ${mappingGapReport ? `
+          <article class="admin-mini-card ${mappingGapWarningCount ? "is-risk" : ""}">
+            <span>미매핑 진단</span>
+            <strong>${escapeHtml(String(mappingGapReport.summary?.groupCount || 0))}개 그룹</strong>
+            <p>상세 성공 ${escapeHtml(String((mappingGapReport.summary?.detailProductNos || []).length))}/${escapeHtml(String((mappingGapReport.summary?.detailTargetProductNos || []).length))}개 · warning ${escapeHtml(String(mappingGapWarningCount))}개</p>
+            <span class="admin-badge ${mappingGapWarningCount ? "is-warn" : "is-success"}">${mappingGapWarningCount ? "부분 확인" : "확인됨"}</span>
+          </article>
+        ` : ""}
+      </div>
+    </div>
+  `;
+}
+
+export function renderCafe24MappingGapReport({ report = null, escapeHtml }) {
+  if (!report) return "";
+  const summary = report.summary || {};
+  const warnings = Array.isArray(report.warnings) ? report.warnings : [];
+  const groups = Array.isArray(report.groups) ? report.groups.slice(0, 8) : [];
+  const detailProductNos = Array.isArray(summary.detailProductNos) ? summary.detailProductNos : [];
+  const detailTargetProductNos = Array.isArray(summary.detailTargetProductNos) ? summary.detailTargetProductNos : [];
+  const detailAttemptedProductNos = Array.isArray(summary.detailAttemptedProductNos) ? summary.detailAttemptedProductNos : [];
+  return `
+    <div class="admin-panel">
+      <div class="section-head section-head--compact">
+        <h3>미매핑 진단 결과</h3>
+        <p>결제완료 미매핑 품주를 상품번호/품목코드 기준으로 묶고, 옵션/수량 후보와 다음 작업을 표시합니다.</p>
+      </div>
+      <div class="admin-mapping-preview">
+        <article class="admin-mini-card ${warnings.length ? "is-risk" : ""}">
+          <span>진단 그룹</span>
+          <strong>${escapeHtml(String(summary.groupCount || 0))}</strong>
+          <p>품주 ${escapeHtml(String(summary.itemCount || 0))}건 · 수동 보정 ${escapeHtml(String(summary.manualInputRequiredGroupCount || 0))}개 · 매핑 후보 ${escapeHtml(String(summary.mappingCandidateGroupCount || 0))}개</p>
+        </article>
+        <article class="admin-mini-card ${detailTargetProductNos.length && detailProductNos.length < detailTargetProductNos.length ? "is-risk" : ""}">
+          <span>상품 상세 조회</span>
+          <strong>${escapeHtml(String(detailProductNos.length))} / ${escapeHtml(String(detailTargetProductNos.length))}</strong>
+          <p>시도 ${escapeHtml(String(detailAttemptedProductNos.length))}개 · budget ${escapeHtml(String(summary.detailApiBudgetSeconds || "-"))}초 · per-call ${escapeHtml(String(summary.detailApiTimeoutSeconds || "-"))}초</p>
+        </article>
+      </div>
+      ${warnings.length ? `
+        <div class="admin-inline-note">
+          <strong>warning</strong><br />
+          ${warnings.map((warning) => escapeHtml(warning)).join("<br />")}
+        </div>
+      ` : ""}
+      <div class="admin-table-wrap">
+        <table class="admin-table">
+          <thead><tr><th>상품 키</th><th>품주</th><th>후보</th><th>다음 작업</th><th>적용</th></tr></thead>
+          <tbody>
+            ${groups.length ? groups.map((group) => {
+              const diagnostics = group.diagnostics || {};
+              const quantityCandidates = Array.isArray(group.quantityCandidates) ? group.quantityCandidates : [];
+              return `
+                <tr>
+                  <td>${escapeHtml([group.productNo, group.variantCode, group.customProductCode].filter(Boolean).join(" / ") || "-")}</td>
+                  <td>${escapeHtml(String(group.count || 0))}건<br />${escapeHtml((group.errorMessages || []).join(" / ") || "")}</td>
+                  <td>${escapeHtml(diagnostics.status || "-")}<br />${escapeHtml(quantityCandidates.map((candidate) => candidate.value).join(", ") || "수량 후보 없음")}</td>
+                  <td>${escapeHtml(diagnostics.nextAction || "-")}</td>
+                  <td>
+                    <button
+                      class="admin-secondary-button"
+                      type="button"
+                      data-admin-cafe24-use-product="${escapeHtml(group.productNo || "")}"
+                      data-admin-cafe24-variant-code="${escapeHtml(group.variantCode || "")}"
+                      data-admin-cafe24-custom-product-code="${escapeHtml(group.customProductCode || "")}"
+                    >매핑폼 적용</button>
+                  </td>
+                </tr>
+              `;
+            }).join("") : `<tr><td colspan="5">미매핑 진단 결과가 없습니다.</td></tr>`}
+          </tbody>
+        </table>
       </div>
     </div>
   `;

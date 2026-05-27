@@ -35,6 +35,10 @@ on:
         description: Per Cafe24 product API retry attempts
         required: true
         default: "2"
+      detail_api_budget_seconds:
+        description: Total seconds to spend enriching products before returning partial mapping gaps
+        required: true
+        default: "24"
       fail_on_warnings:
         description: Fail when mapping gap detail lookup returns warnings
         required: true
@@ -43,6 +47,7 @@ on:
 permissions:
   actions: read
   contents: read
+  id-token: write
 
 jobs:
   gaps:
@@ -52,7 +57,6 @@ jobs:
       - name: Read Cafe24 mapping gaps
         env:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
-          GITHUB_TOKEN: ${{ github.token }}
           MALL_ID: ${{ inputs.mall_id }}
           SHOP_NO: ${{ inputs.shop_no }}
           PRODUCT_NOS: ${{ inputs.product_nos }}
@@ -61,12 +65,19 @@ jobs:
           DETAIL_FETCH_LIMIT: ${{ inputs.detail_fetch_limit }}
           DETAIL_API_TIMEOUT_SECONDS: ${{ inputs.detail_api_timeout_seconds }}
           DETAIL_API_MAX_ATTEMPTS: ${{ inputs.detail_api_max_attempts }}
+          DETAIL_API_BUDGET_SECONDS: ${{ inputs.detail_api_budget_seconds }}
           FAIL_ON_WARNINGS: ${{ inputs.fail_on_warnings }}
         run: |
           set -euo pipefail
-          auth_token="${CRON_SECRET:-${GITHUB_TOKEN:-}}"
+          oidc_token=""
+          if [ -z "${CRON_SECRET:-}" ]; then
+            oidc_token="$(curl --fail-with-body --show-error --silent \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=instamart-cron" | jq -r '.value // empty')"
+          fi
+          auth_token="${CRON_SECRET:-${oidc_token:-}}"
           if [ -z "${auth_token:-}" ]; then
-            echo "CRON_SECRET or GITHUB_TOKEN is required" >&2
+            echo "Repository secret CRON_SECRET or GitHub Actions OIDC token is required for production cron auth." >&2
             exit 1
           fi
           response_file="$(mktemp)"
@@ -86,7 +97,8 @@ jobs:
               --argjson detailFetchLimit "$DETAIL_FETCH_LIMIT" \
               --argjson detailApiTimeoutSeconds "$DETAIL_API_TIMEOUT_SECONDS" \
               --argjson detailApiMaxAttempts "$DETAIL_API_MAX_ATTEMPTS" \
-              '{mallId:$mallId,shopNo:$shopNo,productNos:$productNos,includeProductDetails:$includeProductDetails,limit:$limit,detailFetchLimit:$detailFetchLimit,detailApiTimeoutSeconds:$detailApiTimeoutSeconds,detailApiMaxAttempts:$detailApiMaxAttempts}')" > "$response_file"
+              --argjson detailApiBudgetSeconds "$DETAIL_API_BUDGET_SECONDS" \
+              '{mallId:$mallId,shopNo:$shopNo,productNos:$productNos,includeProductDetails:$includeProductDetails,limit:$limit,detailFetchLimit:$detailFetchLimit,detailApiTimeoutSeconds:$detailApiTimeoutSeconds,detailApiMaxAttempts:$detailApiMaxAttempts,detailApiBudgetSeconds:$detailApiBudgetSeconds}')" > "$response_file"
           jq '{integration,summary,warnings,groups}' "$response_file"
           warning_count="$(jq -r '(.warnings // []) | length' "$response_file")"
           if [ "$FAIL_ON_WARNINGS" = "true" ] && [ "$warning_count" -gt 0 ]; then

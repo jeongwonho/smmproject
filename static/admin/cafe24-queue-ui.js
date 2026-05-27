@@ -51,7 +51,7 @@ export function renderCafe24AutoPollCards({ activeIntegration = {}, automation =
     <article class="${tickRisk ? "is-risk" : tickStatus === "success" ? "is-hot" : ""}">
       <span>자동화 Tick</span>
       <strong>${escapeHtml(automation.paused ? "긴급 중단" : tickStatus === "success" ? "정상" : tickStatus === "failed" ? "실패" : "대기")}</strong>
-      <small>${escapeHtml(automation.lastTickAt || lastTick.finishedAt || "GitHub Actions 10분 주기")}</small>
+      <small>${escapeHtml(automation.lastTickAt || lastTick.finishedAt || "GitHub Actions 5분 주기")}</small>
     </article>
     <article class="${autoPollRisk ? "is-risk" : autoPollStatus === "success" ? "is-hot" : ""}">
       <span>자동 수집</span>
@@ -60,7 +60,7 @@ export function renderCafe24AutoPollCards({ activeIntegration = {}, automation =
     </article>
     <article>
       <span>다음 예상 수집</span>
-      <strong>${escapeHtml(activeIntegration.nextAutoPollAt || "10분 주기")}</strong>
+      <strong>${escapeHtml(activeIntegration.nextAutoPollAt || "5분 주기")}</strong>
       <small>외부 스케줄러 호출 기준</small>
     </article>
     <article class="${Number(cafe24Dispatch.failed || 0) ? "is-risk" : Number(cafe24Dispatch.submitted || 0) ? "is-hot" : ""}">
@@ -87,13 +87,13 @@ export function renderCafe24AutoPollCards({ activeIntegration = {}, automation =
 }
 
 export function renderCafe24SchedulerNotice({ origin, escapeHtml }) {
-  const cronEndpoint = `${origin}/api/cron/automation/tick`;
+  const cronEndpoint = `${origin}/api/cron/cafe24/flow-tick`;
   return `
     <div class="admin-inline-note">
-      <strong>10분 자동 주문 처리 설정</strong><br />
-      GitHub Actions 외부 스케줄러가 <code>POST ${escapeHtml(cronEndpoint)}</code>를 10분마다 호출하도록 구성되어 있습니다.
-      다른 스케줄러를 추가할 때는 헤더 <code>Authorization: Bearer &lt;CRON_SECRET&gt;</code>를 사용하세요.
-      수집, 공급사 점검, 자동 발주, 공급사 상태 조회, Cafe24 구매확정을 순서대로 실행합니다.
+      <strong>5분 Cafe24 주문 처리 설정</strong><br />
+      GitHub Actions 외부 스케줄러가 <code>POST ${escapeHtml(cronEndpoint)}</code>를 5분마다 호출하도록 구성되어 있습니다.
+      GitHub Actions는 서명된 OIDC 토큰을 사용하고, 다른 스케줄러를 추가할 때는 헤더 <code>Authorization: Bearer &lt;CRON_SECRET&gt;</code>를 사용하세요.
+      증분 수집, preflight, 자동 발주, 공급사 상태 조회, Cafe24 구매확정을 순서대로 실행합니다.
     </div>
   `;
 }
@@ -162,11 +162,44 @@ export function renderCafe24QueueActionHint({ item = {}, canDispatch = false, es
   `;
 }
 
-export function renderCafe24ManualInputForm({ item = {}, suppliers = [], supplierServices = [], selectedSupplierId = "", escapeHtml }) {
+export function renderCafe24PreflightSummary({ preflight = null, escapeHtml }) {
+  if (!preflight) return "";
+  const blockingReasons = Array.isArray(preflight.blockingReasons) ? preflight.blockingReasons : [];
+  const quantity = preflight.quantity || {};
+  const supplierPayload = preflight.supplierPayload || {};
+  const readiness = preflight.supplierReadiness || {};
+  const canDispatch = preflight.canDispatch === true;
+  return `
+    <div class="admin-inline-note">
+      <span class="admin-badge ${canDispatch ? "is-success" : "is-warn"}">${canDispatch ? "preflight 통과" : "preflight 차단"}</span>
+      수량 ${escapeHtml(String(quantity.normalized ?? "-"))}${quantity.expected ? ` / 예상 ${escapeHtml(String(quantity.expected))}` : ""}
+      · service ${escapeHtml(supplierPayload.service || "-")}
+      · readiness ${escapeHtml(readiness.code || "unknown")}
+      ${blockingReasons.length ? `<br />차단: ${escapeHtml(blockingReasons.join(", "))}` : ""}
+    </div>
+  `;
+}
+
+export function renderCafe24ManualInputForm({ item = {}, suppliers = [], supplierServices = [], selectedSupplierId = "", manualPreview = null, escapeHtml }) {
   if (!cafe24NeedsManualInput(item)) return "";
-  const activeSupplierId = item.supplierId || (supplierServices.length ? selectedSupplierId : "") || "";
+  const activeSupplierId = item.supplierId || selectedSupplierId || "";
   const quantity = item.normalizedFields?.orderedCount || item.supplierPayload?.quantity || "";
   const target = item.targetDiagnostics?.input || item.normalizedFields?.targetUrl || item.normalizedFields?.targetValue || "";
+  const previewPreflight = manualPreview?.preflight || null;
+  const previewCanDispatch = previewPreflight?.canDispatch === true;
+  const previewPayload = manualPreview
+    ? {
+        wouldUpdate: manualPreview.wouldUpdate || {},
+        normalizedFields: manualPreview.normalizedFields || {},
+        supplierPayload: manualPreview.supplierPayload || {},
+      }
+    : null;
+  const selectedSupplier = suppliers.find((supplier) => supplier.id === activeSupplierId) || null;
+  const serviceHelp = activeSupplierId
+    ? supplierServices.length
+      ? `${selectedSupplier?.name || "선택 공급사"} 서비스 ${supplierServices.length}개 중 하나를 선택하세요.`
+      : "공급사 서비스 목록을 불러오는 중이거나 동기화된 서비스가 없습니다. 공급사를 다시 선택하거나 service sync를 먼저 실행하세요."
+    : "공급사를 선택하면 해당 공급사의 서비스 목록을 불러옵니다.";
   const supplierOptions = [
     `<option value="">공급사 선택</option>`,
     ...suppliers.map((supplier) => `<option value="${escapeHtml(supplier.id)}" ${supplier.id === activeSupplierId ? "selected" : ""}>${escapeHtml(supplier.name)}</option>`),
@@ -183,11 +216,26 @@ export function renderCafe24ManualInputForm({ item = {}, suppliers = [], supplie
         <label class="form-field"><span class="field-label">공급사 서비스</span><div class="field-shell"><select class="field-select" name="supplierServiceId" data-admin-cafe24-manual-service-select>${serviceOptions}</select></div></label>
         <label class="form-field"><span class="field-label">수량</span><div class="field-shell"><input class="field-input" name="orderedCount" inputmode="numeric" value="${escapeHtml(quantity)}" placeholder="예: 50" /></div></label>
       </div>
+      <p class="admin-inline-note">${escapeHtml(serviceHelp)}</p>
       <div class="admin-two-column">
         <label class="form-field"><span class="field-label">대상 링크/계정</span><div class="field-shell"><input class="field-input" name="targetValue" value="${escapeHtml(target)}" placeholder="SNS 링크 또는 계정 ID" /></div></label>
         <label class="form-field"><span class="field-label">요청 메모</span><div class="field-shell"><input class="field-input" name="requestMemo" value="${escapeHtml(item.normalizedFields?.requestMemo || "")}" placeholder="공급사 comments로 보낼 메모" /></div></label>
       </div>
-      <div class="admin-action-row"><button class="admin-secondary-button" type="submit">수동 보정 저장</button></div>
+      ${previewPreflight ? renderCafe24PreflightSummary({ preflight: previewPreflight, escapeHtml }) : ""}
+      ${
+        manualPreview
+          ? `
+            <details class="admin-disclosure" ${previewCanDispatch ? "" : "open"}>
+              <summary>수동 보정 payload preview</summary>
+              <pre>${escapeHtml(JSON.stringify(previewPayload, null, 2))}</pre>
+            </details>
+          `
+          : ""
+      }
+      <div class="admin-action-row">
+        <button class="admin-secondary-button" type="button" data-admin-cafe24-manual-preview-item="${escapeHtml(item.id)}">payload preview</button>
+        <button class="admin-primary-button" type="submit">수동 보정 저장</button>
+      </div>
     </form>
   `;
 }

@@ -246,7 +246,7 @@ function supplierDispatchReadinessChecks({
     {
       label: "서비스 동기화",
       value: supplierSyncReadinessLabel(syncStatus),
-      ok: syncStatus !== "failed",
+      ok: syncStatus === "success",
       blocking: syncStatus === "failed",
       description: syncStatus === "failed"
         ? selectedSupplier?.serviceSyncMessage || "최근 서비스 동기화 실패를 먼저 해소해야 합니다."
@@ -256,11 +256,13 @@ function supplierDispatchReadinessChecks({
     },
     {
       label: "서비스 선택",
-      value: selectedService ? `#${selectedExternalServiceId || selectedService.id}` : "미선택",
+      value: selectedService ? selectedExternalServiceId ? `#${selectedExternalServiceId}` : "외부 ID 없음" : "미선택",
       ok: Boolean(selectedService?.id && selectedExternalServiceId && selectedServiceActive),
       blocking: true,
       description: selectedService && !selectedServiceActive
         ? "비활성 공급사 서비스는 매핑과 발주 전에 service sync 또는 서비스 교체가 필요합니다."
+        : selectedService && !selectedExternalServiceId
+          ? `${supplierIntegrationDisplayName(integrationType)} 서비스의 외부 ID가 없어 발주 payload의 service/action 값을 만들 수 없습니다.`
         : supplierServicePayloadHint(integrationType, selectedService),
     },
     {
@@ -314,6 +316,190 @@ function renderSupplierReadinessBadge(check, escapeHtml) {
   const className = check.ok ? "is-success" : check.blocking ? "is-error" : "is-warn";
   const label = check.ok ? "통과" : check.blocking ? "차단" : "확인";
   return `<span class="admin-badge ${className}">${escapeHtml(label)}</span>`;
+}
+
+function supplierServerRequirementClass(requirement = {}) {
+  if (requirement.ok === true || requirement.status === "pass") return "is-success";
+  if (requirement.blocking === true || requirement.status === "blocked") return "is-error";
+  return "is-warn";
+}
+
+function supplierServerRequirementBadgeLabel(requirement = {}) {
+  if (requirement.ok === true || requirement.status === "pass") return "통과";
+  if (requirement.blocking === true || requirement.status === "blocked") return "차단";
+  return "확인";
+}
+
+function supplierServerVerdict(readiness = {}) {
+  if (readiness.ok) {
+    return {
+      className: "is-success",
+      label: "발주 가능",
+      message: readiness.message || "서버 기준 자동/수동 발주 조건을 통과했습니다.",
+    };
+  }
+  if (readiness.retryable) {
+    return {
+      className: "is-warn",
+      label: "재시도 필요",
+      message: readiness.message || "일시 실패 조건을 해소한 뒤 다시 점검하세요.",
+    };
+  }
+  return {
+    className: "is-error",
+    label: "발주 차단",
+    message: readiness.message || "서버 기준 발주 조건을 통과하지 못했습니다.",
+  };
+}
+
+function renderSupplierServerReadinessRequirements(selectedSupplier, escapeHtml) {
+  const readiness = selectedSupplier?.autoDispatchReadiness || {};
+  const requirements = Array.isArray(readiness.requirements) ? readiness.requirements : [];
+  const contract = readiness.dispatchContract || {};
+  const blockingRequirements = requirements.filter((requirement) => requirement.blocking === true || requirement.status === "blocked");
+  const reviewRequirements = requirements.filter((requirement) => !requirement.ok && requirement.blocking !== true && requirement.status !== "blocked");
+  const verdict = supplierServerVerdict(readiness);
+  if (!requirements.length) return "";
+  return `
+    <div class="admin-subcard">
+      <div class="admin-subcard__head">
+        <strong>서버 발주 판정 기준</strong>
+        <span class="admin-badge ${verdict.className}">${escapeHtml(verdict.label)}</span>
+      </div>
+      <div class="admin-readiness-verdict">
+        <div>
+          <span>최종 판정</span>
+          <strong>${escapeHtml(verdict.message)}</strong>
+        </div>
+        <div>
+          <span>${blockingRequirements.length ? "차단 조건" : reviewRequirements.length ? "확인 조건" : "통과 조건"}</span>
+          <strong>${escapeHtml(
+            blockingRequirements.length
+              ? blockingRequirements.map((requirement) => requirement.label || requirement.key || "조건").join(", ")
+              : reviewRequirements.length
+                ? reviewRequirements.map((requirement) => requirement.label || requirement.key || "조건").join(", ")
+                : "모든 서버 조건 통과"
+          )}</strong>
+        </div>
+      </div>
+      <p class="admin-inline-note">
+        <strong>다음 조치</strong> ${escapeHtml(readiness.nextAction || readiness.message || "readiness 조건을 확인하세요.")}
+        <br />${escapeHtml(contract.label || supplierIntegrationDisplayName(selectedSupplier?.integrationType))} · ${escapeHtml(contract.endpointMode || "-")} · ${escapeHtml(contract.authMode || "-")} · ${escapeHtml(contract.serviceIdRule || "-")}
+      </p>
+      <div class="admin-readiness-checks">
+        ${requirements
+          .map(
+            (requirement) => `
+              <div class="admin-readiness-check">
+                <div class="admin-readiness-check__text">
+                  <strong>${escapeHtml(requirement.label || requirement.key || "조건")} ${requirement.value ? `· ${escapeHtml(requirement.value)}` : ""}</strong>
+                  <span>${escapeHtml(requirement.message || requirement.code || "")}</span>
+                </div>
+                <span class="admin-badge ${supplierServerRequirementClass(requirement)}">${escapeHtml(supplierServerRequirementBadgeLabel(requirement))}</span>
+              </div>
+            `
+          )
+          .join("")}
+      </div>
+    </div>
+  `;
+}
+
+export function renderSupplierDispatchReadinessSnapshot({
+  selectedSupplier,
+  selectedService,
+  allServices,
+  activeConnection,
+  syncStatus,
+  escapeHtml,
+}) {
+  if (!selectedSupplier) {
+    return `
+      <div class="admin-panel">
+        <div class="section-head section-head--compact">
+          <h3>선택 공급사 발주 readiness</h3>
+          <p>Cafe24 매핑에 사용할 공급사를 선택하면 service sync, health check, 공급사별 발주 조건을 확인합니다.</p>
+        </div>
+        <div class="admin-empty-card"><strong>공급사 선택 필요</strong><p>매핑 저장과 payload preview 전에 공급사를 선택하세요.</p></div>
+      </div>
+    `;
+  }
+
+  const effectiveSyncStatus = syncStatus || selectedSupplier.serviceSyncStatus || "never";
+  const checks = supplierDispatchReadinessChecks({
+    selectedSupplier,
+    selectedService,
+    allServices,
+    activeConnection,
+    connectionState: "",
+    syncStatus: effectiveSyncStatus,
+  });
+  const blockingChecks = checks.filter((check) => !check.ok && check.blocking);
+  const reviewChecks = checks.filter((check) => !check.ok && !check.blocking);
+  const readiness = selectedSupplier.autoDispatchReadiness || {};
+  const contract = readiness.dispatchContract || {};
+  const verdict = supplierServerVerdict(readiness);
+  const contractCards = supplierDispatchContractCards(selectedSupplier, selectedService);
+  const statusLabel = blockingChecks.length
+    ? `${blockingChecks.length}개 차단`
+    : reviewChecks.length
+      ? `${reviewChecks.length}개 확인`
+      : "발주 가능";
+
+  return `
+    <div class="admin-panel">
+      <div class="section-head section-head--compact">
+        <h3>선택 공급사 발주 readiness</h3>
+        <p>Cafe24 매핑 저장과 payload preview 전에 ${escapeHtml(supplierIntegrationDisplayName(selectedSupplier.integrationType))} 발주 조건을 확인합니다.</p>
+      </div>
+      <div class="admin-mapping-preview">
+        <article class="admin-mini-card ${blockingChecks.length ? "is-risk" : ""}">
+          <span>현재 선택값</span>
+          <strong>${escapeHtml(statusLabel)}</strong>
+          <p>${escapeHtml(blockingChecks.length ? blockingChecks.map((check) => check.label).join(", ") : selectedService ? "선택 서비스 기준 차단 조건 없음" : "공급사 서비스를 선택해야 합니다.")}</p>
+          <span class="admin-badge ${blockingChecks.length ? "is-error" : selectedService ? "is-success" : "is-warn"}">${escapeHtml(blockingChecks.length ? "차단" : selectedService ? "확인됨" : "서비스 필요")}</span>
+        </article>
+        <article class="admin-mini-card ${readiness.ok ? "" : "is-risk"}">
+          <span>서버 판정</span>
+          <strong>${escapeHtml(verdict.label)}</strong>
+          <p>${escapeHtml(readiness.nextAction || verdict.message)}</p>
+          <span class="admin-badge ${verdict.className}">${escapeHtml(verdict.label)}</span>
+        </article>
+        <article class="admin-mini-card">
+          <span>Service sync</span>
+          <strong>${escapeHtml(supplierSyncReadinessLabel(effectiveSyncStatus))}</strong>
+          <p>${escapeHtml(selectedSupplier.serviceSyncMessage || selectedSupplier.serviceSyncCompletedAt || "동기화 이력을 확인하세요.")}</p>
+        </article>
+        <article class="admin-mini-card ${selectedSupplier.healthStatus === "ok" ? "" : "is-risk"}">
+          <span>Health check</span>
+          <strong>${escapeHtml(supplierHealthReadinessLabel(selectedSupplier.healthStatus || "unknown"))}</strong>
+          <p>${escapeHtml(selectedSupplier.healthMessage || selectedSupplier.healthCheckedAt || "health_status가 ok여야 자동 발주됩니다.")}</p>
+        </article>
+      </div>
+      <p class="admin-inline-note">
+        <strong>발주 계약</strong>
+        ${escapeHtml(contract.label || supplierIntegrationDisplayName(selectedSupplier.integrationType))}
+        · ${escapeHtml(contract.endpointMode || contractCards[0]?.value || "-")}
+        · ${escapeHtml(contract.authMode || contractCards[1]?.value || "-")}
+        · ${escapeHtml(contract.serviceIdRule || contractCards[2]?.description || "-")}
+      </p>
+      <div class="admin-readiness-checks">
+        ${checks
+          .map(
+            (check) => `
+              <div class="admin-readiness-check">
+                <div class="admin-readiness-check__text">
+                  <strong>${escapeHtml(check.label)} · ${escapeHtml(check.value)}</strong>
+                  <span>${escapeHtml(check.description || "")}</span>
+                </div>
+                ${renderSupplierReadinessBadge(check, escapeHtml)}
+              </div>
+            `
+          )
+          .join("")}
+      </div>
+    </div>
+  `;
 }
 
 export function renderSupplierDispatchReadinessPanel({
@@ -387,12 +573,14 @@ export function renderSupplierDispatchReadinessPanel({
           {
             label: "공급사별 조건",
             value: supplierIntegrationDisplayName(integrationType),
-            description: checks[checks.length - 1]?.description || "",
+            description: selectedSupplier.autoDispatchReadiness?.nextAction || checks[checks.length - 1]?.description || "",
             tone: checks[checks.length - 1]?.ok ? "success" : "warning",
           },
         ],
         "admin-insight-grid--compact"
       )}
+
+      ${renderSupplierServerReadinessRequirements(selectedSupplier, escapeHtml)}
 
       <div class="admin-mapping-preview">
         ${contractCards

@@ -1,8 +1,8 @@
 import { renderCafe24OperationalAuditPanel } from "./cafe24-audit-ui.js";
 import { renderCafe24ProductLookupPanel } from "./cafe24-product-ui.js";
-import { renderCafe24AutoPollCards, renderCafe24ManualInputForm, renderCafe24Pagination, renderCafe24QueueActionHint, renderCafe24QueueToolbar, renderCafe24SchedulerNotice } from "./cafe24-queue-ui.js";
-import { renderCafe24MappingWorkflowChecklist } from "./cafe24-workflow-ui.js";
-import { renderSupplierDispatchReadinessPanel } from "./supplier-readiness-ui.js";
+import { renderCafe24AutoPollCards, renderCafe24ManualInputForm, renderCafe24Pagination, renderCafe24PreflightSummary, renderCafe24QueueActionHint, renderCafe24QueueToolbar, renderCafe24SchedulerNotice } from "./cafe24-queue-ui.js";
+import { renderCafe24MappingGapReport, renderCafe24MappingWorkflowChecklist } from "./cafe24-workflow-ui.js";
+import { renderSupplierDispatchReadinessPanel, renderSupplierDispatchReadinessSnapshot } from "./supplier-readiness-ui.js";
 import { supplierSyncInsight } from "./supplier-sync-ui.js";
 let runtime = {}, state = {};
 let DEFAULT_SITE_NAME = "인스타마트";
@@ -116,21 +116,57 @@ function renderAdminHealthBadge(status) {
   }
   return `<span class="admin-badge ${className}">${escapeHtml(label)}</span>`;
 }
-function renderSupplierReadinessSummary(readiness = {}) {
-  const ok = readiness.ok === true;
-  const className = ok ? "is-success" : readiness.retryable ? "is-warn" : "is-error";
-  const label = ok ? "발주 가능" : "발주 차단";
-  const blockingRequirements = Array.isArray(readiness.requirements)
-    ? readiness.requirements.filter((requirement) => requirement && requirement.ok !== true && requirement.blocking === true)
-    : [];
-  const blockerLabel = blockingRequirements.length
-    ? blockingRequirements.slice(0, 3).map((requirement) => requirement.label || requirement.key || "조건").join(", ")
-    : readiness.message || readiness.code || "readiness 확인 필요";
+function supplierReadinessRequirementClass(requirement = {}) {
+  if (requirement.ok === true || requirement.status === "pass") return "is-success";
+  if (requirement.blocking === true || requirement.status === "blocked") return "is-error";
+  return "is-warn";
+}
+function supplierReadinessRequirementLabel(requirement = {}) {
+  if (requirement.ok === true || requirement.status === "pass") return "통과";
+  if (requirement.blocking === true || requirement.status === "blocked") return "차단";
+  return "확인";
+}
+function supplierReadinessContractSummary(readiness = {}) {
+  const contract = readiness.dispatchContract || {};
+  return [
+    contract.label,
+    contract.endpointMode,
+    contract.authMode,
+    contract.serviceIdRule,
+  ].filter(Boolean).join(" · ");
+}
+function renderSupplierReadinessRequirementList(readiness = {}) {
+  const requirements = Array.isArray(readiness.requirements) ? readiness.requirements : [];
+  const contractSummary = supplierReadinessContractSummary(readiness);
+  if (!requirements.length && !contractSummary) return "";
   return `
-    <p class="admin-inline-note">
-      <span class="admin-badge ${className}">${escapeHtml(label)}</span>
-      ${escapeHtml(blockerLabel)}
-    </p>
+    <div class="admin-readiness-checks">
+      ${contractSummary ? `
+        <div class="admin-readiness-check">
+          <div class="admin-readiness-check__text">
+            <strong>발주 계약</strong>
+            <span>${escapeHtml(contractSummary)}</span>
+          </div>
+          <span class="admin-badge is-neutral">기준</span>
+        </div>
+      ` : ""}
+      ${requirements
+        .map(
+          (requirement) => {
+            const valueSuffix = requirement.value ? ` · ${requirement.value}` : "";
+            return `
+            <div class="admin-readiness-check">
+              <div class="admin-readiness-check__text">
+                <strong>${escapeHtml(`${requirement.label || requirement.key || "조건"}${valueSuffix}`)}</strong>
+                <span>${escapeHtml(requirement.message || requirement.value || "")}</span>
+              </div>
+              <span class="admin-badge ${supplierReadinessRequirementClass(requirement)}">${escapeHtml(supplierReadinessRequirementLabel(requirement))}</span>
+            </div>
+          `;
+          }
+        )
+        .join("")}
+    </div>
   `;
 }
 function cafe24OrderItemProductLabel(item = {}) {
@@ -2003,8 +2039,25 @@ function renderCafe24MappingPanel(activeIntegration = {}, products = [], supplie
   const sampleItems = (state.adminCafe24OrderList?.items || state.adminBootstrap?.cafe24OrderItems || []).slice(0, 30);
   const sampleOptions = sampleItems.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.orderId || "-")} · ${escapeHtml(item.productNo || "-")} · ${escapeHtml(item.productName || item.buyerName || "")}</option>`).join("");
   const preview = state.adminCafe24MappingPreview || null;
+  const lookupWarnings = state.adminCafe24ProductLookup?.warnings || [];
+  const mappingGapReport = state.adminCafe24MappingGapReport || null;
+  const selectedCafe24Supplier = suppliers.find((supplier) => supplier.id === selectedCafe24SupplierId) || null;
+  const selectedCafe24ServiceId = state.ui.adminCafe24SelectedSupplierServiceId || "";
+  const selectedCafe24Service = cafe24SupplierServices.find((service) => service.id === selectedCafe24ServiceId) || null;
   return `
-    ${renderCafe24MappingWorkflowChecklist({ activeIntegration, lookupDetail, serviceCount: cafe24SupplierServices.length, preview, orderItems: sampleItems, escapeHtml, canDispatchItem: cafe24CanDispatchItem })}
+    ${renderCafe24MappingWorkflowChecklist({ activeIntegration, lookupDetail, lookupWarnings, mappingGapReport, serviceCount: cafe24SupplierServices.length, preview, orderItems: sampleItems, escapeHtml, canDispatchItem: cafe24CanDispatchItem })}
+    ${renderSupplierDispatchReadinessSnapshot({
+      selectedSupplier: selectedCafe24Supplier,
+      selectedService: selectedCafe24Service,
+      allServices: cafe24SupplierServices,
+      activeConnection: null,
+      syncStatus: selectedCafe24Supplier?.serviceSyncStatus || "never",
+      escapeHtml,
+    })}
+    <div class="admin-action-row">
+      <button class="admin-secondary-button" type="button" data-admin-cafe24-mapping-gaps="${escapeHtml(activeIntegration.id || "")}" ${activeIntegration.id ? "" : "disabled"}>미매핑 진단 실행</button>
+    </div>
+    ${renderCafe24MappingGapReport({ report: mappingGapReport, escapeHtml })}
     <div class="admin-two-column">
       <form class="admin-panel admin-form" data-admin-cafe24-mapping-form>
         <div class="section-head section-head--compact">
@@ -2023,7 +2076,7 @@ function renderCafe24MappingPanel(activeIntegration = {}, products = [], supplie
             <div class="field-shell">
               <select class="field-select" name="supplierServiceId" data-admin-cafe24-service-select>
                 <option value="">공급사 선택 후 서비스 목록을 불러오세요</option>
-                ${cafe24SupplierServices.map((service) => `<option value="${escapeHtml(service.id)}">${escapeHtml(service.name)} · ${escapeHtml(service.externalServiceId || "")} · ${escapeHtml(service.minAmount || "-")}~${escapeHtml(service.maxAmount || "-")}</option>`).join("")}
+                ${cafe24SupplierServices.map((service) => `<option value="${escapeHtml(service.id)}" ${service.id === selectedCafe24ServiceId ? "selected" : ""}>${escapeHtml(service.name)} · ${escapeHtml(service.externalServiceId || "")} · ${escapeHtml(service.minAmount || "-")}~${escapeHtml(service.maxAmount || "-")}</option>`).join("")}
               </select>
             </div>
           </label>
@@ -2113,6 +2166,7 @@ function renderCafe24OrderQueuePanel(orderItems = [], suppliers = [], supplierSe
       <div class="admin-order-list cafe24-order-list">
         ${sortedItems.length ? sortedItems.map((item) => {
           const canDispatchCafe24Item = cafe24CanDispatchItem(item);
+          const preflight = state.adminCafe24Preflights?.[item.id] || null;
           return `
             <article class="admin-order-card ${item.standardStatus === "failed" ? "is-risk" : ""}">
               <div class="admin-order-card__top">
@@ -2140,8 +2194,16 @@ function renderCafe24OrderQueuePanel(orderItems = [], suppliers = [], supplierSe
               ${item.targetDiagnostics?.message ? `<p class="admin-inline-note">대상 확인: ${escapeHtml(item.targetDiagnostics.message)}</p>` : ""}
               ${item.targetDiagnostics?.normalized ? `<p class="admin-inline-note">입력값을 공급사 전송 형식으로 변환했습니다: ${escapeHtml(item.targetDiagnostics.input || "-")} → ${escapeHtml(item.targetDiagnostics.supplierLink || "-")}</p>` : ""}
               ${renderCafe24QueueActionHint({ item, canDispatch: canDispatchCafe24Item, escapeHtml })}
+              ${renderCafe24PreflightSummary({ preflight, escapeHtml })}
               ${item.errorMessage ? `<p class="admin-inline-note">${escapeHtml(item.errorMessage)}</p>` : ""}
-              ${renderCafe24ManualInputForm({ item, suppliers, supplierServices, selectedSupplierId, escapeHtml })}
+              ${renderCafe24ManualInputForm({
+                item,
+                suppliers,
+                supplierServices,
+                selectedSupplierId,
+                manualPreview: state.adminCafe24ManualPreviews?.[item.id] || null,
+                escapeHtml,
+              })}
               <details class="admin-disclosure">
                 <summary>정규화/공급 payload 보기</summary>
                 <pre>${escapeHtml(JSON.stringify({ target: item.targetDiagnostics, fields: item.normalizedFields, supplierPayload: item.supplierPayload, supplierResponse: item.supplierResponse, raw: item.rawPayloadPreview }, null, 2))}</pre>
@@ -2149,6 +2211,7 @@ function renderCafe24OrderQueuePanel(orderItems = [], suppliers = [], supplierSe
               <div class="admin-action-row">
                 <button class="admin-secondary-button" type="button" data-admin-cafe24-resync-item="${escapeHtml(item.id)}">재동기화</button>
                 <button class="admin-secondary-button" type="button" data-admin-cafe24-retry-item="${escapeHtml(item.id)}">재검증</button>
+                <button class="admin-secondary-button" type="button" data-admin-cafe24-preflight-item="${escapeHtml(item.id)}">preflight</button>
                 <button class="admin-primary-button" type="button" data-admin-cafe24-dispatch-item="${escapeHtml(item.id)}" ${canDispatchCafe24Item ? "" : "disabled"}>공급사 발주</button>
               </div>
               <form class="admin-order-form" data-admin-cafe24-item-status-form>
@@ -3645,6 +3708,8 @@ function renderSupplierAdminSection({
                   .map(
                     (supplier) => {
                       const readiness = supplier.autoDispatchReadiness || {};
+                      const readinessOk = readiness.ok === true;
+                      const readinessClass = readinessOk ? "is-success" : readiness.retryable ? "is-warn" : "is-error";
                       return `
                         <button
                           class="admin-supplier-card ${state.ui.adminSelectedSupplierId === supplier.id && state.ui.adminSupplierMode !== "new" ? "is-active" : ""}"
@@ -3663,7 +3728,11 @@ function renderSupplierAdminSection({
                             <span>매핑 ${escapeHtml(String(supplier.mappingCount || 0))}</span>
                             <span>${supplier.isActive ? "활성" : "비활성"}</span>
                           </div>
-                          ${renderSupplierReadinessSummary(readiness)}
+                          <p class="admin-inline-note">
+                            <span class="admin-badge ${readinessClass}">${escapeHtml(readinessOk ? "발주 가능" : "발주 차단")}</span>
+                            ${escapeHtml(readiness.nextAction || readiness.message || readiness.code || "readiness 확인 필요")}
+                          </p>
+                          ${renderSupplierReadinessRequirementList(readiness)}
                         </button>
                       `;
                     }

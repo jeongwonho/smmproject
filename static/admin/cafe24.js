@@ -59,6 +59,84 @@ function buildCafe24FieldMappingJson(formData) {
   return JSON.stringify(mapping);
 }
 
+const CAFE24_PREFLIGHT_BLOCKER_LABELS = {
+  payment_not_confirmed: "결제 미확인",
+  mapping_missing: "매핑 없음",
+  supplier_mapping_missing: "공급사 매핑 없음",
+  supplier_payload_missing: "payload 없음",
+  supplier_order_already_exists: "이미 공급사 주문 있음",
+  quantity_mismatch: "수량 불일치",
+  supplier_missing: "공급사 없음",
+  supplier_inactive: "공급사 비활성",
+  supplier_service_missing: "공급사 서비스 없음",
+  supplier_service_inactive: "공급사 서비스 비활성",
+  mkt24_panel_service_id_invalid: "MKT24 서비스 ID 재매핑 필요",
+  supplier_services_empty: "활성 공급사 서비스 없음",
+  supplier_sync_failed: "공급사 서비스 동기화 실패",
+  supplier_health_not_ok: "공급사 health 확인 필요",
+  supplier_balance_failed: "공급사 잔액 확인 실패",
+};
+
+function describeCafe24PreflightBlocker(reason) {
+  const key = String(reason || "").trim();
+  if (!key) return "";
+  if (CAFE24_PREFLIGHT_BLOCKER_LABELS[key]) return CAFE24_PREFLIGHT_BLOCKER_LABELS[key];
+  if (key.startsWith("status_")) return `상태 ${key.slice("status_".length)}`;
+  return key;
+}
+
+export function cafe24ManualInputToastMessage(result = {}) {
+  const preflight = result.preflight && typeof result.preflight === "object" ? result.preflight : null;
+  if (preflight?.canDispatch) {
+    return "Cafe24 수동 보정 저장: preflight 통과, 단건 발주 가능";
+  }
+  const blockers = Array.isArray(preflight?.blockingReasons)
+    ? preflight.blockingReasons.map(describeCafe24PreflightBlocker).filter(Boolean)
+    : [];
+  if (blockers.length) {
+    return `Cafe24 수동 보정 저장: ${blockers.join(", ")} 확인 필요`;
+  }
+  return `Cafe24 수동 보정 저장: ${result.item?.standardStatus || "ready_to_submit"}`;
+}
+
+function findCafe24OrderItem(itemId) {
+  return (state.adminCafe24OrderList?.items || []).find((item) => item.id === itemId) || null;
+}
+
+function cafe24ExpectedQuantityForItem(item = {}) {
+  return item.normalizedFields?.orderedCount
+    || item.supplierPayload?.quantity
+    || item.supplierPayload?.orderedCount
+    || "";
+}
+
+function cafe24MappingGapProductNos() {
+  const items = state.adminCafe24OrderList?.items || state.adminBootstrap?.cafe24OrderItems || [];
+  const productNos = [];
+  for (const item of items) {
+    const productNo = String(item?.productNo || "").trim();
+    if (!productNo || productNos.includes(productNo)) continue;
+    const unmapped = !item.mappingId && !item.supplierServiceId;
+    if (item.paymentGateStatus === "payment_confirmed" && unmapped) {
+      productNos.push(productNo);
+    }
+  }
+  return productNos.slice(0, 8);
+}
+
+export function cafe24PreflightToastMessage(result = {}) {
+  if (result.canDispatch) {
+    return "Cafe24 preflight 통과: 단건 발주 가능";
+  }
+  const blockers = Array.isArray(result.blockingReasons)
+    ? result.blockingReasons.map(describeCafe24PreflightBlocker).filter(Boolean)
+    : [];
+  if (blockers.length) {
+    return `Cafe24 preflight 차단: ${blockers.join(", ")}`;
+  }
+  return "Cafe24 preflight 결과를 확인했습니다.";
+}
+
 function applyCafe24ProductToMapping(button) {
   const mappingForm = document.querySelector("[data-admin-cafe24-mapping-form]");
   if (!mappingForm) return false;
@@ -131,10 +209,21 @@ export async function handleCafe24AdminChange(target) {
     renderRoute();
     return true;
   }
+  if (target.matches("[data-admin-cafe24-service-select]")) {
+    state.ui = state.ui || {};
+    state.ui.adminCafe24SelectedSupplierServiceId = target.value || "";
+    state.adminCafe24MappingPreview = null;
+    renderRoute();
+    return true;
+  }
   if (!target.matches("[data-admin-cafe24-supplier-select], [data-admin-cafe24-manual-supplier-select]")) return false;
   const supplierId = target.value || "";
   state.ui = state.ui || {};
   state.ui.adminCafe24SelectedSupplierId = supplierId;
+  if (target.matches("[data-admin-cafe24-supplier-select]")) {
+    state.ui.adminCafe24SelectedSupplierServiceId = "";
+    state.adminCafe24MappingPreview = null;
+  }
   try {
     const data = await loadCafe24SupplierServices(supplierId);
     const serviceSelect = target.closest("form")?.querySelector("[data-admin-cafe24-service-select], [data-admin-cafe24-manual-service-select]")
@@ -148,6 +237,9 @@ export async function handleCafe24AdminChange(target) {
       ].join("");
     }
     showToast("공급사 서비스 목록을 불러왔습니다.");
+    if (target.matches("[data-admin-cafe24-supplier-select]")) {
+      renderRoute();
+    }
   } catch (error) {
     showToast(error.message || "공급사 서비스 목록을 불러오지 못했습니다.", "error");
   }
@@ -182,6 +274,31 @@ export async function handleCafe24AdminClick(closest) {
       renderRoute();
     } catch (error) {
       showToast(error.message || "Cafe24 운영 상태 조회에 실패했습니다.", "error");
+    }
+    return true;
+  }
+
+  const cafe24MappingGapsButton = closest("[data-admin-cafe24-mapping-gaps]");
+  if (cafe24MappingGapsButton) {
+    const integrationId = cafe24MappingGapsButton.getAttribute("data-admin-cafe24-mapping-gaps") || "";
+    const productNos = cafe24MappingGapProductNos();
+    try {
+      const result = await apiPost("/api/admin/cafe24/mapping-gaps", {
+        integrationId,
+        productNos: productNos.join(","),
+        includeProductDetails: true,
+        limit: 50,
+        detailFetchLimit: 5,
+        detailApiTimeoutSeconds: 4,
+        detailApiMaxAttempts: 2,
+        detailApiBudgetSeconds: 24,
+      });
+      state.adminCafe24MappingGapReport = result;
+      const warningCount = (result.warnings || []).length;
+      showToast(`Cafe24 미매핑 진단: ${result.summary?.groupCount || 0}개 그룹${warningCount ? ` · warning ${warningCount}개` : ""}`);
+      renderRoute();
+    } catch (error) {
+      showToast(error.message || "Cafe24 미매핑 진단에 실패했습니다.", "error");
     }
     return true;
   }
@@ -329,6 +446,9 @@ export async function handleCafe24AdminClick(closest) {
         fieldMappingJson: buildCafe24FieldMappingJson(formData),
         sampleOrderItemId: formData.get("sampleOrderItemId"),
       });
+      state.ui = state.ui || {};
+      state.ui.adminCafe24SelectedSupplierId = String(formData.get("supplierId") || "");
+      state.ui.adminCafe24SelectedSupplierServiceId = String(formData.get("supplierServiceId") || "");
       state.adminCafe24MappingPreview = result;
       showToast(result.ok ? "Cafe24 매핑 payload를 확인했습니다." : "Cafe24 매핑 검증이 필요합니다.", result.ok ? "success" : "error");
       renderRoute();
@@ -349,6 +469,65 @@ export async function handleCafe24AdminClick(closest) {
       renderRoute();
     } catch (error) {
       showToast(error.message || "Cafe24 품주 재처리에 실패했습니다.", "error");
+    }
+    return true;
+  }
+
+  const cafe24PreflightButton = closest("[data-admin-cafe24-preflight-item]");
+  if (cafe24PreflightButton) {
+    const itemId = cafe24PreflightButton.getAttribute("data-admin-cafe24-preflight-item") || "";
+    const item = findCafe24OrderItem(itemId);
+    try {
+      const result = await apiPost("/api/admin/cafe24/order-items/preflight", {
+        itemId,
+        expectedQuantity: cafe24ExpectedQuantityForItem(item),
+      });
+      state.adminCafe24Preflights = {
+        ...(state.adminCafe24Preflights || {}),
+        [itemId]: result,
+      };
+      showToast(cafe24PreflightToastMessage(result), result.canDispatch ? "success" : "error");
+      renderRoute();
+    } catch (error) {
+      showToast(error.message || "Cafe24 preflight 확인에 실패했습니다.", "error");
+    }
+    return true;
+  }
+
+  const cafe24ManualPreviewButton = closest("[data-admin-cafe24-manual-preview-item]");
+  if (cafe24ManualPreviewButton) {
+    const itemId = cafe24ManualPreviewButton.getAttribute("data-admin-cafe24-manual-preview-item") || "";
+    const form = cafe24ManualPreviewButton.closest("[data-admin-cafe24-item-manual-form]");
+    const formData = form ? new FormData(form) : new FormData();
+    try {
+      const result = await apiPost("/api/admin/cafe24/order-items/manual-input/preview", {
+        itemId: formData.get("itemId") || itemId,
+        supplierId: formData.get("supplierId"),
+        supplierServiceId: formData.get("supplierServiceId"),
+        targetValue: formData.get("targetValue"),
+        orderedCount: formData.get("orderedCount"),
+        requestMemo: formData.get("requestMemo"),
+        expectedQuantity: formData.get("orderedCount"),
+      });
+      state.adminCafe24ManualPreviews = {
+        ...(state.adminCafe24ManualPreviews || {}),
+        [itemId]: result,
+      };
+      if (result.preflight) {
+        state.adminCafe24Preflights = {
+          ...(state.adminCafe24Preflights || {}),
+          [itemId]: result.preflight,
+        };
+      }
+      showToast(
+        result.preflight?.canDispatch
+          ? "수동 보정 preview 통과: 저장 후 단건 발주 가능"
+          : cafe24PreflightToastMessage(result.preflight || {}),
+        result.preflight?.canDispatch ? "success" : "error"
+      );
+      renderRoute();
+    } catch (error) {
+      showToast(error.message || "Cafe24 수동 보정 preview에 실패했습니다.", "error");
     }
     return true;
   }
@@ -504,9 +683,15 @@ export async function handleCafe24AdminSubmit(form, event) {
         orderedCount: formData.get("orderedCount"),
         requestMemo: formData.get("requestMemo"),
       });
+      if (result.item?.id && result.preflight) {
+        state.adminCafe24Preflights = {
+          ...(state.adminCafe24Preflights || {}),
+          [result.item.id]: result.preflight,
+        };
+      }
       await refreshAdminData({ preserveDraft: true });
       await refreshCafe24OrderItems({ force: true });
-      showToast(`Cafe24 수동 보정 저장: ${result.item?.standardStatus || "ready_to_submit"}`);
+      showToast(cafe24ManualInputToastMessage(result));
       renderRoute();
     } catch (error) {
       showToast(error.message || "Cafe24 수동 보정 저장에 실패했습니다.", "error");

@@ -156,7 +156,7 @@ def cafe24_preflight_blocking_reasons(
     has_item_level_supplier_payload = bool(item["supplierId"] and item["supplierServiceId"] and supplier_payload)
     if item["paymentGateStatus"] != "payment_confirmed":
         blocking_reasons.append("payment_not_confirmed")
-    if item["standardStatus"] != "ready_to_submit":
+    if item["standardStatus"] not in {"ready_to_submit", "failed"}:
         blocking_reasons.append(f"status_{item['standardStatus'] or 'unknown'}")
     if not item["mappingId"] and not has_item_level_supplier_payload:
         blocking_reasons.append("mapping_missing")
