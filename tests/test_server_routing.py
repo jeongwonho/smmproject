@@ -475,7 +475,7 @@ class WorkflowConfigurationTest(unittest.TestCase):
         for workflow_name in workflow_names:
             with self.subTest(workflow=workflow_name):
                 workflow = (APP_ROOT / ".github" / "workflows" / workflow_name).read_text()
-                self.assertIn("actions: read", workflow)
+                self.assertRegex(workflow, r"actions: (read|write)")
                 self.assertIn("id-token: write", workflow)
                 self.assertIn("ACTIONS_ID_TOKEN_REQUEST_TOKEN", workflow)
                 self.assertIn("audience=instamart-cron", workflow)
@@ -511,13 +511,20 @@ class WorkflowConfigurationTest(unittest.TestCase):
         self.assertIn("--argjson requestTimeoutSeconds 5", workflow)
         self.assertIn("--argjson maxAttempts 1", workflow)
         self.assertIn("live_dispatch:", workflow)
+        self.assertIn("chain_runs_remaining:", workflow)
         self.assertIn("MANUAL_LIVE_DISPATCH", workflow)
+        self.assertIn("CHAIN_RUNS_REMAINING", workflow)
+        self.assertIn("actions: write", workflow)
+        self.assertIn("timeout-minutes: 8", workflow)
         self.assertIn("dispatch_limit=50", workflow)
         self.assertIn("completion_limit=50", workflow)
         self.assertIn("dispatch_limit=0", workflow)
         self.assertIn("completion_limit=0", workflow)
         self.assertIn("dispatchLimit: $dispatchLimit", workflow)
         self.assertIn("completionLimit: $completionLimit", workflow)
+        self.assertIn("chain_runs_remaining=0", workflow)
+        self.assertIn("actions/workflows/cafe24-order-poll.yml/dispatches", workflow)
+        self.assertIn("Dispatched next Cafe24 flow tick", workflow)
         self.assertNotIn("/api/cron/automation/tick", workflow)
 
     def test_cafe24_operational_audit_workflow_uses_summary_cli(self):

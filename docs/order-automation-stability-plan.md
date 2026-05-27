@@ -56,6 +56,8 @@ flowchart LR
     - `maxAttempts=1`
   - 수동 `workflow_dispatch`는 기본적으로 검증 모드로 실행되어 `dispatchLimit=0`, `completionLimit=0`을 보낸다.
   - 운영자가 실제 수동 발주/완료 처리를 의도할 때만 `live_dispatch=true`로 실행한다.
+  - GitHub `schedule` 이벤트가 지연/drop될 때는 `workflow_dispatch`의 `chain_runs_remaining`을 사용해 제한된 횟수만 5분 간격으로 다음 실행을 자체 예약할 수 있다.
+  - 체인 실행도 기본값은 검증 모드이며, 실제 자동 발주까지 허용할 때만 `live_dispatch=true`와 함께 사용한다.
 - `smm_panel/.github/workflows/supplier-service-sync.yml`
   - 30분마다 `/api/cron/suppliers/sync` 호출
   - supplier sync limit은 `10`

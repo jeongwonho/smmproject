@@ -10,9 +10,13 @@ on:
         required: false
         type: boolean
         default: false
+      chain_runs_remaining:
+        description: "현재 실행 이후 5분 간격으로 이어서 실행할 횟수입니다. 0이면 체인을 만들지 않습니다."
+        required: false
+        default: "0"
 
 permissions:
-  actions: read
+  actions: write
   contents: read
   id-token: write
 
@@ -23,15 +27,18 @@ concurrency:
 jobs:
   tick:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - name: Run Cafe24 flow tick
         env:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
           TICK_URL: https://smmproject-lime.vercel.app/api/cron/cafe24/flow-tick
           MANUAL_LIVE_DISPATCH: ${{ github.event_name == 'workflow_dispatch' && inputs.live_dispatch == true }}
+          CHAIN_RUNS_REMAINING: ${{ inputs.chain_runs_remaining || '0' }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          run_started_seconds=$SECONDS
           oidc_token=""
           if [ -z "${CRON_SECRET:-}" ]; then
             oidc_token="$(curl --fail-with-body --show-error --silent \
@@ -101,4 +108,38 @@ jobs:
           if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
             echo "Cafe24 flow tick failed with HTTP ${http_code}"
             exit 1
+          fi
+
+          chain_runs_remaining="${CHAIN_RUNS_REMAINING:-0}"
+          if ! [[ "$chain_runs_remaining" =~ ^[0-9]+$ ]]; then
+            chain_runs_remaining=0
+          fi
+          if [ "$chain_runs_remaining" -gt 0 ]; then
+            elapsed_seconds=$((SECONDS - run_started_seconds))
+            sleep_seconds=$((300 - elapsed_seconds))
+            if [ "$sleep_seconds" -gt 0 ]; then
+              echo "Waiting ${sleep_seconds}s before dispatching the next Cafe24 flow tick."
+              sleep "$sleep_seconds"
+            fi
+
+            next_remaining=$((chain_runs_remaining - 1))
+            live_dispatch=false
+            if [ "${MANUAL_LIVE_DISPATCH}" = "true" ]; then
+              live_dispatch=true
+            fi
+            next_payload="$(
+              jq -nc \
+                --arg ref "${GITHUB_REF_NAME:-main}" \
+                --argjson liveDispatch "$live_dispatch" \
+                --arg remaining "$next_remaining" \
+                '{ref: $ref, inputs: {live_dispatch: $liveDispatch, chain_runs_remaining: $remaining}}'
+            )"
+            curl --fail-with-body --show-error --silent \
+              -X POST \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/cafe24-order-poll.yml/dispatches" \
+              --data "$next_payload"
+            echo "Dispatched next Cafe24 flow tick with chain_runs_remaining=${next_remaining}."
           fi
