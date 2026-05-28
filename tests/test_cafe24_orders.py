@@ -1042,6 +1042,9 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
 
     def test_cafe24_mapping_gap_report_marks_personal_payment_for_manual_input(self):
         order_payload = self._order_payload()
+        order_payload["payment"]["payment_date"] = (
+            dt.datetime.now().astimezone() - dt.timedelta(days=1)
+        ).isoformat(timespec="seconds")
         order_payload["order_id"] = "20260512-0000017"
         order_payload["items"][0]["order_item_code"] = "20260512-0000017-01"
         order_payload["items"][0]["product_no"] = "32"
@@ -2275,10 +2278,13 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(row["last_auto_poll_status"], "reconnect_required")
 
     def test_cafe24_order_items_list_defaults_to_five_per_page_for_month_window(self):
+        recent_prefix = (dt.datetime.now().astimezone() - dt.timedelta(days=1)).strftime("%Y%m%d")
+        recent_payment_date = (dt.datetime.now().astimezone() - dt.timedelta(days=1)).isoformat(timespec="seconds")
         for index in range(6):
             payload = json.loads(json.dumps(self._order_payload()))
-            payload["order_id"] = f"20260429-{index:06d}"
-            payload["items"][0]["order_item_code"] = f"20260429-{index:06d}-01"
+            payload["order_id"] = f"{recent_prefix}-{index:06d}"
+            payload["payment"]["payment_date"] = recent_payment_date
+            payload["items"][0]["order_item_code"] = f"{recent_prefix}-{index:06d}-01"
             payload["buyer"]["name"] = f"구매자{index}"
             self.store._process_cafe24_item(
                 self.conn,
@@ -2292,7 +2298,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
 
         first_page = self.store.list_cafe24_order_items({"page": "1"})
         second_page = self.store.list_cafe24_order_items({"page": "2"})
-        searched = self.store.list_cafe24_order_items({"q": "20260429-000005"})
+        searched = self.store.list_cafe24_order_items({"q": f"{recent_prefix}-000005"})
 
         self.assertEqual(first_page["pagination"]["pageSize"], 5)
         self.assertEqual(first_page["pagination"]["total"], 6)

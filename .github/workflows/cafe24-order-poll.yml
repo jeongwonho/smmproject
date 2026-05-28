@@ -35,7 +35,7 @@ jobs:
           TICK_URL: https://smmproject-lime.vercel.app/api/cron/cafe24/flow-tick
           MANUAL_LIVE_DISPATCH: ${{ github.event_name == 'workflow_dispatch' && inputs.live_dispatch == true }}
           CHAIN_RUNS_REMAINING: ${{ inputs.chain_runs_remaining || '0' }}
-          SCHEDULE_CHAIN_RUNS: "6"
+          SCHEDULE_CHAIN_RUNS: "72"
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -117,7 +117,27 @@ jobs:
 
           chain_runs_remaining="${CHAIN_RUNS_REMAINING:-0}"
           if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
-            chain_runs_remaining="${SCHEDULE_CHAIN_RUNS:-6}"
+            chain_runs_remaining="${SCHEDULE_CHAIN_RUNS:-72}"
+            dispatch_runs_json="$(
+              curl --fail-with-body --show-error --silent \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/cafe24-order-poll.yml/runs?event=workflow_dispatch&per_page=20" \
+                2>/dev/null || true
+            )"
+            active_dispatch_count=0
+            if [ -n "${dispatch_runs_json:-}" ]; then
+              active_dispatch_count="$(
+                printf '%s' "$dispatch_runs_json" \
+                  | jq -r '[.workflow_runs[]? | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "pending")] | length' \
+                  2>/dev/null || echo 0
+              )"
+            fi
+            if [ "${active_dispatch_count:-0}" -gt 0 ]; then
+              echo "Active Cafe24 flow dispatch chain already exists; skipping schedule chain bootstrap."
+              chain_runs_remaining=0
+            fi
           fi
           if ! [[ "$chain_runs_remaining" =~ ^[0-9]+$ ]]; then
             chain_runs_remaining=0
