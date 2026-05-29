@@ -666,7 +666,7 @@ def _integration_has_recent_api_failure(item: Dict[str, Any]) -> bool:
     auto_poll_status = str(item.get("lastAutoPollStatus") or "").strip()
     if auto_poll_status == "failed":
         return True
-    if auto_poll_status == "success":
+    if auto_poll_status in {"success", "running", "in_progress", "processing"}:
         return False
     return str(item.get("lastSyncStatus") or "").strip() == "failed"
 

@@ -861,6 +861,25 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         readiness_checks = {item["key"]: item for item in audit["operationalReadiness"]["checks"]}
         self.assertEqual(readiness_checks["cafe24_api_health"]["status"], "pass")
 
+    def test_cafe24_operational_audit_ignores_sync_failure_during_auto_poll_run(self):
+        self.conn.execute(
+            """
+            UPDATE cafe24_integrations
+            SET last_sync_status = 'failed',
+                last_sync_message = 'Cafe24 API 오류 422: invalid payment_status',
+                last_auto_poll_status = 'running',
+                last_auto_poll_message = '자동 주문 수집 진행 중'
+            WHERE id = ?
+            """,
+            (self.integration["id"],),
+        )
+        self.conn.commit()
+
+        audit = self.store.cafe24_operational_audit()
+
+        readiness_checks = {item["key"]: item for item in audit["operationalReadiness"]["checks"]}
+        self.assertEqual(readiness_checks["cafe24_api_health"]["status"], "pass")
+
     def test_cafe24_operational_audit_flags_auto_poll_failures(self):
         self.conn.execute(
             """
