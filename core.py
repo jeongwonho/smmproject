@@ -13346,7 +13346,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                     FROM cafe24_order_items coi
                     JOIN suppliers s ON s.id = coi.supplier_id
                     WHERE coi.supplier_order_uuid <> ''
-                      AND coi.standard_status IN ('submitting', 'supplier_submitted', 'supplier_progress')
+                      AND coi.standard_status IN ('ready_to_submit', 'submitting', 'supplier_submitted', 'supplier_progress')
                       AND (coi.automation_last_checked_at = '' OR coi.automation_last_checked_at <= ?)
                     ORDER BY COALESCE(NULLIF(coi.automation_last_checked_at, ''), coi.last_submitted_at, coi.updated_at) ASC
                     LIMIT ?

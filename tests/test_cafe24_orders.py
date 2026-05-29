@@ -1646,6 +1646,40 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(item["standard_status"], "completed")
         self.assertEqual(item["cafe24_completion_status"], "pending")
 
+    def test_ready_cafe24_item_with_supplier_order_is_status_checked(self):
+        self._enable_auto_submit_and_supplier_ready()
+        order_payload = self._order_payload()
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        item_id = self.conn.execute("SELECT id FROM cafe24_order_items").fetchone()["id"]
+        old_check = (dt.datetime.now().astimezone() - dt.timedelta(minutes=20)).isoformat(timespec="seconds")
+        self.conn.execute(
+            """
+            UPDATE cafe24_order_items
+            SET standard_status = 'ready_to_submit',
+                supplier_order_uuid = 'SUP-READY-STATUS',
+                automation_last_checked_at = ?
+            WHERE id = ?
+            """,
+            (old_check, item_id),
+        )
+        self.conn.commit()
+
+        with patch("core.SupplierApiClient.status", return_value={"status": "completed"}) as status_call:
+            result = self.store.refresh_due_supplier_order_statuses(actor="cron", limit=10)
+
+        status_call.assert_called_once_with("SUP-READY-STATUS")
+        self.assertEqual(result["completed"], 1)
+        item = self.conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
+        self.assertEqual(item["standard_status"], "completed")
+        self.assertEqual(item["cafe24_completion_status"], "pending")
+
     def test_cafe24_completion_confirms_purchase_once_supplier_completed(self):
         self._enable_auto_submit_and_supplier_ready()
         order_payload = self._order_payload()
