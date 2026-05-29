@@ -842,6 +842,43 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(readiness_checks["cafe24_api_health"]["status"], "warning")
         self.assertIn("최근 Cafe24 API 호출 실패", readiness_checks["cafe24_api_health"]["message"])
 
+    def test_cafe24_operational_audit_ignores_superseded_sync_failure_after_auto_poll_success(self):
+        self.conn.execute(
+            """
+            UPDATE cafe24_integrations
+            SET last_sync_status = 'failed',
+                last_sync_message = 'Cafe24 API 오류 422: invalid payment_status',
+                last_auto_poll_status = 'success',
+                last_auto_poll_message = '자동 수집 완료'
+            WHERE id = ?
+            """,
+            (self.integration["id"],),
+        )
+        self.conn.commit()
+
+        audit = self.store.cafe24_operational_audit()
+
+        readiness_checks = {item["key"]: item for item in audit["operationalReadiness"]["checks"]}
+        self.assertEqual(readiness_checks["cafe24_api_health"]["status"], "pass")
+
+    def test_cafe24_operational_audit_flags_auto_poll_failures(self):
+        self.conn.execute(
+            """
+            UPDATE cafe24_integrations
+            SET last_sync_status = 'success',
+                last_auto_poll_status = 'failed',
+                last_auto_poll_message = 'Cafe24 API 오류 500: server error'
+            WHERE id = ?
+            """,
+            (self.integration["id"],),
+        )
+        self.conn.commit()
+
+        audit = self.store.cafe24_operational_audit()
+
+        readiness_checks = {item["key"]: item for item in audit["operationalReadiness"]["checks"]}
+        self.assertEqual(readiness_checks["cafe24_api_health"]["status"], "warning")
+
     def test_cafe24_mapping_gap_report_groups_unmapped_items_without_targets(self):
         order_payload = self._order_payload()
         order_payload["order_id"] = "20260512-0000017"

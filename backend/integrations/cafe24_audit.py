@@ -662,6 +662,15 @@ def _manual_workflow_payload(
     }
 
 
+def _integration_has_recent_api_failure(item: Dict[str, Any]) -> bool:
+    auto_poll_status = str(item.get("lastAutoPollStatus") or "").strip()
+    if auto_poll_status == "failed":
+        return True
+    if auto_poll_status == "success":
+        return False
+    return str(item.get("lastSyncStatus") or "").strip() == "failed"
+
+
 def _operational_readiness_payload(
     *,
     environment: Dict[str, Any],
@@ -688,7 +697,7 @@ def _operational_readiness_payload(
     sync_failed_integrations = [
         item
         for item in active_integrations
-        if item.get("lastSyncStatus") == "failed" or item.get("lastAutoPollStatus") == "failed"
+        if _integration_has_recent_api_failure(item)
     ]
     cafe24_env_keys = (
         "SMM_PANEL_CAFE24_CLIENT_ID",
