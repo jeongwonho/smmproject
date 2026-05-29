@@ -938,9 +938,6 @@ function handleAdminMouseLeave(event, ctx) {
 async function handleAdminSubmit(event, ctx) {
   const { apiPost, blankCategoryDraft, blankCustomerDraft, blankFaqDraft, blankNoticeDraft, blankPopupDraft, blankProductDraft, blankSiteSettingsDraft, blankSupplierDraft, categoryToDraft, collectMkt24ProductSettingPayload, customerToDraft, ensureAdminCustomerDetail, ensureAdminSupplierServices, faqToDraft, getAdminPlatformGroups, getSelectedAdminHomeBanner, getSelectedAdminPlatformSection, getSelectedAdminProduct, getSelectedAdminSupplier, homeBannerToDraft, mkt24ProductSettingKey, noticeToDraft, platformSectionToDraft, popupToDraft, productToDraft, refreshAdminData, refreshCoreData, renderRoute, resetAdminState, setAdminAnalyticsExclusion, showToast, siteSettingsToDraft, state, supplierToDraft } = ctx;
   const form = event.target;
-  if (await handleCafe24AdminSubmit(form, event)) {
-    return true;
-  }
 
   if (form.matches("[data-admin-login-form]")) {
     event.preventDefault();
@@ -967,6 +964,10 @@ async function handleAdminSubmit(event, ctx) {
     } catch (error) {
       showToast(error.message || "관리자 로그인에 실패했습니다.", "error");
     }
+    return true;
+  }
+
+  if (await handleCafe24AdminSubmit(form, event)) {
     return true;
   }
 
