@@ -328,6 +328,30 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         )
         self.conn.commit()
 
+    def test_save_cafe24_integration_preserves_completion_policy_when_missing(self):
+        self.conn.execute(
+            "UPDATE cafe24_integrations SET completion_policy = 'purchase_confirm' WHERE id = ?",
+            (self.integration["id"],),
+        )
+        self.conn.commit()
+
+        self.store.save_cafe24_integration(
+            {
+                "id": self.integration["id"],
+                "mallId": "instamart",
+                "shopNo": 1,
+                "autoSubmit": True,
+                "isActive": True,
+                "_adminActor": "qa",
+            }
+        )
+
+        row = self.conn.execute(
+            "SELECT completion_policy FROM cafe24_integrations WHERE id = ?",
+            (self.integration["id"],),
+        ).fetchone()
+        self.assertEqual(row["completion_policy"], "purchase_confirm")
+
     def test_cafe24_item_normalizes_to_supplier_payload_without_internal_product(self):
         order_payload = self._order_payload()
         result = self.store._process_cafe24_item(

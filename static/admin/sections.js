@@ -2026,6 +2026,15 @@ function renderCafe24QuickControls(activeIntegration = {}) {
         <span>연동 활성화</span>
       </label>
       <label class="admin-toggle"><input type="checkbox" name="autoSubmit" ${activeIntegration.autoSubmit !== false ? "checked" : ""} /><span>자동 발주 활성화</span></label>
+      <label class="form-field">
+        <span class="field-label">완료 처리</span>
+        <div class="field-shell">
+          <select class="field-select" name="completionPolicy">
+            <option value="memo_only" ${activeIntegration.completionPolicy === "purchase_confirm" ? "" : "selected"}>공급사 완료만 기록</option>
+            <option value="purchase_confirm" ${activeIntegration.completionPolicy === "purchase_confirm" ? "selected" : ""}>Cafe24 구매확정</option>
+          </select>
+        </div>
+      </label>
       <p class="admin-inline-note">자동 발주는 결제완료, 매핑완료, 공급사 상태 정상, 중복 발주 없음 조건을 모두 통과한 주문만 실행합니다. 긴급 중단은 <code>SMM_PANEL_AUTOMATION_PAUSED=1</code>로 제어합니다.</p>
       ${renderCafe24SchedulerNotice({ origin: window.location.origin, escapeHtml })}
     </form>

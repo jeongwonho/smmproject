@@ -610,6 +610,7 @@ export async function handleCafe24AdminSubmit(form, event) {
         refreshTokenExpiresAt: formData.get("refreshTokenExpiresAt"),
         scopes: formData.get("scopes"),
         autoSubmit: Boolean(formData.get("autoSubmit")),
+        completionPolicy: formData.get("completionPolicy"),
         isActive: Boolean(formData.get("isActive")),
       });
       await refreshAdminData({ preserveDraft: true });

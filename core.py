@@ -8459,7 +8459,7 @@ class PanelStore(PanelStoreDatabaseMixin):
         expires_at = str(payload.get("expiresAt") or "").strip()
         refresh_expires_at = str(payload.get("refreshTokenExpiresAt") or "").strip()
         auto_submit = 1 if payload.get("autoSubmit", False) else 0
-        completion_policy = str(payload.get("completionPolicy") or "memo_only").strip() or "memo_only"
+        requested_completion_policy = str(payload.get("completionPolicy") or "").strip()
         is_active = 1 if payload.get("isActive", True) else 0
         actor = self._admin_actor(payload)
         if not mall_id:
@@ -8475,6 +8475,12 @@ class PanelStore(PanelStoreDatabaseMixin):
                     "SELECT * FROM cafe24_integrations WHERE mall_id = ? AND shop_no = ?",
                     (mall_id, shop_no),
                 ).fetchone()
+            if requested_completion_policy in {"memo_only", "purchase_confirm"}:
+                completion_policy = requested_completion_policy
+            elif existing:
+                completion_policy = str(existing["completion_policy"] or "memo_only")
+            else:
+                completion_policy = "memo_only"
             timestamp = now_iso()
             stored_access_token = encrypt_secret_value(
                 access_token or (decrypt_secret_value(existing["access_token"]) if existing else ""),

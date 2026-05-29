@@ -603,6 +603,15 @@ class WorkflowConfigurationTest(unittest.TestCase):
         self.assertIn("supplierReadinessByIntegration", source)
         self.assertIn("MKT24, FastTraffic, classic별", source)
 
+    def test_cafe24_integration_form_exposes_completion_policy(self):
+        sections_source = (APP_ROOT / "static" / "admin" / "sections.js").read_text()
+        actions_source = (APP_ROOT / "static" / "admin" / "cafe24.js").read_text()
+
+        self.assertIn('name="completionPolicy"', sections_source)
+        self.assertIn('value="purchase_confirm"', sections_source)
+        self.assertIn("Cafe24 구매확정", sections_source)
+        self.assertIn('completionPolicy: formData.get("completionPolicy")', actions_source)
+
     def test_cafe24_mapping_panel_runs_and_renders_mapping_gaps(self):
         sections_source = (APP_ROOT / "static" / "admin" / "sections.js").read_text()
         workflow_source = (APP_ROOT / "static" / "admin" / "cafe24-workflow-ui.js").read_text()
