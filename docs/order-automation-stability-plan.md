@@ -12,6 +12,9 @@ flowchart LR
     D --> E["preflight 통과 주문 자동 발주"]
     E --> F["공급사 상태 조회"]
     F --> G["공급사 완료 후 Cafe24 완료 처리"]
+    H["GitHub Actions Gmail Order Witness"] --> I["Cafe24 주문 안내 메일 주문번호 추출"]
+    I --> J["/api/cron/cafe24/email-order-witness"]
+    J --> C
 ```
 
 ## MKT24 Panel API 기준
@@ -58,6 +61,11 @@ flowchart LR
   - 운영자가 실제 수동 발주/완료 처리를 의도할 때만 `live_dispatch=true`로 실행한다.
   - GitHub `schedule` 이벤트가 지연/drop될 때는 `workflow_dispatch`의 `chain_runs_remaining`을 사용해 제한된 횟수만 5분 간격으로 다음 실행을 자체 예약할 수 있다.
   - 체인 실행도 기본값은 검증 모드이며, 실제 자동 발주까지 허용할 때만 `live_dispatch=true`와 함께 사용한다.
+- `.github/workflows/cafe24-gmail-order-witness.yml`
+  - 최근 Gmail Cafe24 주문 안내 메일에서 Cafe24 주문번호만 추출한다.
+  - 추출한 주문번호를 `/api/cron/cafe24/email-order-witness` 로 전달한다.
+  - 서버는 이미 저장된 주문을 건너뛰고, 누락 주문만 Cafe24 단건 재수집으로 보정한다.
+  - 이 경로는 메일 본문 전체를 서버로 보내지 않고, 자동 발주도 직접 실행하지 않는다.
 - `smm_panel/.github/workflows/supplier-service-sync.yml`
   - 30분마다 `/api/cron/suppliers/sync` 호출
   - supplier sync limit은 `10`

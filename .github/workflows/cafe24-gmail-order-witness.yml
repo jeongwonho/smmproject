@@ -1,0 +1,119 @@
+name: Cafe24 Gmail Order Witness
+
+on:
+  schedule:
+    - cron: "1,31 * * * *"
+  workflow_dispatch:
+    inputs:
+      chain_runs_remaining:
+        description: "현재 실행 이후 5분 간격으로 이어서 실행할 횟수입니다. 0이면 체인을 만들지 않습니다."
+        required: false
+        default: "0"
+
+permissions:
+  actions: write
+  contents: read
+  id-token: write
+
+concurrency:
+  group: instamart-cafe24-gmail-order-witness
+  cancel-in-progress: false
+
+jobs:
+  witness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Cafe24 Gmail order witness
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          CAFE24_GMAIL_CLIENT_ID: ${{ secrets.CAFE24_GMAIL_CLIENT_ID }}
+          CAFE24_GMAIL_CLIENT_SECRET: ${{ secrets.CAFE24_GMAIL_CLIENT_SECRET }}
+          CAFE24_GMAIL_REFRESH_TOKEN: ${{ secrets.CAFE24_GMAIL_REFRESH_TOKEN }}
+          CAFE24_GMAIL_QUERY: ${{ vars.CAFE24_GMAIL_QUERY }}
+          CAFE24_GMAIL_MAX_MESSAGES: ${{ vars.CAFE24_GMAIL_MAX_MESSAGES }}
+          CAFE24_GMAIL_WITNESS_URL: https://smmproject-lime.vercel.app/api/cron/cafe24/email-order-witness
+          CHAIN_RUNS_REMAINING: ${{ inputs.chain_runs_remaining || '0' }}
+          SCHEDULE_CHAIN_RUNS: "72"
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_started_seconds=$SECONDS
+          oidc_token=""
+          if [ -z "${CRON_SECRET:-}" ]; then
+            oidc_token="$(curl --fail-with-body --show-error --silent \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=instamart-cron" | jq -r '.value // empty')"
+          fi
+          auth_token="${CRON_SECRET:-${oidc_token:-}}"
+          if [ -z "${auth_token:-}" ]; then
+            echo "Repository secret CRON_SECRET or GitHub Actions OIDC token is required for production cron auth." >&2
+            exit 1
+          fi
+          export SMM_PANEL_CRON_TOKEN="$auth_token"
+
+          gmail_credentials_configured=true
+          if [ -z "${CAFE24_GMAIL_CLIENT_ID:-}" ] || [ -z "${CAFE24_GMAIL_CLIENT_SECRET:-}" ] || [ -z "${CAFE24_GMAIL_REFRESH_TOKEN:-}" ]; then
+            gmail_credentials_configured=false
+          fi
+
+          python3 scripts/cafe24_gmail_order_witness.py --allow-missing-credentials
+
+          if [ "$gmail_credentials_configured" != "true" ]; then
+            echo "Cafe24 Gmail credentials are not configured; skipping 5-minute chain dispatch."
+            exit 0
+          fi
+
+          chain_runs_remaining="${CHAIN_RUNS_REMAINING:-0}"
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            chain_runs_remaining="${SCHEDULE_CHAIN_RUNS:-72}"
+            dispatch_runs_json="$(
+              curl --fail-with-body --show-error --silent \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/cafe24-gmail-order-witness.yml/runs?event=workflow_dispatch&per_page=20" \
+                2>/dev/null || true
+            )"
+            active_dispatch_count=0
+            if [ -n "${dispatch_runs_json:-}" ]; then
+              active_dispatch_count="$(
+                printf '%s' "$dispatch_runs_json" \
+                  | jq -r '[.workflow_runs[]? | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "pending")] | length' \
+                  2>/dev/null || echo 0
+              )"
+            fi
+            if [ "${active_dispatch_count:-0}" -gt 0 ]; then
+              echo "Active Cafe24 Gmail witness dispatch chain already exists; skipping schedule chain bootstrap."
+              chain_runs_remaining=0
+            fi
+          fi
+          if ! [[ "$chain_runs_remaining" =~ ^[0-9]+$ ]]; then
+            chain_runs_remaining=0
+          fi
+          if [ "$chain_runs_remaining" -gt 0 ]; then
+            elapsed_seconds=$((SECONDS - run_started_seconds))
+            sleep_seconds=$((300 - elapsed_seconds))
+            if [ "$sleep_seconds" -gt 0 ]; then
+              echo "Waiting ${sleep_seconds}s before dispatching the next Cafe24 Gmail witness check."
+              sleep "$sleep_seconds"
+            fi
+
+            next_remaining=$((chain_runs_remaining - 1))
+            next_payload="$(
+              jq -nc \
+                --arg ref "${GITHUB_REF_NAME:-main}" \
+                --arg remaining "$next_remaining" \
+                '{ref: $ref, inputs: {chain_runs_remaining: $remaining}}'
+            )"
+            curl --fail-with-body --show-error --silent \
+              -X POST \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/cafe24-gmail-order-witness.yml/dispatches" \
+              --data "$next_payload"
+            echo "Dispatched next Cafe24 Gmail witness check with chain_runs_remaining=${next_remaining}."
+          fi

@@ -470,6 +470,7 @@ class WorkflowConfigurationTest(unittest.TestCase):
         workflow_names = [
             "cafe24-check-supplier-status.yml",
             "cafe24-dispatch-one.yml",
+            "cafe24-gmail-order-witness.yml",
             "cafe24-manual-input-one.yml",
             "cafe24-manual-input-preview-one.yml",
             "cafe24-mapping-gaps.yml",
@@ -538,6 +539,20 @@ class WorkflowConfigurationTest(unittest.TestCase):
         self.assertIn("actions/workflows/cafe24-order-poll.yml/dispatches", workflow)
         self.assertIn("Dispatched next Cafe24 flow tick", workflow)
         self.assertNotIn("/api/cron/automation/tick", workflow)
+
+    def test_cafe24_gmail_order_witness_workflow_runs_recent_mail_check_chain(self):
+        workflow = (APP_ROOT / ".github" / "workflows" / "cafe24-gmail-order-witness.yml").read_text()
+
+        self.assertIn('cron: "1,31 * * * *"', workflow)
+        self.assertIn("scripts/cafe24_gmail_order_witness.py", workflow)
+        self.assertIn("CAFE24_GMAIL_CLIENT_ID", workflow)
+        self.assertIn("CAFE24_GMAIL_CLIENT_SECRET", workflow)
+        self.assertIn("CAFE24_GMAIL_REFRESH_TOKEN", workflow)
+        self.assertIn("/api/cron/cafe24/email-order-witness", workflow)
+        self.assertIn("chain_runs_remaining:", workflow)
+        self.assertIn('SCHEDULE_CHAIN_RUNS: "72"', workflow)
+        self.assertIn("actions/workflows/cafe24-gmail-order-witness.yml/dispatches", workflow)
+        self.assertIn("Active Cafe24 Gmail witness dispatch chain already exists", workflow)
 
     def test_cafe24_operational_audit_workflow_uses_summary_cli(self):
         workflow = (APP_ROOT / ".github" / "workflows" / "cafe24-operational-audit.yml").read_text()
