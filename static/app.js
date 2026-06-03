@@ -165,6 +165,31 @@ const DEFAULT_HOME_BANNER_ASSETS = {
   banner_consult: "/static/assets/home-banner-consult.jpg",
 };
 const DEFAULT_SITE_NAME = "인스타마트";
+const FALLBACK_PUBLIC_PLATFORMS = [
+  { id: "pf_popular", slug: "popular", displayName: "인기 패키지", description: "처음 시작할 때 가장 많이 찾는 추천 조합", icon: "★", logoImageUrl: "", accentColor: "#ffb84d" },
+  { id: "pf_instagram", slug: "instagram", displayName: "인스타그램", description: "팔로워, 좋아요, 릴스, 조회수", icon: "IG", logoImageUrl: "", accentColor: "#e64683" },
+  { id: "pf_youtube", slug: "youtube", displayName: "유튜브", description: "조회수, 구독자, 좋아요, 댓글", icon: "YT", logoImageUrl: "", accentColor: "#ff3b30" },
+  { id: "pf_tiktok", slug: "tiktok", displayName: "틱톡", description: "조회수, 팔로워, 좋아요", icon: "TT", logoImageUrl: "", accentColor: "#111827" },
+  { id: "pf_threads", slug: "threads", displayName: "스레드", description: "팔로워와 게시물 반응", icon: "TH", logoImageUrl: "", accentColor: "#111111" },
+];
+const FALLBACK_PUBLIC_BANNERS = [
+  { id: "banner_launch", title: "SNS 마케팅 서비스를 바로 비교하세요", subtitle: "상품 조건을 확인한 뒤 주문 직전에 로그인합니다.", ctaLabel: "상품 보기", route: "/products", imageUrl: "", theme: "blue", isActive: true },
+  { id: "banner_safe", title: "필요한 플랫폼을 빠르게 선택하세요", subtitle: "가격, 수량, 정책을 먼저 확인할 수 있습니다.", ctaLabel: "주문 가이드", route: "/help", imageUrl: "", theme: "mint", isActive: true },
+  { id: "banner_consult", title: "운영 문의는 도움말에서 확인하세요", subtitle: "공지와 FAQ를 한 곳에서 확인합니다.", ctaLabel: "도움말", route: "/help", imageUrl: "", theme: "dark", isActive: true },
+];
+const FALLBACK_AUTH_CONFIG = {
+  signupEnabled: true,
+  loginRoute: "/login",
+  passwordResetEnabled: false,
+  signupRoute: "/signup",
+  emailVerificationRequired: false,
+  verificationCodeLength: 6,
+  verificationExpiresInSeconds: 600,
+  verificationCompleteExpiresInSeconds: 900,
+  verificationResendIntervalSeconds: 60,
+  passwordPolicy: {},
+  oauthProviders: [],
+};
 
 const adminSectionBlueprints = [
   { id: "overview", label: "대시보드", icon: "⌂", description: "운영 요약과 핵심 지표", title: "운영 대시보드", summary: "전체 운영 현황과 빠른 실행 메뉴를 한 곳에서 확인합니다." },
@@ -2070,6 +2095,70 @@ function routeNeedsFullBootstrap(route) {
   return isLoggedIn() && ["charge", "orders", "my"].includes(route.name);
 }
 
+function createFallbackPublicShell() {
+  return {
+    ok: true,
+    app: {
+      name: DEFAULT_SITE_NAME,
+      subtitle: "고객 친화형 SMM 서비스 쇼핑몰",
+      accentColor: "#4c76ff",
+    },
+    siteSettings: {
+      siteName: DEFAULT_SITE_NAME,
+      siteDescription: "실제 판매형 SNS 마케팅 서비스 쇼핑몰",
+      useMailSmsSiteName: false,
+      mailSmsSiteName: "",
+      effectiveMailSmsSiteName: DEFAULT_SITE_NAME,
+      headerLogoUrl: "",
+      faviconUrl: "",
+      shareImageUrl: "",
+    },
+    user: null,
+    viewer: { authenticated: false, csrfToken: "", user: null },
+    topLinks: [
+      { label: "서비스 소개서", route: "/products" },
+      { label: "이용 가이드", route: "/help" },
+    ],
+    popup: null,
+    platforms: FALLBACK_PUBLIC_PLATFORMS,
+    banners: FALLBACK_PUBLIC_BANNERS,
+    featuredServices: [
+      { id: "featured_instagram", title: "인스타그램 인기 상품", subtitle: "팔로워와 게시물 반응을 확인하세요.", route: "/products", icon: "IG" },
+      { id: "featured_youtube", title: "유튜브 성장 상품", subtitle: "조회수, 구독자, 좋아요 상품을 비교하세요.", route: "/products", icon: "YT" },
+      { id: "featured_tiktok", title: "틱톡 반응 상품", subtitle: "짧은 영상 노출과 반응을 확인하세요.", route: "/products", icon: "TT" },
+      { id: "featured_support", title: "주문 전 가이드", subtitle: "주문 전 필요한 정보를 확인하세요.", route: "/help", icon: "?" },
+    ],
+    supportLinks: [
+      { id: "support_products", title: "상품 보기", subtitle: "플랫폼별 상품 비교", route: "/products", icon: "▦", externalUrl: "" },
+      { id: "support_help", title: "이용 가이드", subtitle: "주문 전 확인 사항", route: "/help", icon: "?", externalUrl: "" },
+      { id: "support_charge", title: "충전 안내", subtitle: "로그인 후 이용 가능", route: "/charge", icon: "₩", externalUrl: "" },
+    ],
+    notices: [],
+    authConfig: FALLBACK_AUTH_CONFIG,
+    legalDocuments: [],
+    company: {
+      name: DEFAULT_SITE_NAME,
+      representative: "운영 관리자",
+      contact: "고객센터 문의",
+      hours: "평일 10:00 - 19:00",
+    },
+    chargeConfig: { methods: [], bankTransfer: {}, policyHighlights: [], minimumAmount: 5000 },
+    isShell: true,
+    isFallbackShell: true,
+  };
+}
+
+function ensureFallbackPublicShell() {
+  if (state.bootstrap) return;
+  const fallback = createFallbackPublicShell();
+  state.bootstrap = fallback;
+  state.bootstrapMode = "fallback-shell";
+  state.publicCsrfToken = "";
+  if (!state.ui.activePlatform && fallback.platforms.length) {
+    state.ui.activePlatform = fallback.platforms[0].id;
+  }
+}
+
 async function refreshCoreData({ shell = false } = {}) {
   const endpoint = shell ? "/api/public-shell" : "/api/bootstrap";
   const bootstrapData = await apiGetWithRetry(endpoint);
@@ -3165,6 +3254,19 @@ function updateLiveSummary() {
   updateOrderValidation(detail);
 }
 
+function refreshPublicShellAfterInitialRender() {
+  refreshCoreData({ shell: true })
+    .then(() => {
+      const currentRoute = getRoute();
+      if (routeCanUsePublicShell(currentRoute) && !routeNeedsFullBootstrap(currentRoute)) {
+        renderRoute();
+      }
+    })
+    .catch((error) => {
+      console.warn("Public shell refresh failed after initial render.", error);
+    });
+}
+
 function isExternalTarget(path) {
   return /^https?:\/\//i.test(String(path || "").trim());
 }
@@ -3499,6 +3601,12 @@ async function init() {
   showLoading();
   try {
     const route = getRoute();
+    if (routeCanUsePublicShell(route) && !routeNeedsFullBootstrap(route)) {
+      ensureFallbackPublicShell();
+      await renderRoute();
+      refreshPublicShellAfterInitialRender();
+      return;
+    }
     await refreshCoreData({ shell: routeCanUsePublicShell(route) });
     await renderRoute();
   } catch (error) {

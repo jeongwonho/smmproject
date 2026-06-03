@@ -49,6 +49,13 @@ class VercelRewriteRoutingTest(unittest.TestCase):
         self.assertEqual(path, "/api/products?q=instagram")
 
 
+class VercelConfigurationTest(unittest.TestCase):
+    def test_function_region_is_close_to_supabase_korea_region(self):
+        config = json.loads((APP_ROOT / "vercel.json").read_text())
+
+        self.assertEqual(config.get("regions"), ["icn1"])
+
+
 class OrderIdempotencyTest(unittest.TestCase):
     def test_derived_order_idempotency_key_is_stable_with_sorted_fields(self):
         first = derive_order_idempotency_key(
@@ -901,6 +908,15 @@ class RouterRegistryTest(unittest.TestCase):
 
     def test_cafe24_flow_tick_cron_route_declares_cron_auth(self):
         matched = ROUTER.match("POST", "/api/cron/cafe24/flow-tick")
+
+        self.assertIsNotNone(matched)
+        route, params = matched
+        self.assertEqual(params, {})
+        self.assertEqual(route.auth, "cron")
+        self.assertFalse(route.csrf)
+
+    def test_cafe24_email_order_witness_cron_route_declares_cron_auth(self):
+        matched = ROUTER.match("POST", "/api/cron/cafe24/email-order-witness")
 
         self.assertIsNotNone(matched)
         route, params = matched

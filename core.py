@@ -110,6 +110,7 @@ try:
         cafe24_integration_payload_from_row,
         cafe24_item_identity,
         cafe24_mapping_payload_from_row,
+        cafe24_mall_now as _cafe24_mall_now,
         cafe24_next_auto_poll_at as _cafe24_next_auto_poll_at,
         cafe24_normalize_datetime_text,
         cafe24_oauth_timestamp_from_response,
@@ -313,6 +314,7 @@ except ImportError:  # pragma: no cover - top-level script runtime
         cafe24_integration_payload_from_row,
         cafe24_item_identity,
         cafe24_mapping_payload_from_row,
+        cafe24_mall_now as _cafe24_mall_now,
         cafe24_next_auto_poll_at as _cafe24_next_auto_poll_at,
         cafe24_normalize_datetime_text,
         cafe24_oauth_timestamp_from_response,
@@ -10377,7 +10379,7 @@ class PanelStore(PanelStoreDatabaseMixin):
         except (TypeError, ValueError):
             max_attempts = 0
         max_attempts = min(max(max_attempts, 0), 3) or None
-        now = dt.datetime.now().astimezone()
+        now = _cafe24_mall_now()
         start_at = now - (dt.timedelta(minutes=lookback_minutes) if lookback_minutes else dt.timedelta(days=lookback_days))
         start_date = start_at.strftime("%Y-%m-%d %H:%M:%S")
         end_date = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -10949,6 +10951,69 @@ class PanelStore(PanelStoreDatabaseMixin):
                 "submittedCount": submitted,
                 "failedCount": failed,
             },
+        }
+
+    def reconcile_cafe24_email_order_witness(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        actor = self._admin_actor(payload) or "cron"
+        integration_id = str(payload.get("integrationId") or "").strip()
+        raw_order_ids = payload.get("orderIds")
+        order_ids: List[str] = []
+        if isinstance(raw_order_ids, list):
+            order_ids.extend(str(value or "").strip() for value in raw_order_ids)
+        else:
+            order_ids.append(str(payload.get("orderId") or payload.get("cafe24OrderId") or "").strip())
+        witness_text = " ".join(
+            str(payload.get(key) or "")
+            for key in ("subject", "snippet", "body", "text", "emailBody")
+        )
+        order_ids.extend(re.findall(r"\b\d{8}-\d{7}\b", witness_text))
+        deduped_order_ids = list(dict.fromkeys(order_id for order_id in order_ids if order_id))
+        if not deduped_order_ids:
+            raise PanelError("메일에서 확인한 Cafe24 주문번호가 필요합니다.", status=400)
+
+        results: List[Dict[str, Any]] = []
+        resynced = 0
+        present = 0
+        failed = 0
+        for order_id in deduped_order_ids:
+            with self._connect() as conn:
+                existing = conn.execute(
+                    "SELECT COUNT(*) AS count FROM cafe24_order_items WHERE cafe24_order_id = ?",
+                    (order_id,),
+                ).fetchone()
+            existing_count = int(dict(existing or {}).get("count") or 0)
+            if existing_count > 0:
+                present += 1
+                results.append({"orderId": order_id, "status": "present", "existingItemCount": existing_count})
+                continue
+            try:
+                resync = self.resync_cafe24_order_by_id(
+                    {
+                        "integrationId": integration_id,
+                        "orderId": order_id,
+                        "submitReady": False,
+                        "_adminActor": actor,
+                    }
+                )
+                stored = int((resync.get("summary") or {}).get("storedOrderItemCount") or resync.get("processed") or 0)
+                status = "resynced" if stored > 0 else "missing_in_cafe24_api"
+                if stored > 0:
+                    resynced += 1
+                else:
+                    failed += 1
+                results.append({"orderId": order_id, "status": status, "storedOrderItemCount": stored, "resync": resync})
+            except Exception as exc:
+                failed += 1
+                results.append({"orderId": order_id, "status": "failed", "error": str(exc)[:1000]})
+
+        return {
+            "status": "ok" if failed == 0 else "review",
+            "source": "email_order_witness",
+            "checked": len(deduped_order_ids),
+            "present": present,
+            "resynced": resynced,
+            "failed": failed,
+            "results": results,
         }
 
     def retry_cafe24_order_item(self, payload: Dict[str, Any]) -> Dict[str, Any]:

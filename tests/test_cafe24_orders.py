@@ -14,7 +14,7 @@ from backend.integrations.cafe24_quantity import (
     cafe24_quantity_candidates_from_options,
     cafe24_quantity_candidates_from_text,
 )
-from core import Cafe24ApiError, PanelError, PanelStore, SupplierApiError, now_iso
+from core import Cafe24ApiError, PanelError, PanelStore, SupplierApiError, cafe24_poll_datetime_window, now_iso
 
 
 class FakeCafe24ProductClient:
@@ -156,6 +156,44 @@ class FakeCafe24OrderClient:
 
 
 class Cafe24OrderIntegrationTest(unittest.TestCase):
+    def test_cafe24_poll_cursor_window_formats_utc_cursor_as_kst(self):
+        window = cafe24_poll_datetime_window(
+            end_raw="2026-06-03T12:30:00+00:00",
+            last_poll_at="2026-06-03T12:24:41+00:00",
+            use_cursor=True,
+            overlap_minutes=20,
+        )
+
+        self.assertEqual(window["start"], "2026-06-03 21:04:41")
+        self.assertEqual(window["end"], "2026-06-03 21:30:00")
+
+    def test_email_order_witness_resyncs_missing_order_id_from_body(self):
+        order_payload = self._order_payload()
+        order_payload["order_id"] = "20260603-0000011"
+        order_payload["items"][0]["order_item_code"] = "20260603-0000011-01"
+        fake_client = FakeCafe24OrderClient(order_payload)
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client):
+            result = self.store.reconcile_cafe24_email_order_witness(
+                {
+                    "integrationId": self.integration["id"],
+                    "subject": "[인스타마트] 주문 내역",
+                    "body": "주문번호\n20260603-0000011\n주문일자",
+                }
+            )
+
+        self.assertEqual(result["resynced"], 1)
+        self.assertEqual(result["present"], 0)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(fake_client.order_calls, ["20260603-0000011"])
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM cafe24_order_items WHERE cafe24_order_id = ?",
+                ("20260603-0000011",),
+            ).fetchone()[0],
+            1,
+        )
+
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmpdir.name) / "instamart_cafe24_orders_test.db"

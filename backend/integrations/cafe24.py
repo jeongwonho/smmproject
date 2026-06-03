@@ -24,6 +24,7 @@ CAFE24_TOKEN_STATUS_FAILED = "failed"
 CAFE24_ORDER_OVERLAP_MINUTES = 20
 CAFE24_ORDER_DEFAULT_LOOKBACK_DAYS = 30
 CAFE24_ORDER_PAGE_LIMIT = 1000
+CAFE24_MALL_TIMEZONE = dt.timezone(dt.timedelta(hours=9), "KST")
 CAFE24_ORDER_ITEM_DATE_EXPR = (
     "COALESCE(NULLIF(coi.cafe24_order_date, ''), NULLIF(coi.payment_paid_at, ''), "
     "NULLIF(coi.last_synced_at, ''), coi.created_at)"
@@ -253,6 +254,10 @@ def cafe24_access_token_error(error: Any) -> bool:
     return "401" in message and any(marker in message for marker in token_markers)
 
 
+def cafe24_mall_now() -> dt.datetime:
+    return dt.datetime.now(CAFE24_MALL_TIMEZONE)
+
+
 def cafe24_poll_datetime_window(
     *,
     start_raw: str = "",
@@ -262,7 +267,7 @@ def cafe24_poll_datetime_window(
     overlap_minutes: int = CAFE24_ORDER_OVERLAP_MINUTES,
     default_lookback_days: int = CAFE24_ORDER_DEFAULT_LOOKBACK_DAYS,
 ) -> Dict[str, str]:
-    now = dt.datetime.now().astimezone()
+    now = cafe24_mall_now()
     default_start = (now - dt.timedelta(days=default_lookback_days)).replace(
         hour=0,
         minute=0,

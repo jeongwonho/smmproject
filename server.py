@@ -41,6 +41,26 @@ ADMIN_LOGIN_MAX_ATTEMPTS = 5
 ROBOTS_TXT = "User-agent: *\nDisallow: /admin\nDisallow: /admin/\nDisallow: /api/\nAllow: /\n"
 INDEX_TEMPLATE_PATH = STATIC_ROOT / "index.html"
 VERCEL_REWRITE_PATH_QUERY_KEY = "__path"
+PUBLIC_SHELL_CACHE_SECONDS = 60
+PUBLIC_BOOTSTRAP_CACHE_SECONDS = 60
+PUBLIC_CATALOG_CACHE_SECONDS = 60
+PUBLIC_SHELL_CACHE_CONTROL = "public, max-age=60, s-maxage=300, stale-while-revalidate=1800"
+PUBLIC_BOOTSTRAP_CACHE_CONTROL = "public, max-age=60, s-maxage=300, stale-while-revalidate=1800"
+PUBLIC_CATALOG_CACHE_CONTROL = "public, max-age=60, s-maxage=300, stale-while-revalidate=1800"
+PUBLIC_CACHE_INVALIDATING_METHODS = {
+    "save_site_settings",
+    "save_home_popup",
+    "save_home_banner",
+    "save_platform_section",
+    "save_category",
+    "delete_category",
+    "save_catalog_product",
+    "delete_catalog_product",
+    "save_notice",
+    "delete_notice",
+    "save_faq",
+    "delete_faq",
+}
 
 
 def env_flag(value: str) -> bool:
@@ -271,6 +291,10 @@ class TTLResponseCache:
             self.items[key] = (now + max(1, ttl_seconds), raw)
             self._prune(now)
         return json.loads(raw.decode("utf-8"))
+
+    def clear(self) -> None:
+        with self.lock:
+            self.items.clear()
 
 
 class SignedSessionStore:
@@ -992,6 +1016,11 @@ class AppHandler(SimpleHTTPRequestHandler):
     def _public_cached_payload(self, cache_key: str, ttl_seconds: int, factory: Any) -> Dict[str, Any]:
         return self._server().public_cache.get_or_set(cache_key, ttl_seconds, factory)
 
+    def _server_timing_header(self, name: str, started_at: float) -> tuple[str, str]:
+        metric = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-") or "app"
+        elapsed_ms = max(0.0, (time.perf_counter() - started_at) * 1000.0)
+        return ("Server-Timing", f"{metric};dur={elapsed_ms:.1f}")
+
     def _query_value(self, request: RouteRequest, key: str, default: str = "") -> str:
         return request.query.get(key, [default])[0]
 
@@ -1043,11 +1072,19 @@ class AppHandler(SimpleHTTPRequestHandler):
 
     def _write_store_result(self, method_name: str, payload: Dict[str, Any]) -> None:
         result = getattr(self._server().store, method_name)(payload)
+        if method_name in PUBLIC_CACHE_INVALIDATING_METHODS:
+            self._server().public_cache.clear()
         write_json(self, 200, {"ok": True, **result})
 
     @route("GET", "/api/health")
     def _get_health(self, request: RouteRequest) -> None:
-        write_json(self, 200, {"ok": True, "service": f"{DEFAULT_SITE_NAME} Panel"})
+        started_at = time.perf_counter()
+        write_json(
+            self,
+            200,
+            {"ok": True, "service": f"{DEFAULT_SITE_NAME} Panel"},
+            extra_headers=[self._server_timing_header("health", started_at)],
+        )
 
     @route("GET", "/api/cron/suppliers/sync", auth="cron")
     def _get_cron_supplier_sync(self, request: RouteRequest) -> None:
@@ -1080,36 +1117,48 @@ class AppHandler(SimpleHTTPRequestHandler):
 
     @route("GET", "/api/public-shell")
     def _get_public_shell(self, request: RouteRequest) -> None:
+        started_at = time.perf_counter()
         session = self._public_session()
         user_id = str((session or {}).get("user", {}).get("id") or "")
         payload = (
             self._server().store.public_shell(user_id)
             if user_id
-            else self._public_cached_payload("public-shell:v1", 15, lambda: self._server().store.public_shell(""))
+            else self._public_cached_payload(
+                "public-shell:v1",
+                PUBLIC_SHELL_CACHE_SECONDS,
+                lambda: self._server().store.public_shell(""),
+            )
         )
         payload["viewer"] = self._public_session_payload()
         write_json(
             self,
             200,
             {"ok": True, **payload},
-            cache_control="no-store" if session else "public, max-age=15, s-maxage=60, stale-while-revalidate=300",
+            cache_control="no-store" if session else PUBLIC_SHELL_CACHE_CONTROL,
+            extra_headers=[self._server_timing_header("public-shell", started_at)],
         )
 
     @route("GET", "/api/bootstrap")
     def _get_bootstrap(self, request: RouteRequest) -> None:
+        started_at = time.perf_counter()
         session = self._public_session()
         user_id = str((session or {}).get("user", {}).get("id") or "")
         payload = (
             self._server().store.bootstrap(user_id)
             if user_id
-            else self._public_cached_payload("bootstrap:v1", 15, lambda: self._server().store.bootstrap(""))
+            else self._public_cached_payload(
+                "bootstrap:v1",
+                PUBLIC_BOOTSTRAP_CACHE_SECONDS,
+                lambda: self._server().store.bootstrap(""),
+            )
         )
         payload["viewer"] = self._public_session_payload()
         write_json(
             self,
             200,
             {"ok": True, **payload},
-            cache_control="no-store" if session else "public, max-age=15, s-maxage=60, stale-while-revalidate=300",
+            cache_control="no-store" if session else PUBLIC_BOOTSTRAP_CACHE_CONTROL,
+            extra_headers=[self._server_timing_header("bootstrap", started_at)],
         )
 
     @route("GET", "/api/auth/oauth/<provider>/start")
@@ -1231,11 +1280,22 @@ class AppHandler(SimpleHTTPRequestHandler):
 
     @route("GET", "/api/products")
     def _get_products(self, request: RouteRequest) -> None:
+        started_at = time.perf_counter()
+        search_query = self._query_value(request, "q")
+        cache_key = f"products:v1:{search_query.strip().lower()[:160]}"
         write_json(
             self,
             200,
-            {"ok": True, **self._server().store.list_catalog(self._query_value(request, "q"))},
-            cache_control="public, max-age=30, s-maxage=120, stale-while-revalidate=600",
+            {
+                "ok": True,
+                **self._public_cached_payload(
+                    cache_key,
+                    PUBLIC_CATALOG_CACHE_SECONDS,
+                    lambda: self._server().store.list_catalog(search_query),
+                ),
+            },
+            cache_control=PUBLIC_CATALOG_CACHE_CONTROL,
+            extra_headers=[self._server_timing_header("products", started_at)],
         )
 
     @route("GET", "/api/admin/suppliers/<supplier_id>/services", auth="admin")
@@ -1265,11 +1325,21 @@ class AppHandler(SimpleHTTPRequestHandler):
 
     @route("GET", "/api/product-categories/<category_id>")
     def _get_product_category(self, request: RouteRequest) -> None:
+        started_at = time.perf_counter()
+        category_id = request.params["category_id"]
         write_json(
             self,
             200,
-            {"ok": True, "category": self._server().store.get_product_category(request.params["category_id"])},
-            cache_control="public, max-age=30, s-maxage=120, stale-while-revalidate=600",
+            {
+                "ok": True,
+                **self._public_cached_payload(
+                    f"product-category:v1:{category_id}",
+                    PUBLIC_CATALOG_CACHE_SECONDS,
+                    lambda: {"category": self._server().store.get_product_category(category_id)},
+                ),
+            },
+            cache_control=PUBLIC_CATALOG_CACHE_CONTROL,
+            extra_headers=[self._server_timing_header("product-category", started_at)],
         )
 
     @route("GET", "/api/orders", auth="public")
@@ -1449,6 +1519,13 @@ class AppHandler(SimpleHTTPRequestHandler):
                 **result,
             },
         )
+
+    @route("POST", "/api/cron/cafe24/email-order-witness", auth="cron", read_json_body=True)
+    def _post_cron_cafe24_email_order_witness(self, request: RouteRequest) -> None:
+        payload = dict(request.payload or {})
+        payload["_adminActor"] = "cron"
+        result = self._server().store.reconcile_cafe24_email_order_witness(payload)
+        write_json(self, 200, {"ok": True, **result})
 
     @route("POST", "/api/cron/cafe24/order-items/dispatch-one", auth="cron", read_json_body=True)
     def _post_cron_cafe24_order_items_dispatch_one(self, request: RouteRequest) -> None:
