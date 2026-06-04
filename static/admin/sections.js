@@ -1,8 +1,8 @@
 import { renderCafe24OperationalAuditPanel } from "./cafe24-audit-ui.js";
 import { renderCafe24ProductLookupPanel } from "./cafe24-product-ui.js";
-import { renderCafe24AutoPollCards, renderCafe24ManualInputForm, renderCafe24Pagination, renderCafe24PreflightSummary, renderCafe24QueueActionHint, renderCafe24QueueToolbar, renderCafe24SchedulerNotice } from "./cafe24-queue-ui.js";
+import { renderCafe24AutoPollCards, renderCafe24OrderQueuePanel, renderCafe24SchedulerNotice } from "./cafe24-queue-ui.js";
 import { renderCafe24MappingGapReport, renderCafe24MappingWorkflowChecklist } from "./cafe24-workflow-ui.js";
-import { renderSupplierDispatchReadinessPanel, renderSupplierDispatchReadinessSnapshot } from "./supplier-readiness-ui.js";
+import { renderSupplierDispatchReadinessPanel, renderSupplierDispatchReadinessSnapshot, renderSupplierOpsSummary } from "./supplier-readiness-ui.js";
 import { supplierSyncInsight } from "./supplier-sync-ui.js";
 let runtime = {}, state = {};
 let DEFAULT_SITE_NAME = "인스타마트";
@@ -115,59 +115,6 @@ function renderAdminHealthBadge(status) {
     className = "is-warn";
   }
   return `<span class="admin-badge ${className}">${escapeHtml(label)}</span>`;
-}
-function supplierReadinessRequirementClass(requirement = {}) {
-  if (requirement.ok === true || requirement.status === "pass") return "is-success";
-  if (requirement.blocking === true || requirement.status === "blocked") return "is-error";
-  return "is-warn";
-}
-function supplierReadinessRequirementLabel(requirement = {}) {
-  if (requirement.ok === true || requirement.status === "pass") return "통과";
-  if (requirement.blocking === true || requirement.status === "blocked") return "차단";
-  return "확인";
-}
-function supplierReadinessContractSummary(readiness = {}) {
-  const contract = readiness.dispatchContract || {};
-  return [
-    contract.label,
-    contract.endpointMode,
-    contract.authMode,
-    contract.serviceIdRule,
-  ].filter(Boolean).join(" · ");
-}
-function renderSupplierReadinessRequirementList(readiness = {}) {
-  const requirements = Array.isArray(readiness.requirements) ? readiness.requirements : [];
-  const contractSummary = supplierReadinessContractSummary(readiness);
-  if (!requirements.length && !contractSummary) return "";
-  return `
-    <div class="admin-readiness-checks">
-      ${contractSummary ? `
-        <div class="admin-readiness-check">
-          <div class="admin-readiness-check__text">
-            <strong>발주 계약</strong>
-            <span>${escapeHtml(contractSummary)}</span>
-          </div>
-          <span class="admin-badge is-neutral">기준</span>
-        </div>
-      ` : ""}
-      ${requirements
-        .map(
-          (requirement) => {
-            const valueSuffix = requirement.value ? ` · ${requirement.value}` : "";
-            return `
-            <div class="admin-readiness-check">
-              <div class="admin-readiness-check__text">
-                <strong>${escapeHtml(`${requirement.label || requirement.key || "조건"}${valueSuffix}`)}</strong>
-                <span>${escapeHtml(requirement.message || requirement.value || "")}</span>
-              </div>
-              <span class="admin-badge ${supplierReadinessRequirementClass(requirement)}">${escapeHtml(supplierReadinessRequirementLabel(requirement))}</span>
-            </div>
-          `;
-          }
-        )
-        .join("")}
-    </div>
-  `;
 }
 function cafe24OrderItemProductLabel(item = {}) {
   return item.internalProductName
@@ -1985,25 +1932,43 @@ function renderCafe24QuickControls(activeIntegration = {}) {
       <input type="hidden" name="id" value="${escapeHtml(activeIntegration.id || "")}" />
       <input type="hidden" name="scopes" value="${escapeHtml((activeIntegration.scopes || ["mall.read_order", "mall.write_order", "mall.read_product"]).join(","))}" />
       <div class="section-head section-head--compact">
-        <h3>실시간 주문 조회</h3>
-        <p>최근 1개월 주문을 즉시 다시 수집하거나, 누락 의심 주문번호를 직접 조회합니다. 자동 발주는 서버 자동화 Tick에서 안전 조건 통과 시 처리됩니다.</p>
+        <h3>운영 바로가기</h3>
+        <p>누락 의심 주문번호 조회와 수동 수집만 앞으로 두고, 연동 정책과 기간 지정 수집은 접어서 관리합니다.</p>
       </div>
-      <div class="cafe24-control-grid">
+      <div class="cafe24-control-primary">
         <label class="form-field">
-          <span class="field-label">Mall ID</span>
-          <div class="field-shell"><input class="field-input" name="mallId" value="${escapeHtml(activeIntegration.mallId || "")}" placeholder="예: instamart" /></div>
-        </label>
-        <label class="form-field">
-          <span class="field-label">Shop No</span>
-          <div class="field-shell"><input class="field-input" name="shopNo" type="number" value="${escapeHtml(String(activeIntegration.shopNo || 1))}" /></div>
-        </label>
-        <label class="form-field cafe24-control-grid__wide">
-          <span class="field-label">주문번호 직접 조회</span>
+          <span class="field-label">누락 의심 주문번호</span>
           <div class="field-shell"><input class="field-input" name="resyncOrderId" placeholder="예: 20260506-000001" /></div>
         </label>
+        <div class="cafe24-control-actions">
+          <button class="admin-primary-button" type="button" data-admin-cafe24-resync-by-id="${escapeHtml(activeIntegration.id || "")}" ${activeIntegration.id ? "" : "disabled"}>주문번호 조회</button>
+          <button class="admin-secondary-button" type="button" data-admin-cafe24-poll="${escapeHtml(activeIntegration.id || "")}" ${activeIntegration.id ? "" : "disabled"}>최근 1개월 수동 수집</button>
+          <button class="admin-secondary-button" type="button" data-admin-cafe24-oauth-start>OAuth 재연결</button>
+        </div>
       </div>
+      <details class="admin-disclosure cafe24-policy-controls" open>
+        <summary>Cafe24 연동 / 자동화 정책</summary>
+        <div class="cafe24-policy-grid">
+          <label class="form-field"><span class="field-label">Mall ID</span><div class="field-shell"><input class="field-input" name="mallId" value="${escapeHtml(activeIntegration.mallId || "")}" placeholder="예: instamart" /></div></label>
+          <label class="form-field"><span class="field-label">Shop No</span><div class="field-shell"><input class="field-input" name="shopNo" type="number" value="${escapeHtml(String(activeIntegration.shopNo || 1))}" /></div></label>
+          <label class="form-field">
+            <span class="field-label">완료 처리</span>
+            <div class="field-shell">
+              <select class="field-select" name="completionPolicy">
+                <option value="memo_only" ${activeIntegration.completionPolicy === "purchase_confirm" ? "" : "selected"}>공급사 완료만 기록</option>
+                <option value="purchase_confirm" ${activeIntegration.completionPolicy === "purchase_confirm" ? "selected" : ""}>Cafe24 구매확정</option>
+              </select>
+            </div>
+          </label>
+        </div>
+        <div class="admin-action-row">
+          <label class="admin-toggle"><input type="checkbox" name="isActive" ${activeIntegration.isActive !== false ? "checked" : ""} /><span>연동 활성화</span></label>
+          <label class="admin-toggle"><input type="checkbox" name="autoSubmit" ${activeIntegration.autoSubmit !== false ? "checked" : ""} /><span>자동 발주 활성화</span></label>
+          <button class="admin-secondary-button" type="submit">연동 저장</button>
+        </div>
+      </details>
       <details class="admin-disclosure cafe24-advanced-controls">
-        <summary>기간을 지정해서 다시 조회</summary>
+        <summary>기간 지정 수집 / 스케줄러 안내</summary>
         <div class="admin-two-column">
           <label class="form-field">
             <span class="field-label">수집 시작일</span>
@@ -2014,29 +1979,9 @@ function renderCafe24QuickControls(activeIntegration = {}) {
             <div class="field-shell"><input class="field-input" name="pollEndDate" type="date" /></div>
           </label>
         </div>
+        ${renderCafe24SchedulerNotice({ origin: window.location.origin, escapeHtml })}
       </details>
-      <div class="admin-action-row">
-        <button class="admin-primary-button" type="button" data-admin-cafe24-poll="${escapeHtml(activeIntegration.id || "")}" ${activeIntegration.id ? "" : "disabled"}>최근 1개월 실시간 조회</button>
-        <button class="admin-secondary-button" type="button" data-admin-cafe24-resync-by-id="${escapeHtml(activeIntegration.id || "")}" ${activeIntegration.id ? "" : "disabled"}>주문번호 조회</button>
-        <button class="admin-secondary-button" type="button" data-admin-cafe24-oauth-start>OAuth 연결/재연결</button>
-        <button class="admin-secondary-button" type="submit">연동 저장</button>
-      </div>
-      <label class="admin-toggle">
-        <input type="checkbox" name="isActive" ${activeIntegration.isActive !== false ? "checked" : ""} />
-        <span>연동 활성화</span>
-      </label>
-      <label class="admin-toggle"><input type="checkbox" name="autoSubmit" ${activeIntegration.autoSubmit !== false ? "checked" : ""} /><span>자동 발주 활성화</span></label>
-      <label class="form-field">
-        <span class="field-label">완료 처리</span>
-        <div class="field-shell">
-          <select class="field-select" name="completionPolicy">
-            <option value="memo_only" ${activeIntegration.completionPolicy === "purchase_confirm" ? "" : "selected"}>공급사 완료만 기록</option>
-            <option value="purchase_confirm" ${activeIntegration.completionPolicy === "purchase_confirm" ? "selected" : ""}>Cafe24 구매확정</option>
-          </select>
-        </div>
-      </label>
       <p class="admin-inline-note">자동 발주는 결제완료, 매핑완료, 공급사 상태 정상, 중복 발주 없음 조건을 모두 통과한 주문만 실행합니다. 긴급 중단은 <code>SMM_PANEL_AUTOMATION_PAUSED=1</code>로 제어합니다.</p>
-      ${renderCafe24SchedulerNotice({ origin: window.location.origin, escapeHtml })}
     </form>
   `;
 }
@@ -2156,102 +2101,6 @@ function renderCafe24MappingPanel(activeIntegration = {}, products = [], supplie
   `;
 }
 
-function renderCafe24OrderQueuePanel(orderItems = [], suppliers = [], supplierServices = [], selectedSupplierId = "") {
-  const list = state.adminCafe24OrderList || {};
-  const pagination = list.pagination || { page: state.ui.adminCafe24OrderPage || 1, pageSize: 5, total: orderItems.length, totalPages: 1 };
-  const sourceItems = Array.isArray(list.items) ? list.items : orderItems;
-  const sortedItems = [...sourceItems].sort((a, b) => {
-    const aScore = cafe24CanDispatchItem(a) ? 0 : a.standardStatus === "failed" ? 1 : !a.mappingId ? 2 : 3;
-    const bScore = cafe24CanDispatchItem(b) ? 0 : b.standardStatus === "failed" ? 1 : !b.mappingId ? 2 : 3;
-    return aScore - bScore;
-  });
-  return `
-    <div class="admin-panel">
-      <div class="section-head section-head--compact">
-        <h3>주문 처리 큐</h3>
-        <p>최근 1개월 Cafe24 품주를 5개씩 조회합니다. 결제완료·매핑완료·필드검증 통과 품주만 공급사 발주가 활성화됩니다.</p>
-      </div>
-      ${renderCafe24QueueToolbar({ state, escapeHtml })}
-      <div class="admin-order-list cafe24-order-list">
-        ${sortedItems.length ? sortedItems.map((item) => {
-          const canDispatchCafe24Item = cafe24CanDispatchItem(item);
-          const preflight = state.adminCafe24Preflights?.[item.id] || null;
-          return `
-            <article class="admin-order-card ${item.standardStatus === "failed" ? "is-risk" : ""}">
-              <div class="admin-order-card__top">
-                <div>
-                  <span class="order-card__platform">Cafe24 · ${escapeHtml(item.mallId)} / ${escapeHtml(String(item.shopNo))}</span>
-                  <strong>${escapeHtml(cafe24OrderItemProductLabel(item))}</strong>
-                  <p>${escapeHtml(item.orderId)} · ${escapeHtml(item.orderItemCode)}${item.orderDate ? ` · ${escapeHtml(item.orderDate)}` : ""}</p>
-                </div>
-                <div class="admin-order-card__statusbox">
-                  <span class="admin-order-card__number">${escapeHtml(item.orderStatusCode || "-")}</span>
-                  <span class="admin-badge ${cafe24StatusTone(item)}">${escapeHtml(item.standardStatus)}</span>
-                </div>
-              </div>
-              <div class="admin-order-card__fact-grid">
-                <article><span>상품번호</span><strong>${escapeHtml(item.productNo || "-")}</strong></article>
-                <article><span>품목코드</span><strong>${escapeHtml(item.variantCode || "-")}</strong></article>
-                <article><span>결제 게이트</span><strong>${escapeHtml(item.paymentGateStatus || "-")}</strong></article>
-                <article><span>결제 근거</span><strong>${escapeHtml(item.paymentStatusSource || "-")}</strong></article>
-                <article><span>공급사</span><strong>${escapeHtml(item.supplierExternalServiceId || "-")}</strong></article>
-                <article><span>구매자</span><strong>${escapeHtml(item.buyerName || "-")}</strong></article>
-                <article><span>재시도</span><strong>${escapeHtml(String(item.retryCount || 0))}회</strong></article>
-                <article><span>주문 입력값</span><strong>${escapeHtml(item.targetDiagnostics?.input || "-")}</strong></article>
-                <article><span>공급 링크</span><strong>${escapeHtml(item.targetDiagnostics?.supplierLink || "-")}</strong></article>
-              </div>
-              ${item.targetDiagnostics?.message ? `<p class="admin-inline-note">대상 확인: ${escapeHtml(item.targetDiagnostics.message)}</p>` : ""}
-              ${item.targetDiagnostics?.normalized ? `<p class="admin-inline-note">입력값을 공급사 전송 형식으로 변환했습니다: ${escapeHtml(item.targetDiagnostics.input || "-")} → ${escapeHtml(item.targetDiagnostics.supplierLink || "-")}</p>` : ""}
-              ${renderCafe24QueueActionHint({ item, canDispatch: canDispatchCafe24Item, escapeHtml })}
-              ${renderCafe24PreflightSummary({ preflight, escapeHtml })}
-              ${item.errorMessage ? `<p class="admin-inline-note">${escapeHtml(item.errorMessage)}</p>` : ""}
-              ${renderCafe24ManualInputForm({
-                item,
-                suppliers,
-                supplierServices,
-                selectedSupplierId,
-                manualPreview: state.adminCafe24ManualPreviews?.[item.id] || null,
-                escapeHtml,
-              })}
-              <details class="admin-disclosure">
-                <summary>정규화/공급 payload 보기</summary>
-                <pre>${escapeHtml(JSON.stringify({ target: item.targetDiagnostics, fields: item.normalizedFields, supplierPayload: item.supplierPayload, supplierResponse: item.supplierResponse, raw: item.rawPayloadPreview }, null, 2))}</pre>
-              </details>
-              <div class="admin-action-row">
-                <button class="admin-secondary-button" type="button" data-admin-cafe24-resync-item="${escapeHtml(item.id)}">재동기화</button>
-                <button class="admin-secondary-button" type="button" data-admin-cafe24-retry-item="${escapeHtml(item.id)}">재검증</button>
-                <button class="admin-secondary-button" type="button" data-admin-cafe24-preflight-item="${escapeHtml(item.id)}">preflight</button>
-                <button class="admin-primary-button" type="button" data-admin-cafe24-dispatch-item="${escapeHtml(item.id)}" ${canDispatchCafe24Item ? "" : "disabled"}>공급사 발주</button>
-              </div>
-              <form class="admin-order-form" data-admin-cafe24-item-status-form>
-                <input type="hidden" name="itemId" value="${escapeHtml(item.id)}" />
-                <div class="admin-three-column">
-                  <label class="form-field">
-                    <span class="field-label">수동 상태</span>
-                    <div class="field-shell">
-                      <select class="field-select" name="status">
-                        ${["received", "payment_pending", "payment_review_required", "waiting_input", "mapping_error", "missing_required_field", "invalid_quantity", "invalid_target", "supplier_range_error", "needs_manual_review", "ready_to_submit", "submitting", "supplier_submitted", "supplier_progress", "completed", "failed", "cancelled"].map((status) => `<option value="${status}" ${item.standardStatus === status ? "selected" : ""}>${status}</option>`).join("")}
-                      </select>
-                    </div>
-                  </label>
-                  <label class="form-field admin-order-form__memo">
-                    <span class="field-label">운영 메모</span>
-                    <div class="field-shell"><input class="field-input" name="memo" value="${escapeHtml(item.errorMessage || "")}" /></div>
-                  </label>
-                  <div class="admin-order-form__submit">
-                    <button class="admin-secondary-button" type="submit">상태 저장</button>
-                  </div>
-                </div>
-              </form>
-            </article>
-          `;
-        }).join("") : `<div class="admin-empty-card"><strong>조건에 맞는 Cafe24 주문이 없습니다.</strong><p>상단에서 최근 1개월 실시간 조회를 실행하거나 주문번호로 직접 조회해 주세요.</p></div>`}
-      </div>
-      ${renderCafe24Pagination({ pagination, escapeHtml })}
-    </div>
-  `;
-}
-
 function renderCafe24ConnectionPanel(activeIntegration = {}, cafe24OAuthRedirectUri = "") {
   const tokenStatus = activeIntegration.tokenStatus || "reconnect_required";
   const tokenBadgeClass = {
@@ -2330,7 +2179,7 @@ function renderCafe24AdminSection() {
           <strong>연결</strong><small>OAuth/Redirect</small>
         </button>
       </nav>
-      ${activeCafe24Tab === "queue" ? renderCafe24OrderQueuePanel(orderItems, suppliers, cafe24SupplierServices, selectedCafe24SupplierId) : ""}
+      ${activeCafe24Tab === "queue" ? renderCafe24OrderQueuePanel({ state, orderItems, suppliers, supplierServices: cafe24SupplierServices, selectedSupplierId: selectedCafe24SupplierId, escapeHtml, canDispatchItem: cafe24CanDispatchItem, statusTone: cafe24StatusTone, productLabel: cafe24OrderItemProductLabel }) : ""}
       ${activeCafe24Tab === "mapping" ? renderCafe24MappingPanel(activeIntegration, products, suppliers, cafe24SupplierServices, selectedCafe24SupplierId, mappings) : ""}
       ${activeCafe24Tab === "lookup" ? renderCafe24ProductLookupPanel({ state, activeIntegration, escapeHtml }) : ""}
       ${activeCafe24Tab === "monitor" ? renderCafe24PaymentAuditPanel(orderItems) : ""}
@@ -3741,7 +3590,7 @@ function renderSupplierAdminSection({
                             <span class="admin-badge ${readinessClass}">${escapeHtml(readinessOk ? "발주 가능" : "발주 차단")}</span>
                             ${escapeHtml(readiness.nextAction || readiness.message || readiness.code || "readiness 확인 필요")}
                           </p>
-                          ${renderSupplierReadinessRequirementList(readiness)}
+                          <span class="admin-supplier-card__action">선택해서 상세 확인</span>
                         </button>
                       `;
                     }
@@ -3775,30 +3624,31 @@ function renderSupplierAdminSection({
               </div>
             </label>
 
-            <label class="form-field">
-              <span class="field-label">API URL</span>
-              <div class="field-shell">
-                <input class="field-input" type="url" name="apiUrl" value="${escapeHtml(draft.apiUrl)}" placeholder="${escapeHtml(supplierUrlPlaceholder(integrationType))}" data-admin-supplier-field="apiUrl" />
-              </div>
-            </label>
-
-            <label class="form-field">
-              <span class="field-label">${escapeHtml(apiKeyLabel)}</span>
-              <div class="field-shell">
-                <input class="field-input" type="password" name="apiKey" value="${escapeHtml(draft.apiKey)}" autocomplete="new-password" placeholder="${escapeHtml(supplierApiKeyPlaceholder(integrationType, Boolean(draft.id)))}" data-admin-supplier-field="apiKey" />
-              </div>
-            </label>
-            ${integrationType === "mkt24"
-              ? `<p class="admin-inline-note">MKT24 대행사용 API는 기존 API Key만 사용합니다. Bearer Token은 저장하거나 갱신할 필요가 없습니다.</p>`
-              : integrationType === "fasttraffic"
-                ? `<p class="admin-inline-note">FastTraffic은 로그인 계정이 아니라 API 페이지에서 발급한 64자 API Key만 저장합니다. 주문 등록은 분당 제한이 있어 자동 발주 시 throttle을 적용합니다.</p>`
-              : ""}
-            <p class="admin-inline-note">저장된 시크릿 상태: ${escapeHtml(savedSecretSummary)} · 기존 원문은 브라우저로 다시 내려오지 않습니다.</p>
-
-            <label class="form-field">
-              <span class="field-label">메모</span>
-              <textarea class="field-textarea" name="notes" rows="4" data-admin-supplier-field="notes">${escapeHtml(draft.notes)}</textarea>
-            </label>
+            <details class="admin-disclosure supplier-settings-disclosure" ${draft.id ? "" : "open"}>
+              <summary>API 인증 / 메모</summary>
+              <label class="form-field">
+                <span class="field-label">API URL</span>
+                <div class="field-shell">
+                  <input class="field-input" type="url" name="apiUrl" value="${escapeHtml(draft.apiUrl)}" placeholder="${escapeHtml(supplierUrlPlaceholder(integrationType))}" data-admin-supplier-field="apiUrl" />
+                </div>
+              </label>
+              <label class="form-field">
+                <span class="field-label">${escapeHtml(apiKeyLabel)}</span>
+                <div class="field-shell">
+                  <input class="field-input" type="password" name="apiKey" value="${escapeHtml(draft.apiKey)}" autocomplete="new-password" placeholder="${escapeHtml(supplierApiKeyPlaceholder(integrationType, Boolean(draft.id)))}" data-admin-supplier-field="apiKey" />
+                </div>
+              </label>
+              ${integrationType === "mkt24"
+                ? `<p class="admin-inline-note">MKT24 대행사용 API는 기존 API Key만 사용합니다. Bearer Token은 저장하거나 갱신할 필요가 없습니다.</p>`
+                : integrationType === "fasttraffic"
+                  ? `<p class="admin-inline-note">FastTraffic은 로그인 계정이 아니라 API 페이지에서 발급한 64자 API Key만 저장합니다. 주문 등록은 분당 제한이 있어 자동 발주 시 throttle을 적용합니다.</p>`
+                  : ""}
+              <p class="admin-inline-note">저장된 시크릿 상태: ${escapeHtml(savedSecretSummary)} · 기존 원문은 브라우저로 다시 내려오지 않습니다.</p>
+              <label class="form-field">
+                <span class="field-label">메모</span>
+                <textarea class="field-textarea" name="notes" rows="4" data-admin-supplier-field="notes">${escapeHtml(draft.notes)}</textarea>
+              </label>
+            </details>
 
             <label class="admin-toggle">
               <input type="checkbox" name="isActive" ${draft.isActive ? "checked" : ""} data-admin-supplier-field="isActive" />
@@ -3813,26 +3663,7 @@ function renderSupplierAdminSection({
         </section>
       </aside>
       <main class="admin-main">
-        <section class="admin-card">
-          <div class="admin-step-strip">
-            ${[
-              ["1. 연결 확인", Boolean(activeConnection?.resolvedApiUrl || selectedSupplier?.lastCheckedAt), "공급사 인증 정보와 응답 상태를 먼저 검증합니다."],
-              ["2. 서비스 동기화", Boolean(allServices.length), "실제 공급사 서비스 목록을 불러와 내부에서 검색 가능하게 만듭니다."],
-              ["3. 서비스 선택", Boolean(selectedService), "연동할 공급사 서비스를 선택하고 호출 예시를 검토합니다."],
-              ["4. 내부 상품 매핑", Boolean(selectedProduct?.mapping), "실제 판매 상품과 공급사 서비스를 연결해 주문 발주를 준비합니다."],
-            ]
-              .map(
-                ([label, done, description]) => `
-                  <article class="admin-step-card ${done ? "is-complete" : ""}">
-                    <strong>${escapeHtml(String(label))}</strong>
-                    <p>${escapeHtml(String(description))}</p>
-                    <span>${done ? "완료" : "대기"}</span>
-                  </article>
-                `
-              )
-            .join("")}
-          </div>
-        </section>
+        ${renderSupplierOpsSummary({ suppliers, selectedSupplier, selectedService, selectedProduct, products, allServices, activeConnection, nextAction, connectionState, syncStatus, escapeHtml })}
         <section class="admin-card">
           <div class="section-head section-head--compact">
             <h2>API 연결 상태</h2>

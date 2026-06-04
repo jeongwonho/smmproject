@@ -502,6 +502,48 @@ export function renderSupplierDispatchReadinessSnapshot({
   `;
 }
 
+export function renderSupplierOpsSummary({
+  suppliers = [],
+  selectedSupplier = null,
+  selectedService = null,
+  selectedProduct = null,
+  products = [],
+  allServices = [],
+  activeConnection = null,
+  nextAction = "",
+  connectionState = "never",
+  syncStatus = "never",
+  escapeHtml,
+}) {
+  const readySuppliers = suppliers.filter((supplier) => supplier.autoDispatchReadiness?.ok === true).length;
+  const activeSuppliers = suppliers.filter((supplier) => supplier.isActive !== false).length;
+  const mappedProducts = products.filter((product) => product.mapping).length;
+  const connectionReady = Boolean(activeConnection?.resolvedApiUrl || selectedSupplier?.lastCheckedAt);
+  const steps = [
+    ["연결", connectionReady, "API 인증 확인"],
+    ["서비스", Boolean(allServices.length), supplierSyncReadinessLabel(syncStatus)],
+    ["선택", Boolean(selectedService), selectedService?.externalServiceId || "서비스 선택"],
+    ["매핑", Boolean(selectedProduct?.mapping), selectedProduct?.mapping ? "상품 연결됨" : "상품 매핑 필요"],
+  ];
+  return `
+    <section class="admin-card supplier-command-panel">
+      <div class="section-head section-head--compact">
+        <h2>공급사 운영 요약</h2>
+        <p>선택한 공급사의 다음 작업과 전체 공급사 준비 상태를 먼저 보여줍니다.</p>
+      </div>
+      <div class="supplier-ops-grid">
+        <article class="${connectionState === "success" ? "" : "is-risk"}"><span>선택 공급사</span><strong>${escapeHtml(selectedSupplier?.name || "선택 필요")}</strong><p>${escapeHtml(selectedSupplier ? supplierIntegrationDisplayName(selectedSupplier.integrationType) : "왼쪽에서 공급사를 선택하세요.")}</p></article>
+        <article><span>다음 액션</span><strong>${escapeHtml(nextAction || "상태 확인")}</strong><p>${escapeHtml(selectedService ? `서비스 #${selectedService.externalServiceId || "-"}` : "서비스 선택 전")}</p></article>
+        <article><span>발주 가능 공급사</span><strong>${escapeHtml(String(readySuppliers))} / ${escapeHtml(String(suppliers.length))}</strong><p>활성 ${escapeHtml(String(activeSuppliers))}개</p></article>
+        <article><span>상품 매핑</span><strong>${escapeHtml(String(mappedProducts))} / ${escapeHtml(String(products.length))}</strong><p>동기화 서비스 ${escapeHtml(String(allServices.length))}개</p></article>
+      </div>
+      <div class="admin-step-strip admin-step-strip--compact">
+        ${steps.map(([label, done, detail]) => `<article class="admin-step-card ${done ? "is-complete" : ""}"><strong>${escapeHtml(label)}</strong><p>${escapeHtml(detail)}</p><span>${done ? "완료" : "대기"}</span></article>`).join("")}
+      </div>
+    </section>
+  `;
+}
+
 export function renderSupplierDispatchReadinessPanel({
   selectedSupplier,
   selectedService,

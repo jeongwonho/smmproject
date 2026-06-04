@@ -603,10 +603,11 @@ class WorkflowConfigurationTest(unittest.TestCase):
         self.assertIn("refusing to call dispatch-one", workflow)
         self.assertIn("/api/cron/cafe24/order-items/dispatch-one", workflow)
 
-    def test_supplier_admin_list_renders_dispatch_contract_summary(self):
-        source = (APP_ROOT / "static" / "admin" / "sections.js").read_text()
+    def test_supplier_admin_readiness_renders_dispatch_contract_summary(self):
+        source = (APP_ROOT / "static" / "admin" / "supplier-readiness-ui.js").read_text()
+        sections_source = (APP_ROOT / "static" / "admin" / "sections.js").read_text()
 
-        self.assertIn("supplierReadinessContractSummary", source)
+        self.assertIn("renderSupplierOpsSummary", sections_source)
         self.assertIn("dispatchContract", source)
         self.assertIn("serviceIdRule", source)
         self.assertIn("발주 계약", source)
