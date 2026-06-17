@@ -1,0 +1,108 @@
+name: Cafe24 Mapping Gaps
+
+on:
+  workflow_dispatch:
+    inputs:
+      mall_id:
+        description: Cafe24 mall id
+        required: true
+        default: growit
+      shop_no:
+        description: Cafe24 shop number
+        required: true
+        default: "1"
+      product_nos:
+        description: Optional comma-separated Cafe24 product numbers
+        required: false
+        default: ""
+      include_product_details:
+        description: Fetch Cafe24 product/options/variants
+        required: true
+        default: "true"
+      limit:
+        description: Max order items to inspect
+        required: true
+        default: "50"
+      detail_fetch_limit:
+        description: Max Cafe24 products to enrich with options/variants
+        required: true
+        default: "5"
+      detail_api_timeout_seconds:
+        description: Per Cafe24 product API call timeout
+        required: true
+        default: "4"
+      detail_api_max_attempts:
+        description: Per Cafe24 product API retry attempts
+        required: true
+        default: "2"
+      detail_api_budget_seconds:
+        description: Total seconds to spend enriching products before returning partial mapping gaps
+        required: true
+        default: "24"
+      fail_on_warnings:
+        description: Fail when mapping gap detail lookup returns warnings
+        required: true
+        default: "true"
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+jobs:
+  gaps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - name: Read Cafe24 mapping gaps
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          MALL_ID: ${{ inputs.mall_id }}
+          SHOP_NO: ${{ inputs.shop_no }}
+          PRODUCT_NOS: ${{ inputs.product_nos }}
+          INCLUDE_PRODUCT_DETAILS: ${{ inputs.include_product_details }}
+          LIMIT: ${{ inputs.limit }}
+          DETAIL_FETCH_LIMIT: ${{ inputs.detail_fetch_limit }}
+          DETAIL_API_TIMEOUT_SECONDS: ${{ inputs.detail_api_timeout_seconds }}
+          DETAIL_API_MAX_ATTEMPTS: ${{ inputs.detail_api_max_attempts }}
+          DETAIL_API_BUDGET_SECONDS: ${{ inputs.detail_api_budget_seconds }}
+          FAIL_ON_WARNINGS: ${{ inputs.fail_on_warnings }}
+        run: |
+          set -euo pipefail
+          oidc_token=""
+          if [ -z "${CRON_SECRET:-}" ]; then
+            oidc_token="$(curl --fail-with-body --show-error --silent \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=instamart-cron" | jq -r '.value // empty')"
+          fi
+          auth_token="${CRON_SECRET:-${oidc_token:-}}"
+          if [ -z "${auth_token:-}" ]; then
+            echo "Repository secret CRON_SECRET or GitHub Actions OIDC token is required for production cron auth." >&2
+            exit 1
+          fi
+          response_file="$(mktemp)"
+          curl --fail-with-body --show-error --silent --connect-timeout 10 --max-time 240 \
+            -X POST "https://smmproject-lime.vercel.app/api/cron/cafe24/mapping-gaps" \
+            -H "Authorization: Bearer ${auth_token}" \
+            -H "X-GitHub-Repository: ${GITHUB_REPOSITORY}" \
+            -H "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" \
+            -H "X-GitHub-Workflow: ${GITHUB_WORKFLOW}" \
+            -H "Content-Type: application/json" \
+            --data "$(jq -nc \
+              --arg mallId "$MALL_ID" \
+              --argjson shopNo "$SHOP_NO" \
+              --arg productNos "$PRODUCT_NOS" \
+              --argjson includeProductDetails "$INCLUDE_PRODUCT_DETAILS" \
+              --argjson limit "$LIMIT" \
+              --argjson detailFetchLimit "$DETAIL_FETCH_LIMIT" \
+              --argjson detailApiTimeoutSeconds "$DETAIL_API_TIMEOUT_SECONDS" \
+              --argjson detailApiMaxAttempts "$DETAIL_API_MAX_ATTEMPTS" \
+              --argjson detailApiBudgetSeconds "$DETAIL_API_BUDGET_SECONDS" \
+              '{mallId:$mallId,shopNo:$shopNo,productNos:$productNos,includeProductDetails:$includeProductDetails,limit:$limit,detailFetchLimit:$detailFetchLimit,detailApiTimeoutSeconds:$detailApiTimeoutSeconds,detailApiMaxAttempts:$detailApiMaxAttempts,detailApiBudgetSeconds:$detailApiBudgetSeconds}')" > "$response_file"
+          jq '{integration,summary,warnings,groups}' "$response_file"
+          warning_count="$(jq -r '(.warnings // []) | length' "$response_file")"
+          if [ "$FAIL_ON_WARNINGS" = "true" ] && [ "$warning_count" -gt 0 ]; then
+            echo "Cafe24 mapping gap detail lookup returned ${warning_count} warning(s)." >&2
+            jq -r '.warnings[]' "$response_file" >&2
+            exit 1
+          fi

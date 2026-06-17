@@ -1,4 +1,4 @@
-name: Cafe24 Dispatch One
+name: Cafe24 Preflight One
 
 on:
   workflow_dispatch:
@@ -18,9 +18,9 @@ on:
         description: Cafe24 order item code
         required: true
       expected_quantity:
-        description: Expected supplier quantity
-        required: true
-        default: "50"
+        description: Expected supplier quantity, optional
+        required: false
+        default: ""
 
 permissions:
   actions: read
@@ -28,10 +28,10 @@ permissions:
   id-token: write
 
 jobs:
-  dispatch:
+  preflight:
     runs-on: ubuntu-latest
     steps:
-      - name: Dispatch one Cafe24 order item
+      - name: Read Cafe24 order item preflight
         env:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
           MALL_ID: ${{ inputs.mall_id }}
@@ -52,14 +52,6 @@ jobs:
             echo "Repository secret CRON_SECRET or GitHub Actions OIDC token is required for production cron auth." >&2
             exit 1
           fi
-          request_payload="$(jq -nc \
-            --arg mallId "$MALL_ID" \
-            --argjson shopNo "$SHOP_NO" \
-            --arg orderId "$ORDER_ID" \
-            --arg orderItemCode "$ORDER_ITEM_CODE" \
-            --argjson expectedQuantity "$EXPECTED_QUANTITY" \
-            '{mallId:$mallId,shopNo:$shopNo,orderId:$orderId,orderItemCode:$orderItemCode,expectedQuantity:$expectedQuantity}')"
-          preflight_response="$(mktemp)"
           curl --fail-with-body --show-error --silent \
             -X POST "https://smmproject-lime.vercel.app/api/cron/cafe24/order-items/preflight" \
             -H "Authorization: Bearer ${auth_token}" \
@@ -67,20 +59,10 @@ jobs:
             -H "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" \
             -H "X-GitHub-Workflow: ${GITHUB_WORKFLOW}" \
             -H "Content-Type: application/json" \
-            --data "$request_payload" > "$preflight_response"
-          echo "Preflight summary:"
-          jq '{itemId,canDispatch,blockingReasons,identity,statuses,mapping,quantity,supplierPayload,supplierReadiness}' "$preflight_response"
-          if [ "$(jq -r '.canDispatch // false' "$preflight_response")" != "true" ]; then
-            echo "Preflight is not dispatchable; refusing to call dispatch-one." >&2
-            exit 1
-          fi
-          curl --fail-with-body --show-error --silent \
-            -X POST "https://smmproject-lime.vercel.app/api/cron/cafe24/order-items/dispatch-one" \
-            -H "Authorization: Bearer ${auth_token}" \
-            -H "X-GitHub-Repository: ${GITHUB_REPOSITORY}" \
-            -H "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" \
-            -H "X-GitHub-Workflow: ${GITHUB_WORKFLOW}" \
-            -H "Content-Type: application/json" \
             --data "$(jq -nc \
-              --argjson base "$request_payload" \
-              '$base + {allowExpectedQuantityMappingUpdate:true,allowCanceledSupplierRedispatch:true}')"
+              --arg mallId "$MALL_ID" \
+              --argjson shopNo "$SHOP_NO" \
+              --arg orderId "$ORDER_ID" \
+              --arg orderItemCode "$ORDER_ITEM_CODE" \
+              --arg expectedQuantity "$EXPECTED_QUANTITY" \
+              '{mallId:$mallId,shopNo:$shopNo,orderId:$orderId,orderItemCode:$orderItemCode,expectedQuantity:$expectedQuantity}')"

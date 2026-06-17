@@ -1,0 +1,615 @@
+function supplierIntegrationDisplayName(integrationType) {
+  if (integrationType === "mkt24") return "MKT24";
+  if (integrationType === "fasttraffic") return "FastTraffic";
+  return "classic SMM";
+}
+
+function supplierHealthReadinessLabel(status) {
+  if (status === "ok") return "정상";
+  if (status === "failed") return "실패";
+  return "점검 필요";
+}
+
+function supplierBalanceReadinessLabel(status) {
+  if (status === "ok") return "정상";
+  if (status === "failed") return "실패";
+  if (status === "unsupported") return "해당 없음";
+  return "미확인";
+}
+
+function supplierSyncReadinessLabel(status) {
+  if (status === "success") return "동기화 정상";
+  if (status === "syncing") return "동기화 중";
+  if (status === "failed") return "동기화 실패";
+  return "동기화 필요";
+}
+
+function supplierServiceIdLooksUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(value || "").trim());
+}
+
+function supplierServiceIdLooksNumeric(value) {
+  return /^\d+$/.test(String(value || "").trim());
+}
+
+function firstNumberValue(values, fallback = 0) {
+  for (const value of values) {
+    if (value === undefined || value === null || value === "") continue;
+    const numberValue = Number(value);
+    if (Number.isFinite(numberValue)) return numberValue;
+  }
+  return fallback;
+}
+
+function supplierActiveServiceCount({ selectedSupplier, allServices, activeConnection }) {
+  const services = Array.isArray(allServices) ? allServices : [];
+  const loadedActiveCount = services.filter((service) => service?.isActive !== false).length;
+  return firstNumberValue([
+    activeConnection?.serviceCount,
+    selectedSupplier?.serviceCount,
+    services.length ? loadedActiveCount : undefined,
+    selectedSupplier?.lastServiceCount,
+  ]);
+}
+
+function supplierInactiveServiceCount({ selectedSupplier, allServices }) {
+  const services = Array.isArray(allServices) ? allServices : [];
+  if (services.length) return services.filter((service) => service?.isActive === false).length;
+  return firstNumberValue([selectedSupplier?.inactiveServiceCount], 0);
+}
+
+function supplierUsesMkt24PanelApi(supplier) {
+  return String(supplier?.apiUrl || "").includes("/v3/panel");
+}
+
+function supplierApiEndpointCheck(selectedSupplier) {
+  const integrationType = selectedSupplier?.integrationType || "classic";
+  const apiUrl = String(selectedSupplier?.apiUrl || "").trim();
+  if (integrationType === "mkt24") {
+    const usesPanelApi = supplierUsesMkt24PanelApi(selectedSupplier);
+    return {
+      value: usesPanelApi ? "/v3/panel" : "legacy URL",
+      ok: usesPanelApi,
+      blocking: false,
+      description: usesPanelApi
+        ? "MKT24 대행사용 표준 endpoint로 service sync와 panel 발주를 실행합니다."
+        : "legacy MKT24 URL은 직접 주문 모드입니다. 신규 매핑은 /v3/panel 전환 여부를 먼저 확인하세요.",
+    };
+  }
+  if (integrationType === "fasttraffic") {
+    const normalized = apiUrl.includes("fastraffic.co.kr/nblog_api.php") || apiUrl.includes("fasttraffic.co.kr/nblog_api.php");
+    return {
+      value: normalized ? "전용 endpoint" : "URL 확인",
+      ok: normalized,
+      blocking: false,
+      description: normalized
+        ? "FastTraffic 전용 endpoint와 X-Api-Key 헤더 조건으로 발주합니다."
+        : "FastTraffic은 https://fastraffic.co.kr/nblog_api.php endpoint를 사용해야 합니다.",
+    };
+  }
+  return {
+    value: apiUrl ? "classic API" : "URL 없음",
+    ok: Boolean(apiUrl),
+    blocking: true,
+    description: apiUrl ? "classic SMM API는 services/add/status action을 사용합니다." : "classic 공급사는 API URL이 필요합니다.",
+  };
+}
+
+function supplierServicePayloadHint(integrationType, selectedService) {
+  if (!selectedService) return "서비스 하나를 선택해야 payload preview와 발주가 가능합니다.";
+  const guide = selectedService.requestGuide || {};
+  const example = guide.callExamplePayload || {};
+  const keys = Object.keys(example).filter((key) => key !== "key").slice(0, 5);
+  const keyText = keys.length ? `전송 키: ${keys.join(", ")}` : "공급사 payload 예시를 확인하세요.";
+  if (integrationType === "mkt24") return `${keyText}. MKT24 panel은 service, link 또는 username 중 하나, quantity 조합을 확인합니다.`;
+  if (integrationType === "fasttraffic") return `${keyText}. FastTraffic은 action별 필수값과 quantityParam이 다릅니다.`;
+  return `${keyText}. classic은 service, link 또는 username, quantity 조합을 확인합니다.`;
+}
+
+function supplierDispatchContractCards(selectedSupplier, selectedService) {
+  const integrationType = selectedSupplier?.integrationType || "classic";
+  const externalServiceId = String(selectedService?.externalServiceId || "").trim();
+  const guide = selectedService?.requestGuide || {};
+  const example = guide.callExamplePayload || {};
+  const keys = Object.keys(example).filter((key) => key !== "key");
+  if (integrationType === "mkt24") {
+    const panelApi = supplierUsesMkt24PanelApi(selectedSupplier);
+    return [
+      {
+        label: "Endpoint",
+        value: panelApi ? "/v3/panel" : "legacy v3",
+        description: panelApi ? "form key + action=add로 전송" : "JSON /order/sns 직접 주문 설정 확인 필요",
+      },
+      {
+        label: "인증",
+        value: "API Key",
+        description: "Bearer Token 없이 key 파라미터만 사용",
+      },
+      {
+        label: "서비스",
+        value: externalServiceId || "미선택",
+        description: panelApi ? "숫자형 panel service ID 필요" : "상품 UUID와 optionInfo 설정 필요",
+      },
+      {
+        label: "대상/수량",
+        value: "link 또는 username + quantity",
+        description: "link로 정규화되면 username을 같이 보내지 않음",
+      },
+    ];
+  }
+  if (integrationType === "fasttraffic") {
+    return [
+      {
+        label: "Endpoint",
+        value: "nblog_api.php",
+        description: "FastTraffic 전용 form endpoint",
+      },
+      {
+        label: "인증",
+        value: "X-Api-Key",
+        description: "API Key는 헤더로만 전송",
+      },
+      {
+        label: "Action",
+        value: externalServiceId || "미선택",
+        description: "정적 카탈로그의 action과 상태 조회 action 사용",
+      },
+      {
+        label: "필수값",
+        value: keys.length ? keys.join(", ") : "서비스 선택 필요",
+        description: "서비스별 targetParam/quantityParam 기준",
+      },
+    ];
+  }
+  return [
+    {
+      label: "Endpoint",
+      value: "classic API",
+      description: "key + action form API",
+    },
+    {
+      label: "인증",
+      value: "key",
+      description: "요청 body에 공급사 key 포함",
+    },
+    {
+      label: "서비스",
+      value: externalServiceId || "미선택",
+      description: "action=add의 service 값",
+    },
+    {
+      label: "대상/수량",
+      value: "link/username + quantity",
+      description: "서비스 타입에 맞는 target 필드와 수량 필요",
+    },
+  ];
+}
+
+function supplierDispatchReadinessChecks({
+  selectedSupplier,
+  selectedService,
+  allServices,
+  activeConnection,
+  connectionState,
+  syncStatus,
+}) {
+  const integrationType = selectedSupplier?.integrationType || "classic";
+  const serviceCount = supplierActiveServiceCount({ selectedSupplier, allServices, activeConnection });
+  const inactiveServiceCount = supplierInactiveServiceCount({ selectedSupplier, allServices });
+  const healthStatus = String(selectedSupplier?.healthStatus || "unknown");
+  const balanceStatus = String(selectedSupplier?.balanceStatus || "unknown");
+  const selectedExternalServiceId = String(selectedService?.externalServiceId || "").trim();
+  const selectedServiceActive = !selectedService || selectedService.isActive !== false;
+  const endpointCheck = supplierApiEndpointCheck(selectedSupplier);
+  const checks = [
+    {
+      label: "공급사 활성",
+      value: selectedSupplier?.isActive ? "활성" : "비활성",
+      ok: Boolean(selectedSupplier?.isActive),
+      blocking: true,
+      description: selectedSupplier?.isActive ? "자동 발주 대상에 포함됩니다." : "비활성 공급사는 자동/수동 발주가 차단됩니다.",
+    },
+    {
+      label: "API 인증",
+      value: selectedSupplier?.hasApiKey ? "Key 저장됨" : "Key 없음",
+      ok: Boolean(selectedSupplier?.hasApiKey),
+      blocking: true,
+      description: integrationType === "fasttraffic"
+        ? "FastTraffic은 X-Api-Key 헤더로 인증합니다."
+        : integrationType === "mkt24"
+          ? "MKT24 /v3/panel은 key 파라미터만 사용합니다."
+          : "classic SMM API는 key 파라미터로 services/add/status를 호출합니다.",
+    },
+    {
+      label: "API endpoint",
+      value: endpointCheck.value,
+      ok: endpointCheck.ok,
+      blocking: endpointCheck.blocking,
+      description: endpointCheck.description,
+    },
+    {
+      label: "Health check",
+      value: supplierHealthReadinessLabel(healthStatus),
+      ok: healthStatus === "ok",
+      blocking: true,
+      description: selectedSupplier?.healthMessage || (connectionState === "success" ? "최근 연결 확인은 성공했지만 자동 발주 health 상태를 확인해야 합니다." : "상태 점검이 ok여야 자동 발주가 진행됩니다."),
+    },
+    {
+      label: "활성 서비스",
+      value: `${String(serviceCount)}개`,
+      ok: serviceCount > 0,
+      blocking: true,
+      description: serviceCount > 0
+        ? `발주 후보 서비스 ${String(serviceCount)}개${inactiveServiceCount ? ` · 비활성 ${String(inactiveServiceCount)}개` : ""}`
+        : "동기화된 활성 공급사 서비스가 없으면 자동/수동 발주가 차단됩니다.",
+    },
+    {
+      label: "서비스 동기화",
+      value: supplierSyncReadinessLabel(syncStatus),
+      ok: syncStatus === "success",
+      blocking: syncStatus === "failed",
+      description: syncStatus === "failed"
+        ? selectedSupplier?.serviceSyncMessage || "최근 서비스 동기화 실패를 먼저 해소해야 합니다."
+        : syncStatus === "success"
+          ? selectedSupplier?.serviceSyncCompletedAt || "최근 서비스 동기화가 성공했습니다."
+          : "동기화 이력이 없거나 진행 전이면 먼저 service sync를 실행하세요.",
+    },
+    {
+      label: "서비스 선택",
+      value: selectedService ? selectedExternalServiceId ? `#${selectedExternalServiceId}` : "외부 ID 없음" : "미선택",
+      ok: Boolean(selectedService?.id && selectedExternalServiceId && selectedServiceActive),
+      blocking: true,
+      description: selectedService && !selectedServiceActive
+        ? "비활성 공급사 서비스는 매핑과 발주 전에 service sync 또는 서비스 교체가 필요합니다."
+        : selectedService && !selectedExternalServiceId
+          ? `${supplierIntegrationDisplayName(integrationType)} 서비스의 외부 ID가 없어 발주 payload의 service/action 값을 만들 수 없습니다.`
+        : supplierServicePayloadHint(integrationType, selectedService),
+    },
+    {
+      label: "잔액 확인",
+      value: supplierBalanceReadinessLabel(balanceStatus),
+      ok: balanceStatus !== "failed",
+      blocking: balanceStatus === "failed",
+      description: selectedSupplier?.supportsBalanceCheck === false
+        ? "이 공급사는 잔액 조회 없이 health/service 조건으로 판단합니다."
+        : balanceStatus === "failed"
+          ? "잔액 조회 실패 상태에서는 발주 전 점검이 필요합니다."
+          : "잔액 실패 상태가 아니면 readiness 차단 조건은 아닙니다.",
+    },
+  ];
+
+  if (integrationType === "mkt24") {
+    const panelApi = supplierUsesMkt24PanelApi(selectedSupplier);
+    const uuidLike = supplierServiceIdLooksUuid(selectedExternalServiceId);
+    const numericId = supplierServiceIdLooksNumeric(selectedExternalServiceId);
+    checks.push({
+      label: "MKT24 발주 ID",
+      value: !selectedService ? "서비스 필요" : panelApi && uuidLike ? "UUID 매핑 차단" : panelApi && !numericId ? "ID 형식 확인" : "panel ID 준비",
+      ok: Boolean(selectedService) && (!panelApi || (numericId && !uuidLike)),
+      blocking: Boolean(selectedService) && panelApi && (!numericId || uuidLike),
+      description: panelApi
+        ? "MKT24 /v3/panel 발주는 상품 UUID가 아니라 숫자형 panel 서비스 ID로 매핑해야 합니다."
+        : "현재 URL은 /v3/panel 모드가 아니므로 MKT24 설정을 다시 확인하세요.",
+    });
+  } else if (integrationType === "fasttraffic") {
+    checks.push({
+      label: "FastTraffic payload",
+      value: selectedService ? "정적 action 준비" : "서비스 필요",
+      ok: Boolean(selectedService),
+      blocking: !selectedService,
+      description: "정적 카탈로그의 action별 필수값과 quantityParam으로 주문 payload를 구성합니다.",
+    });
+  } else {
+    checks.push({
+      label: "classic payload",
+      value: selectedService ? "service/add 준비" : "서비스 필요",
+      ok: Boolean(selectedService),
+      blocking: !selectedService,
+      description: "service ID, link, quantity를 classic SMM action=add payload로 보냅니다.",
+    });
+  }
+
+  return checks;
+}
+
+function renderSupplierReadinessBadge(check, escapeHtml) {
+  const className = check.ok ? "is-success" : check.blocking ? "is-error" : "is-warn";
+  const label = check.ok ? "통과" : check.blocking ? "차단" : "확인";
+  return `<span class="admin-badge ${className}">${escapeHtml(label)}</span>`;
+}
+
+function supplierServerRequirementClass(requirement = {}) {
+  if (requirement.ok === true || requirement.status === "pass") return "is-success";
+  if (requirement.blocking === true || requirement.status === "blocked") return "is-error";
+  return "is-warn";
+}
+
+function supplierServerRequirementBadgeLabel(requirement = {}) {
+  if (requirement.ok === true || requirement.status === "pass") return "통과";
+  if (requirement.blocking === true || requirement.status === "blocked") return "차단";
+  return "확인";
+}
+
+function supplierServerVerdict(readiness = {}) {
+  if (readiness.ok) {
+    return {
+      className: "is-success",
+      label: "발주 가능",
+      message: readiness.message || "서버 기준 자동/수동 발주 조건을 통과했습니다.",
+    };
+  }
+  if (readiness.retryable) {
+    return {
+      className: "is-warn",
+      label: "재시도 필요",
+      message: readiness.message || "일시 실패 조건을 해소한 뒤 다시 점검하세요.",
+    };
+  }
+  return {
+    className: "is-error",
+    label: "발주 차단",
+    message: readiness.message || "서버 기준 발주 조건을 통과하지 못했습니다.",
+  };
+}
+
+function renderSupplierServerReadinessRequirements(selectedSupplier, escapeHtml) {
+  const readiness = selectedSupplier?.autoDispatchReadiness || {};
+  const requirements = Array.isArray(readiness.requirements) ? readiness.requirements : [];
+  const contract = readiness.dispatchContract || {};
+  const blockingRequirements = requirements.filter((requirement) => requirement.blocking === true || requirement.status === "blocked");
+  const reviewRequirements = requirements.filter((requirement) => !requirement.ok && requirement.blocking !== true && requirement.status !== "blocked");
+  const verdict = supplierServerVerdict(readiness);
+  if (!requirements.length) return "";
+  return `
+    <div class="admin-subcard">
+      <div class="admin-subcard__head">
+        <strong>서버 발주 판정 기준</strong>
+        <span class="admin-badge ${verdict.className}">${escapeHtml(verdict.label)}</span>
+      </div>
+      <div class="admin-readiness-verdict">
+        <div>
+          <span>최종 판정</span>
+          <strong>${escapeHtml(verdict.message)}</strong>
+        </div>
+        <div>
+          <span>${blockingRequirements.length ? "차단 조건" : reviewRequirements.length ? "확인 조건" : "통과 조건"}</span>
+          <strong>${escapeHtml(
+            blockingRequirements.length
+              ? blockingRequirements.map((requirement) => requirement.label || requirement.key || "조건").join(", ")
+              : reviewRequirements.length
+                ? reviewRequirements.map((requirement) => requirement.label || requirement.key || "조건").join(", ")
+                : "모든 서버 조건 통과"
+          )}</strong>
+        </div>
+      </div>
+      <p class="admin-inline-note">
+        <strong>다음 조치</strong> ${escapeHtml(readiness.nextAction || readiness.message || "readiness 조건을 확인하세요.")}
+        <br />${escapeHtml(contract.label || supplierIntegrationDisplayName(selectedSupplier?.integrationType))} · ${escapeHtml(contract.endpointMode || "-")} · ${escapeHtml(contract.authMode || "-")} · ${escapeHtml(contract.serviceIdRule || "-")}
+      </p>
+      <div class="admin-readiness-checks">
+        ${requirements
+          .map(
+            (requirement) => `
+              <div class="admin-readiness-check">
+                <div class="admin-readiness-check__text">
+                  <strong>${escapeHtml(requirement.label || requirement.key || "조건")} ${requirement.value ? `· ${escapeHtml(requirement.value)}` : ""}</strong>
+                  <span>${escapeHtml(requirement.message || requirement.code || "")}</span>
+                </div>
+                <span class="admin-badge ${supplierServerRequirementClass(requirement)}">${escapeHtml(supplierServerRequirementBadgeLabel(requirement))}</span>
+              </div>
+            `
+          )
+          .join("")}
+      </div>
+    </div>
+  `;
+}
+
+export function renderSupplierDispatchReadinessSnapshot({
+  selectedSupplier,
+  selectedService,
+  allServices,
+  activeConnection,
+  syncStatus,
+  escapeHtml,
+}) {
+  if (!selectedSupplier) {
+    return `
+      <div class="admin-panel">
+        <div class="section-head section-head--compact">
+          <h3>선택 공급사 발주 readiness</h3>
+          <p>Cafe24 매핑에 사용할 공급사를 선택하면 service sync, health check, 공급사별 발주 조건을 확인합니다.</p>
+        </div>
+        <div class="admin-empty-card"><strong>공급사 선택 필요</strong><p>매핑 저장과 payload preview 전에 공급사를 선택하세요.</p></div>
+      </div>
+    `;
+  }
+
+  const effectiveSyncStatus = syncStatus || selectedSupplier.serviceSyncStatus || "never";
+  const checks = supplierDispatchReadinessChecks({
+    selectedSupplier,
+    selectedService,
+    allServices,
+    activeConnection,
+    connectionState: "",
+    syncStatus: effectiveSyncStatus,
+  });
+  const blockingChecks = checks.filter((check) => !check.ok && check.blocking);
+  const reviewChecks = checks.filter((check) => !check.ok && !check.blocking);
+  const readiness = selectedSupplier.autoDispatchReadiness || {};
+  const contract = readiness.dispatchContract || {};
+  const verdict = supplierServerVerdict(readiness);
+  const contractCards = supplierDispatchContractCards(selectedSupplier, selectedService);
+  const statusLabel = blockingChecks.length
+    ? `${blockingChecks.length}개 차단`
+    : reviewChecks.length
+      ? `${reviewChecks.length}개 확인`
+      : "발주 가능";
+
+  return `
+    <div class="admin-panel">
+      <div class="section-head section-head--compact">
+        <h3>선택 공급사 발주 readiness</h3>
+        <p>Cafe24 매핑 저장과 payload preview 전에 ${escapeHtml(supplierIntegrationDisplayName(selectedSupplier.integrationType))} 발주 조건을 확인합니다.</p>
+      </div>
+      <div class="admin-mapping-preview">
+        <article class="admin-mini-card ${blockingChecks.length ? "is-risk" : ""}">
+          <span>현재 선택값</span>
+          <strong>${escapeHtml(statusLabel)}</strong>
+          <p>${escapeHtml(blockingChecks.length ? blockingChecks.map((check) => check.label).join(", ") : selectedService ? "선택 서비스 기준 차단 조건 없음" : "공급사 서비스를 선택해야 합니다.")}</p>
+          <span class="admin-badge ${blockingChecks.length ? "is-error" : selectedService ? "is-success" : "is-warn"}">${escapeHtml(blockingChecks.length ? "차단" : selectedService ? "확인됨" : "서비스 필요")}</span>
+        </article>
+        <article class="admin-mini-card ${readiness.ok ? "" : "is-risk"}">
+          <span>서버 판정</span>
+          <strong>${escapeHtml(verdict.label)}</strong>
+          <p>${escapeHtml(readiness.nextAction || verdict.message)}</p>
+          <span class="admin-badge ${verdict.className}">${escapeHtml(verdict.label)}</span>
+        </article>
+        <article class="admin-mini-card">
+          <span>Service sync</span>
+          <strong>${escapeHtml(supplierSyncReadinessLabel(effectiveSyncStatus))}</strong>
+          <p>${escapeHtml(selectedSupplier.serviceSyncMessage || selectedSupplier.serviceSyncCompletedAt || "동기화 이력을 확인하세요.")}</p>
+        </article>
+        <article class="admin-mini-card ${selectedSupplier.healthStatus === "ok" ? "" : "is-risk"}">
+          <span>Health check</span>
+          <strong>${escapeHtml(supplierHealthReadinessLabel(selectedSupplier.healthStatus || "unknown"))}</strong>
+          <p>${escapeHtml(selectedSupplier.healthMessage || selectedSupplier.healthCheckedAt || "health_status가 ok여야 자동 발주됩니다.")}</p>
+        </article>
+      </div>
+      <p class="admin-inline-note">
+        <strong>발주 계약</strong>
+        ${escapeHtml(contract.label || supplierIntegrationDisplayName(selectedSupplier.integrationType))}
+        · ${escapeHtml(contract.endpointMode || contractCards[0]?.value || "-")}
+        · ${escapeHtml(contract.authMode || contractCards[1]?.value || "-")}
+        · ${escapeHtml(contract.serviceIdRule || contractCards[2]?.description || "-")}
+      </p>
+      <div class="admin-readiness-checks">
+        ${checks
+          .map(
+            (check) => `
+              <div class="admin-readiness-check">
+                <div class="admin-readiness-check__text">
+                  <strong>${escapeHtml(check.label)} · ${escapeHtml(check.value)}</strong>
+                  <span>${escapeHtml(check.description || "")}</span>
+                </div>
+                ${renderSupplierReadinessBadge(check, escapeHtml)}
+              </div>
+            `
+          )
+          .join("")}
+      </div>
+    </div>
+  `;
+}
+
+export function renderSupplierDispatchReadinessPanel({
+  selectedSupplier,
+  selectedService,
+  allServices,
+  activeConnection,
+  connectionState,
+  syncStatus,
+  escapeHtml,
+  renderAdminInsightStrip,
+}) {
+  if (!selectedSupplier) {
+    return `
+      <section class="admin-card">
+        <div class="section-head section-head--compact">
+          <h2>자동 발주 준비 상태</h2>
+          <p>공급사를 선택하면 service sync, health check, 공급사별 발주 조건을 한 번에 점검합니다.</p>
+        </div>
+        <div class="admin-empty-card"><strong>공급사 선택 필요</strong><p>왼쪽 목록에서 운영 공급사를 선택하세요.</p></div>
+      </section>
+    `;
+  }
+
+  const checks = supplierDispatchReadinessChecks({
+    selectedSupplier,
+    selectedService,
+    allServices,
+    activeConnection,
+    connectionState,
+    syncStatus,
+  });
+  const blockingChecks = checks.filter((check) => !check.ok && check.blocking);
+  const reviewChecks = checks.filter((check) => !check.ok && !check.blocking);
+  const integrationType = selectedSupplier.integrationType || "classic";
+  const contractCards = supplierDispatchContractCards(selectedSupplier, selectedService);
+  const statusValue = blockingChecks.length
+    ? `${blockingChecks.length}개 차단`
+    : reviewChecks.length
+      ? `${reviewChecks.length}개 확인`
+      : "발주 가능";
+  const statusTone = blockingChecks.length ? "warning" : "success";
+
+  return `
+    <section class="admin-card">
+      <div class="section-head section-head--compact">
+        <h2>자동 발주 준비 상태</h2>
+        <p>${escapeHtml(supplierIntegrationDisplayName(integrationType))} 기준으로 자동/수동 발주 전에 필요한 조건을 확인합니다.</p>
+      </div>
+
+      ${renderAdminInsightStrip(
+        [
+          {
+            label: "발주 readiness",
+            value: statusValue,
+            description: blockingChecks.length ? blockingChecks.map((check) => check.label).join(", ") : "현재 선택값으로 발주 차단 조건이 없습니다.",
+            tone: statusTone,
+          },
+          {
+            label: "Service sync",
+            value: supplierSyncReadinessLabel(syncStatus),
+            description: selectedSupplier.serviceSyncMessage || selectedSupplier.serviceSyncCompletedAt || "동기화 완료 이력이 필요합니다.",
+            tone: syncStatus === "failed" ? "warning" : syncStatus === "success" ? "success" : "warning",
+          },
+          {
+            label: "Health check",
+            value: supplierHealthReadinessLabel(selectedSupplier.healthStatus || "unknown"),
+            description: selectedSupplier.healthMessage || selectedSupplier.healthCheckedAt || "health_status가 ok여야 자동 발주됩니다.",
+            tone: selectedSupplier.healthStatus === "ok" ? "success" : "warning",
+          },
+          {
+            label: "공급사별 조건",
+            value: supplierIntegrationDisplayName(integrationType),
+            description: selectedSupplier.autoDispatchReadiness?.nextAction || checks[checks.length - 1]?.description || "",
+            tone: checks[checks.length - 1]?.ok ? "success" : "warning",
+          },
+        ],
+        "admin-insight-grid--compact"
+      )}
+
+      ${renderSupplierServerReadinessRequirements(selectedSupplier, escapeHtml)}
+
+      <div class="admin-mapping-preview">
+        ${contractCards
+          .map(
+            (card) => `
+              <article class="admin-mini-card">
+                <span>${escapeHtml(card.label)}</span>
+                <strong>${escapeHtml(card.value)}</strong>
+                <p>${escapeHtml(card.description)}</p>
+              </article>
+            `
+          )
+          .join("")}
+      </div>
+
+      <div class="admin-mapping-preview">
+        ${checks
+          .map(
+            (check) => `
+              <article class="admin-mini-card ${!check.ok && check.blocking ? "is-risk" : ""}">
+                <span>${escapeHtml(check.label)}</span>
+                <strong>${escapeHtml(check.value)}</strong>
+                <p>${escapeHtml(check.description || "")}</p>
+                ${renderSupplierReadinessBadge(check, escapeHtml)}
+              </article>
+            `
+          )
+          .join("")}
+      </div>
+    </section>
+  `;
+}

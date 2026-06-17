@@ -918,7 +918,8 @@ async function handleAdminChange(event, ctx) {
 
 function handleAdminMouseMove(event, ctx) {
   const { hideAnalyticsChartTooltip, updateAnalyticsChartTooltip } = ctx;
-  const svg = event.target.closest(".admin-analytics-chart__svg");
+  const target = event.target instanceof Element ? event.target : null;
+  const svg = target?.closest(".admin-analytics-chart__svg");
   if (!svg) {
     document.querySelectorAll(".admin-analytics-chart").forEach((chart) => hideAnalyticsChartTooltip(chart));
     return;
@@ -928,7 +929,8 @@ function handleAdminMouseMove(event, ctx) {
 
 function handleAdminMouseLeave(event, ctx) {
   const { hideAnalyticsChartTooltip } = ctx;
-  const svg = event.target.closest(".admin-analytics-chart__svg");
+  const target = event.target instanceof Element ? event.target : null;
+  const svg = target?.closest(".admin-analytics-chart__svg");
   if (!svg) return;
   hideAnalyticsChartTooltip(svg.closest(".admin-analytics-chart"));
 }

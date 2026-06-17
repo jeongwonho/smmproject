@@ -1,0 +1,152 @@
+name: Cafe24 Manual Input One
+
+on:
+  workflow_dispatch:
+    inputs:
+      mall_id:
+        description: Cafe24 mall id
+        required: true
+        default: growit
+      shop_no:
+        description: Cafe24 shop number
+        required: true
+        default: "1"
+      order_id:
+        description: Cafe24 order id
+        required: true
+      order_item_code:
+        description: Cafe24 order item code
+        required: true
+      supplier_id:
+        description: Internal supplier id
+        required: true
+      supplier_service_id:
+        description: Internal supplier service id
+        required: true
+      target_secret_name:
+        description: Repository secret name containing the target URL/account. Do not pass customer targets as workflow inputs.
+        required: true
+        default: CAFE24_MANUAL_TARGET_VALUE
+      ordered_count:
+        description: Supplier quantity to send
+        required: true
+      request_memo:
+        description: Optional request memo
+        required: false
+        default: ""
+      expected_quantity:
+        description: Expected quantity for preflight check
+        required: false
+        default: ""
+      dispatch_after_save:
+        description: Dispatch the order item after manual input if preflight passes
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+jobs:
+  manual-input:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Save manual input, run preflight, and optionally dispatch
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          MALL_ID: ${{ inputs.mall_id }}
+          SHOP_NO: ${{ inputs.shop_no }}
+          ORDER_ID: ${{ inputs.order_id }}
+          ORDER_ITEM_CODE: ${{ inputs.order_item_code }}
+          SUPPLIER_ID: ${{ inputs.supplier_id }}
+          SUPPLIER_SERVICE_ID: ${{ inputs.supplier_service_id }}
+          TARGET_SECRET_NAME: ${{ inputs.target_secret_name }}
+          TARGET_VALUE_CAFE24_MANUAL: ${{ secrets.CAFE24_MANUAL_TARGET_VALUE }}
+          TARGET_VALUE_CAFE24_MANUAL_2: ${{ secrets.CAFE24_MANUAL_TARGET_VALUE_2 }}
+          TARGET_VALUE_CAFE24_MANUAL_3: ${{ secrets.CAFE24_MANUAL_TARGET_VALUE_3 }}
+          ORDERED_COUNT: ${{ inputs.ordered_count }}
+          REQUEST_MEMO: ${{ inputs.request_memo }}
+          EXPECTED_QUANTITY: ${{ inputs.expected_quantity }}
+          DISPATCH_AFTER_SAVE: ${{ inputs.dispatch_after_save }}
+        run: |
+          set -euo pipefail
+          oidc_token=""
+          if [ -z "${CRON_SECRET:-}" ]; then
+            oidc_token="$(curl --fail-with-body --show-error --silent \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=instamart-cron" | jq -r '.value // empty')"
+          fi
+          auth_token="${CRON_SECRET:-${oidc_token:-}}"
+          if [ -z "${auth_token:-}" ]; then
+            echo "Repository secret CRON_SECRET or GitHub Actions OIDC token is required for production cron auth." >&2
+            exit 1
+          fi
+          case "$TARGET_SECRET_NAME" in
+            CAFE24_MANUAL_TARGET_VALUE)
+              TARGET_VALUE="${TARGET_VALUE_CAFE24_MANUAL:-}"
+              ;;
+            CAFE24_MANUAL_TARGET_VALUE_2)
+              TARGET_VALUE="${TARGET_VALUE_CAFE24_MANUAL_2:-}"
+              ;;
+            CAFE24_MANUAL_TARGET_VALUE_3)
+              TARGET_VALUE="${TARGET_VALUE_CAFE24_MANUAL_3:-}"
+              ;;
+            *)
+              echo "Unsupported target secret ${TARGET_SECRET_NAME}. Add it to the workflow allow-list before dispatching." >&2
+              exit 1
+              ;;
+          esac
+          if [ -z "${TARGET_VALUE:-}" ]; then
+            echo "Target secret ${TARGET_SECRET_NAME} is required" >&2
+            exit 1
+          fi
+          echo "::add-mask::${TARGET_VALUE}"
+
+          response_file="$(mktemp)"
+          http_code="$(
+            curl -sS -X POST "https://smmproject-lime.vercel.app/api/cron/cafe24/order-items/manual-input" \
+              -H "Authorization: Bearer ${auth_token}" \
+              -H "X-GitHub-Repository: ${GITHUB_REPOSITORY}" \
+              -H "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" \
+              -H "X-GitHub-Workflow: ${GITHUB_WORKFLOW}" \
+              -H "Content-Type: application/json" \
+              --data "$(jq -nc \
+                --arg mallId "$MALL_ID" \
+                --argjson shopNo "$SHOP_NO" \
+                --arg orderId "$ORDER_ID" \
+                --arg orderItemCode "$ORDER_ITEM_CODE" \
+                --arg supplierId "$SUPPLIER_ID" \
+                --arg supplierServiceId "$SUPPLIER_SERVICE_ID" \
+                --arg targetValue "$TARGET_VALUE" \
+                --arg orderedCount "$ORDERED_COUNT" \
+                --arg requestMemo "$REQUEST_MEMO" \
+                --arg expectedQuantity "${EXPECTED_QUANTITY:-$ORDERED_COUNT}" \
+                --arg dispatchAfterSave "${DISPATCH_AFTER_SAVE:-false}" \
+                '{mallId:$mallId,shopNo:$shopNo,orderId:$orderId,orderItemCode:$orderItemCode,supplierId:$supplierId,supplierServiceId:$supplierServiceId,targetValue:$targetValue,orderedCount:$orderedCount,requestMemo:$requestMemo,expectedQuantity:$expectedQuantity,dispatchAfterSave:($dispatchAfterSave == "true"),confirmManualInput:true}')" \
+              -o "$response_file" \
+              -w "%{http_code}"
+          )"
+
+          cat "$response_file"
+          echo
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "Cafe24 manual input failed with HTTP ${http_code}" >&2
+            exit 1
+          fi
+
+          can_dispatch="$(jq -r '.preflight.canDispatch // false' "$response_file")"
+          if [ "$can_dispatch" != "true" ]; then
+            echo "Manual input saved, but preflight is not dispatchable." >&2
+            exit 1
+          fi
+          if [ "${DISPATCH_AFTER_SAVE:-false}" = "true" ]; then
+            dispatch_submitted="$(jq -r '.dispatch.submitted // false' "$response_file")"
+            dispatch_status="$(jq -r '.dispatch.status // ""' "$response_file")"
+            if [ "$dispatch_submitted" != "true" ]; then
+              echo "Manual input dispatch did not submit supplier order: ${dispatch_status}" >&2
+              exit 1
+            fi
+          fi

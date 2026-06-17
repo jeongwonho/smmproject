@@ -1,0 +1,36 @@
+name: Cafe24 Operational Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read Cafe24 operational audit
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          set -euo pipefail
+          oidc_token=""
+          if [ -z "${CRON_SECRET:-}" ]; then
+            oidc_token="$(curl --fail-with-body --show-error --silent \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=instamart-cron" | jq -r '.value // empty')"
+          fi
+          auth_token="${CRON_SECRET:-${oidc_token:-}}"
+          if [ -z "${auth_token:-}" ]; then
+            echo "Repository secret CRON_SECRET or GitHub Actions OIDC token is required for production cron auth." >&2
+            exit 1
+          fi
+          export SMM_PANEL_AUDIT_BEARER_TOKEN="${auth_token}"
+          python3 scripts/cafe24_operational_audit.py \
+            --source remote \
+            --base-url "https://smmproject-lime.vercel.app" \
+            --format summary
