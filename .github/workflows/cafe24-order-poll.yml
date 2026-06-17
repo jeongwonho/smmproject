@@ -1,16 +1,17 @@
-name: Instamart Automation Tick
+name: Cafe24 Flow Tick
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
   actions: read
   contents: read
+  id-token: write
 
 concurrency:
-  group: instamart-automation
+  group: instamart-cafe24-flow
   cancel-in-progress: false
 
 jobs:
@@ -18,16 +19,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Run automation tick
+      - name: Run Cafe24 flow tick
         env:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
-          GITHUB_TOKEN: ${{ github.token }}
-          TICK_URL: https://smmproject-lime.vercel.app/api/cron/automation/tick
+          TICK_URL: https://smmproject-lime.vercel.app/api/cron/cafe24/flow-tick
         run: |
           set -euo pipefail
-          auth_token="${CRON_SECRET:-${GITHUB_TOKEN:-}}"
+          oidc_token=""
+          if [ -z "${CRON_SECRET:-}" ]; then
+            oidc_token="$(curl --fail-with-body --show-error --silent \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=instamart-cron" | jq -r '.value // empty')"
+          fi
+          auth_token="${CRON_SECRET:-${oidc_token:-}}"
           if [ -z "${auth_token:-}" ]; then
-            echo "CRON_SECRET or GITHUB_TOKEN is required."
+            echo "Repository secret CRON_SECRET or GitHub Actions OIDC token is required for production cron auth." >&2
             exit 1
           fi
 
@@ -39,7 +45,7 @@ jobs:
               -H "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" \
               -H "X-GitHub-Workflow: ${GITHUB_WORKFLOW}" \
               -H "Content-Type: application/json" \
-              --data '{"lookbackDays":30,"supplierLimit":10,"supplierSyncLimit":10,"supplierHealthLimit":10,"cafe24Limit":5,"cafe24PageLimit":1000,"cafe24MaxPages":30,"cafe24DetailFetchLimit":200,"dispatchLimit":25,"statusLimit":50,"completionLimit":25}' \
+              --data '{"lookbackMinutes":180,"useCursor":true,"overlapMinutes":20,"cafe24Limit":5,"pageLimit":200,"maxPages":3,"detailFetchLimit":50,"dispatchLimit":50,"statusLimit":75,"completionLimit":50,"requestTimeoutSeconds":5,"maxAttempts":1}' \
               -o "$response_file" \
               -w "%{http_code}"
           )"
@@ -48,6 +54,6 @@ jobs:
           echo
 
           if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
-            echo "Instamart automation tick failed with HTTP ${http_code}"
+            echo "Cafe24 flow tick failed with HTTP ${http_code}"
             exit 1
           fi

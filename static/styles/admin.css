@@ -554,9 +554,40 @@ body[data-route-surface="admin"] .admin-module-header__row {
   margin-bottom: 16px;
 }
 
+.admin-disclosure {
+  border: 1px solid rgba(221, 228, 246, 0.96);
+  border-radius: 14px;
+  background: rgba(248, 250, 255, 0.82);
+  padding: 0;
+}
+
+.admin-disclosure > summary {
+  cursor: pointer;
+  padding: 12px 14px;
+  color: var(--text);
+  font-weight: 800;
+  list-style-position: inside;
+}
+
+.admin-disclosure > :not(summary) {
+  margin: 0 14px 14px;
+}
+
+.admin-disclosure .admin-disclosure {
+  margin-top: 12px;
+  background: #ffffff;
+}
+
+.cafe24-quick-lookup {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 12px;
+}
+
 .cafe24-control-grid {
   display: grid;
-  grid-template-columns: minmax(180px, 0.8fr) minmax(120px, 0.5fr) minmax(280px, 1.4fr);
+  grid-template-columns: minmax(180px, 0.8fr) minmax(120px, 0.5fr) repeat(2, minmax(160px, 0.8fr));
   gap: 12px;
 }
 
@@ -564,7 +595,65 @@ body[data-route-surface="admin"] .admin-module-header__row {
   margin: 10px 0 4px;
 }
 
+.cafe24-order-search {
+  align-items: stretch;
+  margin: 12px 0 4px;
+}
+
+.cafe24-order-search__field {
+  flex: 1 1 360px;
+}
+
+.cafe24-order-search__clear[hidden] {
+  display: none;
+}
+
+.cafe24-filter-disclosure {
+  flex: 1 1 100%;
+}
+
+.cafe24-filter-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(160px, 1fr));
+  gap: 10px;
+}
+
+.cafe24-primary-tabs {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 16px 0 10px;
+}
+
+.cafe24-advanced-tabs {
+  margin: 0 0 16px;
+}
+
+.cafe24-advanced-tabs .admin-analytics-subnav {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
 .cafe24-order-list {
+  margin-top: 12px;
+}
+
+.cafe24-order-card__summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.cafe24-order-card__summary span {
+  padding: 6px 9px;
+  border: 1px solid rgba(221, 228, 246, 0.96);
+  border-radius: 999px;
+  background: #f8fbff;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.cafe24-order-card__primary-actions,
+.cafe24-order-card__details {
   margin-top: 12px;
 }
 
@@ -670,7 +759,15 @@ body[data-route-surface="admin"] .admin-module-header__row {
   .admin-order-card__fact-grid,
   .admin-connection-grid,
   .admin-record-row,
-  .admin-mapping-layout {
+  .admin-mapping-layout,
+  .cafe24-control-grid,
+  .cafe24-filter-grid,
+  .cafe24-primary-tabs,
+  .cafe24-advanced-tabs .admin-analytics-subnav {
+    grid-template-columns: 1fr;
+  }
+
+  .cafe24-quick-lookup {
     grid-template-columns: 1fr;
   }
 

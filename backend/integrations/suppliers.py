@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
@@ -12,6 +13,20 @@ SUPPLIER_INTEGRATION_CLASSIC = "classic"
 SUPPLIER_INTEGRATION_MKT24 = "mkt24"
 SUPPLIER_INTEGRATION_FASTTRAFFIC = "fasttraffic"
 FASTTRAFFIC_API_URL = "https://fastraffic.co.kr/nblog_api.php"
+UUID_LIKE_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+SUPPLIER_PLATFORM_LABELS = {
+    "instagram": "인스타그램",
+    "youtube": "유튜브",
+    "facebook": "페이스북",
+    "threads": "스레드",
+    "naver": "N포털",
+    "tiktok": "틱톡",
+    "x": "X",
+    "twitter": "X",
+}
 FASTTRAFFIC_STATUS_ACTIONS = (
     "check_nblog",
     "check_nblog_daily",
@@ -24,12 +39,12 @@ SUPPLIER_SERVICE_SYNC_DEFAULT_INTERVAL_MINUTES = 30
 SUPPLIER_SERVICE_SYNC_LOCK_MINUTES = 10
 SUPPLIER_SERVICE_SYNC_RETRY_BASE_MINUTES = 10
 SUPPLIER_SERVICE_SYNC_RETRY_MAX_MINUTES = 60
+SUPPLIER_PANEL_REQUEST_TIMEOUT_SECONDS = 12.0
+SUPPLIER_FASTTRAFFIC_REQUEST_TIMEOUT_SECONDS = 15.0
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
 )
-
-
 FASTTRAFFIC_SERVICE_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "service": "nblog_auto",
@@ -231,6 +246,229 @@ def normalize_supplier_integration_type(raw: Any) -> str:
     return SUPPLIER_INTEGRATION_CLASSIC
 
 
+def supplier_platform_label(platform_key: str) -> str:
+    key = str(platform_key or "").strip().lower()
+    return SUPPLIER_PLATFORM_LABELS.get(key, key)
+
+
+def _safe_float(value: Any, fallback: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _as_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def normalize_api_candidates(raw_api_url: str) -> List[str]:
+    candidate = str(raw_api_url or "").strip()
+    if not candidate:
+        return []
+    if not candidate.startswith(("http://", "https://")):
+        candidate = f"https://{candidate}"
+    candidate = candidate.rstrip("/")
+    parsed = urlparse(candidate)
+    if not parsed.netloc:
+        return []
+
+    candidates: List[str] = []
+    path = parsed.path.rstrip("/")
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+
+    if path.endswith("/api/v2"):
+        candidates.append(candidate)
+    elif path.endswith("/api"):
+        candidates.extend([f"{candidate}/v2", candidate])
+    elif not path or path == "/":
+        candidates.extend([f"{origin}/api/v2", f"{origin}/api", candidate])
+    else:
+        candidates.extend([candidate, f"{candidate}/v2"])
+
+    deduped: List[str] = []
+    for item in candidates:
+        normalized = item.rstrip("/")
+        if normalized and normalized not in deduped:
+            deduped.append(normalized)
+    return deduped
+
+
+def normalize_mkt24_candidates(raw_api_url: str) -> List[str]:
+    candidate = str(raw_api_url or "").strip()
+    if not candidate:
+        return []
+    if not candidate.startswith(("http://", "https://")):
+        candidate = f"https://{candidate}"
+    candidate = candidate.rstrip("/")
+    parsed = urlparse(candidate)
+    if not parsed.netloc:
+        return []
+
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    path = parsed.path.rstrip("/")
+    candidates: List[str] = []
+
+    if path.endswith("/panel"):
+        candidates.append(candidate)
+    elif path.endswith("/products/sns") or path.endswith("/products"):
+        candidates.append(f"{origin}/v3/panel")
+    elif path.endswith("/v3"):
+        candidates.append(f"{candidate}/panel")
+    elif not path or path == "/":
+        candidates.append(f"{origin}/v3/panel")
+    else:
+        candidates.extend([f"{candidate}/panel", f"{origin}/v3/panel"])
+
+    deduped: List[str] = []
+    for item in candidates:
+        normalized = item.rstrip("/")
+        if normalized and normalized not in deduped:
+            deduped.append(normalized)
+    return deduped
+
+
+def normalize_fasttraffic_candidates(raw_api_url: str) -> List[str]:
+    candidate = str(raw_api_url or "").strip()
+    if not candidate:
+        return [FASTTRAFFIC_API_URL]
+    if not candidate.startswith(("http://", "https://")):
+        candidate = f"https://{candidate}"
+    candidate = candidate.rstrip("/")
+    parsed = urlparse(candidate)
+    if not parsed.netloc:
+        return [FASTTRAFFIC_API_URL]
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    candidates: List[str] = []
+    if parsed.netloc.endswith("fastraffic.co.kr"):
+        candidates.append(f"{origin}/nblog_api.php")
+    if parsed.path.rstrip("/").endswith("/nblog_api.php"):
+        candidates.append(candidate)
+    candidates.append(FASTTRAFFIC_API_URL)
+
+    deduped: List[str] = []
+    for item in candidates:
+        normalized = item.rstrip("/")
+        if normalized and normalized not in deduped:
+            deduped.append(normalized)
+    return deduped
+
+
+def looks_like_uuid(value: Any) -> bool:
+    return bool(UUID_LIKE_RE.match(str(value or "").strip()))
+
+
+def normalize_supplier_api_candidates(integration_type: str, raw_api_url: str) -> List[str]:
+    normalized_type = normalize_supplier_integration_type(integration_type)
+    if normalized_type == SUPPLIER_INTEGRATION_MKT24:
+        return normalize_mkt24_candidates(raw_api_url)
+    if normalized_type == SUPPLIER_INTEGRATION_FASTTRAFFIC:
+        return normalize_fasttraffic_candidates(raw_api_url)
+    return normalize_api_candidates(raw_api_url)
+
+
+def normalize_supplier_services_payload(integration_type: str, payload: Any) -> List[Dict[str, Any]]:
+    normalized_type = normalize_supplier_integration_type(integration_type)
+    if normalized_type == SUPPLIER_INTEGRATION_FASTTRAFFIC:
+        if not isinstance(payload, list):
+            raise SupplierApiError("FastTraffic 서비스 카탈로그 형식이 올바르지 않습니다.")
+        return [item for item in payload if isinstance(item, dict)]
+    if normalized_type == SUPPLIER_INTEGRATION_MKT24:
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if isinstance(payload, dict) and isinstance(payload.get("services"), list):
+            return [item for item in payload["services"] if isinstance(item, dict)]
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            raise SupplierApiError("서비스 목록 형식이 올바르지 않습니다.")
+        services: List[Dict[str, Any]] = []
+        for platform_key, items in data.items():
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                normalized_item = dict(item)
+                normalized_item["_platformKey"] = str(platform_key or "").strip().lower()
+                services.append(normalized_item)
+        return services
+
+    if not isinstance(payload, list):
+        raise SupplierApiError("서비스 목록 형식이 올바르지 않습니다.")
+    return [item for item in payload if isinstance(item, dict)]
+
+
+def supplier_service_record(integration_type: str, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    normalized_type = normalize_supplier_integration_type(integration_type)
+    if normalized_type == SUPPLIER_INTEGRATION_FASTTRAFFIC:
+        external_service_id = str(item.get("service") or item.get("action") or "").strip()
+        if not external_service_id:
+            return None
+        return {
+            "externalServiceId": external_service_id,
+            "name": str(item.get("name") or f"FastTraffic {external_service_id}").strip(),
+            "category": str(item.get("category") or "FastTraffic").strip(),
+            "type": str(item.get("type") or "").strip(),
+            "rate": _safe_float(item.get("rate"), 0.0),
+            "minAmount": int(float(item.get("min") or 0) or 0),
+            "maxAmount": int(float(item.get("max") or 0) or 0),
+            "dripfeed": False,
+            "refill": False,
+            "cancel": False,
+            "rawJson": _as_json(item),
+        }
+    if normalized_type == SUPPLIER_INTEGRATION_MKT24:
+        panel_service_id = str(item.get("service") or item.get("id") or "").strip()
+        if panel_service_id:
+            return {
+                "externalServiceId": panel_service_id,
+                "name": str(item.get("name") or f"서비스 {panel_service_id}").strip(),
+                "category": str(item.get("category") or "").strip(),
+                "type": str(item.get("type") or "").strip(),
+                "rate": _safe_float(item.get("rate"), 0.0),
+                "minAmount": int(float(item.get("min") or 0) or 0),
+                "maxAmount": int(float(item.get("max") or 0) or 0),
+                "dripfeed": bool(item.get("dripfeed")),
+                "refill": bool(item.get("refill")),
+                "cancel": bool(item.get("cancel")),
+                "rawJson": _as_json(item),
+            }
+        external_service_id = str(item.get("productUuid") or "").strip()
+        if not external_service_id:
+            return None
+        platform_key = str(item.get("_platformKey") or "").strip().lower()
+        return {
+            "externalServiceId": external_service_id,
+            "name": str(item.get("fullName") or item.get("menuName") or item.get("cardName") or external_service_id).strip(),
+            "category": supplier_platform_label(platform_key),
+            "type": str(item.get("productTypeName") or item.get("menuName") or "").strip(),
+            "rate": _safe_float(item.get("normalPrice"), 0.0),
+            "minAmount": 0,
+            "maxAmount": 0,
+            "dripfeed": False,
+            "refill": False,
+            "cancel": False,
+            "rawJson": _as_json(item),
+        }
+
+    external_service_id = str(item.get("service") or item.get("id") or "").strip()
+    if not external_service_id:
+        return None
+    return {
+        "externalServiceId": external_service_id,
+        "name": str(item.get("name") or f"서비스 {external_service_id}").strip(),
+        "category": str(item.get("category") or "").strip(),
+        "type": str(item.get("type") or "").strip(),
+        "rate": _safe_float(item.get("rate"), 0.0),
+        "minAmount": int(float(item.get("min") or 0) or 0),
+        "maxAmount": int(float(item.get("max") or 0) or 0),
+        "dripfeed": bool(item.get("dripfeed")),
+        "refill": bool(item.get("refill")),
+        "cancel": bool(item.get("cancel")),
+        "rawJson": _as_json(item),
+    }
+
+
 def supplier_supports_balance_check(integration_type: str) -> bool:
     return normalize_supplier_integration_type(integration_type) in {
         SUPPLIER_INTEGRATION_CLASSIC,
@@ -255,6 +493,384 @@ def supplier_uses_panel_api(integration_type: str, api_url: str) -> bool:
         return False
     parsed = urlparse(str(api_url or ""))
     return normalized_type == SUPPLIER_INTEGRATION_MKT24 and parsed.path.rstrip("/").endswith("/panel")
+
+
+def _supplier_readiness_requirement(
+    key: str,
+    label: str,
+    value: str,
+    *,
+    ok: bool,
+    blocking: bool,
+    code: str,
+    message: str,
+) -> Dict[str, Any]:
+    return {
+        "key": key,
+        "label": label,
+        "value": value,
+        "ok": bool(ok),
+        "blocking": bool(blocking),
+        "status": "pass" if ok else "blocked" if blocking else "warning",
+        "code": code,
+        "message": message,
+    }
+
+
+def supplier_dispatch_contract_payload(
+    integration_type: str,
+    api_url: str = "",
+    *,
+    service_external_id: Any = "",
+) -> Dict[str, Any]:
+    normalized_type = normalize_supplier_integration_type(integration_type)
+    uses_panel_api = supplier_uses_panel_api(normalized_type, api_url)
+    external_service_id = str(service_external_id or "").strip()
+    if normalized_type == SUPPLIER_INTEGRATION_MKT24:
+        return {
+            "integrationType": normalized_type,
+            "label": "MKT24",
+            "endpointMode": "/v3/panel" if uses_panel_api else "v3-direct",
+            "authMode": "api_key_form",
+            "dispatchAction": "action=add" if uses_panel_api else "direct_order",
+            "statusAction": "action=status" if uses_panel_api else "direct_status",
+            "serviceIdRule": "numeric_panel_service_id" if uses_panel_api else "product_uuid_or_option_setting",
+            "serviceIdValue": external_service_id,
+            "targetRule": "link_or_username",
+            "quantityRule": "quantity",
+            "supportsBalanceCheck": supplier_supports_balance_check(normalized_type),
+        }
+    if normalized_type == SUPPLIER_INTEGRATION_FASTTRAFFIC:
+        return {
+            "integrationType": normalized_type,
+            "label": "FastTraffic",
+            "endpointMode": "nblog_api.php",
+            "authMode": "x_api_key_header",
+            "dispatchAction": "service_action",
+            "statusAction": "service_status_action",
+            "serviceIdRule": "fasttraffic_action_key",
+            "serviceIdValue": external_service_id,
+            "targetRule": "service_target_param",
+            "quantityRule": "service_quantity_param",
+            "supportsBalanceCheck": supplier_supports_balance_check(normalized_type),
+        }
+    return {
+        "integrationType": normalized_type,
+        "label": "classic SMM",
+        "endpointMode": "panel_api",
+        "authMode": "key_form",
+        "dispatchAction": "action=add",
+        "statusAction": "action=status",
+        "serviceIdRule": "numeric_or_panel_service_id",
+        "serviceIdValue": external_service_id,
+        "targetRule": "link_or_username",
+        "quantityRule": "quantity",
+        "supportsBalanceCheck": supplier_supports_balance_check(normalized_type),
+    }
+
+
+def supplier_readiness_next_action(code: Any, integration_type: str = "") -> str:
+    normalized_type = normalize_supplier_integration_type(integration_type)
+    key = str(code or "").strip()
+    if key == "ok":
+        return "현재 선택값으로 공급사 발주를 진행할 수 있습니다."
+    if key == "supplier_inactive":
+        return "공급사를 활성화한 뒤 연결 확인과 service sync를 다시 실행하세요."
+    if key == "supplier_api_key_missing":
+        return "공급사 API Key를 저장한 뒤 연결 확인을 실행하세요."
+    if key in {"supplier_service_missing", "supplier_service_inactive", "supplier_service_external_id_missing"}:
+        return "서비스 동기화 후 활성 공급사 서비스를 다시 선택하고 매핑을 저장하세요."
+    if key in {"supplier_services_empty", "supplier_sync_failed", "supplier_sync_not_verified"}:
+        return "서비스 동기화를 실행해 활성 서비스 목록과 external service ID를 갱신하세요."
+    if key == "supplier_health_not_ok":
+        return "API 연결 재확인 또는 health check를 실행해 공급사 상태를 ok로 만든 뒤 발주하세요."
+    if key in {"supplier_balance_failed", "supplier_balance_not_verified"}:
+        return "공급사 잔액 확인 상태를 점검하세요. 실패 상태에서는 발주 전 확인이 필요합니다."
+    if key == "mkt24_panel_service_id_invalid":
+        return "MKT24 /v3/panel 서비스를 다시 동기화하고 숫자형 panel service ID로 재매핑하세요."
+    if normalized_type == SUPPLIER_INTEGRATION_FASTTRAFFIC:
+        return "FastTraffic action별 필수값과 quantityParam을 확인한 뒤 payload preview를 실행하세요."
+    if normalized_type == SUPPLIER_INTEGRATION_MKT24:
+        return "MKT24 panel service ID와 대상/수량 payload를 preview로 확인하세요."
+    return "classic SMM service, target, quantity payload를 preview로 확인하세요."
+
+
+def supplier_auto_dispatch_readiness(
+    row: Dict[str, Any],
+    *,
+    supplier_service_id: str = "",
+) -> Dict[str, Any]:
+    integration_type = normalize_supplier_integration_type(row.get("integration_type"))
+    api_url = str(row.get("api_url") or "")
+    api_key_present = bool(str(row.get("api_key") or "").strip())
+    service_external_id = str(row.get("service_external_id") or "").strip()
+    active_service_count = int(row.get("active_service_count") or 0)
+    service_sync_status = str(row.get("service_sync_status") or "never")
+    health_status = str(row.get("health_status") or "unknown")
+    balance_status = str(row.get("balance_status") or "unknown")
+    supports_balance_check = supplier_supports_balance_check(integration_type)
+    uses_panel_api = supplier_uses_panel_api(integration_type, api_url)
+    service_is_missing = bool(supplier_service_id and row.get("service_is_active") is None)
+    service_is_inactive = bool(supplier_service_id and row.get("service_is_active") is not None and not bool(row.get("service_is_active")))
+    service_external_id_missing = bool(
+        supplier_service_id
+        and not service_is_missing
+        and not service_is_inactive
+        and not service_external_id
+    )
+    mkt24_panel_service_id_invalid = bool(
+        supplier_service_id
+        and integration_type == SUPPLIER_INTEGRATION_MKT24
+        and uses_panel_api
+        and service_external_id
+        and not service_external_id.isdigit()
+    )
+    supplier_is_active = bool(row.get("is_active"))
+    contract = supplier_dispatch_contract_payload(
+        integration_type,
+        api_url,
+        service_external_id=service_external_id,
+    )
+    requirements = [
+        _supplier_readiness_requirement(
+            "supplier_active",
+            "공급사 활성",
+            "활성" if supplier_is_active else "비활성",
+            ok=supplier_is_active,
+            blocking=not supplier_is_active,
+            code="ok" if supplier_is_active else "supplier_inactive",
+            message="자동/수동 발주 대상입니다." if supplier_is_active else "공급사가 비활성 상태입니다.",
+        )
+    ]
+    requirements.append(
+        _supplier_readiness_requirement(
+            "api_auth",
+            "API 인증",
+            "Key 저장됨" if api_key_present else "Key 없음",
+            ok=api_key_present,
+            blocking=not api_key_present,
+            code="ok" if api_key_present else "supplier_api_key_missing",
+            message=(
+                "MKT24 /v3/panel은 Bearer Token 없이 API Key를 key 파라미터로 사용합니다."
+                if api_key_present and integration_type == SUPPLIER_INTEGRATION_MKT24
+                else "FastTraffic은 API Key를 X-Api-Key 헤더로 전송합니다."
+                if api_key_present and integration_type == SUPPLIER_INTEGRATION_FASTTRAFFIC
+                else "classic SMM API는 API Key를 key 파라미터로 전송합니다."
+                if api_key_present
+                else "공급사 API Key가 저장되어 있지 않아 service sync, health check, 발주를 실행할 수 없습니다."
+            ),
+        )
+    )
+    if supplier_service_id:
+        service_ok = not service_is_missing and not service_is_inactive and not service_external_id_missing
+        requirements.append(
+            _supplier_readiness_requirement(
+                "supplier_service",
+                "공급사 서비스",
+                "활성" if service_ok else "외부 ID 없음" if service_external_id_missing else "확인 필요",
+                ok=service_ok,
+                blocking=not service_ok,
+                code=(
+                    "ok"
+                    if service_ok
+                    else "supplier_service_missing"
+                    if service_is_missing
+                    else "supplier_service_inactive"
+                    if service_is_inactive
+                    else "supplier_service_external_id_missing"
+                ),
+                message=(
+                    "매핑된 공급사 서비스를 사용할 수 있습니다."
+                    if service_ok
+                    else "공급사 서비스를 찾을 수 없습니다."
+                    if service_is_missing
+                    else "공급사 서비스가 비활성 상태입니다."
+                    if service_is_inactive
+                    else "공급사 서비스의 external_service_id가 없어 발주 payload의 service/action 값을 만들 수 없습니다."
+                ),
+            )
+        )
+    requirements.append(
+        _supplier_readiness_requirement(
+            "service_catalog",
+            "활성 서비스",
+            f"{active_service_count}개",
+            ok=active_service_count > 0,
+            blocking=active_service_count <= 0,
+            code="ok" if active_service_count > 0 else "supplier_services_empty",
+            message=(
+                "동기화된 활성 서비스가 있습니다."
+                if active_service_count > 0
+                else "동기화된 활성 공급사 서비스가 없습니다."
+            ),
+        )
+    )
+    requirements.append(
+        _supplier_readiness_requirement(
+            "service_sync",
+            "Service sync",
+            "실패" if service_sync_status == "failed" else "성공" if service_sync_status == "success" else "확인 필요",
+            ok=service_sync_status == "success",
+            blocking=service_sync_status == "failed",
+            code="supplier_sync_failed" if service_sync_status == "failed" else "ok" if service_sync_status == "success" else "supplier_sync_not_verified",
+            message=(
+                row.get("service_sync_message")
+                or ("공급사 서비스 동기화가 실패 상태입니다." if service_sync_status == "failed" else "서비스 동기화 성공 이력을 확인하세요.")
+            ),
+        )
+    )
+    requirements.append(
+        _supplier_readiness_requirement(
+            "health_check",
+            "Health check",
+            "정상" if health_status == "ok" else "점검 필요",
+            ok=health_status == "ok",
+            blocking=health_status != "ok",
+            code="ok" if health_status == "ok" else "supplier_health_not_ok",
+            message=row.get("health_message") or ("공급사 상태가 정상입니다." if health_status == "ok" else "공급사 상태 점검이 필요합니다."),
+        )
+    )
+    requirements.append(
+        _supplier_readiness_requirement(
+            "balance_check",
+            "잔액 확인",
+            "미지원" if not supports_balance_check or balance_status == "unsupported" else "실패" if balance_status == "failed" else "정상" if balance_status == "ok" else "미확인",
+            ok=balance_status != "failed",
+            blocking=balance_status == "failed",
+            code="supplier_balance_failed" if balance_status == "failed" else "ok" if balance_status in {"ok", "unsupported"} or not supports_balance_check else "supplier_balance_not_verified",
+            message=(
+                "공급사 잔액 확인에 실패했습니다."
+                if balance_status == "failed"
+                else "이 공급사는 잔액 API 없이 health/service 조건으로 판단합니다."
+                if not supports_balance_check or balance_status == "unsupported"
+                else "잔액 실패 상태가 아니면 발주 차단 조건은 아닙니다."
+            ),
+        )
+    )
+    if integration_type == SUPPLIER_INTEGRATION_MKT24:
+        requirements.append(
+            _supplier_readiness_requirement(
+                "mkt24_dispatch_contract",
+                "MKT24 발주 조건",
+                "숫자형 panel ID 필요" if uses_panel_api else "v3 직접 주문",
+                ok=not mkt24_panel_service_id_invalid,
+                blocking=mkt24_panel_service_id_invalid,
+                code="ok" if not mkt24_panel_service_id_invalid else "mkt24_panel_service_id_invalid",
+                message=(
+                    "MKT24 /v3/panel 발주는 숫자형 panel 서비스 ID 매핑이 필요합니다. 기존 v3 상품 UUID 매핑을 새로 동기화된 panel 서비스로 재매핑해 주세요."
+                    if mkt24_panel_service_id_invalid
+                    else "MKT24는 API Key와 panel 서비스 ID 기준으로 발주합니다."
+                    if uses_panel_api
+                    else "MKT24 v3 직접 주문 모드는 productUuid/formStructure 설정을 함께 확인해야 합니다."
+                ),
+            )
+        )
+    elif integration_type == SUPPLIER_INTEGRATION_FASTTRAFFIC:
+        requirements.append(
+            _supplier_readiness_requirement(
+                "fasttraffic_dispatch_contract",
+                "FastTraffic 발주 조건",
+                "X-Api-Key + action",
+                ok=True,
+                blocking=False,
+                code="ok",
+                message="FastTraffic은 전용 endpoint, X-Api-Key 헤더, action별 payload로 발주합니다.",
+            )
+        )
+    else:
+        requirements.append(
+            _supplier_readiness_requirement(
+                "classic_dispatch_contract",
+                "classic 발주 조건",
+                "key + action=add",
+                ok=True,
+                blocking=False,
+                code="ok",
+                message="classic SMM API는 service, target, quantity를 action=add payload로 보냅니다.",
+            )
+        )
+
+    blocker = next((requirement for requirement in requirements if requirement["blocking"]), None)
+    review_requirements = [
+        requirement
+        for requirement in requirements
+        if not requirement["ok"] and not requirement["blocking"]
+    ]
+    if blocker:
+        code = str(blocker["code"])
+        return {
+            "ok": False,
+            "retryable": code in {
+                "supplier_services_empty",
+                "supplier_sync_failed",
+                "supplier_health_not_ok",
+                "supplier_balance_failed",
+            },
+            "code": code,
+            "message": blocker["message"],
+            "nextAction": supplier_readiness_next_action(code, integration_type),
+            "dispatchContract": contract,
+            "reviewRequired": bool(review_requirements),
+            "reviewCodes": [str(requirement["code"]) for requirement in review_requirements],
+            "requirements": requirements,
+        }
+    return {
+        "ok": True,
+        "retryable": False,
+        "code": "ok",
+        "message": "발주 가능",
+        "nextAction": supplier_readiness_next_action("ok", integration_type),
+        "dispatchContract": contract,
+        "reviewRequired": bool(review_requirements),
+        "reviewCodes": [str(requirement["code"]) for requirement in review_requirements],
+        "requirements": requirements,
+    }
+
+
+def supplier_auto_dispatch_readiness_payload(
+    row: Dict[str, Any],
+    *,
+    supplier_service_id: str = "",
+    include_requirements: bool = True,
+) -> Dict[str, Any]:
+    try:
+        row_map = dict(row or {})
+    except (TypeError, ValueError):
+        row_map = row or {}
+    readiness = supplier_auto_dispatch_readiness(
+        {
+            "is_active": row_map.get("is_active"),
+            "integration_type": row_map.get("integration_type"),
+            "api_url": row_map.get("api_url") or "",
+            "api_key": row_map.get("api_key") or "",
+            "service_is_active": row_map.get("service_is_active"),
+            "service_external_id": row_map.get("service_external_id") or "",
+            "active_service_count": row_map.get("active_service_count", row_map.get("service_count", 0)) or 0,
+            "service_sync_status": row_map.get("service_sync_status") or "never",
+            "service_sync_message": row_map.get("service_sync_message") or "",
+            "health_status": row_map.get("health_status") or "unknown",
+            "health_message": row_map.get("health_message") or "",
+            "balance_status": row_map.get("balance_status") or "unknown",
+        },
+        supplier_service_id=supplier_service_id,
+    )
+    payload = {
+        "ok": bool(readiness.get("ok")),
+        "retryable": bool(readiness.get("retryable")),
+        "code": readiness.get("code") or "unknown",
+        "message": readiness.get("message") or "",
+        "nextAction": readiness.get("nextAction") or supplier_readiness_next_action(readiness.get("code"), row_map.get("integration_type")),
+        "dispatchContract": readiness.get("dispatchContract") or supplier_dispatch_contract_payload(
+            row_map.get("integration_type"),
+            str(row_map.get("api_url") or ""),
+            service_external_id=row_map.get("service_external_id") or "",
+        ),
+        "reviewRequired": bool(readiness.get("reviewRequired")),
+        "reviewCodes": readiness.get("reviewCodes") if isinstance(readiness.get("reviewCodes"), list) else [],
+    }
+    if include_requirements:
+        payload["requirements"] = readiness.get("requirements") if isinstance(readiness.get("requirements"), list) else []
+    return payload
 
 
 def normalize_fasttraffic_api_url(api_url: str) -> str:
@@ -350,6 +966,16 @@ def supplier_sync_interval_minutes(value: Any) -> int:
     return max(5, min(interval, 24 * 60))
 
 
+def supplier_request_timeout_seconds(value: Any, default_seconds: float) -> float:
+    try:
+        timeout = float(value or 0)
+    except (TypeError, ValueError):
+        timeout = 0.0
+    if timeout <= 0:
+        timeout = float(default_seconds)
+    return max(2.0, min(timeout, 30.0))
+
+
 def supplier_service_sync_due(row: Dict[str, Any], now: Optional[dt.datetime] = None) -> bool:
     if not bool(row.get("is_active", True)):
         return False
@@ -402,6 +1028,7 @@ class SupplierApiClient:
         *,
         integration_type: str = SUPPLIER_INTEGRATION_CLASSIC,
         bearer_token: str = "",
+        request_timeout_seconds: Optional[float] = None,
     ) -> None:
         self.integration_type = normalize_supplier_integration_type(integration_type)
         if self.integration_type == SUPPLIER_INTEGRATION_MKT24:
@@ -413,6 +1040,14 @@ class SupplierApiClient:
         self.api_url = normalized_api_url.rstrip("/")
         self.api_key = api_key.strip()
         self.bearer_token = bearer_token.strip()
+        self.request_timeout_seconds = supplier_request_timeout_seconds(
+            request_timeout_seconds,
+            SUPPLIER_PANEL_REQUEST_TIMEOUT_SECONDS,
+        )
+        self.fasttraffic_request_timeout_seconds = supplier_request_timeout_seconds(
+            request_timeout_seconds,
+            SUPPLIER_FASTTRAFFIC_REQUEST_TIMEOUT_SECONDS,
+        )
 
     @property
     def uses_panel_api(self) -> bool:
@@ -431,7 +1066,7 @@ class SupplierApiClient:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=12) as response:
+            with urlopen(request, timeout=self.request_timeout_seconds) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except HTTPError as exc:
             raw_error = ""
@@ -475,7 +1110,7 @@ class SupplierApiClient:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=15) as response:
+            with urlopen(request, timeout=self.fasttraffic_request_timeout_seconds) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except HTTPError as exc:
             raw_error = ""
@@ -527,7 +1162,7 @@ class SupplierApiClient:
             request_headers.setdefault("Content-Type", "application/json")
         request = Request(url or self.api_url, data=data, headers=request_headers, method=method)
         try:
-            with urlopen(request, timeout=12) as response:
+            with urlopen(request, timeout=self.request_timeout_seconds) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except HTTPError as exc:
             raw_error = ""

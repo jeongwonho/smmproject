@@ -19,12 +19,13 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence
-from urllib import error as urllib_error
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse
-from urllib import request as urllib_request
 
 from backend.auth import hash_password, verify_password
-from core import APP_ROOT, DEFAULT_SITE_NAME, PanelError, PanelStore
+from backend.cron_auth import cron_authorization_valid, cron_secret
+from backend.errors import PanelError
+from backend.integrations.cafe24_manual import build_cafe24_manual_input_cron_response
+from core import APP_ROOT, DEFAULT_SITE_NAME, PanelStore
 
 
 STATIC_ROOT = APP_ROOT / "static"
@@ -40,10 +41,40 @@ ADMIN_LOGIN_MAX_ATTEMPTS = 5
 ROBOTS_TXT = "User-agent: *\nDisallow: /admin\nDisallow: /admin/\nDisallow: /api/\nAllow: /\n"
 INDEX_TEMPLATE_PATH = STATIC_ROOT / "index.html"
 VERCEL_REWRITE_PATH_QUERY_KEY = "__path"
+PUBLIC_SHELL_CACHE_SECONDS = 60
+PUBLIC_BOOTSTRAP_CACHE_SECONDS = 60
+PUBLIC_CATALOG_CACHE_SECONDS = 60
+PUBLIC_SHELL_CACHE_CONTROL = "public, max-age=60, s-maxage=300, stale-while-revalidate=1800"
+PUBLIC_BOOTSTRAP_CACHE_CONTROL = "public, max-age=60, s-maxage=300, stale-while-revalidate=1800"
+PUBLIC_CATALOG_CACHE_CONTROL = "public, max-age=60, s-maxage=300, stale-while-revalidate=1800"
+PUBLIC_CACHE_INVALIDATING_METHODS = {
+    "save_site_settings",
+    "save_home_popup",
+    "save_home_banner",
+    "save_platform_section",
+    "save_category",
+    "delete_category",
+    "save_catalog_product",
+    "delete_catalog_product",
+    "save_notice",
+    "delete_notice",
+    "save_faq",
+    "delete_faq",
+}
 
 
 def env_flag(value: str) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def bounded_timeout_seconds(value: Any, default_seconds: float = 6.0) -> float:
+    try:
+        timeout = float(value or 0)
+    except (TypeError, ValueError):
+        timeout = 0.0
+    if timeout <= 0:
+        timeout = default_seconds
+    return max(2.0, min(timeout, 30.0))
 
 
 def normalize_origin(value: str) -> str:
@@ -83,56 +114,6 @@ def is_dev_runtime() -> bool:
     if mode in {"prod", "production", "live"}:
         return False
     return not bool(os.environ.get("VERCEL"))
-
-
-def cron_secret() -> str:
-    return str(os.environ.get("CRON_SECRET") or os.environ.get("SMM_PANEL_CRON_SECRET") or "").strip()
-
-
-def github_actions_cron_authorization_valid(headers: Any) -> bool:
-    auth_header = str(headers.get("Authorization", "") if headers else "").strip()
-    if not auth_header.startswith("Bearer "):
-        return False
-    repository = str(headers.get("X-GitHub-Repository", "") if headers else "").strip()
-    run_id = str(headers.get("X-GitHub-Run-Id", "") if headers else "").strip()
-    expected_repository = str(
-        os.environ.get("SMM_PANEL_GITHUB_CRON_REPOSITORY") or "jeongwonho/smmproject"
-    ).strip()
-    if repository != expected_repository or not run_id.isdigit():
-        return False
-
-    request = urllib_request.Request(
-        f"https://api.github.com/repos/{expected_repository}/actions/runs/{run_id}",
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": auth_header,
-            "User-Agent": "instamart-cafe24-cron-verifier",
-        },
-        method="GET",
-    )
-    try:
-        with urllib_request.urlopen(request, timeout=5) as response:
-            if int(getattr(response, "status", 0) or 0) != 200:
-                return False
-            payload = json.load(response)
-    except (urllib_error.URLError, TimeoutError, ValueError, json.JSONDecodeError):
-        return False
-
-    run_repository = str((payload.get("repository") or {}).get("full_name") or "")
-    run_event = str(payload.get("event") or "")
-    return (
-        str(payload.get("id") or "") == run_id
-        and run_repository == expected_repository
-        and run_event in {"schedule", "workflow_dispatch"}
-    )
-
-
-def cron_authorization_valid(header_value: str, headers: Any = None) -> bool:
-    expected = cron_secret()
-    provided = str(header_value or "").strip()
-    if expected and provided and hmac.compare_digest(provided, f"Bearer {expected}"):
-        return True
-    return github_actions_cron_authorization_valid(headers)
 
 
 def parse_origins(raw_value: str) -> tuple[str, ...]:
@@ -310,6 +291,10 @@ class TTLResponseCache:
             self.items[key] = (now + max(1, ttl_seconds), raw)
             self._prune(now)
         return json.loads(raw.decode("utf-8"))
+
+    def clear(self) -> None:
+        with self.lock:
+            self.items.clear()
 
 
 class SignedSessionStore:
@@ -1031,6 +1016,11 @@ class AppHandler(SimpleHTTPRequestHandler):
     def _public_cached_payload(self, cache_key: str, ttl_seconds: int, factory: Any) -> Dict[str, Any]:
         return self._server().public_cache.get_or_set(cache_key, ttl_seconds, factory)
 
+    def _server_timing_header(self, name: str, started_at: float) -> tuple[str, str]:
+        metric = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-") or "app"
+        elapsed_ms = max(0.0, (time.perf_counter() - started_at) * 1000.0)
+        return ("Server-Timing", f"{metric};dur={elapsed_ms:.1f}")
+
     def _query_value(self, request: RouteRequest, key: str, default: str = "") -> str:
         return request.query.get(key, [default])[0]
 
@@ -1082,16 +1072,36 @@ class AppHandler(SimpleHTTPRequestHandler):
 
     def _write_store_result(self, method_name: str, payload: Dict[str, Any]) -> None:
         result = getattr(self._server().store, method_name)(payload)
+        if method_name in PUBLIC_CACHE_INVALIDATING_METHODS:
+            self._server().public_cache.clear()
         write_json(self, 200, {"ok": True, **result})
 
     @route("GET", "/api/health")
     def _get_health(self, request: RouteRequest) -> None:
-        write_json(self, 200, {"ok": True, "service": f"{DEFAULT_SITE_NAME} Panel"})
+        started_at = time.perf_counter()
+        write_json(
+            self,
+            200,
+            {"ok": True, "service": f"{DEFAULT_SITE_NAME} Panel"},
+            extra_headers=[self._server_timing_header("health", started_at)],
+        )
 
     @route("GET", "/api/cron/suppliers/sync", auth="cron")
     def _get_cron_supplier_sync(self, request: RouteRequest) -> None:
         limit = int(self._query_value(request, "limit", "10") or 10)
-        write_json(self, 200, {"ok": True, **self._server().store.sync_due_supplier_services(actor="cron", limit=limit)})
+        request_timeout_seconds = bounded_timeout_seconds(self._query_value(request, "requestTimeoutSeconds", "6"))
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                **self._server().store.sync_due_supplier_services(
+                    actor="cron",
+                    limit=limit,
+                    request_timeout_seconds=request_timeout_seconds,
+                ),
+            },
+        )
 
     @route("GET", "/robots.txt")
     def _get_robots(self, request: RouteRequest) -> None:
@@ -1107,36 +1117,48 @@ class AppHandler(SimpleHTTPRequestHandler):
 
     @route("GET", "/api/public-shell")
     def _get_public_shell(self, request: RouteRequest) -> None:
+        started_at = time.perf_counter()
         session = self._public_session()
         user_id = str((session or {}).get("user", {}).get("id") or "")
         payload = (
             self._server().store.public_shell(user_id)
             if user_id
-            else self._public_cached_payload("public-shell:v1", 15, lambda: self._server().store.public_shell(""))
+            else self._public_cached_payload(
+                "public-shell:v1",
+                PUBLIC_SHELL_CACHE_SECONDS,
+                lambda: self._server().store.public_shell(""),
+            )
         )
         payload["viewer"] = self._public_session_payload()
         write_json(
             self,
             200,
             {"ok": True, **payload},
-            cache_control="no-store" if session else "public, max-age=15, s-maxage=60, stale-while-revalidate=300",
+            cache_control="no-store" if session else PUBLIC_SHELL_CACHE_CONTROL,
+            extra_headers=[self._server_timing_header("public-shell", started_at)],
         )
 
     @route("GET", "/api/bootstrap")
     def _get_bootstrap(self, request: RouteRequest) -> None:
+        started_at = time.perf_counter()
         session = self._public_session()
         user_id = str((session or {}).get("user", {}).get("id") or "")
         payload = (
             self._server().store.bootstrap(user_id)
             if user_id
-            else self._public_cached_payload("bootstrap:v1", 15, lambda: self._server().store.bootstrap(""))
+            else self._public_cached_payload(
+                "bootstrap:v1",
+                PUBLIC_BOOTSTRAP_CACHE_SECONDS,
+                lambda: self._server().store.bootstrap(""),
+            )
         )
         payload["viewer"] = self._public_session_payload()
         write_json(
             self,
             200,
             {"ok": True, **payload},
-            cache_control="no-store" if session else "public, max-age=15, s-maxage=60, stale-while-revalidate=300",
+            cache_control="no-store" if session else PUBLIC_BOOTSTRAP_CACHE_CONTROL,
+            extra_headers=[self._server_timing_header("bootstrap", started_at)],
         )
 
     @route("GET", "/api/auth/oauth/<provider>/start")
@@ -1199,6 +1221,24 @@ class AppHandler(SimpleHTTPRequestHandler):
             },
         )
 
+    @route("GET", "/api/admin/cafe24/operational-audit", auth="admin")
+    def _get_admin_cafe24_operational_audit(self, request: RouteRequest) -> None:
+        write_json(self, 200, {"ok": True, **self._server().store.cafe24_operational_audit()})
+
+    @route("GET", "/api/cron/cafe24/operational-audit", auth="cron")
+    def _get_cron_cafe24_operational_audit(self, request: RouteRequest) -> None:
+        write_json(self, 200, {"ok": True, **self._server().store.cafe24_operational_audit()})
+
+    @route("POST", "/api/admin/cafe24/mapping-gaps", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_mapping_gaps(self, request: RouteRequest) -> None:
+        write_json(self, 200, {"ok": True, **self._server().store.cafe24_mapping_gap_report(request.payload)})
+
+    @route("POST", "/api/cron/cafe24/mapping-gaps", auth="cron", read_json_body=True)
+    def _post_cron_cafe24_mapping_gaps(self, request: RouteRequest) -> None:
+        payload = dict(request.payload or {})
+        payload["_adminActor"] = "cron"
+        write_json(self, 200, {"ok": True, **self._server().store.cafe24_mapping_gap_report(payload)})
+
     @route("GET", "/api/admin/customers/<customer_id>", auth="admin")
     def _get_admin_customer_detail(self, request: RouteRequest) -> None:
         write_json(self, 200, {"ok": True, **self._server().store.get_customer_detail(request.params["customer_id"])})
@@ -1240,11 +1280,22 @@ class AppHandler(SimpleHTTPRequestHandler):
 
     @route("GET", "/api/products")
     def _get_products(self, request: RouteRequest) -> None:
+        started_at = time.perf_counter()
+        search_query = self._query_value(request, "q")
+        cache_key = f"products:v1:{search_query.strip().lower()[:160]}"
         write_json(
             self,
             200,
-            {"ok": True, **self._server().store.list_catalog(self._query_value(request, "q"))},
-            cache_control="public, max-age=30, s-maxage=120, stale-while-revalidate=600",
+            {
+                "ok": True,
+                **self._public_cached_payload(
+                    cache_key,
+                    PUBLIC_CATALOG_CACHE_SECONDS,
+                    lambda: self._server().store.list_catalog(search_query),
+                ),
+            },
+            cache_control=PUBLIC_CATALOG_CACHE_CONTROL,
+            extra_headers=[self._server_timing_header("products", started_at)],
         )
 
     @route("GET", "/api/admin/suppliers/<supplier_id>/services", auth="admin")
@@ -1274,11 +1325,21 @@ class AppHandler(SimpleHTTPRequestHandler):
 
     @route("GET", "/api/product-categories/<category_id>")
     def _get_product_category(self, request: RouteRequest) -> None:
+        started_at = time.perf_counter()
+        category_id = request.params["category_id"]
         write_json(
             self,
             200,
-            {"ok": True, "category": self._server().store.get_product_category(request.params["category_id"])},
-            cache_control="public, max-age=30, s-maxage=120, stale-while-revalidate=600",
+            {
+                "ok": True,
+                **self._public_cached_payload(
+                    f"product-category:v1:{category_id}",
+                    PUBLIC_CATALOG_CACHE_SECONDS,
+                    lambda: {"category": self._server().store.get_product_category(category_id)},
+                ),
+            },
+            cache_control=PUBLIC_CATALOG_CACHE_CONTROL,
+            extra_headers=[self._server_timing_header("product-category", started_at)],
         )
 
     @route("GET", "/api/orders", auth="public")
@@ -1400,6 +1461,11 @@ class AppHandler(SimpleHTTPRequestHandler):
 
     @route("POST", "/api/cron/suppliers/sync", auth="cron", read_json_body=True)
     def _post_cron_supplier_sync(self, request: RouteRequest) -> None:
+        request_timeout_seconds = bounded_timeout_seconds(
+            request.payload.get("requestTimeoutSeconds")
+            or request.payload.get("request_timeout_seconds")
+            or 6
+        )
         write_json(
             self,
             200,
@@ -1408,6 +1474,7 @@ class AppHandler(SimpleHTTPRequestHandler):
                 **self._server().store.sync_due_supplier_services(
                     actor="cron",
                     limit=int(request.payload.get("limit") or 10),
+                    request_timeout_seconds=request_timeout_seconds,
                 ),
             },
         )
@@ -1439,12 +1506,89 @@ class AppHandler(SimpleHTTPRequestHandler):
             },
         )
 
+    @route("POST", "/api/cron/cafe24/flow-tick", auth="cron", read_json_body=True)
+    def _post_cron_cafe24_flow_tick(self, request: RouteRequest) -> None:
+        payload = dict(request.payload or {})
+        payload["_adminActor"] = "cron"
+        result = self._server().store.run_cafe24_flow_tick(payload)
+        write_json(
+            self,
+            500 if result.get("status") == "failed" else 200,
+            {
+                "ok": result.get("status") != "failed",
+                **result,
+            },
+        )
+
+    @route("POST", "/api/cron/cafe24/email-order-witness", auth="cron", read_json_body=True)
+    def _post_cron_cafe24_email_order_witness(self, request: RouteRequest) -> None:
+        payload = dict(request.payload or {})
+        payload["_adminActor"] = "cron"
+        result = self._server().store.reconcile_cafe24_email_order_witness(payload)
+        write_json(self, 200, {"ok": True, **result})
+
     @route("POST", "/api/cron/cafe24/order-items/dispatch-one", auth="cron", read_json_body=True)
     def _post_cron_cafe24_order_items_dispatch_one(self, request: RouteRequest) -> None:
         payload = dict(request.payload or {})
         payload["_adminActor"] = "cron"
         result = self._server().store.dispatch_single_cafe24_order_item(payload)
         write_json(self, 200, {"ok": True, **result})
+
+    @route("POST", "/api/cron/cafe24/order-items/preflight", auth="cron", read_json_body=True)
+    def _post_cron_cafe24_order_items_preflight(self, request: RouteRequest) -> None:
+        payload = dict(request.payload or {})
+        payload["_adminActor"] = "cron"
+        result = self._server().store.preflight_single_cafe24_order_item(payload)
+        write_json(self, 200, {"ok": True, **result})
+
+    @route("POST", "/api/cron/cafe24/order-items/preview", auth="cron", read_json_body=True)
+    def _post_cron_cafe24_order_items_preview(self, request: RouteRequest) -> None:
+        payload = dict(request.payload or {})
+        payload["_adminActor"] = "cron"
+        result = self._server().store.preview_single_cafe24_order_item(payload)
+        write_json(self, 200, {"ok": True, **result})
+
+    @route("POST", "/api/cron/cafe24/order-items/manual-input/preview", auth="cron", read_json_body=True)
+    def _post_cron_cafe24_order_items_manual_input_preview(self, request: RouteRequest) -> None:
+        payload = dict(request.payload or {})
+        if not env_flag(payload.get("confirmManualInputPreview")):
+            raise PanelError("Cron 수동 보정 미리보기는 confirmManualInputPreview=true가 필요합니다.", status=400)
+        payload["_adminActor"] = "cron"
+        result = self._server().store.preview_cafe24_order_item_manual_input(payload)
+        write_json(self, 200, {"ok": True, **result})
+
+    @route("POST", "/api/cron/cafe24/order-items/manual-input", auth="cron", read_json_body=True)
+    def _post_cron_cafe24_order_items_manual_input(self, request: RouteRequest) -> None:
+        payload = dict(request.payload or {})
+        if not env_flag(payload.get("confirmManualInput")):
+            raise PanelError("Cron 수동 보정은 confirmManualInput=true가 필요합니다.", status=400)
+        payload["_adminActor"] = "cron"
+        result = self._server().store.save_cafe24_order_item_manual_input(payload)
+        item = result.get("item") or {}
+        item_id = str(item.get("id") or payload.get("itemId") or payload.get("id") or "")
+        expected_quantity = payload.get("expectedQuantity") or payload.get("expected_quantity") or payload.get("orderedCount")
+        preflight = self._server().store.preflight_single_cafe24_order_item(
+            {"itemId": item_id, "expectedQuantity": expected_quantity, "_adminActor": "cron"}
+        )
+        dispatch_after_save = env_flag(payload.get("dispatchAfterSave") or payload.get("dispatch_after_save"))
+        dispatch_result = None
+        if dispatch_after_save:
+            if not bool(preflight.get("canDispatch")):
+                raise PanelError("수동 보정 preflight가 발주 가능 상태가 아니므로 단건 발주를 실행하지 않았습니다.", status=409)
+            dispatch_result = self._server().store.dispatch_cafe24_order_item(
+                {"itemId": item_id, "_adminActor": "cron"}
+            )
+        write_json(
+            self,
+            200,
+            build_cafe24_manual_input_cron_response(
+                item_id=item_id,
+                result=result,
+                preflight=preflight,
+                dispatch_after_save=dispatch_after_save,
+                dispatch=dispatch_result,
+            ),
+        )
 
     @route("POST", "/api/cron/cafe24/order-items/check-supplier-status", auth="cron", read_json_body=True)
     def _post_cron_cafe24_order_items_check_supplier_status(self, request: RouteRequest) -> None:
@@ -1724,6 +1868,10 @@ class AppHandler(SimpleHTTPRequestHandler):
     def _post_admin_cafe24_order_items_retry(self, request: RouteRequest) -> None:
         self._write_store_result("retry_cafe24_order_item", request.payload)
 
+    @route("POST", "/api/admin/cafe24/order-items/preflight", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_order_items_preflight(self, request: RouteRequest) -> None:
+        self._write_store_result("preflight_single_cafe24_order_item", request.payload)
+
     @route("POST", "/api/admin/cafe24/order-items/dispatch", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
     def _post_admin_cafe24_order_items_dispatch(self, request: RouteRequest) -> None:
         self._write_store_result("dispatch_cafe24_order_item", request.payload)
@@ -1731,6 +1879,26 @@ class AppHandler(SimpleHTTPRequestHandler):
     @route("POST", "/api/admin/cafe24/order-items/resync", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
     def _post_admin_cafe24_order_items_resync(self, request: RouteRequest) -> None:
         self._write_store_result("resync_cafe24_order_item", request.payload)
+
+    @route("POST", "/api/admin/cafe24/order-items/manual-input/preview", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_order_items_manual_input_preview(self, request: RouteRequest) -> None:
+        self._write_store_result("preview_cafe24_order_item_manual_input", request.payload)
+
+    @route("POST", "/api/admin/cafe24/order-items/manual-input", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_order_items_manual_input(self, request: RouteRequest) -> None:
+        payload = dict(request.payload or {})
+        result = self._server().store.save_cafe24_order_item_manual_input(payload)
+        item = result.get("item") or {}
+        item_id = str(item.get("id") or payload.get("itemId") or payload.get("id") or "")
+        expected_quantity = payload.get("expectedQuantity") or payload.get("expected_quantity") or payload.get("orderedCount")
+        preflight = self._server().store.preflight_single_cafe24_order_item(
+            {
+                "itemId": item_id,
+                "expectedQuantity": expected_quantity,
+                "_adminActor": payload.get("_adminActor") or "admin",
+            }
+        )
+        write_json(self, 200, {"ok": True, **result, "preflight": preflight})
 
     @route("POST", "/api/admin/cafe24/order-items/status", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
     def _post_admin_cafe24_order_items_status(self, request: RouteRequest) -> None:
