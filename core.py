@@ -537,6 +537,7 @@ CAFE24_FLOW_STATUS_LIMIT = 75
 CAFE24_FLOW_COMPLETION_LIMIT = 50
 CAFE24_FLOW_REQUEST_TIMEOUT_SECONDS = 5.0
 CAFE24_FLOW_MAX_ATTEMPTS = 1
+CAFE24_WEBHOOK_ORDER_PROCESSED_EVENT_NO = "90023"
 CAFE24_ORDER_ELIGIBLE_STATUSES = {"N10", "N20", "N21", "N22", "N30", "N40", "N50"}
 CAFE24_ORDER_UNPAID_STATUSES = {"N00"}
 CAFE24_ORDER_CANCELLED_PREFIXES = ("C", "R", "E")
@@ -618,6 +619,10 @@ def payment_secret_key() -> str:
 
 def payment_webhook_secret() -> str:
     return str(os.environ.get("SMM_PANEL_PAYMENT_WEBHOOK_SECRET") or "").strip()
+
+
+def cafe24_webhook_api_key() -> str:
+    return str(os.environ.get("SMM_PANEL_CAFE24_WEBHOOK_API_KEY") or "").strip()
 
 
 def legacy_payment_webhook_secret_allowed() -> bool:
@@ -1366,6 +1371,28 @@ CREATE TABLE IF NOT EXISTS cafe24_api_events (
 
 CREATE INDEX IF NOT EXISTS idx_cafe24_api_events_created_at
     ON cafe24_api_events(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS cafe24_webhook_events (
+    id TEXT PRIMARY KEY,
+    trace_id TEXT NOT NULL DEFAULT '',
+    event_no TEXT NOT NULL DEFAULT '',
+    mall_id TEXT NOT NULL DEFAULT '',
+    shop_no INTEGER NOT NULL DEFAULT 1,
+    cafe24_order_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'received',
+    message TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    result_json TEXT NOT NULL DEFAULT '{}',
+    processed_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cafe24_webhook_events_order_created_at
+    ON cafe24_webhook_events(mall_id, shop_no, cafe24_order_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_cafe24_webhook_events_trace_id
+    ON cafe24_webhook_events(trace_id);
 
 CREATE TABLE IF NOT EXISTS home_popups (
     id TEXT PRIMARY KEY,
@@ -4309,6 +4336,25 @@ class PanelStore(PanelStoreDatabaseMixin):
                 error_message TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS cafe24_webhook_events (
+                id TEXT PRIMARY KEY,
+                trace_id TEXT NOT NULL DEFAULT '',
+                event_no TEXT NOT NULL DEFAULT '',
+                mall_id TEXT NOT NULL DEFAULT '',
+                shop_no INTEGER NOT NULL DEFAULT 1,
+                cafe24_order_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'received',
+                message TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                result_json TEXT NOT NULL DEFAULT '{}',
+                processed_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_cafe24_webhook_events_order_created_at
+                ON cafe24_webhook_events(mall_id, shop_no, cafe24_order_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_cafe24_webhook_events_trace_id
+                ON cafe24_webhook_events(trace_id);
             """
         )
 
@@ -8248,6 +8294,108 @@ class PanelStore(PanelStoreDatabaseMixin):
             ),
         )
 
+    def _record_cafe24_webhook_event(
+        self,
+        conn: DatabaseConnection,
+        *,
+        trace_id: str = "",
+        event_no: str = "",
+        mall_id: str = "",
+        shop_no: int = CAFE24_DEFAULT_SHOP_NO,
+        order_id: str = "",
+        status: str = "received",
+        message: str = "",
+        payload: Any = None,
+        result: Any = None,
+    ) -> str:
+        timestamp = now_iso()
+        event_id = f"cafe24_webhook_{uuid4().hex[:16]}"
+        conn.execute(
+            """
+            INSERT INTO cafe24_webhook_events (
+                id, trace_id, event_no, mall_id, shop_no, cafe24_order_id,
+                status, message, payload_json, result_json, processed_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                str(trace_id or "")[:200],
+                str(event_no or "")[:40],
+                str(mall_id or "")[:100],
+                int(shop_no or CAFE24_DEFAULT_SHOP_NO),
+                str(order_id or "")[:100],
+                str(status or "received")[:40],
+                str(message or "")[:1000],
+                as_json(redact_external_payload(payload or {})),
+                as_json(redact_external_payload(result or {})),
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+        return event_id
+
+    def _acquire_runtime_lock(self, conn: DatabaseConnection, key: str, *, ttl_seconds: int) -> str:
+        owner = uuid4().hex
+        now_value = now_iso()
+        lock_until = (dt.datetime.now().astimezone() + dt.timedelta(seconds=max(ttl_seconds, 1))).isoformat(timespec="seconds")
+        lock_value = f"{lock_until}|{owner}"
+        cursor = conn.execute(
+            """
+            INSERT INTO runtime_metadata (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO NOTHING
+            """,
+            (key, lock_value, now_value),
+        )
+        if cursor.rowcount == 1:
+            return lock_value
+        cursor = conn.execute(
+            """
+            UPDATE runtime_metadata
+            SET value = ?, updated_at = ?
+            WHERE key = ? AND (value = '' OR value < ?)
+            """,
+            (lock_value, now_value, key, now_value),
+        )
+        return lock_value if cursor.rowcount == 1 else ""
+
+    def _release_runtime_lock(self, conn: DatabaseConnection, key: str, lock_value: str) -> None:
+        if not lock_value:
+            return
+        conn.execute(
+            """
+            UPDATE runtime_metadata
+            SET value = '', updated_at = ?
+            WHERE key = ? AND value = ?
+            """,
+            (now_iso(), key, lock_value),
+        )
+
+    def _compact_cafe24_flow_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        def compact_section(section: Any) -> Any:
+            if not isinstance(section, dict):
+                return section
+            compacted: Dict[str, Any] = {}
+            for key, value in section.items():
+                if key == "results":
+                    compacted["resultCount"] = len(value) if isinstance(value, list) else 0
+                    continue
+                if key == "summary" and isinstance(value, dict):
+                    compacted[key] = {
+                        summary_key: summary_value
+                        for summary_key, summary_value in value.items()
+                        if summary_key not in {"requestWindows", "queryPages", "pages"}
+                    }
+                    continue
+                compacted[key] = value
+            return compacted
+
+        compacted = dict(result)
+        for key in ("cafe24Poll", "cafe24Dispatch", "supplierStatusRefresh", "cafe24Completion"):
+            compacted[key] = compact_section(compacted.get(key))
+        return compacted
+
     def list_cafe24_order_items(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         options = cafe24_order_item_list_options(payload)
         page = int(options["page"])
@@ -10959,6 +11107,143 @@ class PanelStore(PanelStoreDatabaseMixin):
             },
         }
 
+    def process_cafe24_order_webhook(
+        self,
+        payload: Dict[str, Any],
+        *,
+        provided_api_key: str = "",
+        trace_id: str = "",
+        actor: str = "cafe24_webhook",
+    ) -> Dict[str, Any]:
+        expected_api_key = cafe24_webhook_api_key()
+        if not expected_api_key:
+            raise PanelError("Cafe24 WebHook 인증정보가 설정되지 않았습니다.", status=503)
+        if not hmac.compare_digest(str(provided_api_key or ""), expected_api_key):
+            raise PanelError("Cafe24 WebHook 인증에 실패했습니다.", status=401)
+        if not isinstance(payload, dict):
+            raise PanelError("Cafe24 WebHook payload 형식이 올바르지 않습니다.", status=400)
+
+        resource = payload.get("resource") if isinstance(payload.get("resource"), dict) else {}
+        event_no = str(payload.get("event_no") or payload.get("eventNo") or resource.get("event_no") or "").strip()
+        mall_id = str(resource.get("mall_id") or payload.get("mall_id") or payload.get("mallId") or "").strip()
+        shop_no = normalize_cafe24_shop_no(
+            resource.get("event_shop_no")
+            or resource.get("shop_no")
+            or payload.get("event_shop_no")
+            or payload.get("shopNo")
+            or payload.get("shop_no")
+            or CAFE24_DEFAULT_SHOP_NO
+        )
+        order_id = str(
+            resource.get("order_id")
+            or resource.get("order_no")
+            or payload.get("order_id")
+            or payload.get("orderNo")
+            or payload.get("cafe24OrderId")
+            or ""
+        ).strip()
+
+        base_result: Dict[str, Any] = {
+            "source": "cafe24_webhook",
+            "traceId": str(trace_id or ""),
+            "eventNo": event_no,
+            "mallId": mall_id,
+            "shopNo": shop_no,
+            "orderId": order_id,
+        }
+        if event_no and event_no != CAFE24_WEBHOOK_ORDER_PROCESSED_EVENT_NO:
+            with self._connect() as conn:
+                event_id = self._record_cafe24_webhook_event(
+                    conn,
+                    trace_id=trace_id,
+                    event_no=event_no,
+                    mall_id=mall_id,
+                    shop_no=shop_no,
+                    order_id=order_id,
+                    status="ignored",
+                    message="지원하지 않는 Cafe24 WebHook 이벤트입니다.",
+                    payload=payload,
+                    result=base_result,
+                )
+                conn.commit()
+            return {**base_result, "webhookEventId": event_id, "status": "ignored"}
+        if not order_id:
+            result = {**base_result, "status": "review", "message": "Cafe24 WebHook payload에 주문번호가 없습니다."}
+            with self._connect() as conn:
+                event_id = self._record_cafe24_webhook_event(
+                    conn,
+                    trace_id=trace_id,
+                    event_no=event_no,
+                    mall_id=mall_id,
+                    shop_no=shop_no,
+                    order_id=order_id,
+                    status="review",
+                    message=result["message"],
+                    payload=payload,
+                    result=result,
+                )
+                conn.commit()
+            return {**result, "webhookEventId": event_id}
+
+        integration_id = ""
+        try:
+            with self._connect() as conn:
+                integration_row = None
+                if mall_id:
+                    integration_row = conn.execute(
+                        """
+                        SELECT id
+                        FROM cafe24_integrations
+                        WHERE mall_id = ? AND shop_no = ? AND is_active = 1
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                        """,
+                        (mall_id, shop_no),
+                    ).fetchone()
+                if integration_row is not None:
+                    integration_id = str(integration_row["id"])
+                elif mall_id:
+                    raise PanelError(f"Cafe24 연동 정보를 찾을 수 없습니다: {mall_id}/{shop_no}", status=404)
+
+            resync = self.resync_cafe24_order_by_id(
+                {
+                    "integrationId": integration_id,
+                    "orderId": order_id,
+                    "submitReady": False,
+                    "_adminActor": actor,
+                }
+            )
+            dispatch = self.dispatch_due_cafe24_order_items(
+                actor=actor,
+                limit=20,
+                cafe24_order_id=order_id,
+                mall_id=mall_id,
+                shop_no=shop_no,
+            )
+            status = "processed"
+            message = "Cafe24 WebHook 주문 재수집 완료"
+            result = {**base_result, "status": status, "message": message, "resync": resync, "dispatch": dispatch}
+        except Exception as exc:
+            status = "review"
+            message = str(exc)
+            result = {**base_result, "status": status, "message": message[:1000]}
+
+        with self._connect() as conn:
+            event_id = self._record_cafe24_webhook_event(
+                conn,
+                trace_id=trace_id,
+                event_no=event_no,
+                mall_id=mall_id,
+                shop_no=shop_no,
+                order_id=order_id,
+                status=status,
+                message=message,
+                payload=payload,
+                result=result,
+            )
+            conn.commit()
+        return {**result, "webhookEventId": event_id}
+
     def reconcile_cafe24_email_order_witness(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         actor = self._admin_actor(payload) or "cron"
         integration_id = str(payload.get("integrationId") or "").strip()
@@ -13057,15 +13342,35 @@ class PanelStore(PanelStoreDatabaseMixin):
             (timestamp, code, automation_retry_at(attempts), message[:1000], timestamp, item_id),
         )
 
-    def dispatch_due_cafe24_order_items(self, *, actor: str = "cron", limit: int = 20) -> Dict[str, Any]:
+    def dispatch_due_cafe24_order_items(
+        self,
+        *,
+        actor: str = "cron",
+        limit: int = 20,
+        cafe24_order_id: str = "",
+        mall_id: str = "",
+        shop_no: Optional[int] = None,
+    ) -> Dict[str, Any]:
         requested_limit = 20 if limit is None else int(limit)
         if requested_limit <= 0:
             return {"checked": 0, "submitted": 0, "blocked": 0, "failed": 0, "duplicates": 0, "results": [], "ranAt": now_iso(), "skippedByLimit": True}
         max_items = max(1, min(requested_limit, 100))
         timestamp = now_iso()
+        scoped_clauses: List[str] = []
+        scoped_params: List[Any] = []
+        if cafe24_order_id:
+            scoped_clauses.append("coi.cafe24_order_id = ?")
+            scoped_params.append(str(cafe24_order_id))
+        if mall_id:
+            scoped_clauses.append("coi.mall_id = ?")
+            scoped_params.append(str(mall_id))
+        if shop_no is not None:
+            scoped_clauses.append("coi.shop_no = ?")
+            scoped_params.append(int(shop_no or CAFE24_DEFAULT_SHOP_NO))
+        scoped_sql = "".join(f"\n                  AND {clause}" for clause in scoped_clauses)
         with self._connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT
                     coi.id, coi.supplier_id, coi.supplier_service_id, coi.retry_count,
                     coi.mapping_id, coi.auto_dispatch_approved
@@ -13095,10 +13400,11 @@ class PanelStore(PanelStoreDatabaseMixin):
                   )
                   AND COALESCE(coi.retry_count, 0) < ?
                   AND (coi.next_retry_at = '' OR coi.next_retry_at <= ?)
+                  {scoped_sql}
                 ORDER BY coi.updated_at ASC
                 LIMIT ?
                 """,
-                (AUTOMATION_RETRY_MAX_ATTEMPTS, timestamp, max_items),
+                (AUTOMATION_RETRY_MAX_ATTEMPTS, timestamp, *scoped_params, max_items),
             ).fetchall()
 
         submitted = 0
@@ -13641,6 +13947,7 @@ class PanelStore(PanelStoreDatabaseMixin):
         payload = payload or {}
         actor = str(payload.get("_adminActor") or payload.get("actor") or "cron").strip() or "cron"
         paused = automation_paused()
+        compact_response = env_flag(payload.get("compactResponse") or payload.get("compact_response"))
         started_at = now_iso()
         started_perf = time.perf_counter()
 
@@ -13698,6 +14005,23 @@ class PanelStore(PanelStoreDatabaseMixin):
         }
         status = "success"
         message = "Cafe24 flow tick completed"
+        lock_key = "cafe24_flow.tick_lock"
+        lock_value = ""
+        with self._connect() as conn:
+            lock_value = self._acquire_runtime_lock(conn, lock_key, ttl_seconds=240)
+            conn.commit()
+        if not lock_value:
+            result["finishedAt"] = now_iso()
+            result["durationMs"] = int((time.perf_counter() - started_perf) * 1000)
+            result["status"] = "locked"
+            result["message"] = "Cafe24 flow tick already running"
+            result["locked"] = True
+            with self._connect() as conn:
+                self._set_runtime_metadata(conn, "cafe24_flow.last_tick", as_json(redact_external_payload(result)))
+                self._set_runtime_metadata(conn, "cafe24_flow.last_tick_at", result["finishedAt"])
+                self._set_runtime_metadata(conn, "cafe24_flow.last_tick_status", "locked")
+                conn.commit()
+            return self._compact_cafe24_flow_result(result) if compact_response else result
         try:
             result["cafe24Poll"] = self.poll_due_cafe24_orders(
                 {
@@ -13733,8 +14057,9 @@ class PanelStore(PanelStoreDatabaseMixin):
                 self._set_runtime_metadata(conn, "cafe24_flow.last_tick", as_json(redact_external_payload(result)))
                 self._set_runtime_metadata(conn, "cafe24_flow.last_tick_at", result["finishedAt"])
                 self._set_runtime_metadata(conn, "cafe24_flow.last_tick_status", status)
+                self._release_runtime_lock(conn, lock_key, lock_value)
                 conn.commit()
-        return result
+        return self._compact_cafe24_flow_result(result) if compact_response else result
 
     def run_automation_tick(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload = payload or {}

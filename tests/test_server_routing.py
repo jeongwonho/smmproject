@@ -505,10 +505,11 @@ class WorkflowConfigurationTest(unittest.TestCase):
         self.assertIn("warning_count", workflow)
         self.assertIn("mapping gap detail lookup returned", workflow)
 
-    def test_cafe24_order_poll_workflow_runs_flow_tick_every_five_minutes(self):
+    def test_cafe24_order_poll_workflow_is_manual_backup_only(self):
         workflow = (APP_ROOT / ".github" / "workflows" / "cafe24-order-poll.yml").read_text()
 
-        self.assertIn('cron: "*/5 * * * *"', workflow)
+        self.assertNotIn("schedule:", workflow)
+        self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("/api/cron/cafe24/flow-tick", workflow)
         self.assertIn('"lookbackMinutes":180', workflow)
         self.assertIn('"useCursor":true', workflow)
@@ -517,6 +518,7 @@ class WorkflowConfigurationTest(unittest.TestCase):
         self.assertIn('"maxPages":3', workflow)
         self.assertIn('"requestTimeoutSeconds":5', workflow)
         self.assertIn('"maxAttempts":1', workflow)
+        self.assertIn('"compactResponse":true', workflow)
         self.assertNotIn("/api/cron/automation/tick", workflow)
 
     def test_cafe24_operational_audit_workflow_uses_summary_cli(self):
@@ -897,6 +899,16 @@ class RouterRegistryTest(unittest.TestCase):
         route, params = matched
         self.assertEqual(params, {})
         self.assertEqual(route.auth, "cron")
+        self.assertFalse(route.csrf)
+
+    def test_cafe24_order_webhook_route_reads_raw_body_without_session_auth(self):
+        matched = ROUTER.match("POST", "/api/cafe24/webhooks/orders")
+
+        self.assertIsNotNone(matched)
+        route, params = matched
+        self.assertEqual(params, {})
+        self.assertEqual(route.auth, "none")
+        self.assertTrue(route.read_raw_json_body)
         self.assertFalse(route.csrf)
 
     def test_cafe24_email_order_witness_cron_route_declares_cron_auth(self):

@@ -1459,6 +1459,17 @@ class AppHandler(SimpleHTTPRequestHandler):
             },
         )
 
+    @route("POST", "/api/cafe24/webhooks/orders", read_raw_json_body=True)
+    def _post_cafe24_order_webhook(self, request: RouteRequest) -> None:
+        result = self._server().store.process_cafe24_order_webhook(
+            request.payload,
+            provided_api_key=self.headers.get("X-API-Key", ""),
+            trace_id=self.headers.get("X-Trace-ID", "")
+            or self.headers.get("X-Trace-Id", "")
+            or self.headers.get("X-Trace ID", ""),
+        )
+        write_json(self, 200, {"ok": True, **result})
+
     @route("POST", "/api/cron/suppliers/sync", auth="cron", read_json_body=True)
     def _post_cron_supplier_sync(self, request: RouteRequest) -> None:
         request_timeout_seconds = bounded_timeout_seconds(

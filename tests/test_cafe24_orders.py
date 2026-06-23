@@ -194,6 +194,67 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
             1,
         )
 
+    def test_cafe24_order_webhook_resyncs_and_dispatches_target_order_once(self):
+        self._enable_auto_submit_and_supplier_ready()
+        order_payload = self._order_payload()
+        order_payload["order_id"] = "20260623-0000001"
+        order_payload["items"][0]["order_item_code"] = "20260623-0000001-01"
+        fake_client = FakeCafe24OrderClient(order_payload)
+        payload = {
+            "event_no": 90023,
+            "resource": {
+                "mall_id": "instamart",
+                "event_shop_no": "1",
+                "order_id": "20260623-0000001",
+            },
+        }
+
+        with patch.dict(os.environ, {"SMM_PANEL_CAFE24_WEBHOOK_API_KEY": "webhook-key"}, clear=False), patch.object(
+            self.store,
+            "_cafe24_client_for_row",
+            return_value=fake_client,
+        ), patch("core.SupplierApiClient.order", return_value={"order": "SUP-WEBHOOK-1"}) as order_call:
+            first = self.store.process_cafe24_order_webhook(
+                payload,
+                provided_api_key="webhook-key",
+                trace_id="trace-1",
+            )
+            second = self.store.process_cafe24_order_webhook(
+                payload,
+                provided_api_key="webhook-key",
+                trace_id="trace-2",
+            )
+
+        self.assertEqual(first["status"], "processed")
+        self.assertEqual(first["resync"]["processed"], 1)
+        self.assertEqual(first["dispatch"]["submitted"], 1)
+        self.assertEqual(second["status"], "processed")
+        self.assertEqual(second["dispatch"]["checked"], 0)
+        self.assertEqual(fake_client.order_calls, ["20260623-0000001", "20260623-0000001"])
+        order_call.assert_called_once()
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM cafe24_order_items WHERE cafe24_order_id = ?",
+                ("20260623-0000001",),
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM cafe24_webhook_events").fetchone()[0], 2)
+        item = self.conn.execute("SELECT * FROM cafe24_order_items WHERE cafe24_order_id = ?", ("20260623-0000001",)).fetchone()
+        self.assertEqual(item["standard_status"], "supplier_submitted")
+        self.assertEqual(item["supplier_order_uuid"], "SUP-WEBHOOK-1")
+
+    def test_cafe24_order_webhook_requires_api_key(self):
+        with patch.dict(os.environ, {"SMM_PANEL_CAFE24_WEBHOOK_API_KEY": "webhook-key"}, clear=False):
+            with self.assertRaises(PanelError) as raised:
+                self.store.process_cafe24_order_webhook(
+                    {"event_no": 90023, "resource": {"order_id": "20260623-0000001"}},
+                    provided_api_key="wrong-key",
+                )
+
+        self.assertEqual(raised.exception.status, 401)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM cafe24_webhook_events").fetchone()[0], 0)
+
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmpdir.name) / "instamart_cafe24_orders_test.db"
@@ -2198,6 +2259,28 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(item["supplier_order_uuid"], "SUP-FLOW-1")
         self.assertTrue(item["preflight_checked_at"])
         self.assertEqual(json.loads(item["preflight_blockers_json"]), [])
+
+    def test_cafe24_flow_tick_compact_response_omits_large_results(self):
+        self._enable_auto_submit_and_supplier_ready()
+        fake_client = FakeCafe24OrderClient(self._order_payload())
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client), patch(
+            "core.SupplierApiClient.order",
+            return_value={"order": "SUP-FLOW-COMPACT"},
+        ):
+            result = self.store.run_cafe24_flow_tick({"actor": "cron", "compactResponse": True})
+
+        self.assertEqual(result["status"], "success")
+        self.assertNotIn("results", result["cafe24Dispatch"])
+        self.assertEqual(result["cafe24Dispatch"]["resultCount"], 1)
+
+    def test_cafe24_flow_tick_returns_locked_when_existing_tick_is_running(self):
+        with patch.object(self.store, "_acquire_runtime_lock", return_value=""):
+            result = self.store.run_cafe24_flow_tick({"actor": "cron", "compactResponse": True})
+
+        self.assertEqual(result["status"], "locked")
+        self.assertTrue(result["locked"])
+        self.assertEqual(result["message"], "Cafe24 flow tick already running")
 
     def test_auto_dispatch_requires_mapping_auto_dispatch_enabled(self):
         self._enable_auto_submit_and_supplier_ready()
