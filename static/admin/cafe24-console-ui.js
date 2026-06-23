@@ -1,4 +1,4 @@
-import { renderCafe24SchedulerNotice } from "./cafe24-queue-ui.js";
+import { formatCafe24KstDateTime, renderCafe24SchedulerNotice } from "./cafe24-queue-ui.js";
 
 export function renderCafe24OpsBoard({ state = {}, orderItems = [], mappings = [], activeIntegration = {}, escapeHtml, canDispatchItem }) {
   const summary = state.adminCafe24OrderList?.summary || {};
@@ -33,6 +33,10 @@ export function renderCafe24OpsBoard({ state = {}, orderItems = [], mappings = [
         : autoPollStatus === "failed"
           ? "실패"
           : "대기";
+  const lastTickLabel = formatCafe24KstDateTime(automation.lastTickAt || lastTick.finishedAt, "GitHub Actions 5분 주기");
+  const lastAutoPollLabel = activeIntegration.lastAutoPollAt
+    ? formatCafe24KstDateTime(activeIntegration.lastAutoPollAt)
+    : activeIntegration.lastAutoPollMessage || "아직 호출 기록 없음";
   return `
     <div class="cafe24-ops-board">
       <article class="${tokenRisk ? "is-risk" : ""}">
@@ -43,12 +47,12 @@ export function renderCafe24OpsBoard({ state = {}, orderItems = [], mappings = [
       <article class="${tickRisk ? "is-risk" : tickStatus === "success" ? "is-hot" : ""}">
         <span>5분 자동화</span>
         <strong>${escapeHtml(automation.paused ? "긴급 중단" : tickStatus === "success" ? "정상" : tickStatus === "failed" ? "실패" : "대기")}</strong>
-        <small>${escapeHtml(automation.lastTickAt || lastTick.finishedAt || "GitHub Actions 5분 주기")}</small>
+        <small>${escapeHtml(lastTickLabel)}</small>
       </article>
       <article class="${autoPollRisk ? "is-risk" : autoPollStatus === "success" ? "is-hot" : ""}">
         <span>주문 수집</span>
         <strong>${escapeHtml(autoPollLabel)}</strong>
-        <small>${escapeHtml(activeIntegration.lastAutoPollAt || activeIntegration.lastAutoPollMessage || "아직 호출 기록 없음")}</small>
+        <small>${escapeHtml(lastAutoPollLabel)}</small>
       </article>
       <article>
         <span>최근 1개월 주문</span>
