@@ -1466,7 +1466,7 @@ CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_entity
     ON admin_audit_logs(entity_type, entity_id, created_at DESC);
 """
 
-RUNTIME_SCHEMA_VERSION = "2026-05-19-01"
+RUNTIME_SCHEMA_VERSION = "2026-06-23-01"
 
 
 class PreviewHTMLParser(HTMLParser):
@@ -4336,6 +4336,31 @@ class PanelStore(PanelStoreDatabaseMixin):
                 error_message TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS cafe24_webhook_events (
+                id TEXT PRIMARY KEY,
+                trace_id TEXT NOT NULL DEFAULT '',
+                event_no TEXT NOT NULL DEFAULT '',
+                mall_id TEXT NOT NULL DEFAULT '',
+                shop_no INTEGER NOT NULL DEFAULT 1,
+                cafe24_order_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'received',
+                message TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                result_json TEXT NOT NULL DEFAULT '{}',
+                processed_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_cafe24_webhook_events_order_created_at
+                ON cafe24_webhook_events(mall_id, shop_no, cafe24_order_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_cafe24_webhook_events_trace_id
+                ON cafe24_webhook_events(trace_id);
+            """
+        )
+
+    def _ensure_cafe24_webhook_events_table(self, conn: DatabaseConnection) -> None:
+        conn.executescript(
+            """
             CREATE TABLE IF NOT EXISTS cafe24_webhook_events (
                 id TEXT PRIMARY KEY,
                 trace_id TEXT NOT NULL DEFAULT '',
@@ -8308,6 +8333,7 @@ class PanelStore(PanelStoreDatabaseMixin):
         payload: Any = None,
         result: Any = None,
     ) -> str:
+        self._ensure_cafe24_webhook_events_table(conn)
         timestamp = now_iso()
         event_id = f"cafe24_webhook_{uuid4().hex[:16]}"
         conn.execute(
