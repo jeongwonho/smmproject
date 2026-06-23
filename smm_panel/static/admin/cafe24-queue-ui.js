@@ -37,6 +37,28 @@ export function renderCafe24QueueToolbar({ state, escapeHtml }) {
   `;
 }
 
+export function formatCafe24KstDateTime(value, fallback = "") {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return fallback;
+  }
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    return raw;
+  }
+  const parts = new Intl.DateTimeFormat("ko-KR", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(parsed);
+  const part = (type) => parts.find((item) => item.type === type)?.value || "";
+  return `${part("year")}. ${part("month")}. ${part("day")}. ${part("hour")}:${part("minute")} KST`;
+}
+
 export function renderCafe24AutoPollCards({ activeIntegration = {}, automation = {}, summary = {}, escapeHtml }) {
   const autoPollStatus = activeIntegration.lastAutoPollStatus || "never";
   const autoPollRisk = ["failed", "reconnect_required"].includes(autoPollStatus);
@@ -56,20 +78,27 @@ export function renderCafe24AutoPollCards({ activeIntegration = {}, automation =
         : autoPollStatus === "failed"
           ? "실패"
           : "대기";
+  const lastTickLabel = formatCafe24KstDateTime(automation.lastTickAt || lastTick.finishedAt, "GitHub Actions 5분 주기");
+  const lastAutoPollLabel = activeIntegration.lastAutoPollAt
+    ? formatCafe24KstDateTime(activeIntegration.lastAutoPollAt)
+    : activeIntegration.lastAutoPollMessage || "외부 스케줄러 미호출";
+  const nextAutoPollLabel = activeIntegration.nextAutoPollAt
+    ? formatCafe24KstDateTime(activeIntegration.nextAutoPollAt)
+    : "5분 주기";
   return `
     <article class="${tickRisk ? "is-risk" : tickStatus === "success" ? "is-hot" : ""}">
       <span>자동화 Tick</span>
       <strong>${escapeHtml(automation.paused ? "긴급 중단" : tickStatus === "success" ? "정상" : tickStatus === "failed" ? "실패" : "대기")}</strong>
-      <small>${escapeHtml(automation.lastTickAt || lastTick.finishedAt || "GitHub Actions 5분 주기")}</small>
+      <small>${escapeHtml(lastTickLabel)}</small>
     </article>
     <article class="${autoPollRisk ? "is-risk" : autoPollStatus === "success" ? "is-hot" : ""}">
       <span>자동 수집</span>
       <strong>${escapeHtml(statusLabel)}</strong>
-      <small>${escapeHtml(activeIntegration.lastAutoPollAt || activeIntegration.lastAutoPollMessage || "외부 스케줄러 미호출")}</small>
+      <small>${escapeHtml(lastAutoPollLabel)}</small>
     </article>
     <article>
       <span>다음 예상 수집</span>
-      <strong>${escapeHtml(activeIntegration.nextAutoPollAt || "5분 주기")}</strong>
+      <strong>${escapeHtml(nextAutoPollLabel)}</strong>
       <small>외부 스케줄러 호출 기준</small>
     </article>
     <article class="${Number(cafe24Dispatch.failed || 0) ? "is-risk" : Number(cafe24Dispatch.submitted || 0) ? "is-hot" : ""}">
