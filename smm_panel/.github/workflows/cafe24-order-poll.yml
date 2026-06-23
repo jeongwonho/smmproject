@@ -1,8 +1,6 @@
 name: Cafe24 Flow Tick
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -45,7 +43,7 @@ jobs:
               -H "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" \
               -H "X-GitHub-Workflow: ${GITHUB_WORKFLOW}" \
               -H "Content-Type: application/json" \
-              --data '{"lookbackMinutes":180,"useCursor":true,"overlapMinutes":20,"cafe24Limit":5,"pageLimit":200,"maxPages":3,"detailFetchLimit":50,"dispatchLimit":50,"statusLimit":75,"completionLimit":50,"requestTimeoutSeconds":5,"maxAttempts":1}' \
+              --data '{"lookbackMinutes":180,"useCursor":true,"overlapMinutes":20,"cafe24Limit":5,"pageLimit":200,"maxPages":3,"detailFetchLimit":50,"dispatchLimit":50,"statusLimit":75,"completionLimit":50,"requestTimeoutSeconds":5,"maxAttempts":1,"compactResponse":true}' \
               -o "$response_file" \
               -w "%{http_code}"
           )"
