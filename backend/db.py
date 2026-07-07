@@ -253,7 +253,7 @@ class PanelStoreDatabaseMixin:
             try:
                 with self._connect() as conn:
                     schema_version = self._runtime_metadata_value_if_available(conn, "schema_version")
-                    if schema_version == self.runtime_schema_version:
+                    if schema_version == self.runtime_schema_version and not self._runtime_schema_repair_needed(conn):
                         return
             except Exception:
                 pass
@@ -273,7 +273,9 @@ class PanelStoreDatabaseMixin:
                 )
                 """
             )
-            if self._runtime_metadata_value(conn, "schema_version") != self.runtime_schema_version:
+            schema_version = self._runtime_metadata_value(conn, "schema_version")
+            schema_repair_needed = self._runtime_schema_repair_needed(conn)
+            if schema_version != self.runtime_schema_version or schema_repair_needed:
                 self._apply_migrations(conn)
                 self._set_runtime_metadata(conn, "schema_version", self.runtime_schema_version)
             has_categories = conn.execute("SELECT COUNT(*) AS count FROM product_categories").fetchone()["count"]
@@ -311,6 +313,34 @@ class PanelStoreDatabaseMixin:
             """,
             (key, value, now_iso()),
         )
+
+    def _runtime_schema_repair_needed(self, conn: DatabaseConnection) -> bool:
+        required_tables = ("notification_events", "cafe24_split_jobs", "cafe24_split_job_parts")
+        placeholders = ", ".join(["?"] * len(required_tables))
+        try:
+            if self.backend == "postgres":
+                rows = conn.execute(
+                    f"""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name IN ({placeholders})
+                    """,
+                    required_tables,
+                ).fetchall()
+                present = {str(row["table_name"] or "") for row in rows}
+            else:
+                rows = conn.execute(
+                    f"""
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type = 'table' AND name IN ({placeholders})
+                    """,
+                    required_tables,
+                ).fetchall()
+                present = {str(row["name"] or "") for row in rows}
+        except Exception:
+            return True
+        return any(table not in present for table in required_tables)
 
     def _apply_migrations(self, conn: DatabaseConnection) -> None:
         self._ensure_column(conn, "users", "password_hash", "TEXT NOT NULL DEFAULT ''")
@@ -411,6 +441,7 @@ class PanelStoreDatabaseMixin:
             """
         )
         self._ensure_charge_support_tables(conn)
+        self._ensure_notification_events_table(conn)
         self._ensure_cafe24_support_tables(conn)
         self._ensure_cafe24_split_support_tables(conn)
         self._ensure_mkt24_product_settings_table(conn)
@@ -551,6 +582,34 @@ class PanelStoreDatabaseMixin:
         conn.execute("UPDATE users SET role = 'admin', is_active = 1, account_status = 'active' WHERE id = ?", (demo_user_id,))
         conn.execute("UPDATE users SET role = COALESCE(NULLIF(role, ''), 'customer') WHERE id != ?", (demo_user_id,))
         self._migrate_supplier_secrets(conn)
+
+    def _ensure_notification_events_table(self, conn: DatabaseConnection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notification_events (
+                id TEXT PRIMARY KEY,
+                channel TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                event_type TEXT NOT NULL DEFAULT '',
+                entity_type TEXT NOT NULL DEFAULT '',
+                entity_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                last_error TEXT NOT NULL DEFAULT '',
+                sent_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(channel, event_key)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_notification_events_status_updated_at
+                ON notification_events(channel, status, updated_at DESC)
+            """
+        )
 
     def _ensure_cafe24_split_support_tables(self, conn: DatabaseConnection) -> None:
         conn.execute(
