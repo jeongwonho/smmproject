@@ -4,7 +4,7 @@ export function renderCafe24QueueToolbar({ state, escapeHtml }) {
   const statusFilter = state.ui.adminCafe24StatusFilter || "all";
   const search = state.ui.adminCafe24Search || "";
   const hasAdvancedFilter = paymentFilter !== "all" || mappingFilter !== "all" || statusFilter !== "all";
-  const statuses = ["ready_to_submit", "waiting_input", "mapping_error", "auto_dispatch_excluded", "payment_pending", "payment_review_required", "supplier_submitted", "supplier_progress", "completed", "failed", "cancelled"];
+  const statuses = ["ready_to_submit", "waiting_input", "mapping_error", "auto_dispatch_excluded", "payment_pending", "payment_review_required", "split_scheduled", "split_in_progress", "supplier_submitted", "supplier_progress", "completed", "failed", "cancelled"];
   return `
     <form class="admin-toolbar cafe24-order-search" data-admin-cafe24-search-form>
       <div class="search-shell cafe24-order-search__field">
@@ -59,9 +59,86 @@ export function formatCafe24KstDateTime(value, fallback = "") {
   return `${part("year")}. ${part("month")}. ${part("day")}. ${part("hour")}:${part("minute")} KST`;
 }
 
-export function renderCafe24AutoPollCards({ activeIntegration = {}, automation = {}, summary = {}, escapeHtml }) {
+const CAFE24_REQUIRED_ORDER_FLOW_SCOPES = ["mall.read_order", "mall.write_order", "mall.read_product"];
+
+export function cafe24OrderFlowState(activeIntegration = {}) {
+  if (!activeIntegration.id) {
+    return {
+      risk: true,
+      status: "missing",
+      label: "미연결",
+      message: "Cafe24 OAuth 연결 후 주문 수집을 시작할 수 있습니다.",
+      missingScopes: CAFE24_REQUIRED_ORDER_FLOW_SCOPES,
+    };
+  }
+  const requiredScopes = Array.isArray(activeIntegration.requiredScopes) && activeIntegration.requiredScopes.length
+    ? activeIntegration.requiredScopes
+    : CAFE24_REQUIRED_ORDER_FLOW_SCOPES;
+  const scopes = Array.isArray(activeIntegration.scopes) ? activeIntegration.scopes : [];
+  const missingScopes = Array.isArray(activeIntegration.missingScopes)
+    ? activeIntegration.missingScopes
+    : requiredScopes.filter((scope) => !scopes.includes(scope));
+  if (missingScopes.length) {
+    return {
+      risk: true,
+      status: "insufficient_scope",
+      label: "권한 부족",
+      message: `Cafe24 주문 처리 권한이 부족합니다. 재연결 필요: ${missingScopes.join(", ")}`,
+      missingScopes,
+    };
+  }
+  if (activeIntegration.orderFlowReady === false || activeIntegration.orderFlowStatus && activeIntegration.orderFlowStatus !== "ready") {
+    return {
+      risk: true,
+      status: activeIntegration.orderFlowStatus || "not_ready",
+      label: activeIntegration.orderFlowStatusLabel || "점검 필요",
+      message: activeIntegration.orderFlowStatusMessage || activeIntegration.lastSyncMessage || "Cafe24 주문 처리 상태를 확인해 주세요.",
+      missingScopes,
+    };
+  }
+  if (activeIntegration.lastSyncStatus === "failed") {
+    return {
+      risk: true,
+      status: "collection_failed",
+      label: "수집 실패",
+      message: activeIntegration.lastSyncMessage || "최근 Cafe24 주문 수집이 실패했습니다.",
+      missingScopes,
+    };
+  }
+  return {
+    risk: false,
+    status: "ready",
+    label: activeIntegration.orderFlowStatusLabel || "정상",
+    message: activeIntegration.orderFlowStatusMessage || "Cafe24 주문 수집/발주 권한이 준비되어 있습니다.",
+    missingScopes,
+  };
+}
+
+export function cafe24AutoPollState(activeIntegration = {}) {
+  const flowState = cafe24OrderFlowState(activeIntegration);
+  if (flowState.risk) {
+    return flowState;
+  }
   const autoPollStatus = activeIntegration.lastAutoPollStatus || "never";
-  const autoPollRisk = ["failed", "reconnect_required"].includes(autoPollStatus);
+  if (autoPollStatus === "success") {
+    return { risk: false, status: autoPollStatus, label: "정상", message: activeIntegration.lastAutoPollMessage || "" };
+  }
+  if (autoPollStatus === "running") {
+    return { risk: false, status: autoPollStatus, label: "진행 중", message: activeIntegration.lastAutoPollMessage || "" };
+  }
+  if (autoPollStatus === "reconnect_required") {
+    return { risk: true, status: autoPollStatus, label: "재연결 필요", message: activeIntegration.lastAutoPollMessage || "Cafe24 OAuth 재연결이 필요합니다." };
+  }
+  if (autoPollStatus === "failed") {
+    return { risk: true, status: autoPollStatus, label: "실패", message: activeIntegration.lastAutoPollMessage || "최근 자동 수집이 실패했습니다." };
+  }
+  return { risk: false, status: autoPollStatus, label: "대기", message: activeIntegration.lastAutoPollMessage || "" };
+}
+
+export function renderCafe24AutoPollCards({ activeIntegration = {}, automation = {}, summary = {}, escapeHtml }) {
+  const autoPollState = cafe24AutoPollState(activeIntegration);
+  const autoPollStatus = autoPollState.status;
+  const autoPollRisk = autoPollState.risk;
   const lastTick = automation.lastTick || {};
   const tickStatus = automation.lastTickStatus || lastTick.status || "never";
   const tickRisk = tickStatus === "failed" || Boolean(automation.paused);
@@ -69,18 +146,11 @@ export function renderCafe24AutoPollCards({ activeIntegration = {}, automation =
   const completion = lastTick.cafe24Completion || {};
   const supplierHealth = lastTick.supplierHealth || {};
   const retryQueueCount = Number(summary.failedCount || 0) + Number(summary.reviewRequiredCount || 0);
-  const statusLabel = autoPollStatus === "success"
-    ? "정상"
-    : autoPollStatus === "running"
-      ? "진행 중"
-      : autoPollStatus === "reconnect_required"
-        ? "재연결 필요"
-        : autoPollStatus === "failed"
-          ? "실패"
-          : "대기";
   const lastTickLabel = formatCafe24KstDateTime(automation.lastTickAt || lastTick.finishedAt, "GitHub Actions 5분 주기");
-  const lastAutoPollLabel = activeIntegration.lastAutoPollAt
-    ? formatCafe24KstDateTime(activeIntegration.lastAutoPollAt)
+  const lastAutoPollLabel = autoPollRisk
+    ? autoPollState.message
+    : activeIntegration.lastAutoPollAt
+      ? formatCafe24KstDateTime(activeIntegration.lastAutoPollAt)
     : activeIntegration.lastAutoPollMessage || "외부 스케줄러 미호출";
   const nextAutoPollLabel = activeIntegration.nextAutoPollAt
     ? formatCafe24KstDateTime(activeIntegration.nextAutoPollAt)
@@ -93,7 +163,7 @@ export function renderCafe24AutoPollCards({ activeIntegration = {}, automation =
     </article>
     <article class="${autoPollRisk ? "is-risk" : autoPollStatus === "success" ? "is-hot" : ""}">
       <span>자동 수집</span>
-      <strong>${escapeHtml(statusLabel)}</strong>
+      <strong>${escapeHtml(autoPollState.label)}</strong>
       <small>${escapeHtml(lastAutoPollLabel)}</small>
     </article>
     <article>

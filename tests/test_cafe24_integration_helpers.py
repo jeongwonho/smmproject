@@ -6,6 +6,7 @@ from backend.errors import PanelError
 from backend.integrations.cafe24 import (
     CAFE24_MANUAL_INPUT_REQUIRED_STATUSES,
     CAFE24_REVIEW_REQUIRED_STATUSES,
+    CAFE24_DEFAULT_SCOPES,
     CAFE24_STANDARD_STATUSES,
     Cafe24PollWindowError,
     Cafe24DispatchRequestError,
@@ -14,6 +15,7 @@ from backend.integrations.cafe24 import (
     cafe24_dispatch_request_context,
     cafe24_enriched_product_payload,
     cafe24_integration_payload_from_row,
+    cafe24_missing_required_order_flow_scopes,
     cafe24_item_identity,
     cafe24_next_auto_poll_at,
     cafe24_normalize_datetime_text,
@@ -25,6 +27,7 @@ from backend.integrations.cafe24 import (
     cafe24_order_item_summary_payload,
     cafe24_order_items_from_order,
     cafe24_orders_from_payload,
+    cafe24_order_flow_readiness,
     cafe24_option_entries,
     cafe24_option_payload,
     cafe24_option_pairs,
@@ -755,10 +758,63 @@ class Cafe24IntegrationHelperTest(unittest.TestCase):
         self.assertEqual(payload["scopes"], ["mall.read_order"])
         self.assertEqual(payload["tokenStatus"], "connected")
         self.assertEqual(payload["tokenStatusLabel"], "정상")
+        self.assertFalse(payload["orderFlowReady"])
+        self.assertEqual(payload["orderFlowStatus"], "insufficient_scope")
+        self.assertEqual(payload["missingScopes"], ["mall.write_order", "mall.read_product"])
         self.assertTrue(payload["autoSubmit"])
         self.assertEqual(payload["nextAutoPollAt"], "2026-05-26T08:05:00+00:00")
         self.assertTrue(payload["accessTokenMasked"].endswith("cret"))
         self.assertTrue(payload["refreshTokenMasked"].endswith("cret"))
+
+    def test_cafe24_order_flow_readiness_blocks_scope_gaps_and_recent_scope_failures(self):
+        base_row = {
+            "id": "cafe24_1",
+            "mall_id": "growit",
+            "shop_no": 1,
+            "access_token": "access-secret",
+            "refresh_token": "refresh-secret",
+            "expires_at": (dt.datetime.now().astimezone() + dt.timedelta(hours=1)).isoformat(),
+            "refresh_token_expires_at": (dt.datetime.now().astimezone() + dt.timedelta(days=10)).isoformat(),
+            "token_status": "connected",
+            "token_refresh_lock_until": "",
+            "reconnect_required_at": "",
+            "reconnect_reason": "",
+            "last_auto_poll_status": "success",
+            "last_auto_poll_message": "ok",
+            "last_sync_status": "success",
+            "last_sync_message": "ok",
+            "is_active": 1,
+        }
+
+        self.assertEqual(
+            cafe24_missing_required_order_flow_scopes(["mall.read_community", "mall.write_community"]),
+            list(CAFE24_DEFAULT_SCOPES),
+        )
+
+        missing_scope = cafe24_order_flow_readiness(
+            {**base_row, "scopes_json": '["mall.read_community", "mall.write_community"]'}
+        )
+        self.assertFalse(missing_scope["ok"])
+        self.assertEqual(missing_scope["status"], "insufficient_scope")
+        self.assertEqual(missing_scope["missingScopes"], list(CAFE24_DEFAULT_SCOPES))
+
+        recent_scope_failure = cafe24_order_flow_readiness(
+            {
+                **base_row,
+                "scopes_json": '["mall.read_order", "mall.write_order", "mall.read_product"]',
+                "last_sync_status": "failed",
+                "last_sync_message": "Cafe24 API 오류 403: insufficient_scope",
+            }
+        )
+        self.assertFalse(recent_scope_failure["ok"])
+        self.assertEqual(recent_scope_failure["status"], "insufficient_scope")
+        self.assertEqual(recent_scope_failure["missingScopes"], [])
+
+        ready = cafe24_order_flow_readiness(
+            {**base_row, "scopes_json": '["mall.read_order", "mall.write_order", "mall.read_product"]'}
+        )
+        self.assertTrue(ready["ok"])
+        self.assertEqual(ready["status"], "ready")
 
     def test_access_token_error_detects_server_expired_access_token(self):
         self.assertTrue(

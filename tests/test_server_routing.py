@@ -505,10 +505,11 @@ class WorkflowConfigurationTest(unittest.TestCase):
         self.assertIn("warning_count", workflow)
         self.assertIn("mapping gap detail lookup returned", workflow)
 
-    def test_cafe24_order_poll_workflow_is_manual_backup_only(self):
+    def test_cafe24_order_poll_workflow_runs_flow_tick_every_five_minutes(self):
         workflow = (APP_ROOT / ".github" / "workflows" / "cafe24-order-poll.yml").read_text()
 
-        self.assertNotIn("schedule:", workflow)
+        self.assertIn("schedule:", workflow)
+        self.assertIn('cron: "*/5 * * * *"', workflow)
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("/api/cron/cafe24/flow-tick", workflow)
         self.assertIn('"lookbackMinutes":180', workflow)
@@ -516,6 +517,7 @@ class WorkflowConfigurationTest(unittest.TestCase):
         self.assertIn('"overlapMinutes":20', workflow)
         self.assertIn('"pageLimit":200', workflow)
         self.assertIn('"maxPages":3', workflow)
+        self.assertIn('"tokenRefreshWindowMinutes":30', workflow)
         self.assertIn('"requestTimeoutSeconds":5', workflow)
         self.assertIn('"maxAttempts":1', workflow)
         self.assertIn('"compactResponse":true', workflow)

@@ -1,4 +1,4 @@
-import { formatCafe24KstDateTime, renderCafe24SchedulerNotice } from "./cafe24-queue-ui.js";
+import { cafe24AutoPollState, cafe24OrderFlowState, formatCafe24KstDateTime, renderCafe24SchedulerNotice } from "./cafe24-queue-ui.js";
 
 export function renderCafe24OpsBoard({ state = {}, orderItems = [], mappings = [], activeIntegration = {}, escapeHtml, canDispatchItem }) {
   const summary = state.adminCafe24OrderList?.summary || {};
@@ -17,32 +17,28 @@ export function renderCafe24OpsBoard({ state = {}, orderItems = [], mappings = [
     && ["waiting_input", "mapping_error", "missing_required_field", "invalid_quantity", "invalid_target", "supplier_range_error", "needs_manual_review"].includes(item.standardStatus)
   )).length);
   const failed = Number(summary.failedCount ?? orderItems.filter((item) => item.standardStatus === "failed").length);
-  const tokenRisk = !activeIntegration.id || ["reconnect_required", "failed"].includes(activeIntegration.tokenStatus || "");
+  const orderFlowState = cafe24OrderFlowState(activeIntegration);
+  const tokenRisk = orderFlowState.risk;
   const automation = state.adminBootstrap?.automation || {};
   const lastTick = automation.lastTick || {};
   const tickStatus = automation.lastTickStatus || lastTick.status || "never";
   const tickRisk = tickStatus === "failed" || Boolean(automation.paused);
-  const autoPollStatus = activeIntegration.lastAutoPollStatus || "never";
-  const autoPollRisk = ["failed", "reconnect_required"].includes(autoPollStatus);
-  const autoPollLabel = autoPollStatus === "success"
-    ? "정상"
-    : autoPollStatus === "running"
-      ? "진행 중"
-      : autoPollStatus === "reconnect_required"
-        ? "재연결 필요"
-        : autoPollStatus === "failed"
-          ? "실패"
-          : "대기";
+  const autoPollState = cafe24AutoPollState(activeIntegration);
+  const autoPollStatus = autoPollState.status;
+  const autoPollRisk = autoPollState.risk;
+  const autoPollLabel = autoPollState.label;
   const lastTickLabel = formatCafe24KstDateTime(automation.lastTickAt || lastTick.finishedAt, "GitHub Actions 5분 주기");
-  const lastAutoPollLabel = activeIntegration.lastAutoPollAt
-    ? formatCafe24KstDateTime(activeIntegration.lastAutoPollAt)
+  const lastAutoPollLabel = autoPollRisk
+    ? autoPollState.message
+    : activeIntegration.lastAutoPollAt
+      ? formatCafe24KstDateTime(activeIntegration.lastAutoPollAt)
     : activeIntegration.lastAutoPollMessage || "아직 호출 기록 없음";
   return `
     <div class="cafe24-ops-board">
       <article class="${tokenRisk ? "is-risk" : ""}">
         <span>연결 상태</span>
-        <strong>${escapeHtml(activeIntegration.tokenStatusLabel || "미연결")}</strong>
-        <small>${escapeHtml(activeIntegration.mallId || "OAuth 연결 필요")}</small>
+        <strong>${escapeHtml(orderFlowState.label || activeIntegration.tokenStatusLabel || "미연결")}</strong>
+        <small>${escapeHtml(orderFlowState.risk ? orderFlowState.message : activeIntegration.mallId || "OAuth 연결 필요")}</small>
       </article>
       <article class="${tickRisk ? "is-risk" : tickStatus === "success" ? "is-hot" : ""}">
         <span>5분 자동화</span>
@@ -94,10 +90,13 @@ export function renderCafe24OpsBoard({ state = {}, orderItems = [], mappings = [
 }
 
 export function renderCafe24QuickControls({ activeIntegration = {}, escapeHtml, origin = "" }) {
+  const requiredScopes = Array.isArray(activeIntegration.requiredScopes) && activeIntegration.requiredScopes.length
+    ? activeIntegration.requiredScopes
+    : ["mall.read_order", "mall.write_order", "mall.read_product"];
   return `
     <form class="admin-panel admin-form cafe24-quick-controls" data-admin-cafe24-integration-form>
       <input type="hidden" name="id" value="${escapeHtml(activeIntegration.id || "")}" />
-      <input type="hidden" name="scopes" value="${escapeHtml((activeIntegration.scopes || ["mall.read_order", "mall.write_order", "mall.read_product"]).join(","))}" />
+      <input type="hidden" name="scopes" value="${escapeHtml(requiredScopes.join(","))}" />
       <div class="section-head section-head--compact">
         <h3>주문번호 빠른 확인</h3>
         <p>메일에는 왔는데 큐에 없는 주문은 주문번호를 넣어 단건 재수집합니다. 자동 발주는 안전 조건을 통과한 품주만 서버 Tick에서 처리됩니다.</p>

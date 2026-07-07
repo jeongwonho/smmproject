@@ -110,6 +110,7 @@ try:
         cafe24_enriched_product_payload,
         cafe24_integration_payload_from_row,
         cafe24_item_identity,
+        cafe24_missing_required_order_flow_scopes,
         cafe24_mapping_payload_from_row,
         cafe24_mall_now as _cafe24_mall_now,
         cafe24_next_auto_poll_at as _cafe24_next_auto_poll_at,
@@ -315,6 +316,7 @@ except ImportError:  # pragma: no cover - top-level script runtime
         cafe24_enriched_product_payload,
         cafe24_integration_payload_from_row,
         cafe24_item_identity,
+        cafe24_missing_required_order_flow_scopes,
         cafe24_mapping_payload_from_row,
         cafe24_mall_now as _cafe24_mall_now,
         cafe24_next_auto_poll_at as _cafe24_next_auto_poll_at,
@@ -1356,6 +1358,66 @@ CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_order_date
 
 CREATE INDEX IF NOT EXISTS idx_cafe24_order_items_internal_order
     ON cafe24_order_items(internal_order_id);
+
+CREATE TABLE IF NOT EXISTS cafe24_split_jobs (
+    id TEXT PRIMARY KEY,
+    cafe24_order_item_id TEXT NOT NULL REFERENCES cafe24_order_items(id) ON DELETE CASCADE,
+    mall_id TEXT NOT NULL,
+    shop_no INTEGER NOT NULL DEFAULT 1,
+    cafe24_order_id TEXT NOT NULL,
+    cafe24_order_item_code TEXT NOT NULL DEFAULT '',
+    dispatch_mode TEXT NOT NULL DEFAULT 'daily_split',
+    status TEXT NOT NULL DEFAULT 'scheduled',
+    target_value TEXT NOT NULL DEFAULT '',
+    total_quantity INTEGER NOT NULL DEFAULT 0,
+    daily_quantity INTEGER NOT NULL DEFAULT 0,
+    duration_days INTEGER NOT NULL DEFAULT 0,
+    dispatched_parts INTEGER NOT NULL DEFAULT 0,
+    completed_parts INTEGER NOT NULL DEFAULT 0,
+    failed_parts INTEGER NOT NULL DEFAULT 0,
+    supplier_id TEXT NOT NULL DEFAULT '',
+    supplier_service_id TEXT NOT NULL DEFAULT '',
+    supplier_external_service_id TEXT NOT NULL DEFAULT '',
+    normalized_fields_json TEXT NOT NULL DEFAULT '{}',
+    supplier_payload_json TEXT NOT NULL DEFAULT '{}',
+    error_message TEXT NOT NULL DEFAULT '',
+    next_dispatch_at TEXT NOT NULL DEFAULT '',
+    last_dispatch_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(cafe24_order_item_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cafe24_split_jobs_status_next
+    ON cafe24_split_jobs(status, next_dispatch_at);
+
+CREATE TABLE IF NOT EXISTS cafe24_split_job_parts (
+    id TEXT PRIMARY KEY,
+    split_job_id TEXT NOT NULL REFERENCES cafe24_split_jobs(id) ON DELETE CASCADE,
+    cafe24_order_item_id TEXT NOT NULL REFERENCES cafe24_order_items(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL,
+    quantity INTEGER NOT NULL DEFAULT 0,
+    scheduled_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    supplier_order_id TEXT NOT NULL DEFAULT '',
+    supplier_order_uuid TEXT NOT NULL DEFAULT '',
+    supplier_response_json TEXT NOT NULL DEFAULT '{}',
+    error_message TEXT NOT NULL DEFAULT '',
+    dispatch_attempts INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TEXT NOT NULL DEFAULT '',
+    dispatched_at TEXT NOT NULL DEFAULT '',
+    last_status_checked_at TEXT NOT NULL DEFAULT '',
+    next_status_check_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(split_job_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cafe24_split_parts_due
+    ON cafe24_split_job_parts(status, scheduled_at, next_retry_at);
+
+CREATE INDEX IF NOT EXISTS idx_cafe24_split_parts_status_check
+    ON cafe24_split_job_parts(status, next_status_check_at);
 
 CREATE TABLE IF NOT EXISTS cafe24_api_events (
     id TEXT PRIMARY KEY,
@@ -8418,9 +8480,92 @@ class PanelStore(PanelStoreDatabaseMixin):
             return compacted
 
         compacted = dict(result)
-        for key in ("cafe24Poll", "cafe24Dispatch", "supplierStatusRefresh", "cafe24Completion"):
+        for key in (
+            "cafe24TokenRefresh",
+            "cafe24Poll",
+            "cafe24Dispatch",
+            "cafe24SplitDispatch",
+            "supplierStatusRefresh",
+            "cafe24SplitStatusRefresh",
+            "cafe24Completion",
+        ):
             compacted[key] = compact_section(compacted.get(key))
         return compacted
+
+    def _cafe24_split_jobs_for_order_items(
+        self,
+        conn: DatabaseConnection,
+        item_ids: List[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        clean_ids = [str(item_id or "").strip() for item_id in item_ids if str(item_id or "").strip()]
+        if not clean_ids:
+            return {}
+        placeholders = ",".join("?" for _ in clean_ids)
+        jobs = conn.execute(
+            f"""
+            SELECT *
+            FROM cafe24_split_jobs
+            WHERE cafe24_order_item_id IN ({placeholders})
+            """,
+            clean_ids,
+        ).fetchall()
+        if not jobs:
+            return {}
+        job_ids = [str(job["id"]) for job in jobs]
+        part_placeholders = ",".join("?" for _ in job_ids)
+        parts = conn.execute(
+            f"""
+            SELECT *
+            FROM cafe24_split_job_parts
+            WHERE split_job_id IN ({part_placeholders})
+            ORDER BY split_job_id ASC, sequence ASC
+            """,
+            job_ids,
+        ).fetchall()
+        parts_by_job: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for part in parts:
+            parts_by_job[str(part["split_job_id"])].append(
+                {
+                    "id": part["id"],
+                    "sequence": int(part["sequence"] or 0),
+                    "quantity": int(part["quantity"] or 0),
+                    "scheduledAt": part["scheduled_at"],
+                    "status": part["status"],
+                    "supplierOrderId": part["supplier_order_id"],
+                    "supplierOrderUuid": part["supplier_order_uuid"],
+                    "errorMessage": part["error_message"],
+                    "dispatchAttempts": int(part["dispatch_attempts"] or 0),
+                    "nextRetryAt": part["next_retry_at"],
+                    "dispatchedAt": part["dispatched_at"],
+                    "lastStatusCheckedAt": part["last_status_checked_at"],
+                    "nextStatusCheckAt": part["next_status_check_at"],
+                    "updatedAt": part["updated_at"],
+                }
+            )
+        result: Dict[str, Dict[str, Any]] = {}
+        for job in jobs:
+            result[str(job["cafe24_order_item_id"])] = {
+                "id": job["id"],
+                "dispatchMode": job["dispatch_mode"],
+                "status": job["status"],
+                "targetValue": job["target_value"],
+                "totalQuantity": int(job["total_quantity"] or 0),
+                "dailyQuantity": int(job["daily_quantity"] or 0),
+                "durationDays": int(job["duration_days"] or 0),
+                "dispatchedParts": int(job["dispatched_parts"] or 0),
+                "completedParts": int(job["completed_parts"] or 0),
+                "failedParts": int(job["failed_parts"] or 0),
+                "supplierId": job["supplier_id"],
+                "supplierServiceId": job["supplier_service_id"],
+                "supplierExternalServiceId": job["supplier_external_service_id"],
+                "errorMessage": job["error_message"],
+                "nextDispatchAt": job["next_dispatch_at"],
+                "lastDispatchAt": job["last_dispatch_at"],
+                "createdAt": job["created_at"],
+                "updatedAt": job["updated_at"],
+                "parts": parts_by_job.get(str(job["id"]), []),
+            }
+        return result
 
     def list_cafe24_order_items(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         options = cafe24_order_item_list_options(payload)
@@ -8482,9 +8627,18 @@ class PanelStore(PanelStoreDatabaseMixin):
                 """,
                 clauses["summaryParams"],
             ).fetchone()
+            item_payloads = [self._cafe24_order_item_payload(row) for row in rows]
+            split_jobs = self._cafe24_split_jobs_for_order_items(
+                conn,
+                [str(payload.get("id") or "") for payload in item_payloads],
+            )
+            for item_payload in item_payloads:
+                split_job = split_jobs.get(str(item_payload.get("id") or ""))
+                if split_job:
+                    item_payload["splitJob"] = split_job
         return {
-            "items": [self._cafe24_order_item_payload(row) for row in rows],
-            "orderItems": [self._cafe24_order_item_payload(row) for row in rows],
+            "items": item_payloads,
+            "orderItems": item_payloads,
             "summary": cafe24_order_item_summary_payload(summary_row),
             "pagination": cafe24_order_item_pagination_payload(
                 page=page,
@@ -8505,6 +8659,9 @@ class PanelStore(PanelStoreDatabaseMixin):
         shop_no = normalize_cafe24_shop_no(payload.get("shopNo"))
         redirect_uri = str(payload.get("redirectUri") or cafe24_redirect_uri()).strip()
         scopes = normalize_cafe24_scopes(payload.get("scopes"))
+        for required_scope in CAFE24_DEFAULT_SCOPES:
+            if required_scope not in scopes:
+                scopes.append(required_scope)
         actor = self._admin_actor(payload)
         if not mall_id:
             raise PanelError("Cafe24 Mall ID를 입력해 주세요.")
@@ -8580,7 +8737,52 @@ class PanelStore(PanelStoreDatabaseMixin):
         redirect_uri = str(state_row["redirect_uri"] or "").strip()
         actor = str(state_row["actor"] or "admin")
         token_payload = Cafe24ApiClient.exchange_authorization_code(mall_id, code, redirect_uri)
-        token_scopes = token_payload.get("scopes") or token_payload.get("scope") or parse_json(state_row["scopes_json"], list(CAFE24_DEFAULT_SCOPES))
+        requested_scopes = normalize_cafe24_scopes(parse_json(state_row["scopes_json"], list(CAFE24_DEFAULT_SCOPES)))
+        raw_token_scopes = token_payload.get("scopes") or token_payload.get("scope")
+        token_scopes = normalize_cafe24_scopes(raw_token_scopes if raw_token_scopes is not None else requested_scopes)
+        missing_token_scopes = cafe24_missing_required_order_flow_scopes(token_scopes)
+        if missing_token_scopes:
+            message = (
+                "Cafe24가 주문 처리 필수 권한을 발급하지 않았습니다. "
+                f"누락 권한: {', '.join(missing_token_scopes)}. "
+                "Cafe24 Developers 앱 권한 설정에서 주문/상품 API 권한을 추가한 뒤 다시 승인해 주세요."
+            )
+            with self._connect() as conn:
+                timestamp = now_iso()
+                conn.execute("UPDATE cafe24_oauth_states SET used_at = ? WHERE state = ?", (timestamp, state))
+                conn.execute(
+                    """
+                    UPDATE cafe24_integrations
+                    SET last_sync_status = ?, last_sync_message = ?, updated_at = ?
+                    WHERE mall_id = ? AND shop_no = ?
+                    """,
+                    ("failed", message[:1000], timestamp, mall_id, shop_no),
+                )
+                self._log_cafe24_event(
+                    conn,
+                    mall_id=mall_id,
+                    shop_no=shop_no,
+                    event_type="oauth_callback",
+                    status="failed",
+                    request_payload={
+                        "state": state,
+                        "redirectUri": redirect_uri,
+                        "requestedScopes": requested_scopes,
+                    },
+                    response_payload={"grantedScopes": token_scopes, "missingScopes": missing_token_scopes},
+                    error_message=message,
+                )
+                self._record_admin_audit(
+                    conn,
+                    actor=actor,
+                    action="cafe24.oauth_scope_failed",
+                    entity_type="cafe24_integration",
+                    entity_id=f"{mall_id}:{shop_no}",
+                    message=message,
+                    metadata={"requestedScopes": requested_scopes, "grantedScopes": token_scopes, "missingScopes": missing_token_scopes},
+                )
+                conn.commit()
+            raise PanelError(message, status=403)
         expires_at_value = str(
             token_payload.get("expires_at")
             or token_payload.get("access_token_expires_at")
@@ -8601,7 +8803,6 @@ class PanelStore(PanelStoreDatabaseMixin):
                 "expiresAt": expires_at_value,
                 "refreshTokenExpiresAt": refresh_expires_at_value,
                 "scopes": token_scopes,
-                "autoSubmit": False,
                 "isActive": True,
                 "_adminActor": actor,
             }
@@ -8615,8 +8816,8 @@ class PanelStore(PanelStoreDatabaseMixin):
                 shop_no=shop_no,
                 event_type="oauth_callback",
                 status="success",
-                request_payload={"state": state, "redirectUri": redirect_uri},
-                response_payload=token_payload,
+                request_payload={"state": state, "redirectUri": redirect_uri, "requestedScopes": requested_scopes},
+                response_payload={**token_payload, "grantedScopes": token_scopes},
             )
             self._record_admin_audit(
                 conn,
@@ -8635,11 +8836,11 @@ class PanelStore(PanelStoreDatabaseMixin):
         shop_no = normalize_cafe24_shop_no(payload.get("shopNo"))
         access_token = str(payload.get("accessToken") or "").strip()
         refresh_token = str(payload.get("refreshToken") or "").strip()
-        scopes = normalize_cafe24_scopes(payload.get("scopes"))
+        requested_scopes = normalize_cafe24_scopes(payload.get("scopes"))
         expires_at = str(payload.get("expiresAt") or "").strip()
         refresh_expires_at = str(payload.get("refreshTokenExpiresAt") or "").strip()
-        auto_submit = 1 if payload.get("autoSubmit", False) else 0
-        completion_policy = str(payload.get("completionPolicy") or "memo_only").strip() or "memo_only"
+        auto_submit_requested = "autoSubmit" in payload
+        completion_policy_requested = "completionPolicy" in payload
         is_active = 1 if payload.get("isActive", True) else 0
         actor = self._admin_actor(payload)
         if not mall_id:
@@ -8656,6 +8857,12 @@ class PanelStore(PanelStoreDatabaseMixin):
                     (mall_id, shop_no),
                 ).fetchone()
             timestamp = now_iso()
+            auto_submit = (
+                1 if payload.get("autoSubmit", False) else 0
+            ) if auto_submit_requested or not existing else int(existing["auto_submit"] or 0)
+            completion_policy = (
+                str(payload.get("completionPolicy") or "memo_only").strip() or "memo_only"
+            ) if completion_policy_requested or not existing else str(existing["completion_policy"] or "memo_only")
             stored_access_token = encrypt_secret_value(
                 access_token or (decrypt_secret_value(existing["access_token"]) if existing else ""),
                 require_key=_secret_encryption_required(),
@@ -8666,6 +8873,11 @@ class PanelStore(PanelStoreDatabaseMixin):
             )
             tokens_updated = bool(access_token or refresh_token or not existing)
             tokens_available = bool(stored_access_token and stored_refresh_token)
+            scopes = (
+                normalize_cafe24_scopes(parse_json(existing["scopes_json"], requested_scopes))
+                if existing and not tokens_updated
+                else requested_scopes
+            )
             next_token_status = (
                 CAFE24_TOKEN_STATUS_CONNECTED
                 if tokens_available
@@ -8682,6 +8894,16 @@ class PanelStore(PanelStoreDatabaseMixin):
                 if access_token or refresh_token
                 else (str(existing.get("token_last_refreshed_at") or "") if existing else "")
             )
+            next_last_sync_status = (
+                "never"
+                if tokens_updated and tokens_available
+                else (str(existing.get("last_sync_status") or "never") if existing else "never")
+            )
+            next_last_sync_message = (
+                ""
+                if tokens_updated and tokens_available
+                else (str(existing.get("last_sync_message") or "") if existing else "")
+            )
             if existing:
                 integration_id = existing["id"]
                 conn.execute(
@@ -8692,6 +8914,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                         token_status = ?, token_last_checked_at = ?, token_last_refreshed_at = ?,
                         token_refresh_lock_until = ?, token_refresh_lock_owner = ?,
                         reconnect_required_at = ?, reconnect_reason = ?, is_active = ?, updated_at = ?
+                        , last_sync_status = ?, last_sync_message = ?
                     WHERE id = ?
                     """,
                     (
@@ -8713,6 +8936,8 @@ class PanelStore(PanelStoreDatabaseMixin):
                         next_reconnect_reason,
                         is_active,
                         timestamp,
+                        next_last_sync_status,
+                        next_last_sync_message,
                         integration_id,
                     ),
                 )
@@ -9200,6 +9425,18 @@ class PanelStore(PanelStoreDatabaseMixin):
         except ValueError:
             return False
 
+    def _cafe24_token_refresh_due(self, expires_at: str, *, window_minutes: int = 30) -> bool:
+        if not expires_at:
+            return True
+        try:
+            expires = dt.datetime.fromisoformat(str(expires_at))
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=dt.datetime.now().astimezone().tzinfo)
+            window = dt.timedelta(minutes=max(int(window_minutes or 0), 0))
+            return expires <= dt.datetime.now().astimezone() + window
+        except (TypeError, ValueError):
+            return True
+
     def _mark_cafe24_token_state(
         self,
         conn: DatabaseConnection,
@@ -9496,6 +9733,150 @@ class PanelStore(PanelStoreDatabaseMixin):
             retry_client = configure(self._cafe24_client_for_row(conn, retry_integration, force_refresh=True))
             return api_call(retry_client)
 
+    def refresh_due_cafe24_tokens(
+        self,
+        *,
+        actor: str = "cron",
+        limit: int = 10,
+        expiry_window_minutes: int = 30,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        try:
+            max_items = min(max(int(limit or 10), 1), 200)
+        except (TypeError, ValueError):
+            max_items = 10
+        try:
+            refresh_window = min(max(int(expiry_window_minutes or 30), 3), 12 * 60)
+        except (TypeError, ValueError):
+            refresh_window = 30
+        actor = str(actor or "cron").strip() or "cron"
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM cafe24_integrations
+                WHERE is_active = 1
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (max_items,),
+            ).fetchall()
+
+        refreshed = 0
+        skipped = 0
+        failed = 0
+        reconnect_required = 0
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            integration = dict(row)
+            integration_id = str(integration["id"])
+            mall_id = str(integration["mall_id"])
+            shop_no = int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO)
+            token_status = self._cafe24_token_status(integration)
+            if token_status == CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED:
+                reconnect_required += 1
+                skipped += 1
+                results.append(
+                    {
+                        "integrationId": integration_id,
+                        "mallId": mall_id,
+                        "shopNo": shop_no,
+                        "status": "reconnect_required",
+                        "message": self._cafe24_token_status_message(integration),
+                    }
+                )
+                continue
+            reasons: List[str] = []
+            if force:
+                reasons.append("force")
+            if self._cafe24_token_refresh_due(str(integration["expires_at"] or ""), window_minutes=refresh_window):
+                reasons.append("access_token_expiring")
+            if cafe24_refresh_token_expiring_soon(integration["refresh_token_expires_at"]):
+                reasons.append("refresh_token_expiring")
+            if token_status == CAFE24_TOKEN_STATUS_FAILED:
+                reasons.append("previous_refresh_failed")
+            if not reasons:
+                skipped += 1
+                results.append(
+                    {
+                        "integrationId": integration_id,
+                        "mallId": mall_id,
+                        "shopNo": shop_no,
+                        "status": "skipped",
+                        "message": "Cafe24 토큰 갱신 대상이 아닙니다.",
+                    }
+                )
+                continue
+            try:
+                with self._connect() as conn:
+                    latest = self._cafe24_integration_row(conn, integration_id)
+                    self._cafe24_client_for_row(conn, latest, force_refresh=True)
+                    refreshed_row = self._cafe24_integration_row(conn, integration_id)
+                    self._log_cafe24_event(
+                        conn,
+                        mall_id=mall_id,
+                        shop_no=shop_no,
+                        event_type="oauth.refresh",
+                        status="success",
+                        request_payload={"actor": actor, "reasons": reasons, "expiryWindowMinutes": refresh_window},
+                        response_payload={
+                            "tokenStatus": self._cafe24_token_status(refreshed_row),
+                            "expiresAt": refreshed_row["expires_at"],
+                            "refreshTokenExpiresAt": refreshed_row["refresh_token_expires_at"],
+                        },
+                    )
+                    conn.commit()
+                refreshed += 1
+                results.append(
+                    {
+                        "integrationId": integration_id,
+                        "mallId": mall_id,
+                        "shopNo": shop_no,
+                        "status": "refreshed",
+                        "reasons": reasons,
+                    }
+                )
+            except Exception as exc:
+                failed += 1
+                message = str(exc)
+                if cafe24_refresh_error_requires_reconnect(message) or "재연결" in message or "refresh token" in message.lower():
+                    reconnect_required += 1
+                with self._connect() as conn:
+                    self._log_cafe24_event(
+                        conn,
+                        mall_id=mall_id,
+                        shop_no=shop_no,
+                        event_type="oauth.refresh",
+                        status="failed",
+                        request_payload={"actor": actor, "reasons": reasons, "expiryWindowMinutes": refresh_window},
+                        error_message=message,
+                    )
+                    conn.commit()
+                results.append(
+                    {
+                        "integrationId": integration_id,
+                        "mallId": mall_id,
+                        "shopNo": shop_no,
+                        "status": "failed",
+                        "message": message[:1000],
+                        "reasons": reasons,
+                    }
+                )
+        return {
+            "checked": len(rows),
+            "refreshed": refreshed,
+            "skipped": skipped,
+            "failed": failed,
+            "reconnectRequired": reconnect_required,
+            "results": results,
+            "ranAt": now_iso(),
+            "settings": {
+                "expiryWindowMinutes": refresh_window,
+                "force": force,
+                "limit": max_items,
+            },
+        }
+
     def list_cafe24_products(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         integration_id = str(payload.get("integrationId") or "").strip()
         keyword = str(payload.get("q") or payload.get("keyword") or "").strip()
@@ -9694,6 +10075,18 @@ class PanelStore(PanelStoreDatabaseMixin):
                         candidates,
                         ambiguity_policy=str(source.get("ambiguityPolicy") or "needs_manual_review"),
                     )
+                elif extract in {"positive_int", "integer", "number"}:
+                    lowered = label.lower()
+                    raw_value = next(
+                        (
+                            str(entry.get("value") or "").strip()
+                            for entry in option_entries
+                            if not lowered or lowered in str(entry.get("label") or "").lower()
+                        ),
+                        "",
+                    )
+                    parsed_value = self._cafe24_positive_int(raw_value)
+                    value = str(parsed_value) if parsed_value > 0 else ""
                 else:
                     lowered = label.lower()
                     value = next(
@@ -9832,7 +10225,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                 break
 
         fields: Dict[str, Any] = {}
-        for field_key in template.keys() | schema.keys():
+        for field_key in set(template.keys()) | set(schema.keys()) | set(field_mapping.keys()):
             mapped_value = self._resolve_cafe24_mapping_source(
                 field_mapping.get(field_key),
                 field_key=field_key,
@@ -10395,7 +10788,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                 payment_snapshot_json = excluded.payment_snapshot_json,
                 source_status = excluded.source_status,
                 standard_status = CASE
-                    WHEN cafe24_order_items.standard_status IN ('supplier_submitted', 'supplier_progress', 'completed')
+                    WHEN cafe24_order_items.standard_status IN ('split_scheduled', 'split_in_progress', 'supplier_submitted', 'supplier_progress', 'completed')
                     THEN cafe24_order_items.standard_status
                     ELSE excluded.standard_status
                 END,
@@ -10459,6 +10852,48 @@ class PanelStore(PanelStoreDatabaseMixin):
             (mall_id, shop_no, identity["orderId"], identity["orderItemCode"]),
         ).fetchone()
         current_status = str(current["standard_status"] or status)
+        if current_status == "ready_to_submit" and supplier_mapping is not None and mapping is not None:
+            try:
+                split_plan = self._cafe24_daily_split_plan(normalized_fields, supplier_mapping)
+            except PanelError as exc:
+                split_status = cafe24_processing_error_status(exc)
+                conn.execute(
+                    """
+                    UPDATE cafe24_order_items
+                    SET standard_status = ?, error_message = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (split_status, str(exc)[:1000], now_iso(), current["id"]),
+                )
+                return {"id": current["id"], "status": split_status, "submitted": False}
+            if split_plan is not None:
+                split_schedule_allowed = bool(mapping.get("auto_dispatch_enabled")) or bool(current["auto_dispatch_approved"])
+                if not split_schedule_allowed:
+                    conn.execute(
+                        """
+                        UPDATE cafe24_order_items
+                        SET standard_status = 'needs_manual_review',
+                            error_message = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        ("데일리 분할 발주 매핑은 자동 발주 사용 또는 수동 승인 후 처리됩니다.", now_iso(), current["id"]),
+                    )
+                    return {"id": current["id"], "status": "needs_manual_review", "submitted": False}
+                split_job = self._ensure_cafe24_daily_split_job(
+                    conn,
+                    item_row=current,
+                    fields=normalized_fields,
+                    supplier_payload=supplier_payload,
+                    supplier_mapping=supplier_mapping,
+                    plan=split_plan,
+                )
+                conn.commit()
+                return {
+                    "id": current["id"],
+                    "status": "split_scheduled",
+                    "submitted": False,
+                    "splitJob": split_job,
+                }
         if current_status == "ready_to_submit" and product is not None:
             internal_order_id = self._create_cafe24_internal_order(
                 conn,
@@ -10835,6 +11270,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                 }
                 requested_windows.append({"mallId": mall_id, "shopNo": shop_no, **request_payload})
                 try:
+                    self._require_cafe24_scope(integration, "mall.read_order", "Cafe24 주문 수집")
                     orders_by_key: Dict[str, Dict[str, Any]] = {}
                     page_events: List[Dict[str, Any]] = []
                     detail_fetch_count = 0
@@ -11033,6 +11469,7 @@ class PanelStore(PanelStoreDatabaseMixin):
             shop_no = int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO)
             request_payload = {"orderId": order_id, "embed": "items,buyer,receivers"}
             try:
+                self._require_cafe24_scope(integration, "mall.read_order", "Cafe24 주문번호 직접 재수집")
                 response = self._cafe24_call_with_token_retry(
                     conn,
                     integration,
@@ -11246,9 +11683,23 @@ class PanelStore(PanelStoreDatabaseMixin):
                 mall_id=mall_id,
                 shop_no=shop_no,
             )
+            split_dispatch = self.dispatch_due_cafe24_split_jobs(
+                actor=actor,
+                limit=20,
+                cafe24_order_id=order_id,
+                mall_id=mall_id,
+                shop_no=shop_no,
+            )
             status = "processed"
             message = "Cafe24 WebHook 주문 재수집 완료"
-            result = {**base_result, "status": status, "message": message, "resync": resync, "dispatch": dispatch}
+            result = {
+                **base_result,
+                "status": status,
+                "message": message,
+                "resync": resync,
+                "dispatch": dispatch,
+                "splitDispatch": split_dispatch,
+            }
         except Exception as exc:
             status = "review"
             message = str(exc)
@@ -13368,6 +13819,825 @@ class PanelStore(PanelStoreDatabaseMixin):
             (timestamp, code, automation_retry_at(attempts), message[:1000], timestamp, item_id),
         )
 
+    def _cafe24_positive_int(self, value: Any) -> int:
+        if isinstance(value, bool) or value in (None, ""):
+            return 0
+        if isinstance(value, (int, float)):
+            return max(int(value), 0)
+        text = str(value or "").strip().replace(",", "")
+        if not text:
+            return 0
+        match = re.search(r"\d+", text)
+        if not match:
+            return 0
+        try:
+            return max(int(match.group(0)), 0)
+        except ValueError:
+            return 0
+
+    def _cafe24_daily_split_plan(
+        self,
+        fields: Dict[str, Any],
+        supplier_mapping: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        mode_values = [
+            str(fields.get(key) or "").strip().lower()
+            for key in ("dispatchMode", "splitMode", "fulfillmentMode")
+        ]
+        split_enabled = any(
+            mode in {"daily_split", "daily_followers", "daily_follower", "daily"}
+            for mode in mode_values
+        ) or env_flag(fields.get("dailySplitEnabled"))
+        if not split_enabled:
+            return None
+
+        def first_int(keys: Iterable[str]) -> int:
+            for key in keys:
+                value = self._cafe24_positive_int(fields.get(key))
+                if value > 0:
+                    return value
+            return 0
+
+        daily_quantity = first_int(
+            (
+                "dailyQuantity",
+                "dailyCount",
+                "dailyLimit",
+                "dailyFollowerCount",
+                "dailyFollowers",
+                "orderedCount",
+            )
+        )
+        duration_days = first_int(
+            (
+                "durationDays",
+                "periodDays",
+                "splitDays",
+                "days",
+                "appliedDays",
+                "expiryDays",
+            )
+        )
+        target_value = str(
+            fields.get("targetUrl")
+            or fields.get("targetValue")
+            or fields.get("targetUsername")
+            or fields.get("username")
+            or ""
+        ).strip()
+        if not target_value:
+            raise PanelError("데일리 분할 발주 대상 계정/링크가 없습니다.")
+        if daily_quantity <= 0:
+            raise PanelError("데일리 분할 발주 1일 수량이 없습니다.")
+        if duration_days <= 0:
+            raise PanelError("데일리 분할 발주 진행 기간이 없습니다.")
+        if duration_days > 366:
+            raise PanelError("데일리 분할 발주 진행 기간은 366일 이하만 허용됩니다.")
+
+        supplier_min = self._cafe24_positive_int(supplier_mapping.get("supplier_min_amount"))
+        supplier_max = self._cafe24_positive_int(supplier_mapping.get("supplier_max_amount"))
+        if supplier_min and daily_quantity < supplier_min:
+            raise PanelError(f"데일리 1회 발주 수량이 공급사 최소 수량보다 작습니다: 최소 {supplier_min}")
+        if supplier_max and daily_quantity > supplier_max:
+            raise PanelError(f"데일리 1회 발주 수량이 공급사 최대 수량보다 큽니다: 최대 {supplier_max}")
+
+        started_at = dt.datetime.now().astimezone().replace(microsecond=0)
+        parts = [
+            {
+                "sequence": sequence,
+                "quantity": daily_quantity,
+                "scheduledAt": (started_at + dt.timedelta(days=sequence - 1)).isoformat(timespec="seconds"),
+            }
+            for sequence in range(1, duration_days + 1)
+        ]
+        return {
+            "mode": "daily_split",
+            "targetValue": target_value,
+            "dailyQuantity": daily_quantity,
+            "durationDays": duration_days,
+            "totalQuantity": daily_quantity * duration_days,
+            "parts": parts,
+        }
+
+    def _ensure_cafe24_daily_split_job(
+        self,
+        conn: DatabaseConnection,
+        *,
+        item_row: Dict[str, Any],
+        fields: Dict[str, Any],
+        supplier_payload: Dict[str, Any],
+        supplier_mapping: Dict[str, Any],
+        plan: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        item = dict(item_row)
+        item_id = str(item["id"])
+        timestamp = now_iso()
+        existing = conn.execute(
+            "SELECT * FROM cafe24_split_jobs WHERE cafe24_order_item_id = ?",
+            (item_id,),
+        ).fetchone()
+        if existing is not None:
+            progressed = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM cafe24_split_job_parts
+                WHERE split_job_id = ? AND status <> 'pending'
+                """,
+                (existing["id"],),
+            ).fetchone()
+            progressed_count = int(dict(progressed or {}).get("count") or 0)
+            if progressed_count > 0:
+                item_status = "split_in_progress" if str(existing["status"] or "") != "completed" else "completed"
+                conn.execute(
+                    """
+                    UPDATE cafe24_order_items
+                    SET standard_status = ?, error_message = '', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (item_status, timestamp, item_id),
+                )
+                return {
+                    "id": existing["id"],
+                    "status": existing["status"],
+                    "parts": int(existing["duration_days"] or 0),
+                    "preserved": True,
+                }
+            conn.execute("DELETE FROM cafe24_split_job_parts WHERE split_job_id = ?", (existing["id"],))
+            job_id = str(existing["id"])
+        else:
+            job_id = f"cafe24_split_{uuid4().hex[:14]}"
+
+        next_dispatch_at = str((plan.get("parts") or [{}])[0].get("scheduledAt") or timestamp)
+        conn.execute(
+            """
+            INSERT INTO cafe24_split_jobs (
+                id, cafe24_order_item_id, mall_id, shop_no, cafe24_order_id,
+                cafe24_order_item_code, dispatch_mode, status, target_value,
+                total_quantity, daily_quantity, duration_days, dispatched_parts,
+                completed_parts, failed_parts, supplier_id, supplier_service_id,
+                supplier_external_service_id, normalized_fields_json, supplier_payload_json,
+                error_message, next_dispatch_at, last_dispatch_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, '', ?, '', ?, ?)
+            ON CONFLICT(cafe24_order_item_id) DO UPDATE SET
+                dispatch_mode = excluded.dispatch_mode,
+                status = excluded.status,
+                target_value = excluded.target_value,
+                total_quantity = excluded.total_quantity,
+                daily_quantity = excluded.daily_quantity,
+                duration_days = excluded.duration_days,
+                dispatched_parts = 0,
+                completed_parts = 0,
+                failed_parts = 0,
+                supplier_id = excluded.supplier_id,
+                supplier_service_id = excluded.supplier_service_id,
+                supplier_external_service_id = excluded.supplier_external_service_id,
+                normalized_fields_json = excluded.normalized_fields_json,
+                supplier_payload_json = excluded.supplier_payload_json,
+                error_message = '',
+                next_dispatch_at = excluded.next_dispatch_at,
+                last_dispatch_at = '',
+                updated_at = excluded.updated_at
+            """,
+            (
+                job_id,
+                item_id,
+                str(item["mall_id"]),
+                int(item["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                str(item["cafe24_order_id"]),
+                str(item["cafe24_order_item_code"] or ""),
+                str(plan.get("mode") or "daily_split"),
+                "scheduled",
+                str(plan.get("targetValue") or ""),
+                int(plan.get("totalQuantity") or 0),
+                int(plan.get("dailyQuantity") or 0),
+                int(plan.get("durationDays") or 0),
+                str(supplier_mapping.get("supplier_id") or ""),
+                str(supplier_mapping.get("supplier_service_id") or ""),
+                str(supplier_mapping.get("supplier_external_service_id") or ""),
+                as_json(fields),
+                as_json(supplier_payload),
+                next_dispatch_at,
+                timestamp,
+                timestamp,
+            ),
+        )
+        stored = conn.execute(
+            "SELECT id FROM cafe24_split_jobs WHERE cafe24_order_item_id = ?",
+            (item_id,),
+        ).fetchone()
+        job_id = str(stored["id"] if stored is not None else job_id)
+        part_rows = [
+            (
+                f"{job_id}_part_{int(part['sequence']):04d}",
+                job_id,
+                item_id,
+                int(part["sequence"]),
+                int(part["quantity"]),
+                str(part["scheduledAt"]),
+                timestamp,
+                timestamp,
+            )
+            for part in plan.get("parts") or []
+        ]
+        if part_rows:
+            conn.executemany(
+                """
+                INSERT INTO cafe24_split_job_parts (
+                    id, split_job_id, cafe24_order_item_id, sequence, quantity,
+                    scheduled_at, status, supplier_order_id, supplier_order_uuid,
+                    supplier_response_json, error_message, dispatch_attempts,
+                    next_retry_at, dispatched_at, last_status_checked_at,
+                    next_status_check_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', '', '', '{}', '', 0, '', '', '', '', ?, ?)
+                ON CONFLICT(split_job_id, sequence) DO UPDATE SET
+                    quantity = excluded.quantity,
+                    scheduled_at = excluded.scheduled_at,
+                    status = 'pending',
+                    supplier_order_id = '',
+                    supplier_order_uuid = '',
+                    supplier_response_json = '{}',
+                    error_message = '',
+                    dispatch_attempts = 0,
+                    next_retry_at = '',
+                    dispatched_at = '',
+                    last_status_checked_at = '',
+                    next_status_check_at = '',
+                    updated_at = excluded.updated_at
+                """,
+                part_rows,
+            )
+        conn.execute(
+            """
+            UPDATE cafe24_order_items
+            SET standard_status = 'split_scheduled', supplier_order_id = '',
+                supplier_order_uuid = '', error_message = '',
+                automation_error_code = '', next_retry_at = '', updated_at = ?
+            WHERE id = ?
+            """,
+            (timestamp, item_id),
+        )
+        return {
+            "id": job_id,
+            "status": "scheduled",
+            "parts": len(part_rows),
+            "nextDispatchAt": next_dispatch_at,
+            "preserved": False,
+        }
+
+    def _refresh_cafe24_split_job_summary(self, conn: DatabaseConnection, split_job_id: str) -> Dict[str, Any]:
+        row = conn.execute(
+            """
+            SELECT
+                j.*,
+                COUNT(p.id) AS total_parts,
+                SUM(CASE WHEN p.supplier_order_uuid <> '' THEN 1 ELSE 0 END) AS dispatched_count,
+                SUM(CASE WHEN p.status = 'completed' THEN 1 ELSE 0 END) AS completed_count,
+                SUM(CASE WHEN p.status IN ('failed', 'needs_manual_review') THEN 1 ELSE 0 END) AS failed_count,
+                SUM(CASE WHEN p.status = 'needs_manual_review' THEN 1 ELSE 0 END) AS manual_count,
+                SUM(CASE WHEN p.status IN ('pending', 'failed') THEN 1 ELSE 0 END) AS remaining_count,
+                MIN(
+                    CASE
+                        WHEN p.status IN ('pending', 'failed')
+                        THEN COALESCE(NULLIF(p.next_retry_at, ''), p.scheduled_at)
+                        ELSE NULL
+                    END
+                ) AS next_dispatch_candidate
+            FROM cafe24_split_jobs j
+            LEFT JOIN cafe24_split_job_parts p ON p.split_job_id = j.id
+            WHERE j.id = ?
+            GROUP BY j.id
+            """,
+            (split_job_id,),
+        ).fetchone()
+        if row is None:
+            return {}
+        total_parts = int(row["total_parts"] or 0)
+        dispatched_count = int(row["dispatched_count"] or 0)
+        completed_count = int(row["completed_count"] or 0)
+        failed_count = int(row["failed_count"] or 0)
+        manual_count = int(row["manual_count"] or 0)
+        remaining_count = int(row["remaining_count"] or 0)
+        if total_parts > 0 and completed_count >= total_parts:
+            job_status = "completed"
+            item_status = "completed"
+            next_dispatch_at = ""
+            error_message = ""
+        elif manual_count > 0:
+            job_status = "needs_manual_review"
+            item_status = "needs_manual_review"
+            next_dispatch_at = ""
+            error_message = "분할 발주 일부가 수동 확인 상태입니다."
+        elif remaining_count > 0:
+            job_status = "scheduled" if dispatched_count == 0 else "in_progress"
+            item_status = "split_scheduled" if dispatched_count == 0 else "split_in_progress"
+            next_dispatch_at = str(row["next_dispatch_candidate"] or "")
+            error_message = ""
+        elif failed_count > 0:
+            job_status = "needs_manual_review"
+            item_status = "needs_manual_review"
+            next_dispatch_at = ""
+            error_message = "분할 발주 실패 건 확인이 필요합니다."
+        else:
+            job_status = "in_progress"
+            item_status = "split_in_progress"
+            next_dispatch_at = ""
+            error_message = ""
+
+        timestamp = now_iso()
+        conn.execute(
+            """
+            UPDATE cafe24_split_jobs
+            SET status = ?, dispatched_parts = ?, completed_parts = ?, failed_parts = ?,
+                error_message = ?, next_dispatch_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                job_status,
+                dispatched_count,
+                completed_count,
+                failed_count,
+                error_message,
+                next_dispatch_at,
+                timestamp,
+                split_job_id,
+            ),
+        )
+        if item_status == "completed":
+            conn.execute(
+                """
+                UPDATE cafe24_order_items
+                SET standard_status = 'completed', error_message = '',
+                    automation_last_checked_at = ?,
+                    cafe24_completion_status = CASE
+                        WHEN cafe24_completion_status = 'done' THEN cafe24_completion_status
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM cafe24_integrations ci
+                            WHERE ci.mall_id = cafe24_order_items.mall_id
+                              AND ci.shop_no = cafe24_order_items.shop_no
+                              AND ci.completion_policy = 'purchase_confirm'
+                        ) THEN 'pending'
+                        ELSE 'skipped'
+                    END,
+                    cafe24_completion_message = CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM cafe24_integrations ci
+                            WHERE ci.mall_id = cafe24_order_items.mall_id
+                              AND ci.shop_no = cafe24_order_items.shop_no
+                              AND ci.completion_policy = 'purchase_confirm'
+                        ) THEN cafe24_completion_message
+                        ELSE 'completion_policy=memo_only'
+                    END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (timestamp, timestamp, row["cafe24_order_item_id"]),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE cafe24_order_items
+                SET standard_status = ?, error_message = ?, automation_last_checked_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (item_status, error_message, timestamp, timestamp, row["cafe24_order_item_id"]),
+            )
+        return {
+            "id": split_job_id,
+            "status": job_status,
+            "itemStatus": item_status,
+            "totalParts": total_parts,
+            "dispatchedParts": dispatched_count,
+            "completedParts": completed_count,
+            "failedParts": failed_count,
+            "nextDispatchAt": next_dispatch_at,
+        }
+
+    def dispatch_due_cafe24_split_jobs(
+        self,
+        *,
+        actor: str = "cron",
+        limit: int = 20,
+        cafe24_order_id: str = "",
+        mall_id: str = "",
+        shop_no: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        requested_limit = 20 if limit is None else int(limit)
+        if requested_limit <= 0:
+            return {"checked": 0, "submitted": 0, "blocked": 0, "failed": 0, "results": [], "ranAt": now_iso(), "skippedByLimit": True}
+        max_items = max(1, min(requested_limit, 100))
+        timestamp = now_iso()
+        scoped_clauses: List[str] = []
+        scoped_params: List[Any] = []
+        if cafe24_order_id:
+            scoped_clauses.append("j.cafe24_order_id = ?")
+            scoped_params.append(str(cafe24_order_id))
+        if mall_id:
+            scoped_clauses.append("j.mall_id = ?")
+            scoped_params.append(str(mall_id))
+        if shop_no is not None:
+            scoped_clauses.append("j.shop_no = ?")
+            scoped_params.append(int(shop_no or CAFE24_DEFAULT_SHOP_NO))
+        scoped_sql = "".join(f"\n                  AND {clause}" for clause in scoped_clauses)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    p.*,
+                    j.mall_id, j.shop_no, j.cafe24_order_id, j.cafe24_order_item_code,
+                    j.supplier_id, j.supplier_service_id, j.supplier_external_service_id,
+                    j.supplier_payload_json,
+                    coi.payment_gate_status,
+                    s.api_url,
+                    s.integration_type,
+                    s.api_key,
+                    s.bearer_token
+                FROM cafe24_split_job_parts p
+                JOIN cafe24_split_jobs j ON j.id = p.split_job_id
+                JOIN cafe24_order_items coi ON coi.id = p.cafe24_order_item_id
+                JOIN cafe24_integrations ci ON ci.mall_id = j.mall_id AND ci.shop_no = j.shop_no
+                JOIN suppliers s ON s.id = j.supplier_id
+                WHERE ci.is_active = 1
+                  AND ci.auto_submit = 1
+                  AND coi.payment_gate_status = 'payment_confirmed'
+                  AND j.status IN ('scheduled', 'in_progress', 'dispatching')
+                  AND p.status IN ('pending', 'failed')
+                  AND p.scheduled_at <= ?
+                  AND (p.next_retry_at = '' OR p.next_retry_at <= ?)
+                  AND COALESCE(p.dispatch_attempts, 0) < ?
+                  {scoped_sql}
+                ORDER BY p.scheduled_at ASC, p.sequence ASC
+                LIMIT ?
+                """,
+                (timestamp, timestamp, AUTOMATION_RETRY_MAX_ATTEMPTS, *scoped_params, max_items),
+            ).fetchall()
+
+        submitted = 0
+        blocked = 0
+        failed = 0
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            part = dict(row)
+            part_id = str(part["id"])
+            job_id = str(part["split_job_id"])
+            item_id = str(part["cafe24_order_item_id"])
+            attempts_after = int(part.get("dispatch_attempts") or 0) + 1
+            try:
+                preflight = self.preflight_single_cafe24_order_item({"itemId": item_id, "_adminActor": actor})
+                blocking_reasons = [str(reason) for reason in preflight.get("blockingReasons") or []]
+                with self._connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE cafe24_order_items
+                        SET preflight_checked_at = ?, preflight_blockers_json = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            str(preflight.get("checkedAt") or now_iso()),
+                            as_json(blocking_reasons),
+                            now_iso(),
+                            item_id,
+                        ),
+                    )
+                    conn.commit()
+                if not bool(preflight.get("canDispatch")):
+                    readiness = preflight.get("supplierReadiness") if isinstance(preflight.get("supplierReadiness"), dict) else {}
+                    retryable = bool(readiness.get("retryable"))
+                    next_retry_at = automation_retry_at(attempts_after) if retryable and attempts_after < AUTOMATION_RETRY_MAX_ATTEMPTS else ""
+                    part_status = "failed" if next_retry_at else "needs_manual_review"
+                    message = str(readiness.get("message") or ", ".join(blocking_reasons) or "Cafe24 split preflight 차단")
+                    blocked += 1
+                    with self._connect() as conn:
+                        conn.execute(
+                            """
+                            UPDATE cafe24_split_job_parts
+                            SET status = ?, error_message = ?, dispatch_attempts = COALESCE(dispatch_attempts, 0) + 1,
+                                next_retry_at = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (part_status, message[:1000], next_retry_at, now_iso(), part_id),
+                        )
+                        self._refresh_cafe24_split_job_summary(conn, job_id)
+                        conn.commit()
+                    results.append({"partId": part_id, "itemId": item_id, "status": "blocked", "preflight": preflight})
+                    continue
+
+                dispatch_id = f"cafe24_split_sord_{uuid4().hex[:12]}"
+                with self._connect() as conn:
+                    cursor = conn.execute(
+                        """
+                        UPDATE cafe24_split_job_parts
+                        SET status = 'submitting', supplier_order_id = ?, error_message = '',
+                            dispatch_attempts = COALESCE(dispatch_attempts, 0) + 1,
+                            next_retry_at = '', updated_at = ?
+                        WHERE id = ?
+                          AND supplier_order_uuid = ''
+                          AND status IN ('pending', 'failed')
+                        """,
+                        (dispatch_id, now_iso(), part_id),
+                    )
+                    if cursor.rowcount != 1:
+                        conn.commit()
+                        continue
+                    conn.execute(
+                        """
+                        UPDATE cafe24_split_jobs
+                        SET status = 'dispatching', last_dispatch_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now_iso(), now_iso(), job_id),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE cafe24_order_items
+                        SET standard_status = 'split_in_progress', error_message = '', updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now_iso(), item_id),
+                    )
+                    conn.commit()
+
+                request_payload = parse_json(part.get("supplier_payload_json"), {})
+                if not isinstance(request_payload, dict):
+                    request_payload = {}
+                request_payload["quantity"] = str(int(part["quantity"] or 0))
+                response_payload: Any = {}
+                supplier_external_order_id = ""
+                next_status = "failed"
+                error_message = ""
+                try:
+                    client = SupplierApiClient(
+                        str(part["api_url"]),
+                        decrypt_secret_value(part["api_key"]),
+                        integration_type=str(part.get("integration_type") or SUPPLIER_INTEGRATION_CLASSIC),
+                        bearer_token=decrypt_secret_value(part.get("bearer_token") or ""),
+                    )
+                    response_payload = client.order(request_payload)
+                    outcome = cafe24_supplier_dispatch_outcome(response_payload)
+                    supplier_external_order_id = outcome["supplierExternalOrderId"]
+                    next_status = outcome["status"]
+                    error_message = outcome["errorMessage"]
+                except Exception as exc:
+                    response_payload = {"error": str(exc)}
+                    error_message = str(exc)
+                    next_status = "failed"
+
+                supplier_auth_failed = supplier_error_is_auth_failure(
+                    error_message,
+                    integration_type=str(part.get("integration_type") or ""),
+                )
+                dispatch_state = cafe24_supplier_dispatch_state(
+                    {"status": next_status, "errorMessage": error_message},
+                    supplier_auth_failed=supplier_auth_failed,
+                    attempts_after=attempts_after,
+                    max_attempts=AUTOMATION_RETRY_MAX_ATTEMPTS,
+                    retry_at=automation_retry_at(attempts_after),
+                )
+                next_status = dispatch_state["status"]
+                error_message = dispatch_state["errorMessage"]
+                next_retry_at = dispatch_state["nextRetryAt"]
+                automation_error_code = dispatch_state["automationErrorCode"]
+                if next_status == "supplier_submitted":
+                    part_status = "supplier_submitted"
+                    next_status_check_at = self._next_supplier_status_check_at("submitted")
+                elif next_status == "needs_manual_review":
+                    part_status = "needs_manual_review"
+                    next_status_check_at = ""
+                else:
+                    part_status = "failed"
+                    next_status_check_at = ""
+
+                with self._connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE cafe24_split_job_parts
+                        SET status = ?, supplier_order_uuid = ?, supplier_response_json = ?,
+                            error_message = ?, next_retry_at = ?, dispatched_at = ?,
+                            next_status_check_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            part_status,
+                            supplier_external_order_id,
+                            as_json(redact_external_payload(response_payload)),
+                            error_message[:1000],
+                            next_retry_at,
+                            now_iso() if supplier_external_order_id else "",
+                            next_status_check_at,
+                            now_iso(),
+                            part_id,
+                        ),
+                    )
+                    if supplier_auth_failed and str(part.get("supplier_id") or "").strip():
+                        conn.execute(
+                            """
+                            UPDATE suppliers
+                            SET health_status = ?, health_message = ?, health_checked_at = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                "failed",
+                                (error_message or "공급사 인증 토큰이 만료되었습니다.")[:1000],
+                                now_iso(),
+                                now_iso(),
+                                str(part["supplier_id"]),
+                            ),
+                        )
+                    if automation_error_code:
+                        conn.execute(
+                            """
+                            UPDATE cafe24_order_items
+                            SET automation_error_code = ?, next_retry_at = ?, error_message = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (automation_error_code, next_retry_at, error_message[:1000], now_iso(), item_id),
+                        )
+                    self._log_cafe24_event(
+                        conn,
+                        mall_id=str(part["mall_id"]),
+                        shop_no=int(part["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                        event_type="supplier.split_dispatch",
+                        status="success" if part_status == "supplier_submitted" else "failed",
+                        request_payload=redact_external_payload(request_payload),
+                        response_payload=redact_external_payload(response_payload),
+                        error_message=error_message,
+                    )
+                    self._refresh_cafe24_split_job_summary(conn, job_id)
+                    conn.commit()
+                if part_status == "supplier_submitted":
+                    submitted += 1
+                else:
+                    failed += 1
+                results.append(
+                    {
+                        "partId": part_id,
+                        "itemId": item_id,
+                        "status": part_status,
+                        "supplierOrderId": dispatch_id,
+                        "supplierOrderUuid": supplier_external_order_id,
+                        "errorMessage": error_message,
+                    }
+                )
+            except Exception as exc:
+                failed += 1
+                with self._connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE cafe24_split_job_parts
+                        SET status = ?, error_message = ?, next_retry_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            "failed" if attempts_after < AUTOMATION_RETRY_MAX_ATTEMPTS else "needs_manual_review",
+                            str(exc)[:1000],
+                            automation_retry_at(attempts_after) if attempts_after < AUTOMATION_RETRY_MAX_ATTEMPTS else "",
+                            now_iso(),
+                            part_id,
+                        ),
+                    )
+                    self._refresh_cafe24_split_job_summary(conn, job_id)
+                    conn.commit()
+                results.append({"partId": part_id, "itemId": item_id, "status": "failed", "error": str(exc)})
+        return {
+            "checked": len(rows),
+            "submitted": submitted,
+            "blocked": blocked,
+            "failed": failed,
+            "results": results,
+            "ranAt": now_iso(),
+        }
+
+    def refresh_due_cafe24_split_job_parts(
+        self,
+        *,
+        actor: str = "cron",
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        requested_limit = 50 if limit is None else int(limit)
+        if requested_limit <= 0:
+            return {"checked": 0, "completed": 0, "failed": 0, "errors": 0, "results": [], "ranAt": now_iso(), "skippedByLimit": True}
+        max_items = max(1, min(requested_limit, 150))
+        timestamp = now_iso()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    p.*,
+                    j.mall_id, j.shop_no, j.cafe24_order_id, j.supplier_id,
+                    s.api_url,
+                    s.integration_type,
+                    s.api_key,
+                    s.bearer_token
+                FROM cafe24_split_job_parts p
+                JOIN cafe24_split_jobs j ON j.id = p.split_job_id
+                JOIN suppliers s ON s.id = j.supplier_id
+                WHERE p.supplier_order_uuid <> ''
+                  AND p.status IN ('supplier_submitted', 'supplier_progress', 'submitting')
+                  AND (p.next_status_check_at = '' OR p.next_status_check_at <= ?)
+                ORDER BY COALESCE(NULLIF(p.next_status_check_at, ''), p.dispatched_at, p.updated_at) ASC
+                LIMIT ?
+                """,
+                (timestamp, max_items),
+            ).fetchall()
+
+        checked = 0
+        completed = 0
+        failed = 0
+        errors = 0
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            part = dict(row)
+            checked += 1
+            part_id = str(part["id"])
+            job_id = str(part["split_job_id"])
+            try:
+                client = SupplierApiClient(
+                    str(part["api_url"]),
+                    decrypt_secret_value(part["api_key"]),
+                    integration_type=str(part.get("integration_type") or SUPPLIER_INTEGRATION_CLASSIC),
+                    bearer_token=decrypt_secret_value(part.get("bearer_token") or ""),
+                )
+                status_payload = client.status(str(part["supplier_order_uuid"]))
+                supplier_status = normalize_supplier_order_status_payload(status_payload)
+                if supplier_status == "completed":
+                    part_status = "completed"
+                    completed += 1
+                elif supplier_status in {"failed", "cancelled"}:
+                    part_status = "failed"
+                    failed += 1
+                else:
+                    part_status = "supplier_progress"
+                next_check = self._next_supplier_status_check_at(supplier_status)
+                response_json = parse_json(part.get("supplier_response_json"), {})
+                response_json["lastStatusCheck"] = {"checkedAt": now_iso(), "payload": status_payload}
+                message = ""
+                if isinstance(status_payload, dict):
+                    message = str(status_payload.get("error") or status_payload.get("message") or "").strip()
+                with self._connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE cafe24_split_job_parts
+                        SET status = ?, supplier_response_json = ?, error_message = ?,
+                            last_status_checked_at = ?, next_status_check_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            part_status,
+                            as_json(redact_external_payload(response_json)),
+                            message[:1000],
+                            now_iso(),
+                            next_check,
+                            now_iso(),
+                            part_id,
+                        ),
+                    )
+                    self._log_cafe24_event(
+                        conn,
+                        mall_id=str(part["mall_id"]),
+                        shop_no=int(part["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                        event_type="supplier.split_status",
+                        status="success",
+                        request_payload={"supplierOrderUuid": part["supplier_order_uuid"]},
+                        response_payload=redact_external_payload(status_payload),
+                        error_message=message,
+                    )
+                    summary = self._refresh_cafe24_split_job_summary(conn, job_id)
+                    conn.commit()
+                results.append({"partId": part_id, "status": supplier_status, "job": summary})
+            except Exception as exc:
+                errors += 1
+                with self._connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE cafe24_split_job_parts
+                        SET last_status_checked_at = ?, next_status_check_at = ?,
+                            error_message = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now_iso(), automation_retry_at(1), str(exc)[:1000], now_iso(), part_id),
+                    )
+                    self._log_cafe24_event(
+                        conn,
+                        mall_id=str(part["mall_id"]),
+                        shop_no=int(part["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                        event_type="supplier.split_status",
+                        status="failed",
+                        request_payload={"supplierOrderUuid": part["supplier_order_uuid"]},
+                        error_message=str(exc),
+                    )
+                    self._refresh_cafe24_split_job_summary(conn, job_id)
+                    conn.commit()
+                results.append({"partId": part_id, "status": "failed", "error": str(exc)})
+        return {
+            "checked": checked,
+            "completed": completed,
+            "failed": failed,
+            "errors": errors,
+            "results": results,
+            "ranAt": now_iso(),
+        }
+
     def dispatch_due_cafe24_order_items(
         self,
         *,
@@ -13904,6 +15174,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                 with self._connect() as conn:
                     integration_payload = dict(row)
                     integration_payload["id"] = integration_payload.get("integration_id") or integration_payload.get("id")
+                    self._require_cafe24_scope(integration_payload, "mall.write_order", "Cafe24 구매확정")
                     response = self._cafe24_call_with_token_retry(
                         conn,
                         integration_payload,
@@ -13999,7 +15270,11 @@ class PanelStore(PanelStoreDatabaseMixin):
         detail_fetch_limit = int_option("detailFetchLimit", CAFE24_FLOW_DETAIL_FETCH_LIMIT, minimum=0, maximum=500)
         dispatch_limit = int_option("dispatchLimit", CAFE24_FLOW_DISPATCH_LIMIT, minimum=0, maximum=100)
         status_limit = int_option("statusLimit", CAFE24_FLOW_STATUS_LIMIT, minimum=0, maximum=150)
+        split_dispatch_limit = int_option("splitDispatchLimit", dispatch_limit, minimum=0, maximum=100)
+        split_status_limit = int_option("splitStatusLimit", status_limit, minimum=0, maximum=150)
         completion_limit = int_option("completionLimit", CAFE24_FLOW_COMPLETION_LIMIT, minimum=0, maximum=100)
+        token_refresh_limit = int_option("tokenRefreshLimit", cafe24_limit, minimum=1, maximum=200)
+        token_refresh_window_minutes = int_option("tokenRefreshWindowMinutes", 30, minimum=3, maximum=12 * 60)
         request_timeout_seconds = float_option(
             "requestTimeoutSeconds",
             CAFE24_FLOW_REQUEST_TIMEOUT_SECONDS,
@@ -14011,9 +15286,12 @@ class PanelStore(PanelStoreDatabaseMixin):
         result: Dict[str, Any] = {
             "startedAt": started_at,
             "paused": paused,
+            "cafe24TokenRefresh": {},
             "cafe24Poll": {},
             "cafe24Dispatch": {"skipped": paused},
+            "cafe24SplitDispatch": {"skipped": paused},
             "supplierStatusRefresh": {"skipped": paused},
+            "cafe24SplitStatusRefresh": {"skipped": paused},
             "cafe24Completion": {"skipped": paused},
             "settings": {
                 "lookbackMinutes": lookback_minutes,
@@ -14024,7 +15302,11 @@ class PanelStore(PanelStoreDatabaseMixin):
                 "detailFetchLimit": detail_fetch_limit,
                 "dispatchLimit": dispatch_limit,
                 "statusLimit": status_limit,
+                "splitDispatchLimit": split_dispatch_limit,
+                "splitStatusLimit": split_status_limit,
                 "completionLimit": completion_limit,
+                "tokenRefreshLimit": token_refresh_limit,
+                "tokenRefreshWindowMinutes": token_refresh_window_minutes,
                 "requestTimeoutSeconds": request_timeout_seconds,
                 "maxAttempts": max_attempts,
             },
@@ -14049,6 +15331,11 @@ class PanelStore(PanelStoreDatabaseMixin):
                 conn.commit()
             return self._compact_cafe24_flow_result(result) if compact_response else result
         try:
+            result["cafe24TokenRefresh"] = self.refresh_due_cafe24_tokens(
+                actor=actor,
+                limit=token_refresh_limit,
+                expiry_window_minutes=token_refresh_window_minutes,
+            )
             result["cafe24Poll"] = self.poll_due_cafe24_orders(
                 {
                     "actor": actor,
@@ -14066,7 +15353,9 @@ class PanelStore(PanelStoreDatabaseMixin):
             )
             if not paused:
                 result["cafe24Dispatch"] = self.dispatch_due_cafe24_order_items(actor=actor, limit=dispatch_limit)
+                result["cafe24SplitDispatch"] = self.dispatch_due_cafe24_split_jobs(actor=actor, limit=split_dispatch_limit)
                 result["supplierStatusRefresh"] = self.refresh_due_supplier_order_statuses(actor=actor, limit=status_limit)
+                result["cafe24SplitStatusRefresh"] = self.refresh_due_cafe24_split_job_parts(actor=actor, limit=split_status_limit)
                 result["cafe24Completion"] = self.complete_due_cafe24_order_items(actor=actor, limit=completion_limit)
             else:
                 message = "Cafe24 flow paused: collection only"
@@ -14103,16 +15392,23 @@ class PanelStore(PanelStoreDatabaseMixin):
         cafe24_detail_fetch_limit = int(payload.get("cafe24DetailFetchLimit") if payload.get("cafe24DetailFetchLimit") is not None else 200)
         dispatch_limit = int(payload.get("dispatchLimit") or 25)
         status_limit = int(payload.get("statusLimit") or 50)
+        split_dispatch_limit = int(payload.get("splitDispatchLimit") if payload.get("splitDispatchLimit") is not None else dispatch_limit)
+        split_status_limit = int(payload.get("splitStatusLimit") if payload.get("splitStatusLimit") is not None else status_limit)
         completion_limit = int(payload.get("completionLimit") or 25)
+        token_refresh_limit = int(payload.get("tokenRefreshLimit") or cafe24_limit)
+        token_refresh_window_minutes = int(payload.get("tokenRefreshWindowMinutes") or 30)
         result: Dict[str, Any] = {
             "startedAt": started_at,
             "paused": paused,
             "supplierServiceSync": {},
             "supplierHealth": {},
+            "cafe24TokenRefresh": {},
             "cafe24Poll": {},
             "webDispatch": {"skipped": paused},
             "cafe24Dispatch": {"skipped": paused},
+            "cafe24SplitDispatch": {"skipped": paused},
             "supplierStatusRefresh": {"skipped": paused},
+            "cafe24SplitStatusRefresh": {"skipped": paused},
             "cafe24Completion": {"skipped": paused},
         }
         status = "success"
@@ -14120,6 +15416,11 @@ class PanelStore(PanelStoreDatabaseMixin):
         try:
             result["supplierServiceSync"] = self.sync_due_supplier_services(actor=actor, limit=supplier_sync_limit)
             result["supplierHealth"] = self.check_due_supplier_health(actor=actor, limit=supplier_health_limit)
+            result["cafe24TokenRefresh"] = self.refresh_due_cafe24_tokens(
+                actor=actor,
+                limit=token_refresh_limit,
+                expiry_window_minutes=token_refresh_window_minutes,
+            )
             result["cafe24Poll"] = self.poll_due_cafe24_orders(
                 {
                     "actor": actor,
@@ -14133,7 +15434,9 @@ class PanelStore(PanelStoreDatabaseMixin):
             if not paused:
                 result["webDispatch"] = self.dispatch_due_web_orders(actor=actor, limit=dispatch_limit)
                 result["cafe24Dispatch"] = self.dispatch_due_cafe24_order_items(actor=actor, limit=dispatch_limit)
+                result["cafe24SplitDispatch"] = self.dispatch_due_cafe24_split_jobs(actor=actor, limit=split_dispatch_limit)
                 result["supplierStatusRefresh"] = self.refresh_due_supplier_order_statuses(actor=actor, limit=status_limit)
+                result["cafe24SplitStatusRefresh"] = self.refresh_due_cafe24_split_job_parts(actor=actor, limit=split_status_limit)
                 result["cafe24Completion"] = self.complete_due_cafe24_order_items(actor=actor, limit=completion_limit)
             else:
                 message = "automation paused: collection only"
