@@ -155,6 +155,19 @@ class FakeCafe24OrderClient:
         return {"order": {"order_id": order_id, "order_item_code": order_item_code, "purchase_confirmation": "T"}}
 
 
+class FakeSlackResponse:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        return b"ok"
+
+
 class Cafe24OrderIntegrationTest(unittest.TestCase):
     def test_cafe24_poll_cursor_window_formats_utc_cursor_as_kst(self):
         window = cafe24_poll_datetime_window(
@@ -291,6 +304,32 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
         self.tmpdir.cleanup()
+
+    def test_panel_store_repairs_required_tables_even_when_schema_version_current(self):
+        self.conn.execute("DROP TABLE cafe24_split_job_parts")
+        self.conn.execute("DROP TABLE cafe24_split_jobs")
+        self.conn.execute(
+            """
+            INSERT INTO runtime_metadata (key, value, updated_at)
+            VALUES ('schema_version', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (PanelStore.runtime_schema_version, now_iso()),
+        )
+        self.conn.commit()
+
+        PanelStore(db_path=self.db_path)
+
+        self.assertIsNotNone(
+            self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cafe24_split_jobs'"
+            ).fetchone()
+        )
+        self.assertIsNotNone(
+            self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cafe24_split_job_parts'"
+            ).fetchone()
+        )
 
     def _seed_supplier_mapping(self):
         timestamp = now_iso()
@@ -1671,6 +1710,139 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(item["splitJob"]["durationDays"], 3)
         self.assertEqual(item["splitJob"]["totalQuantity"], 300)
         self.assertEqual(len(item["splitJob"]["parts"]), 3)
+
+    def test_slack_notifies_mapped_cafe24_supplier_dispatch_failure_once(self):
+        self._enable_auto_submit_and_supplier_ready()
+        order_payload = self._order_payload()
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+            require_mapping_auto_dispatch=True,
+        )
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.conn.execute(
+            """
+            UPDATE cafe24_order_items
+            SET standard_status = 'failed',
+                retry_count = 1,
+                automation_error_code = 'supplier_dispatch_failed',
+                error_message = 'supplier rejected request',
+                supplier_response_json = ?
+            WHERE id = ?
+            """,
+            (json.dumps({"error": "supplier rejected request"}), item["id"]),
+        )
+        self.conn.commit()
+
+        calls = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(json.loads(request.data.decode("utf-8")))
+            return FakeSlackResponse()
+
+        with patch.dict(os.environ, {"SMM_PANEL_SLACK_CAFE24_FAILURE_WEBHOOK_URL": "https://hooks.slack.test/services/abc"}, clear=False), patch(
+            "core.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            first = self.store.notify_cafe24_supplier_failures_to_slack(actor="cron")
+            second = self.store.notify_cafe24_supplier_failures_to_slack(actor="cron")
+
+        self.assertEqual(first["sent"], 1)
+        self.assertEqual(second["sent"], 0)
+        self.assertEqual(second["skipped"], 1)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("20260426-000001", calls[0]["text"])
+        event = self.conn.execute("SELECT * FROM notification_events").fetchone()
+        self.assertEqual(event["status"], "sent")
+
+    def test_slack_skips_unmapped_cafe24_failure(self):
+        order_payload = self._order_payload()
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.conn.execute(
+            """
+            UPDATE cafe24_order_items
+            SET mapping_id = '',
+                auto_dispatch_approved = 0,
+                standard_status = 'failed',
+                supplier_id = ?,
+                supplier_service_id = ?,
+                supplier_external_service_id = ?,
+                retry_count = 1,
+                automation_error_code = 'supplier_dispatch_failed',
+                error_message = 'supplier rejected request',
+                supplier_response_json = ?
+            WHERE id = ?
+            """,
+            (
+                "supplier_test",
+                "supplier_service_test",
+                "svc-1001",
+                json.dumps({"error": "supplier rejected request"}),
+                item["id"],
+            ),
+        )
+        self.conn.commit()
+
+        with patch.dict(os.environ, {"SMM_PANEL_SLACK_CAFE24_FAILURE_WEBHOOK_URL": "https://hooks.slack.test/services/abc"}, clear=False), patch(
+            "core.urlopen",
+        ) as urlopen_call:
+            result = self.store.notify_cafe24_supplier_failures_to_slack(actor="cron")
+
+        self.assertEqual(result["checked"], 0)
+        urlopen_call.assert_not_called()
+
+    def test_slack_notifies_daily_split_part_supplier_failure(self):
+        self._enable_daily_split_mapping()
+        order_payload = self._daily_split_order_payload()
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+            require_mapping_auto_dispatch=True,
+        )
+        part = self.conn.execute("SELECT * FROM cafe24_split_job_parts ORDER BY sequence LIMIT 1").fetchone()
+        self.conn.execute(
+            """
+            UPDATE cafe24_split_job_parts
+            SET status = 'failed',
+                dispatch_attempts = 1,
+                supplier_response_json = ?,
+                error_message = 'split supplier failure'
+            WHERE id = ?
+            """,
+            (json.dumps({"error": "split supplier failure"}), part["id"]),
+        )
+        self.conn.commit()
+        calls = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(json.loads(request.data.decode("utf-8")))
+            return FakeSlackResponse()
+
+        with patch.dict(os.environ, {"SMM_PANEL_SLACK_CAFE24_FAILURE_WEBHOOK_URL": "https://hooks.slack.test/services/abc"}, clear=False), patch(
+            "core.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            result = self.store.notify_cafe24_supplier_failures_to_slack(actor="cron")
+
+        self.assertEqual(result["sent"], 1)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("분할 회차: 1", calls[0]["text"])
 
     def test_daily_split_dispatches_only_due_part(self):
         self._enable_daily_split_mapping()

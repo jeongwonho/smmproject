@@ -540,6 +540,8 @@ CAFE24_FLOW_COMPLETION_LIMIT = 50
 CAFE24_FLOW_REQUEST_TIMEOUT_SECONDS = 5.0
 CAFE24_FLOW_MAX_ATTEMPTS = 1
 CAFE24_WEBHOOK_ORDER_PROCESSED_EVENT_NO = "90023"
+SLACK_NOTIFICATION_TIMEOUT_SECONDS = 5
+SLACK_NOTIFICATION_MAX_ATTEMPTS = 5
 CAFE24_ORDER_ELIGIBLE_STATUSES = {"N10", "N20", "N21", "N22", "N30", "N40", "N50"}
 CAFE24_ORDER_UNPAID_STATUSES = {"N00"}
 CAFE24_ORDER_CANCELLED_PREFIXES = ("C", "R", "E")
@@ -621,6 +623,28 @@ def payment_secret_key() -> str:
 
 def payment_webhook_secret() -> str:
     return str(os.environ.get("SMM_PANEL_PAYMENT_WEBHOOK_SECRET") or "").strip()
+
+
+def slack_cafe24_failure_webhook_url() -> str:
+    return str(
+        os.environ.get("SMM_PANEL_SLACK_CAFE24_FAILURE_WEBHOOK_URL")
+        or os.environ.get("SMM_PANEL_SLACK_WEBHOOK_URL")
+        or os.environ.get("SLACK_WEBHOOK_URL")
+        or ""
+    ).strip()
+
+
+def public_app_origin() -> str:
+    for key in ("SMM_PANEL_PUBLIC_APP_ORIGIN", "SMM_PANEL_PUBLIC_API_BASE_URL", "VERCEL_PROJECT_PRODUCTION_URL", "VERCEL_URL"):
+        value = str(os.environ.get(key) or "").strip()
+        if not value:
+            continue
+        if not value.startswith(("http://", "https://")):
+            value = f"https://{value}"
+        parsed = urlparse(value)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+    return ""
 
 
 def cafe24_webhook_api_key() -> str:
@@ -1510,6 +1534,26 @@ CREATE INDEX IF NOT EXISTS idx_site_visit_events_route
 CREATE INDEX IF NOT EXISTS idx_site_visit_events_session
     ON site_visit_events(session_id);
 
+CREATE TABLE IF NOT EXISTS notification_events (
+    id TEXT PRIMARY KEY,
+    channel TEXT NOT NULL,
+    event_key TEXT NOT NULL,
+    event_type TEXT NOT NULL DEFAULT '',
+    entity_type TEXT NOT NULL DEFAULT '',
+    entity_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    last_error TEXT NOT NULL DEFAULT '',
+    sent_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(channel, event_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_notification_events_status_updated_at
+    ON notification_events(channel, status, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS admin_audit_logs (
     id TEXT PRIMARY KEY,
     actor TEXT NOT NULL DEFAULT 'admin',
@@ -1528,7 +1572,7 @@ CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_entity
     ON admin_audit_logs(entity_type, entity_id, created_at DESC);
 """
 
-RUNTIME_SCHEMA_VERSION = "2026-06-23-01"
+RUNTIME_SCHEMA_VERSION = "2026-07-07-01"
 
 
 class PreviewHTMLParser(HTMLParser):
@@ -8488,6 +8532,7 @@ class PanelStore(PanelStoreDatabaseMixin):
             "supplierStatusRefresh",
             "cafe24SplitStatusRefresh",
             "cafe24Completion",
+            "slackNotifications",
         ):
             compacted[key] = compact_section(compacted.get(key))
         return compacted
@@ -12893,6 +12938,337 @@ class PanelStore(PanelStoreDatabaseMixin):
             "createdLabel": self._relative_date_label(row["created_at"]),
         }
 
+    def _slack_admin_order_search_url(self, order_id: str) -> str:
+        origin = public_app_origin()
+        if not origin or not order_id:
+            return ""
+        return f"{origin}/admin?section=cafe24&q={quote(order_id)}"
+
+    def _slack_failure_text(self, payload: Dict[str, Any]) -> str:
+        order_id = str(payload.get("orderId") or "-")
+        item_code = str(payload.get("orderItemCode") or "-")
+        product = str(payload.get("productName") or payload.get("productNo") or "-")
+        supplier = str(payload.get("supplierName") or "-")
+        service = str(payload.get("supplierServiceName") or payload.get("supplierExternalServiceId") or "-")
+        status = str(payload.get("status") or "-")
+        error_code = str(payload.get("errorCode") or "-")
+        message = str(payload.get("errorMessage") or "").strip()[:700] or "-"
+        attempts = str(payload.get("attempts") or "0")
+        part = ""
+        if payload.get("splitPartSequence"):
+            part = f"\n분할 회차: {payload.get('splitPartSequence')} / 수량 {payload.get('splitPartQuantity') or '-'}"
+        admin_url = str(payload.get("adminUrl") or "")
+        admin_line = f"\n관리자 검색: {admin_url}" if admin_url else f"\n관리자 Cafe24에서 주문번호 검색: {order_id}"
+        return (
+            f"[Cafe24 공급사 발주 실패]\n"
+            f"주문번호: {order_id}\n"
+            f"품주코드: {item_code}\n"
+            f"상품: {product}\n"
+            f"공급사: {supplier} / {service}\n"
+            f"상태: {status} / {error_code}\n"
+            f"시도: {attempts}회"
+            f"{part}\n"
+            f"사유: {message}"
+            f"{admin_line}"
+        )
+
+    def _send_slack_notification(self, webhook_url: str, payload: Dict[str, Any]) -> None:
+        text = self._slack_failure_text(payload)
+        body = {
+            "text": text,
+            "blocks": [
+                {"type": "header", "text": {"type": "plain_text", "text": "Cafe24 공급사 발주 실패", "emoji": False}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+            ],
+        }
+        request = Request(
+            webhook_url,
+            data=as_json(body).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+        with urlopen(request, timeout=SLACK_NOTIFICATION_TIMEOUT_SECONDS) as response:
+            status = int(getattr(response, "status", 200) or 200)
+            if status >= 400:
+                raise PanelError(f"Slack webhook 응답 오류: HTTP {status}")
+
+    def _claim_notification_event(
+        self,
+        conn: DatabaseConnection,
+        *,
+        event_key: str,
+        event_type: str,
+        entity_type: str,
+        entity_id: str,
+        payload: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        timestamp = now_iso()
+        conn.execute(
+            """
+            INSERT INTO notification_events (
+                id, channel, event_key, event_type, entity_type, entity_id,
+                status, attempts, payload_json, last_error, sent_at, created_at, updated_at
+            ) VALUES (?, 'slack', ?, ?, ?, ?, 'pending', 0, ?, '', '', ?, ?)
+            ON CONFLICT(channel, event_key) DO NOTHING
+            """,
+            (
+                f"notif_{uuid4().hex[:16]}",
+                event_key,
+                event_type,
+                entity_type,
+                entity_id,
+                as_json(redact_external_payload(payload)),
+                timestamp,
+                timestamp,
+            ),
+        )
+        row = conn.execute(
+            """
+            SELECT *
+            FROM notification_events
+            WHERE channel = 'slack' AND event_key = ?
+            """,
+            (event_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        if str(row["status"] or "") == "sent":
+            return None
+        if int(row["attempts"] or 0) >= SLACK_NOTIFICATION_MAX_ATTEMPTS:
+            return None
+        conn.execute(
+            """
+            UPDATE notification_events
+            SET status = 'sending', attempts = COALESCE(attempts, 0) + 1,
+                payload_json = ?, last_error = '', updated_at = ?
+            WHERE id = ?
+            """,
+            (as_json(redact_external_payload(payload)), timestamp, row["id"]),
+        )
+        updated = dict(row)
+        updated["attempts"] = int(row["attempts"] or 0) + 1
+        updated["payload_json"] = as_json(redact_external_payload(payload))
+        return updated
+
+    def _mark_notification_event_sent(self, conn: DatabaseConnection, event_id: str) -> None:
+        timestamp = now_iso()
+        conn.execute(
+            """
+            UPDATE notification_events
+            SET status = 'sent', sent_at = ?, last_error = '', updated_at = ?
+            WHERE id = ?
+            """,
+            (timestamp, timestamp, event_id),
+        )
+
+    def _mark_notification_event_failed(self, conn: DatabaseConnection, event_id: str, message: str) -> None:
+        conn.execute(
+            """
+            UPDATE notification_events
+            SET status = 'failed', last_error = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (message[:1000], now_iso(), event_id),
+        )
+
+    def _cafe24_supplier_failure_notification_candidates(self, limit: int) -> List[Dict[str, Any]]:
+        max_items = max(1, min(int(limit or 20), 100))
+        supplier_error_codes = (
+            "supplier_dispatch_failed",
+            "supplier_token_expired",
+            "supplier_response_ambiguous",
+            "supplier_status_check_failed",
+            "dispatch_exception",
+        )
+        placeholders = ",".join("?" for _ in supplier_error_codes)
+        candidates: List[Dict[str, Any]] = []
+        with self._connect() as conn:
+            item_rows = conn.execute(
+                f"""
+                SELECT
+                    coi.id, coi.mall_id, coi.shop_no, coi.cafe24_order_id,
+                    coi.cafe24_order_item_code, coi.cafe24_product_no,
+                    coi.cafe24_variant_code, coi.cafe24_custom_product_code,
+                    coi.standard_status, coi.automation_error_code, coi.error_message,
+                    coi.retry_count, coi.supplier_order_uuid, coi.updated_at,
+                    coi.raw_payload_json,
+                    s.name AS supplier_name,
+                    ss.name AS supplier_service_name,
+                    ss.external_service_id AS supplier_external_service_id
+                FROM cafe24_order_items coi
+                LEFT JOIN suppliers s ON s.id = coi.supplier_id
+                LEFT JOIN supplier_services ss ON ss.id = coi.supplier_service_id
+                WHERE coi.supplier_id <> ''
+                  AND coi.supplier_service_id <> ''
+                  AND coi.supplier_external_service_id <> ''
+                  AND (coi.mapping_id <> '' OR coi.auto_dispatch_approved = 1)
+                  AND (
+                    coi.automation_error_code IN ({placeholders})
+                    OR (coi.standard_status = 'failed' AND coi.supplier_order_uuid <> '')
+                  )
+                  AND (
+                    COALESCE(coi.retry_count, 0) > 0
+                    OR coi.supplier_order_uuid <> ''
+                    OR coi.supplier_response_json <> '{{}}'
+                  )
+                ORDER BY coi.updated_at DESC
+                LIMIT ?
+                """,
+                (*supplier_error_codes, max_items),
+            ).fetchall()
+            split_rows = conn.execute(
+                """
+                SELECT
+                    p.id, p.split_job_id, p.cafe24_order_item_id, p.sequence,
+                    p.quantity, p.status, p.error_message, p.dispatch_attempts,
+                    p.supplier_order_uuid, p.updated_at,
+                    j.mall_id, j.shop_no, j.cafe24_order_id, j.cafe24_order_item_code,
+                    j.supplier_external_service_id,
+                    coi.cafe24_product_no, coi.cafe24_variant_code, coi.cafe24_custom_product_code,
+                    coi.raw_payload_json,
+                    s.name AS supplier_name,
+                    ss.name AS supplier_service_name
+                FROM cafe24_split_job_parts p
+                JOIN cafe24_split_jobs j ON j.id = p.split_job_id
+                JOIN cafe24_order_items coi ON coi.id = p.cafe24_order_item_id
+                LEFT JOIN suppliers s ON s.id = j.supplier_id
+                LEFT JOIN supplier_services ss ON ss.id = j.supplier_service_id
+                WHERE j.supplier_id <> ''
+                  AND j.supplier_service_id <> ''
+                  AND j.supplier_external_service_id <> ''
+                  AND (coi.mapping_id <> '' OR coi.auto_dispatch_approved = 1)
+                  AND p.status IN ('failed', 'needs_manual_review')
+                  AND COALESCE(p.dispatch_attempts, 0) > 0
+                  AND (
+                    p.supplier_order_uuid <> ''
+                    OR p.supplier_response_json <> '{}'
+                  )
+                ORDER BY p.updated_at DESC
+                LIMIT ?
+                """,
+                (max_items,),
+            ).fetchall()
+
+        for row in item_rows:
+            raw_payload = parse_json(row["raw_payload_json"], {})
+            product_name = cafe24_payload_value(raw_payload, ("product_name", "productName", "item_product_name", "name"))
+            error_code = str(row["automation_error_code"] or "")
+            if not error_code and str(row["standard_status"] or "") == "failed":
+                error_code = "supplier_status_failed"
+            payload = {
+                "kind": "cafe24_order_item",
+                "orderId": row["cafe24_order_id"],
+                "orderItemCode": row["cafe24_order_item_code"],
+                "productNo": row["cafe24_product_no"],
+                "variantCode": row["cafe24_variant_code"],
+                "customProductCode": row["cafe24_custom_product_code"],
+                "productName": product_name,
+                "supplierName": row["supplier_name"],
+                "supplierServiceName": row["supplier_service_name"],
+                "supplierExternalServiceId": row["supplier_external_service_id"],
+                "supplierOrderUuid": row["supplier_order_uuid"],
+                "status": row["standard_status"],
+                "errorCode": error_code,
+                "errorMessage": row["error_message"],
+                "attempts": int(row["retry_count"] or 0),
+                "adminUrl": self._slack_admin_order_search_url(str(row["cafe24_order_id"] or "")),
+                "updatedAt": row["updated_at"],
+            }
+            candidates.append(
+                {
+                    "eventKey": f"cafe24:item:{row['id']}:{error_code or row['standard_status']}",
+                    "eventType": "cafe24.supplier_dispatch_failed",
+                    "entityType": "cafe24_order_item",
+                    "entityId": row["id"],
+                    "payload": payload,
+                }
+            )
+
+        for row in split_rows:
+            raw_payload = parse_json(row["raw_payload_json"], {})
+            product_name = cafe24_payload_value(raw_payload, ("product_name", "productName", "item_product_name", "name"))
+            error_code = "split_supplier_dispatch_failed" if str(row["status"] or "") == "failed" else "split_supplier_review_required"
+            payload = {
+                "kind": "cafe24_split_job_part",
+                "orderId": row["cafe24_order_id"],
+                "orderItemCode": row["cafe24_order_item_code"],
+                "productNo": row["cafe24_product_no"],
+                "variantCode": row["cafe24_variant_code"],
+                "customProductCode": row["cafe24_custom_product_code"],
+                "productName": product_name,
+                "supplierName": row["supplier_name"],
+                "supplierServiceName": row["supplier_service_name"],
+                "supplierExternalServiceId": row["supplier_external_service_id"],
+                "supplierOrderUuid": row["supplier_order_uuid"],
+                "status": row["status"],
+                "errorCode": error_code,
+                "errorMessage": row["error_message"],
+                "attempts": int(row["dispatch_attempts"] or 0),
+                "splitPartSequence": int(row["sequence"] or 0),
+                "splitPartQuantity": int(row["quantity"] or 0),
+                "adminUrl": self._slack_admin_order_search_url(str(row["cafe24_order_id"] or "")),
+                "updatedAt": row["updated_at"],
+            }
+            candidates.append(
+                {
+                    "eventKey": f"cafe24:split-part:{row['id']}:{error_code}",
+                    "eventType": "cafe24.split_supplier_dispatch_failed",
+                    "entityType": "cafe24_split_job_part",
+                    "entityId": row["id"],
+                    "payload": payload,
+                }
+            )
+        return candidates[:max_items]
+
+    def notify_cafe24_supplier_failures_to_slack(self, *, actor: str = "cron", limit: int = 20) -> Dict[str, Any]:
+        webhook_url = slack_cafe24_failure_webhook_url()
+        if not webhook_url:
+            return {"enabled": False, "skipped": True, "reason": "slack_webhook_not_configured", "sent": 0, "failed": 0, "checked": 0}
+        candidates = self._cafe24_supplier_failure_notification_candidates(limit)
+        sent = 0
+        failed = 0
+        skipped = 0
+        results: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            payload = dict(candidate["payload"])
+            payload["actor"] = actor
+            with self._connect() as conn:
+                event = self._claim_notification_event(
+                    conn,
+                    event_key=str(candidate["eventKey"]),
+                    event_type=str(candidate["eventType"]),
+                    entity_type=str(candidate["entityType"]),
+                    entity_id=str(candidate["entityId"]),
+                    payload=payload,
+                )
+                conn.commit()
+            if event is None:
+                skipped += 1
+                continue
+            event_id = str(event["id"])
+            try:
+                self._send_slack_notification(webhook_url, payload)
+                with self._connect() as conn:
+                    self._mark_notification_event_sent(conn, event_id)
+                    conn.commit()
+                sent += 1
+                results.append({"eventKey": candidate["eventKey"], "status": "sent"})
+            except Exception as exc:
+                failed += 1
+                with self._connect() as conn:
+                    self._mark_notification_event_failed(conn, event_id, str(exc))
+                    conn.commit()
+                results.append({"eventKey": candidate["eventKey"], "status": "failed", "error": str(exc)[:1000]})
+        return {
+            "enabled": True,
+            "checked": len(candidates),
+            "sent": sent,
+            "failed": failed,
+            "skipped": skipped,
+            "results": results,
+            "ranAt": now_iso(),
+        }
+
     def _notice_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "id": row["id"],
@@ -15293,6 +15669,7 @@ class PanelStore(PanelStoreDatabaseMixin):
             "supplierStatusRefresh": {"skipped": paused},
             "cafe24SplitStatusRefresh": {"skipped": paused},
             "cafe24Completion": {"skipped": paused},
+            "slackNotifications": {},
             "settings": {
                 "lookbackMinutes": lookback_minutes,
                 "useCursor": True,
@@ -15364,6 +15741,13 @@ class PanelStore(PanelStoreDatabaseMixin):
             message = str(exc)
             result["error"] = message
         finally:
+            try:
+                result["slackNotifications"] = self.notify_cafe24_supplier_failures_to_slack(
+                    actor=actor,
+                    limit=int_option("slackNotificationLimit", 20, minimum=1, maximum=100),
+                )
+            except Exception as exc:
+                result["slackNotifications"] = {"enabled": True, "status": "failed", "error": str(exc)[:1000]}
             result["finishedAt"] = now_iso()
             result["durationMs"] = int((time.perf_counter() - started_perf) * 1000)
             result["status"] = status
@@ -15410,6 +15794,7 @@ class PanelStore(PanelStoreDatabaseMixin):
             "supplierStatusRefresh": {"skipped": paused},
             "cafe24SplitStatusRefresh": {"skipped": paused},
             "cafe24Completion": {"skipped": paused},
+            "slackNotifications": {},
         }
         status = "success"
         message = "automation tick completed"
@@ -15445,6 +15830,13 @@ class PanelStore(PanelStoreDatabaseMixin):
             message = str(exc)
             result["error"] = message
         finally:
+            try:
+                result["slackNotifications"] = self.notify_cafe24_supplier_failures_to_slack(
+                    actor=actor,
+                    limit=max(1, min(int(payload.get("slackNotificationLimit") or 20), 100)),
+                )
+            except Exception as exc:
+                result["slackNotifications"] = {"enabled": True, "status": "failed", "error": str(exc)[:1000]}
             result["finishedAt"] = now_iso()
             result["durationMs"] = int((time.perf_counter() - started_perf) * 1000)
             result["status"] = status
