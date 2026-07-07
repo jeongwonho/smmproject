@@ -412,6 +412,7 @@ class PanelStoreDatabaseMixin:
         )
         self._ensure_charge_support_tables(conn)
         self._ensure_cafe24_support_tables(conn)
+        self._ensure_cafe24_split_support_tables(conn)
         self._ensure_mkt24_product_settings_table(conn)
         self._ensure_column(conn, "cafe24_product_mappings", "supplier_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_product_mappings", "supplier_product_uuid", "TEXT NOT NULL DEFAULT ''")
@@ -550,6 +551,83 @@ class PanelStoreDatabaseMixin:
         conn.execute("UPDATE users SET role = 'admin', is_active = 1, account_status = 'active' WHERE id = ?", (demo_user_id,))
         conn.execute("UPDATE users SET role = COALESCE(NULLIF(role, ''), 'customer') WHERE id != ?", (demo_user_id,))
         self._migrate_supplier_secrets(conn)
+
+    def _ensure_cafe24_split_support_tables(self, conn: DatabaseConnection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cafe24_split_jobs (
+                id TEXT PRIMARY KEY,
+                cafe24_order_item_id TEXT NOT NULL REFERENCES cafe24_order_items(id) ON DELETE CASCADE,
+                mall_id TEXT NOT NULL,
+                shop_no INTEGER NOT NULL DEFAULT 1,
+                cafe24_order_id TEXT NOT NULL,
+                cafe24_order_item_code TEXT NOT NULL DEFAULT '',
+                dispatch_mode TEXT NOT NULL DEFAULT 'daily_split',
+                status TEXT NOT NULL DEFAULT 'scheduled',
+                target_value TEXT NOT NULL DEFAULT '',
+                total_quantity INTEGER NOT NULL DEFAULT 0,
+                daily_quantity INTEGER NOT NULL DEFAULT 0,
+                duration_days INTEGER NOT NULL DEFAULT 0,
+                dispatched_parts INTEGER NOT NULL DEFAULT 0,
+                completed_parts INTEGER NOT NULL DEFAULT 0,
+                failed_parts INTEGER NOT NULL DEFAULT 0,
+                supplier_id TEXT NOT NULL DEFAULT '',
+                supplier_service_id TEXT NOT NULL DEFAULT '',
+                supplier_external_service_id TEXT NOT NULL DEFAULT '',
+                normalized_fields_json TEXT NOT NULL DEFAULT '{}',
+                supplier_payload_json TEXT NOT NULL DEFAULT '{}',
+                error_message TEXT NOT NULL DEFAULT '',
+                next_dispatch_at TEXT NOT NULL DEFAULT '',
+                last_dispatch_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(cafe24_order_item_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cafe24_split_jobs_status_next
+                ON cafe24_split_jobs(status, next_dispatch_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cafe24_split_job_parts (
+                id TEXT PRIMARY KEY,
+                split_job_id TEXT NOT NULL REFERENCES cafe24_split_jobs(id) ON DELETE CASCADE,
+                cafe24_order_item_id TEXT NOT NULL REFERENCES cafe24_order_items(id) ON DELETE CASCADE,
+                sequence INTEGER NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 0,
+                scheduled_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                supplier_order_id TEXT NOT NULL DEFAULT '',
+                supplier_order_uuid TEXT NOT NULL DEFAULT '',
+                supplier_response_json TEXT NOT NULL DEFAULT '{}',
+                error_message TEXT NOT NULL DEFAULT '',
+                dispatch_attempts INTEGER NOT NULL DEFAULT 0,
+                next_retry_at TEXT NOT NULL DEFAULT '',
+                dispatched_at TEXT NOT NULL DEFAULT '',
+                last_status_checked_at TEXT NOT NULL DEFAULT '',
+                next_status_check_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(split_job_id, sequence)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cafe24_split_parts_due
+                ON cafe24_split_job_parts(status, scheduled_at, next_retry_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cafe24_split_parts_status_check
+                ON cafe24_split_job_parts(status, next_status_check_at)
+            """
+        )
 
     def _migrate_mkt24_panel_endpoint(self, conn: DatabaseConnection) -> None:
         rows = conn.execute(

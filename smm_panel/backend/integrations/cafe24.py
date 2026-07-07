@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 
 CAFE24_DEFAULT_SHOP_NO = 1
 CAFE24_DEFAULT_SCOPES = ("mall.read_order", "mall.write_order", "mall.read_product")
+CAFE24_REQUIRED_ORDER_FLOW_SCOPES = CAFE24_DEFAULT_SCOPES
 CAFE24_REFRESH_TOKEN_EXPIRY_WARNING_DAYS = 2
 CAFE24_AUTO_POLL_INTERVAL_MINUTES = 5
 CAFE24_TOKEN_STATUS_CONNECTED = "connected"
@@ -48,7 +49,7 @@ CAFE24_REVIEW_REQUIRED_STATUSES = CAFE24_MANUAL_INPUT_REQUIRED_STATUSES | {
     "field_extract_failed",
     "payment_review_required",
 }
-CAFE24_IN_PROGRESS_STATUSES = {"submitting", "supplier_submitted", "supplier_progress"}
+CAFE24_IN_PROGRESS_STATUSES = {"submitting", "supplier_submitted", "supplier_progress", "split_scheduled", "split_in_progress"}
 CAFE24_OPERATOR_ACTION_STATUSES = CAFE24_MANUAL_INPUT_REQUIRED_STATUSES | {"field_extract_failed"}
 CAFE24_PAYMENT_BLOCKED_STATUSES = {"payment_pending", "payment_review_required", "cancelled"}
 CAFE24_AUTO_DISPATCH_EXCLUDED_STATUS = "auto_dispatch_excluded"
@@ -126,6 +127,62 @@ def normalize_cafe24_scopes(raw: Any) -> List[str]:
         if scope and scope not in scopes:
             scopes.append(scope)
     return scopes or list(CAFE24_DEFAULT_SCOPES)
+
+
+def cafe24_missing_required_order_flow_scopes(raw: Any) -> List[str]:
+    scopes = normalize_cafe24_scopes(raw)
+    return [scope for scope in CAFE24_REQUIRED_ORDER_FLOW_SCOPES if scope not in scopes]
+
+
+def cafe24_order_flow_readiness(row: Dict[str, Any]) -> Dict[str, Any]:
+    row_map = dict(row or {})
+    scopes = normalize_cafe24_scopes(_cafe24_parse_json(_cafe24_row_value(row_map, "scopes_json"), []))
+    missing_scopes = cafe24_missing_required_order_flow_scopes(scopes)
+    token_status = cafe24_token_status(row_map)
+    last_sync_status = str(_cafe24_row_value(row_map, "last_sync_status", "never") or "never")
+    last_sync_message = str(_cafe24_row_value(row_map, "last_sync_message") or "")
+    last_auto_poll_status = str(_cafe24_row_value(row_map, "last_auto_poll_status", "never") or "never")
+    last_auto_poll_message = str(_cafe24_row_value(row_map, "last_auto_poll_message") or "")
+    lowered_sync_message = last_sync_message.lower()
+    insufficient_scope_failure = any(token in lowered_sync_message for token in ("insufficient_scope", "scope", "permission", "권한"))
+
+    if not bool(_cafe24_row_value(row_map, "is_active", 0)):
+        status = "inactive"
+        label = "비활성"
+        message = "Cafe24 연동이 비활성 상태입니다."
+    elif token_status in {CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED, CAFE24_TOKEN_STATUS_FAILED}:
+        status = token_status
+        label = "재연결 필요" if token_status == CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED else "연결 실패"
+        message = cafe24_token_status_message(row_map)
+    elif missing_scopes:
+        status = "insufficient_scope"
+        label = "권한 부족"
+        message = "Cafe24 주문 처리 권한이 부족합니다. OAuth를 주문/상품 권한으로 다시 연결해 주세요."
+    elif last_sync_status == "failed" and insufficient_scope_failure:
+        status = "insufficient_scope"
+        label = "권한 부족"
+        message = last_sync_message or "Cafe24 주문 처리 권한이 부족합니다. OAuth 재연결이 필요합니다."
+    elif last_sync_status == "failed":
+        status = "collection_failed"
+        label = "수집 실패"
+        message = last_sync_message or "최근 Cafe24 주문 수집이 실패했습니다."
+    elif last_auto_poll_status == "failed":
+        status = "collection_failed"
+        label = "수집 실패"
+        message = last_auto_poll_message or "최근 Cafe24 자동 수집이 실패했습니다."
+    else:
+        status = "ready"
+        label = "정상"
+        message = "Cafe24 주문 수집/발주 권한이 준비되어 있습니다."
+
+    return {
+        "ok": status == "ready",
+        "status": status,
+        "label": label,
+        "message": message,
+        "requiredScopes": list(CAFE24_REQUIRED_ORDER_FLOW_SCOPES),
+        "missingScopes": missing_scopes,
+    }
 
 
 def cafe24_oauth_timestamp_from_response(payload: Dict[str, Any], absolute_key: str, seconds_key: str) -> str:
@@ -907,11 +964,19 @@ def cafe24_integration_payload_from_row(
     default_shop_no: int = CAFE24_DEFAULT_SHOP_NO,
     auto_poll_interval_minutes: int = CAFE24_AUTO_POLL_INTERVAL_MINUTES,
 ) -> Dict[str, Any]:
+    scopes = _cafe24_parse_json(_cafe24_row_value(row, "scopes_json"), [])
+    readiness = cafe24_order_flow_readiness(row)
     return {
         "id": _cafe24_row_value(row, "id"),
         "mallId": _cafe24_row_value(row, "mall_id"),
         "shopNo": int(_cafe24_row_value(row, "shop_no", default_shop_no) or default_shop_no),
-        "scopes": _cafe24_parse_json(_cafe24_row_value(row, "scopes_json"), []),
+        "scopes": scopes,
+        "requiredScopes": readiness["requiredScopes"],
+        "missingScopes": readiness["missingScopes"],
+        "orderFlowReady": readiness["ok"],
+        "orderFlowStatus": readiness["status"],
+        "orderFlowStatusLabel": readiness["label"],
+        "orderFlowStatusMessage": readiness["message"],
         "hasAccessToken": bool(_cafe24_row_value(row, "access_token")),
         "hasRefreshToken": bool(_cafe24_row_value(row, "refresh_token")),
         "accessTokenMasked": _cafe24_mask_secret(_cafe24_row_value(row, "access_token")),

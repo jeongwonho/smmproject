@@ -1,5 +1,6 @@
 let runtime = {};
 let state = {};
+const CAFE24_REQUIRED_ORDER_FLOW_SCOPES = ["mall.read_order", "mall.write_order", "mall.read_product"];
 
 export function configureCafe24AdminActions(nextRuntime = {}) {
   runtime = nextRuntime;
@@ -330,7 +331,7 @@ export async function handleCafe24AdminClick(closest) {
       const result = await apiPost("/api/admin/cafe24/oauth/start", {
         mallId: formData.get("mallId"),
         shopNo: formData.get("shopNo"),
-        scopes: formData.get("scopes"),
+        scopes: CAFE24_REQUIRED_ORDER_FLOW_SCOPES.join(","),
       });
       showToast("Cafe24 승인 페이지로 이동합니다.");
       window.location.href = result.authorizeUrl;
@@ -629,7 +630,7 @@ export async function handleCafe24AdminSubmit(form, event) {
         refreshToken: formData.get("refreshToken"),
         expiresAt: formData.get("expiresAt"),
         refreshTokenExpiresAt: formData.get("refreshTokenExpiresAt"),
-        scopes: formData.get("scopes"),
+        scopes: CAFE24_REQUIRED_ORDER_FLOW_SCOPES.join(","),
         autoSubmit: Boolean(formData.get("autoSubmit")),
         isActive: Boolean(formData.get("isActive")),
       });

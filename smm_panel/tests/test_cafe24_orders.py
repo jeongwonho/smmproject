@@ -385,6 +385,17 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
             ],
         }
 
+    def _daily_split_order_payload(self):
+        payload = self._order_payload()
+        payload["order_id"] = "20260426-000099"
+        payload["items"][0]["order_item_code"] = "20260426-000099-01"
+        payload["items"][0]["options"] = [
+            {"name": "계정", "value": "instamart_official"},
+            {"name": "1일 팔로워 수", "value": "100명"},
+            {"name": "진행 기간", "value": "3일"},
+        ]
+        return payload
+
     def _integration_row(self):
         return self.conn.execute("SELECT * FROM cafe24_integrations WHERE mall_id = ?", ("instamart",)).fetchone()
 
@@ -409,6 +420,28 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
             (timestamp, timestamp, timestamp, "supplier_test"),
         )
         self.conn.execute("UPDATE cafe24_supplier_mappings SET auto_dispatch_enabled = 1")
+        self.conn.commit()
+
+    def _enable_daily_split_mapping(self):
+        self._enable_auto_submit_and_supplier_ready()
+        self.conn.execute(
+            """
+            UPDATE cafe24_supplier_mappings
+            SET field_mapping_json = ?, auto_dispatch_enabled = 1
+            """,
+            (
+                json.dumps(
+                    {
+                        "dispatchMode": {"source": "fixed", "value": "daily_split"},
+                        "targetValue": "option:계정",
+                        "orderedCount": {"source": "option", "label": "1일 팔로워 수", "extract": "quantity_number"},
+                        "dailyQuantity": {"source": "option", "label": "1일 팔로워 수", "extract": "quantity_number"},
+                        "durationDays": {"source": "option", "label": "진행 기간", "extract": "positive_int"},
+                    },
+                    ensure_ascii=False,
+                ),
+            ),
+        )
         self.conn.commit()
 
     def _set_integration_token_expiry(self, *, access_delta_seconds=7200, refresh_delta_days=14):
@@ -1582,6 +1615,128 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(item["standard_status"], "supplier_submitted")
         self.assertEqual(item["supplier_order_uuid"], "SUP-AUTO")
 
+    def test_daily_split_mapping_schedules_parts_without_immediate_dispatch(self):
+        self._enable_daily_split_mapping()
+        order_payload = self._daily_split_order_payload()
+
+        with patch("core.SupplierApiClient.order") as order_call:
+            result = self.store._process_cafe24_item(
+                self.conn,
+                integration=self._integration_row(),
+                order_payload=order_payload,
+                item_payload=order_payload["items"][0],
+                index=0,
+                submit_ready=True,
+                require_mapping_auto_dispatch=True,
+            )
+
+        self.assertEqual(result["status"], "split_scheduled")
+        order_call.assert_not_called()
+        item = self.conn.execute("SELECT * FROM cafe24_order_items WHERE cafe24_order_id = ?", ("20260426-000099",)).fetchone()
+        self.assertEqual(item["standard_status"], "split_scheduled")
+        self.assertEqual(item["supplier_order_uuid"], "")
+        job = self.conn.execute("SELECT * FROM cafe24_split_jobs WHERE cafe24_order_item_id = ?", (item["id"],)).fetchone()
+        self.assertIsNotNone(job)
+        self.assertEqual(job["daily_quantity"], 100)
+        self.assertEqual(job["duration_days"], 3)
+        self.assertEqual(job["total_quantity"], 300)
+        parts = self.conn.execute(
+            "SELECT * FROM cafe24_split_job_parts WHERE split_job_id = ? ORDER BY sequence",
+            (job["id"],),
+        ).fetchall()
+        self.assertEqual(len(parts), 3)
+        self.assertEqual([part["quantity"] for part in parts], [100, 100, 100])
+        self.assertEqual([part["status"] for part in parts], ["pending", "pending", "pending"])
+
+    def test_cafe24_order_list_includes_daily_split_job_summary(self):
+        self._enable_daily_split_mapping()
+        order_payload = self._daily_split_order_payload()
+        order_payload["order_date"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+            require_mapping_auto_dispatch=True,
+        )
+        self.conn.commit()
+
+        result = self.store.list_cafe24_order_items({"pageSize": 5})
+
+        item = result["items"][0]
+        self.assertEqual(item["standardStatus"], "split_scheduled")
+        self.assertEqual(item["splitJob"]["dailyQuantity"], 100)
+        self.assertEqual(item["splitJob"]["durationDays"], 3)
+        self.assertEqual(item["splitJob"]["totalQuantity"], 300)
+        self.assertEqual(len(item["splitJob"]["parts"]), 3)
+
+    def test_daily_split_dispatches_only_due_part(self):
+        self._enable_daily_split_mapping()
+        order_payload = self._daily_split_order_payload()
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+            require_mapping_auto_dispatch=True,
+        )
+        self.conn.commit()
+
+        with patch("core.SupplierApiClient.order", return_value={"order": "SUP-SPLIT-1"}) as order_call:
+            first = self.store.dispatch_due_cafe24_split_jobs(actor="cron", limit=10)
+            second = self.store.dispatch_due_cafe24_split_jobs(actor="cron", limit=10)
+
+        self.assertEqual(first["submitted"], 1)
+        self.assertEqual(second["checked"], 0)
+        order_call.assert_called_once()
+        self.assertEqual(order_call.call_args[0][0]["quantity"], "100")
+        parts = self.conn.execute("SELECT * FROM cafe24_split_job_parts ORDER BY sequence").fetchall()
+        self.assertEqual(parts[0]["status"], "supplier_submitted")
+        self.assertEqual(parts[0]["supplier_order_uuid"], "SUP-SPLIT-1")
+        self.assertEqual([part["status"] for part in parts[1:]], ["pending", "pending"])
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.assertEqual(item["standard_status"], "split_in_progress")
+
+    def test_daily_split_marks_item_completed_after_all_parts_complete(self):
+        self._enable_daily_split_mapping()
+        order_payload = self._daily_split_order_payload()
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+            require_mapping_auto_dispatch=True,
+        )
+        due_at = (dt.datetime.now().astimezone() - dt.timedelta(minutes=1)).isoformat(timespec="seconds")
+        self.conn.execute("UPDATE cafe24_split_job_parts SET scheduled_at = ?", (due_at,))
+        self.conn.commit()
+
+        with patch(
+            "core.SupplierApiClient.order",
+            side_effect=[{"order": "SUP-SPLIT-1"}, {"order": "SUP-SPLIT-2"}, {"order": "SUP-SPLIT-3"}],
+        ):
+            dispatch = self.store.dispatch_due_cafe24_split_jobs(actor="cron", limit=10)
+        self.conn.execute("UPDATE cafe24_split_job_parts SET next_status_check_at = ''")
+        self.conn.commit()
+
+        with patch("core.SupplierApiClient.status", return_value={"status": "completed"}):
+            status_result = self.store.refresh_due_cafe24_split_job_parts(actor="cron", limit=10)
+
+        self.assertEqual(dispatch["submitted"], 3)
+        self.assertEqual(status_result["completed"], 3)
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.assertEqual(item["standard_status"], "completed")
+        self.assertEqual(item["cafe24_completion_status"], "pending")
+        job = self.conn.execute("SELECT * FROM cafe24_split_jobs").fetchone()
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(job["completed_parts"], 3)
+
     def test_automation_blocks_cafe24_dispatch_when_supplier_health_failed(self):
         self._enable_auto_submit_and_supplier_ready()
         self.conn.execute(
@@ -2260,6 +2415,45 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertTrue(item["preflight_checked_at"])
         self.assertEqual(json.loads(item["preflight_blockers_json"]), [])
 
+    def test_cafe24_flow_tick_refreshes_due_token_before_poll(self):
+        self._set_integration_token_expiry(access_delta_seconds=20 * 60, refresh_delta_days=10)
+        order_response = {"orders": [self._order_payload()]}
+
+        with patch(
+            "core.Cafe24ApiClient.refresh_access_token",
+            return_value={
+                "access_token": "flow-refreshed-access-token",
+                "refresh_token": "flow-refreshed-refresh-token",
+                "expires_in": 7200,
+                "refresh_token_expires_in": 1209600,
+                "scope": "mall.read_order,mall.write_order,mall.read_product",
+            },
+        ) as refresh, patch("core.Cafe24ApiClient.orders", return_value=order_response) as orders:
+            result = self.store.run_cafe24_flow_tick(
+                {"actor": "cron", "tokenRefreshWindowMinutes": 30, "dispatchLimit": 0, "statusLimit": 0, "completionLimit": 0}
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["cafe24TokenRefresh"]["checked"], 1)
+        self.assertEqual(result["cafe24TokenRefresh"]["refreshed"], 1)
+        self.assertEqual(result["cafe24Poll"]["processedIntegrations"], 1)
+        refresh.assert_called_once()
+        orders.assert_called()
+        row = self._integration_row()
+        self.assertEqual(row["token_status"], "connected")
+        self.assertTrue(row["token_last_refreshed_at"])
+
+    def test_refresh_due_cafe24_tokens_skips_token_outside_window(self):
+        self._set_integration_token_expiry(access_delta_seconds=2 * 60 * 60, refresh_delta_days=10)
+
+        with patch("core.Cafe24ApiClient.refresh_access_token") as refresh:
+            result = self.store.refresh_due_cafe24_tokens(actor="cron", limit=10, expiry_window_minutes=30)
+
+        self.assertEqual(result["checked"], 1)
+        self.assertEqual(result["refreshed"], 0)
+        self.assertEqual(result["skipped"], 1)
+        refresh.assert_not_called()
+
     def test_cafe24_flow_tick_compact_response_omits_large_results(self):
         self._enable_auto_submit_and_supplier_ready()
         fake_client = FakeCafe24OrderClient(self._order_payload())
@@ -2273,6 +2467,26 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertNotIn("results", result["cafe24Dispatch"])
         self.assertEqual(result["cafe24Dispatch"]["resultCount"], 1)
+
+    def test_cafe24_flow_tick_dispatches_daily_split_part_same_tick(self):
+        self._enable_daily_split_mapping()
+        fake_client = FakeCafe24OrderClient(self._daily_split_order_payload())
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client), patch(
+            "core.SupplierApiClient.order",
+            return_value={"order": "SUP-SPLIT-FLOW"},
+        ) as order_call:
+            result = self.store.run_cafe24_flow_tick({"actor": "cron"})
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["cafe24Dispatch"]["checked"], 0)
+        self.assertEqual(result["cafe24SplitDispatch"]["submitted"], 1)
+        order_call.assert_called_once()
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        self.assertEqual(item["standard_status"], "split_in_progress")
+        parts = self.conn.execute("SELECT * FROM cafe24_split_job_parts ORDER BY sequence").fetchall()
+        self.assertEqual(parts[0]["supplier_order_uuid"], "SUP-SPLIT-FLOW")
+        self.assertEqual([part["status"] for part in parts[1:]], ["pending", "pending"])
 
     def test_cafe24_flow_tick_returns_locked_when_existing_tick_is_running(self):
         with patch.object(self.store, "_acquire_runtime_lock", return_value=""):
@@ -2523,7 +2737,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
                     "refresh_token": "new-refresh-token",
                     "expires_in": 7200,
                     "refresh_token_expires_in": 1209600,
-                    "scope": "mall.read_order,mall.write_order",
+                    "scope": "mall.read_order,mall.write_order,mall.read_product",
                 },
             ) as exchange:
                 result = self.store.complete_cafe24_oauth_callback({"state": state_result["state"], "code": "auth-code"})
@@ -2538,6 +2752,108 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
             (state_result["state"],),
         ).fetchone()["used_at"]
         self.assertTrue(used_at)
+
+    def test_cafe24_oauth_callback_rejects_token_missing_required_scopes(self):
+        with patch.dict(
+            os.environ,
+            {
+                "SMM_PANEL_CAFE24_CLIENT_ID": "client-id",
+                "SMM_PANEL_CAFE24_CLIENT_SECRET": "client-secret",
+            },
+            clear=False,
+        ):
+            state_result = self.store.create_cafe24_oauth_authorize_url(
+                {
+                    "mallId": "instamart",
+                    "shopNo": 1,
+                    "scopes": ["mall.read_order", "mall.write_order", "mall.read_product"],
+                    "redirectUri": "https://example.com/api/admin/cafe24/oauth/callback",
+                }
+            )
+            with patch(
+                "core.Cafe24ApiClient.exchange_authorization_code",
+                return_value={
+                    "access_token": "community-only-access-token",
+                    "refresh_token": "community-only-refresh-token",
+                    "expires_in": 7200,
+                    "refresh_token_expires_in": 1209600,
+                    "scope": "mall.read_community,mall.write_community",
+                },
+            ):
+                with self.assertRaises(PanelError) as raised:
+                    self.store.complete_cafe24_oauth_callback({"state": state_result["state"], "code": "auth-code"})
+
+        self.assertEqual(raised.exception.status, 403)
+        self.assertIn("주문 처리 필수 권한", str(raised.exception))
+        integration = self._integration_row()
+        self.assertEqual(
+            json.loads(integration["scopes_json"]),
+            ["mall.read_order", "mall.write_order", "mall.read_product"],
+        )
+        self.assertEqual(integration["last_sync_status"], "failed")
+        self.assertIn("누락 권한", integration["last_sync_message"])
+        used_at = self.conn.execute(
+            "SELECT used_at FROM cafe24_oauth_states WHERE state = ?",
+            (state_result["state"],),
+        ).fetchone()["used_at"]
+        self.assertTrue(used_at)
+        event = self.conn.execute(
+            "SELECT * FROM cafe24_api_events WHERE event_type = 'oauth_callback' ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(event["status"], "failed")
+        self.assertIn("mall.read_order", event["error_message"])
+
+    def test_cafe24_oauth_callback_preserves_dispatch_settings_and_clears_stale_scope_error(self):
+        self.conn.execute(
+            """
+            UPDATE cafe24_integrations
+            SET auto_submit = 1, completion_policy = ?, last_sync_status = ?, last_sync_message = ?
+            WHERE id = ?
+            """,
+            (
+                "purchase_confirm",
+                "failed",
+                "Cafe24 주문 수집 권한이 없습니다. Cafe24 OAuth를 mall.read_order 권한으로 다시 연결해 주세요.",
+                self.integration["id"],
+            ),
+        )
+        self.conn.commit()
+
+        with patch.dict(
+            os.environ,
+            {
+                "SMM_PANEL_CAFE24_CLIENT_ID": "client-id",
+                "SMM_PANEL_CAFE24_CLIENT_SECRET": "client-secret",
+            },
+            clear=False,
+        ):
+            state_result = self.store.create_cafe24_oauth_authorize_url(
+                {
+                    "mallId": "instamart",
+                    "shopNo": 1,
+                    "scopes": ["mall.read_order", "mall.write_order", "mall.read_product"],
+                    "redirectUri": "https://example.com/api/admin/cafe24/oauth/callback",
+                }
+            )
+            with patch(
+                "core.Cafe24ApiClient.exchange_authorization_code",
+                return_value={
+                    "access_token": "new-access-token",
+                    "refresh_token": "new-refresh-token",
+                    "expires_in": 7200,
+                    "refresh_token_expires_in": 1209600,
+                    "scope": "mall.read_order,mall.write_order,mall.read_product",
+                },
+            ):
+                result = self.store.complete_cafe24_oauth_callback({"state": state_result["state"], "code": "auth-code"})
+
+        self.assertTrue(result["integration"]["autoSubmit"])
+        self.assertEqual(result["integration"]["completionPolicy"], "purchase_confirm")
+        integration = self._integration_row()
+        self.assertEqual(integration["auto_submit"], 1)
+        self.assertEqual(integration["completion_policy"], "purchase_confirm")
+        self.assertEqual(integration["last_sync_status"], "never")
+        self.assertEqual(integration["last_sync_message"], "")
 
     def test_expired_access_token_refreshes_once_and_rotates_refresh_token(self):
         self._set_integration_token_expiry(access_delta_seconds=-30, refresh_delta_days=10)

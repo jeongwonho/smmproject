@@ -1,7 +1,7 @@
 import { renderCafe24OperationalAuditPanel } from "./cafe24-audit-ui.js";
 import { renderCafe24OpsBoard, renderCafe24QuickControls } from "./cafe24-console-ui.js";
 import { renderCafe24ProductLookupPanel } from "./cafe24-product-ui.js";
-import { renderCafe24ManualInputForm, renderCafe24Pagination, renderCafe24PreflightSummary, renderCafe24QueueActionHint, renderCafe24QueueToolbar } from "./cafe24-queue-ui.js";
+import { cafe24OrderFlowState, formatCafe24KstDateTime, renderCafe24ManualInputForm, renderCafe24Pagination, renderCafe24PreflightSummary, renderCafe24QueueActionHint, renderCafe24QueueToolbar } from "./cafe24-queue-ui.js";
 import { renderCafe24MappingGapReport, renderCafe24MappingWorkflowChecklist } from "./cafe24-workflow-ui.js";
 import { renderSupplierDispatchReadinessPanel, renderSupplierDispatchReadinessSnapshot } from "./supplier-readiness-ui.js";
 import { supplierSyncInsight } from "./supplier-sync-ui.js";
@@ -1907,8 +1907,44 @@ function cafe24StatusTone(item = {}) {
   if (item.standardStatus === "failed" || item.paymentGateStatus === "cancelled") return "is-error";
   if (item.standardStatus === "auto_dispatch_excluded") return "is-neutral";
   if (["waiting_input", "mapping_error", "missing_required_field", "invalid_quantity", "invalid_target", "payment_pending", "payment_review_required"].includes(item.standardStatus) || item.paymentGateStatus !== "payment_confirmed") return "is-warning";
-  if (["supplier_submitted", "supplier_progress", "completed"].includes(item.standardStatus)) return "is-success";
+  if (["split_scheduled", "split_in_progress", "supplier_submitted", "supplier_progress", "completed"].includes(item.standardStatus)) return "is-success";
   return "is-neutral";
+}
+
+function renderCafe24SplitJobSummary(item = {}) {
+  const job = item.splitJob || null;
+  if (!job) return "";
+  const parts = Array.isArray(job.parts) ? job.parts : [];
+  const totalParts = parts.length || Number(job.durationDays || 0);
+  const completed = Number(job.completedParts || 0);
+  const dispatched = Number(job.dispatchedParts || 0);
+  const failed = Number(job.failedParts || 0);
+  const nextDispatch = formatCafe24KstDateTime(job.nextDispatchAt, "대기 없음");
+  return `
+    <div class="admin-inline-note">
+      분할 발주 ${escapeHtml(job.status || "-")} · ${escapeHtml(String(completed))}/${escapeHtml(String(totalParts))} 완료 · ${escapeHtml(String(dispatched))}회 발주 · 다음 ${escapeHtml(nextDispatch)}
+    </div>
+    <details class="admin-disclosure cafe24-order-card__details">
+      <summary>분할 발주 ${escapeHtml(String(totalParts))}회차 보기</summary>
+      <div class="admin-order-card__fact-grid">
+        <article><span>1일 수량</span><strong>${escapeHtml(String(job.dailyQuantity || 0))}</strong></article>
+        <article><span>반복 횟수</span><strong>${escapeHtml(String(job.durationDays || 0))}회</strong></article>
+        <article><span>총 수량</span><strong>${escapeHtml(String(job.totalQuantity || 0))}</strong></article>
+        <article><span>실패/검수</span><strong>${escapeHtml(String(failed))}회</strong></article>
+      </div>
+      <div class="admin-readiness-checks">
+        ${parts.map((part) => `
+          <div class="admin-readiness-check">
+            <div class="admin-readiness-check__text">
+              <strong>${escapeHtml(String(part.sequence || "-"))}회차 · ${escapeHtml(String(part.quantity || 0))}</strong>
+              <span>${escapeHtml(formatCafe24KstDateTime(part.scheduledAt, "-"))}${part.supplierOrderUuid ? ` · 공급사 ${escapeHtml(part.supplierOrderUuid)}` : ""}${part.errorMessage ? ` · ${escapeHtml(part.errorMessage)}` : ""}</span>
+            </div>
+            <span class="admin-badge ${part.status === "completed" ? "is-success" : part.status === "failed" || part.status === "needs_manual_review" ? "is-warning" : "is-neutral"}">${escapeHtml(part.status || "-")}</span>
+          </div>
+        `).join("")}
+      </div>
+    </details>
+  `;
 }
 
 function renderCafe24MappingPanel(activeIntegration = {}, products = [], suppliers = [], cafe24SupplierServices = [], selectedCafe24SupplierId = "", mappings = []) {
@@ -2068,6 +2104,7 @@ function renderCafe24OrderQueuePanel(orderItems = [], suppliers = [], supplierSe
               </div>
               ${renderCafe24QueueActionHint({ item, canDispatch: canDispatchCafe24Item, escapeHtml })}
               ${renderCafe24PreflightSummary({ preflight, escapeHtml })}
+              ${renderCafe24SplitJobSummary(item)}
               ${item.errorMessage ? `<p class="admin-inline-note">${escapeHtml(item.errorMessage)}</p>` : ""}
               <div class="admin-action-row cafe24-order-card__primary-actions">
                 <button class="admin-secondary-button" type="button" data-admin-cafe24-preflight-item="${escapeHtml(item.id)}">preflight</button>
@@ -2111,7 +2148,7 @@ function renderCafe24OrderQueuePanel(orderItems = [], suppliers = [], supplierSe
                       <span class="field-label">수동 상태</span>
                       <div class="field-shell">
                         <select class="field-select" name="status">
-                          ${["received", "payment_pending", "payment_review_required", "waiting_input", "mapping_error", "auto_dispatch_excluded", "missing_required_field", "invalid_quantity", "invalid_target", "supplier_range_error", "needs_manual_review", "ready_to_submit", "submitting", "supplier_submitted", "supplier_progress", "completed", "failed", "cancelled"].map((status) => `<option value="${status}" ${item.standardStatus === status ? "selected" : ""}>${status}</option>`).join("")}
+                          ${["received", "payment_pending", "payment_review_required", "waiting_input", "mapping_error", "auto_dispatch_excluded", "missing_required_field", "invalid_quantity", "invalid_target", "supplier_range_error", "needs_manual_review", "ready_to_submit", "split_scheduled", "split_in_progress", "submitting", "supplier_submitted", "supplier_progress", "completed", "failed", "cancelled"].map((status) => `<option value="${status}" ${item.standardStatus === status ? "selected" : ""}>${status}</option>`).join("")}
                         </select>
                       </div>
                     </label>
@@ -2136,6 +2173,7 @@ function renderCafe24OrderQueuePanel(orderItems = [], suppliers = [], supplierSe
 
 function renderCafe24ConnectionPanel(activeIntegration = {}, cafe24OAuthRedirectUri = "") {
   const tokenStatus = activeIntegration.tokenStatus || "reconnect_required";
+  const orderFlowState = cafe24OrderFlowState(activeIntegration);
   const tokenBadgeClass = {
     connected: "is-success",
     token_expiring: "is-warn",
@@ -2143,6 +2181,11 @@ function renderCafe24ConnectionPanel(activeIntegration = {}, cafe24OAuthRedirect
     reconnect_required: "is-error",
     failed: "is-error",
   }[tokenStatus] || "is-neutral";
+  const badgeClass = orderFlowState.risk ? "is-error" : tokenBadgeClass;
+  const statusLabel = orderFlowState.risk ? orderFlowState.label : activeIntegration.tokenStatusLabel || "미연결";
+  const statusMessage = orderFlowState.risk
+    ? orderFlowState.message
+    : activeIntegration.tokenStatusMessage || "OAuth 연결 후 주문 수집을 시작할 수 있습니다.";
   return `
     <div class="admin-panel">
       <div class="section-head section-head--compact">
@@ -2151,10 +2194,10 @@ function renderCafe24ConnectionPanel(activeIntegration = {}, cafe24OAuthRedirect
       </div>
       <div class="admin-empty-card">
         <div class="admin-action-row">
-          <span class="admin-badge ${tokenBadgeClass}">${escapeHtml(activeIntegration.tokenStatusLabel || "미연결")}</span>
+          <span class="admin-badge ${badgeClass}">${escapeHtml(statusLabel)}</span>
           <strong>${escapeHtml(activeIntegration.mallId || "Cafe24 Mall ID 미설정")}</strong>
         </div>
-        <p>${escapeHtml(activeIntegration.tokenStatusMessage || "OAuth 연결 후 주문 수집을 시작할 수 있습니다.")}</p>
+        <p>${escapeHtml(statusMessage)}</p>
         <p class="admin-inline-note">
           Access 만료: ${escapeHtml(activeIntegration.expiresAt || "미확인")} ·
           Refresh 만료: ${escapeHtml(activeIntegration.refreshTokenExpiresAt || "미확인")} ·
