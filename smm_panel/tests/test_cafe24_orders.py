@@ -3930,6 +3930,29 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(fake_client.product_state["selling"], "T")
         self.assertGreaterEqual(sleep.call_count, 6)
 
+    def test_daily_follower_product_activation_error_reports_ack_and_observed_status(self):
+        self._enable_daily_follower_product_readiness()
+        fake_client = FakeCafe24DelayedActivationDailyFollowerProductClient(activation_read_delay=100)
+
+        with (
+            patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client),
+            patch("core.time.sleep"),
+        ):
+            with self.assertRaises(PanelError) as raised:
+                self.store.configure_cafe24_daily_follower_product(
+                    {
+                        "integrationId": self.integration["id"],
+                        "productNo": "51",
+                        "activate": True,
+                        "_adminActor": "admin",
+                    }
+                )
+
+        self.assertEqual(raised.exception.status, 409)
+        self.assertIn("수정 응답 T/T, 재조회 F/F", str(raised.exception))
+        self.assertEqual(fake_client.product_state["display"], "F")
+        self.assertEqual(fake_client.product_state["selling"], "F")
+
     def test_daily_follower_product_failure_forces_product_hidden(self):
         self._enable_daily_follower_product_readiness()
         fake_client = FakeCafe24DailyFollowerProductClient(fail_on="update_product_options")

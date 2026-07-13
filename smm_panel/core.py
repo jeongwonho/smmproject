@@ -10451,6 +10451,7 @@ class PanelStore(PanelStoreDatabaseMixin):
             updates = daily_follower_product_updates()
             hidden_applied = False
             activation_attempted = False
+            activation_ack = {"display": "", "selling": "", "updatedDate": ""}
             rollback_error = ""
             try:
                 call(lambda client: client.update_product(product_no, {"display": "F", "selling": "F"}))
@@ -10486,7 +10487,17 @@ class PanelStore(PanelStoreDatabaseMixin):
                 final_snapshot = configured_snapshot
                 if activate:
                     activation_attempted = True
-                    call(lambda client: client.update_product(product_no, {"display": "T", "selling": "T"}))
+                    activation_response = call(
+                        lambda client: client.update_product(product_no, {"display": "T", "selling": "T"})
+                    )
+                    activation_products = cafe24_products_from_payload(activation_response)
+                    if activation_products:
+                        activation_product = activation_products[0]
+                        activation_ack = {
+                            "display": str(activation_product.get("display") or ""),
+                            "selling": str(activation_product.get("selling") or ""),
+                            "updatedDate": str(activation_product.get("updated_date") or ""),
+                        }
                     final_snapshot = fetch_validated_snapshot(
                         configured=True,
                         activated=True,
@@ -10494,9 +10505,14 @@ class PanelStore(PanelStoreDatabaseMixin):
                         delay_seconds=1.0,
                     )
                     if final_snapshot["blockers"]:
+                        observed_product = final_snapshot.get("product") or {}
                         raise PanelError(
                             "Cafe24 데일리 팔로워 상품 판매 전환 검증에 실패했습니다: "
-                            + " / ".join(final_snapshot["blockers"]),
+                            + " / ".join(final_snapshot["blockers"])
+                            + " (수정 응답 "
+                            + f"{activation_ack['display']}/{activation_ack['selling']}, "
+                            + "재조회 "
+                            + f"{observed_product.get('display') or ''}/{observed_product.get('selling') or ''})",
                             status=409,
                         )
 
