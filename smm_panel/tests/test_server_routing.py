@@ -1028,6 +1028,23 @@ class RouterRegistryTest(unittest.TestCase):
         self.assertEqual(route.auth, "admin")
         self.assertTrue(route.csrf)
 
+    def test_cafe24_daily_follower_config_route_requires_admin_csrf_and_trusted_origin(self):
+        matched = ROUTER.match("POST", "/api/admin/cafe24/products/51/configure-daily-follower")
+
+        self.assertIsNotNone(matched)
+        route, params = matched
+        self.assertEqual(params, {"product_no": "51"})
+        self.assertEqual(route.auth, "admin")
+        self.assertTrue(route.csrf)
+        self.assertTrue(route.trusted_origin)
+
+    def test_cafe24_oauth_reconnect_requests_product_write_scope(self):
+        source = (APP_ROOT / "static" / "admin" / "cafe24.js").read_text()
+
+        self.assertIn('CAFE24_PRODUCT_MANAGEMENT_SCOPES', source)
+        self.assertIn('"mall.write_product"', source)
+        self.assertIn('scopes: CAFE24_PRODUCT_MANAGEMENT_SCOPES.join(",")', source)
+
     def test_cafe24_mapping_gaps_cron_route_declares_cron_auth(self):
         matched = ROUTER.match("POST", "/api/cron/cafe24/mapping-gaps")
 

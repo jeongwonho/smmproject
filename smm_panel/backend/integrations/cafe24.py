@@ -1750,8 +1750,29 @@ class Cafe24ApiClient:
     def product(self, product_no: str) -> Any:
         return self._request("GET", f"/admin/products/{quote(str(product_no), safe='')}")
 
+    def update_product(self, product_no: str, updates: Dict[str, Any]) -> Any:
+        return self._request(
+            "PUT",
+            f"/admin/products/{quote(str(product_no), safe='')}",
+            payload={"shop_no": self.shop_no, "request": dict(updates or {})},
+        )
+
     def product_options(self, product_no: str) -> Any:
         return self._request("GET", f"/admin/products/{quote(str(product_no), safe='')}/options")
 
+    def update_product_options(self, product_no: str, updates: Dict[str, Any]) -> Any:
+        return self._request(
+            "PUT",
+            f"/admin/products/{quote(str(product_no), safe='')}/options",
+            payload={"shop_no": self.shop_no, "request": dict(updates or {})},
+        )
+
     def product_variants(self, product_no: str) -> Any:
         return self._request("GET", f"/admin/products/{quote(str(product_no), safe='')}/variants")
+
+    def update_product_variants(self, product_no: str, updates: List[Dict[str, Any]]) -> Any:
+        return self._request(
+            "PUT",
+            f"/admin/products/{quote(str(product_no), safe='')}/variants",
+            payload={"shop_no": self.shop_no, "requests": [dict(update or {}) for update in updates]},
+        )

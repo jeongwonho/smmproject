@@ -1301,6 +1301,18 @@ class AppHandler(SimpleHTTPRequestHandler):
             },
         )
 
+    @route(
+        "POST",
+        "/api/admin/cafe24/products/<product_no>/configure-daily-follower",
+        auth="admin",
+        csrf=True,
+        trusted_origin=True,
+        read_json_body=True,
+    )
+    def _post_admin_cafe24_configure_daily_follower(self, request: RouteRequest) -> None:
+        request.payload["productNo"] = request.params["product_no"]
+        self._write_store_result("configure_cafe24_daily_follower_product", request.payload)
+
     @route("GET", "/api/products")
     def _get_products(self, request: RouteRequest) -> None:
         started_at = time.perf_counter()

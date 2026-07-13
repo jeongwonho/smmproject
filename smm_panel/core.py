@@ -159,6 +159,17 @@ try:
         normalize_cafe24_status,
     )
     from .backend.integrations.cafe24_audit import build_cafe24_operational_audit
+    from .backend.integrations.cafe24_daily_follower import (
+        DAILY_FOLLOWER_DAILY_QUANTITIES,
+        DAILY_FOLLOWER_DESCRIPTION_MARKER,
+        DAILY_FOLLOWER_PRODUCT_CODE,
+        DAILY_FOLLOWER_PRODUCT_NO,
+        DAILY_FOLLOWER_SUPPLIER_SERVICE_ID,
+        DAILY_FOLLOWER_VARIANTS,
+        daily_follower_product_plan,
+        daily_follower_product_updates,
+        validate_daily_follower_snapshot,
+    )
     from .backend.integrations.cafe24_mapping_gaps import (
         annotate_cafe24_mapping_gap_groups,
         cafe24_mapping_gap_item_payload,
@@ -218,6 +229,7 @@ try:
     from .backend.integrations.suppliers import (
         FASTTRAFFIC_API_URL,
         SUPPLIER_INTEGRATION_FASTTRAFFIC,
+        SUPPLIER_INTEGRATION_MKT24,
         SupplierApiClient,
         SupplierApiError,
         supplier_auto_dispatch_readiness,
@@ -366,6 +378,17 @@ except ImportError:  # pragma: no cover - top-level script runtime
         normalize_cafe24_status,
     )
     from backend.integrations.cafe24_audit import build_cafe24_operational_audit
+    from backend.integrations.cafe24_daily_follower import (
+        DAILY_FOLLOWER_DAILY_QUANTITIES,
+        DAILY_FOLLOWER_DESCRIPTION_MARKER,
+        DAILY_FOLLOWER_PRODUCT_CODE,
+        DAILY_FOLLOWER_PRODUCT_NO,
+        DAILY_FOLLOWER_SUPPLIER_SERVICE_ID,
+        DAILY_FOLLOWER_VARIANTS,
+        daily_follower_product_plan,
+        daily_follower_product_updates,
+        validate_daily_follower_snapshot,
+    )
     from backend.integrations.cafe24_mapping_gaps import (
         annotate_cafe24_mapping_gap_groups,
         cafe24_mapping_gap_item_payload,
@@ -425,6 +448,7 @@ except ImportError:  # pragma: no cover - top-level script runtime
     from backend.integrations.suppliers import (
         FASTTRAFFIC_API_URL,
         SUPPLIER_INTEGRATION_FASTTRAFFIC,
+        SUPPLIER_INTEGRATION_MKT24,
         SupplierApiClient,
         SupplierApiError,
         supplier_auto_dispatch_readiness,
@@ -516,6 +540,7 @@ CAFE24_ORDER_CHANNEL = ORDER_CHANNEL_CAFE24
 CAFE24_DEFAULT_SHOP_NO = 1
 CAFE24_OAUTH_STATE_TTL_SECONDS = 10 * 60
 CAFE24_DEFAULT_SCOPES = ("mall.read_order", "mall.write_order", "mall.read_product")
+CAFE24_OAUTH_DEFAULT_SCOPES = (*CAFE24_DEFAULT_SCOPES, "mall.write_product")
 CAFE24_REFRESH_LOCK_SECONDS = 90
 CAFE24_POLL_LOCK_SECONDS = 8 * 60
 CAFE24_AUTO_POLL_INTERVAL_MINUTES = 5
@@ -8761,7 +8786,7 @@ class PanelStore(PanelStoreDatabaseMixin):
         shop_no = normalize_cafe24_shop_no(payload.get("shopNo"))
         redirect_uri = str(payload.get("redirectUri") or cafe24_redirect_uri()).strip()
         scopes = normalize_cafe24_scopes(payload.get("scopes"))
-        for required_scope in CAFE24_DEFAULT_SCOPES:
+        for required_scope in CAFE24_OAUTH_DEFAULT_SCOPES:
             if required_scope not in scopes:
                 scopes.append(required_scope)
         actor = self._admin_actor(payload)
@@ -8839,13 +8864,22 @@ class PanelStore(PanelStoreDatabaseMixin):
         redirect_uri = str(state_row["redirect_uri"] or "").strip()
         actor = str(state_row["actor"] or "admin")
         token_payload = Cafe24ApiClient.exchange_authorization_code(mall_id, code, redirect_uri)
-        requested_scopes = normalize_cafe24_scopes(parse_json(state_row["scopes_json"], list(CAFE24_DEFAULT_SCOPES)))
+        requested_scopes = normalize_cafe24_scopes(
+            parse_json(state_row["scopes_json"], list(CAFE24_OAUTH_DEFAULT_SCOPES))
+        )
         raw_token_scopes = token_payload.get("scopes") or token_payload.get("scope")
         token_scopes = normalize_cafe24_scopes(raw_token_scopes if raw_token_scopes is not None else requested_scopes)
-        missing_token_scopes = cafe24_missing_required_order_flow_scopes(token_scopes)
+        missing_token_scopes = list(
+            dict.fromkeys(
+                [scope for scope in requested_scopes if scope not in token_scopes]
+                + cafe24_missing_required_order_flow_scopes(token_scopes)
+            )
+        )
         if missing_token_scopes:
+            missing_order_scopes = cafe24_missing_required_order_flow_scopes(token_scopes)
+            permission_label = "주문 처리 필수 권한" if missing_order_scopes else "요청한 상품 관리 권한"
             message = (
-                "Cafe24가 주문 처리 필수 권한을 발급하지 않았습니다. "
+                f"Cafe24가 {permission_label}을 발급하지 않았습니다. "
                 f"누락 권한: {', '.join(missing_token_scopes)}. "
                 "Cafe24 Developers 앱 권한 설정에서 주문/상품 API 권한을 추가한 뒤 다시 승인해 주세요."
             )
@@ -10096,6 +10130,403 @@ class PanelStore(PanelStoreDatabaseMixin):
             conn.commit()
         return {"product": product_payload, "warnings": warnings}
 
+    def _cafe24_daily_follower_readiness(
+        self,
+        conn: DatabaseConnection,
+        integration: Dict[str, Any],
+        *,
+        product_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        blockers: List[str] = []
+        scopes = normalize_cafe24_scopes(parse_json(integration["scopes_json"], []))
+        token_status = self._cafe24_token_status(integration)
+        if "mall.write_product" not in scopes:
+            blockers.append("Cafe24 OAuth에 mall.write_product 권한이 없습니다.")
+        if not bool(integration["is_active"]):
+            blockers.append("Cafe24 연동이 비활성 상태입니다.")
+        if token_status in {CAFE24_TOKEN_STATUS_RECONNECT_REQUIRED, CAFE24_TOKEN_STATUS_FAILED}:
+            blockers.append("Cafe24 OAuth 토큰을 다시 연결해야 합니다.")
+        if not bool(integration["auto_submit"]):
+            blockers.append("Cafe24 자동 발주가 꺼져 있습니다.")
+        if str(integration["completion_policy"] or "") != "purchase_confirm":
+            blockers.append("Cafe24 완료 정책이 purchase_confirm이 아닙니다.")
+
+        mapping_row = conn.execute(
+            """
+            SELECT
+                cm.*,
+                s.name AS supplier_name,
+                s.is_active AS supplier_is_active,
+                s.integration_type AS supplier_integration_type,
+                s.service_sync_status AS supplier_service_sync_status,
+                s.health_status AS supplier_health_status,
+                ss.external_service_id AS service_external_id,
+                ss.min_amount AS supplier_min_amount,
+                ss.max_amount AS supplier_max_amount,
+                ss.is_active AS service_is_active
+            FROM cafe24_supplier_mappings cm
+            LEFT JOIN suppliers s ON s.id = cm.supplier_id
+            LEFT JOIN supplier_services ss ON ss.id = cm.supplier_service_id
+            WHERE cm.mall_id = ? AND cm.shop_no = ?
+              AND cm.cafe24_product_no = ?
+              AND cm.cafe24_variant_code = ''
+              AND cm.cafe24_custom_product_code = ''
+              AND cm.enabled = 1
+            ORDER BY cm.updated_at DESC
+            LIMIT 1
+            """,
+            (
+                str(integration["mall_id"]),
+                int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                DAILY_FOLLOWER_PRODUCT_NO,
+            ),
+        ).fetchone()
+        mapping_id = ""
+        supplier_name = ""
+        service_external_id = ""
+        supplier_readiness: Dict[str, Any] = {
+            "ok": False,
+            "code": "mapping_missing",
+            "message": "Cafe24 상품 51의 공급사 매핑이 없습니다.",
+        }
+        if mapping_row is None:
+            blockers.append("Cafe24 상품 51의 상품번호 기준 공급사 매핑이 없습니다.")
+        else:
+            mapping_id = str(mapping_row["id"] or "")
+            supplier_name = str(mapping_row["supplier_name"] or "")
+            service_external_id = str(
+                mapping_row["service_external_id"]
+                or mapping_row["supplier_external_service_id"]
+                or ""
+            )
+            if not bool(mapping_row["auto_dispatch_enabled"]):
+                blockers.append("Cafe24 상품 51 매핑의 자동 발주가 꺼져 있습니다.")
+            if not bool(mapping_row["supplier_is_active"]):
+                blockers.append("Cafe24 상품 51에 연결된 공급사가 비활성 상태입니다.")
+            if not bool(mapping_row["service_is_active"]):
+                blockers.append("Cafe24 상품 51에 연결된 공급사 서비스가 비활성 상태입니다.")
+            if str(mapping_row["supplier_service_sync_status"] or "") != "success":
+                blockers.append("Cafe24 상품 51 공급사의 서비스 동기화가 정상 상태가 아닙니다.")
+            if str(mapping_row["supplier_health_status"] or "") not in {"ok", "healthy", "success"}:
+                blockers.append("Cafe24 상품 51 공급사의 health check가 정상 상태가 아닙니다.")
+            if service_external_id != DAILY_FOLLOWER_SUPPLIER_SERVICE_ID:
+                blockers.append("Cafe24 상품 51이 MKT24 서비스 40000에 연결되어 있지 않습니다.")
+
+            supplier_readiness = self._supplier_auto_dispatch_readiness(
+                conn,
+                supplier_id=str(mapping_row["supplier_id"] or ""),
+                supplier_service_id=str(mapping_row["supplier_service_id"] or ""),
+            )
+            if not supplier_readiness.get("ok"):
+                blockers.append(
+                    "Cafe24 상품 51 공급사 자동 발주 준비가 완료되지 않았습니다: "
+                    + str(supplier_readiness.get("message") or supplier_readiness.get("code") or "확인 필요")
+                )
+            dispatch_contract = supplier_readiness.get("dispatchContract") or {}
+            if (
+                str(dispatch_contract.get("integrationType") or "") != SUPPLIER_INTEGRATION_MKT24
+                or str(dispatch_contract.get("endpointMode") or "") != "/v3/panel"
+            ):
+                blockers.append("Cafe24 상품 51 공급사는 MKT24 /v3/panel 자동 발주 방식이어야 합니다.")
+
+            supplier_min_amount = int(mapping_row["supplier_min_amount"] or 0)
+            supplier_max_amount = int(mapping_row["supplier_max_amount"] or 0)
+            required_min_amount = min(DAILY_FOLLOWER_DAILY_QUANTITIES)
+            required_max_amount = max(DAILY_FOLLOWER_DAILY_QUANTITIES)
+            if (
+                supplier_min_amount <= 0
+                or supplier_max_amount <= 0
+                or supplier_min_amount > required_min_amount
+                or supplier_max_amount < required_max_amount
+            ):
+                blockers.append(
+                    "MKT24 서비스 40000의 주문 가능 수량이 데일리 옵션 50~500명을 모두 포함하지 않습니다. "
+                    f"현재 범위: {supplier_min_amount}~{supplier_max_amount}."
+                )
+
+            expected_variant_codes = {str(variant["variantCode"]) for variant in DAILY_FOLLOWER_VARIANTS}
+            product_snapshot = product_snapshot if isinstance(product_snapshot, dict) else {}
+            product_custom_code = str(product_snapshot.get("customProductCode") or "").strip()
+            product_code = str(product_snapshot.get("productCode") or DAILY_FOLLOWER_PRODUCT_CODE).strip()
+            variant_identities: List[Dict[str, str]] = []
+            observed_variant_codes: set[str] = set()
+            for variant in product_snapshot.get("variants") or []:
+                if not isinstance(variant, dict):
+                    continue
+                variant_code = str(variant.get("variantCode") or "").strip()
+                if variant_code not in expected_variant_codes:
+                    continue
+                observed_variant_codes.add(variant_code)
+                variant_identities.append(
+                    {
+                        "productNo": DAILY_FOLLOWER_PRODUCT_NO,
+                        "variantCode": variant_code,
+                        "customProductCode": str(
+                            variant.get("customProductCode")
+                            or product_custom_code
+                            or variant.get("productCode")
+                            or product_code
+                        ).strip(),
+                    }
+                )
+            for variant_code in sorted(expected_variant_codes - observed_variant_codes):
+                variant_identities.append(
+                    {
+                        "productNo": DAILY_FOLLOWER_PRODUCT_NO,
+                        "variantCode": variant_code,
+                        "customProductCode": product_custom_code or product_code,
+                    }
+                )
+
+            candidate_rows = conn.execute(
+                """
+                SELECT id, cafe24_product_no, cafe24_variant_code, cafe24_custom_product_code
+                FROM cafe24_supplier_mappings
+                WHERE mall_id = ? AND shop_no = ? AND enabled = 1 AND id <> ?
+                ORDER BY updated_at DESC
+                """,
+                (
+                    str(integration["mall_id"]),
+                    int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                    mapping_id,
+                ),
+            ).fetchall()
+            conflict_ids: List[str] = []
+            for candidate in candidate_rows:
+                candidate_identity = {
+                    "productNo": str(candidate["cafe24_product_no"] or ""),
+                    "variantCode": str(candidate["cafe24_variant_code"] or ""),
+                    "customProductCode": str(candidate["cafe24_custom_product_code"] or ""),
+                }
+                if not any(candidate_identity.values()):
+                    continue
+                if any(
+                    all(not value or value == identity[key] for key, value in candidate_identity.items())
+                    for identity in variant_identities
+                ):
+                    conflict_ids.append(str(candidate["id"] or ""))
+            if conflict_ids:
+                blockers.append(
+                    "Cafe24 상품 51 주문과 동시에 일치하는 중복 상품/품목 매핑이 있습니다. "
+                    f"중복 매핑을 비활성화한 뒤 진행해 주세요: {', '.join(conflict_ids[:5])}"
+                )
+
+            field_mapping = parse_json(mapping_row["field_mapping_json"], {})
+            dispatch_mode = field_mapping.get("dispatchMode") or {}
+            daily_quantity = field_mapping.get("dailyQuantity") or {}
+            duration_days = field_mapping.get("durationDays") or {}
+            target_value = field_mapping.get("targetValue") or []
+            if not isinstance(target_value, list):
+                target_value = [target_value]
+            if not isinstance(dispatch_mode, dict) or str(dispatch_mode.get("value") or "") != "daily_split":
+                blockers.append("Cafe24 상품 51 매핑이 daily_split 발주 방식이 아닙니다.")
+            if not isinstance(daily_quantity, dict) or str(daily_quantity.get("label") or "") != "1일 유입수량":
+                blockers.append("Cafe24 상품 51의 1일 유입수량 매핑이 올바르지 않습니다.")
+            if not isinstance(duration_days, dict) or str(duration_days.get("label") or "") != "반복 횟수":
+                blockers.append("Cafe24 상품 51의 반복 횟수 매핑이 올바르지 않습니다.")
+            if "option:인스타그램 프로필 URL" not in [str(value) for value in target_value]:
+                blockers.append("Cafe24 상품 51의 프로필 URL 입력값 매핑이 없습니다.")
+
+        blockers = list(dict.fromkeys(blockers))
+        return {
+            "ready": not blockers,
+            "blockers": blockers,
+            "tokenStatus": token_status,
+            "autoSubmit": bool(integration["auto_submit"]),
+            "completionPolicy": str(integration["completion_policy"] or ""),
+            "mappingId": mapping_id,
+            "supplierName": supplier_name,
+            "supplierServiceId": service_external_id,
+            "supplierReadiness": supplier_readiness,
+        }
+
+    def configure_cafe24_daily_follower_product(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        integration_id = str(payload.get("integrationId") or "").strip()
+        product_no = sanitize_external_order_reference(payload.get("productNo"))
+        dry_run = env_flag(payload.get("dryRun"))
+        activate = env_flag(payload.get("activate"))
+        actor = self._admin_actor(payload)
+        if product_no != DAILY_FOLLOWER_PRODUCT_NO:
+            raise PanelError("이 작업은 Cafe24 상품번호 51(P00000BZ)에만 사용할 수 있습니다.", status=400)
+
+        plan = daily_follower_product_plan()
+        public_plan = {
+            "productNo": plan["productNo"],
+            "productCode": plan["productCode"],
+            "productName": plan["productName"],
+            "basePrice": plan["basePrice"],
+            "descriptionVersion": DAILY_FOLLOWER_DESCRIPTION_MARKER,
+            "additionalOption": plan["additionalOption"],
+            "options": plan["options"],
+            "variants": plan["variants"],
+        }
+
+        with self._connect() as conn:
+            integration = self._cafe24_integration_row(conn, integration_id)
+            self._require_cafe24_scope(integration, "mall.read_product", "Cafe24 데일리 팔로워 상품 조회")
+
+            def call(api_call: Any) -> Any:
+                return self._cafe24_call_with_token_retry(conn, integration, api_call)
+
+            def fetch_snapshot() -> Tuple[Any, Any, Any]:
+                return (
+                    call(lambda client: client.product(product_no)),
+                    call(lambda client: client.product_options(product_no)),
+                    call(lambda client: client.product_variants(product_no)),
+                )
+
+            try:
+                product_response, option_response, variant_response = fetch_snapshot()
+            except Cafe24ApiError as exc:
+                raise self._cafe24_api_panel_error("Cafe24 데일리 팔로워 상품 조회", exc) from exc
+
+            snapshot = validate_daily_follower_snapshot(
+                product_response,
+                option_response,
+                variant_response,
+                configured=False,
+            )
+            readiness = self._cafe24_daily_follower_readiness(
+                conn,
+                integration,
+                product_snapshot=snapshot["product"],
+            )
+            blockers = list(dict.fromkeys([*snapshot["blockers"], *readiness["blockers"]]))
+            if dry_run:
+                conn.commit()
+                return {
+                    "dryRun": True,
+                    "canApply": not blockers,
+                    "activateRequested": activate,
+                    "blockers": blockers,
+                    "readiness": readiness,
+                    "plan": public_plan,
+                }
+
+            self._require_cafe24_scope(integration, "mall.write_product", "Cafe24 데일리 팔로워 상품 수정")
+            if blockers:
+                raise PanelError("Cafe24 데일리 팔로워 상품 설정 전 검증에 실패했습니다: " + " / ".join(blockers), status=409)
+
+            updates = daily_follower_product_updates()
+            hidden_applied = False
+            rollback_error = ""
+            try:
+                call(lambda client: client.update_product(product_no, {"display": "F", "selling": "F"}))
+                hidden_applied = True
+                call(lambda client: client.update_product(product_no, updates["product"]))
+                call(lambda client: client.update_product_options(product_no, updates["options"]))
+                call(lambda client: client.update_product_variants(product_no, updates["variants"]))
+
+                product_response, option_response, variant_response = fetch_snapshot()
+                configured_snapshot = validate_daily_follower_snapshot(
+                    product_response,
+                    option_response,
+                    variant_response,
+                    configured=True,
+                    activated=False,
+                )
+                if configured_snapshot["blockers"]:
+                    raise PanelError(
+                        "Cafe24 데일리 팔로워 상품 반영 검증에 실패했습니다: "
+                        + " / ".join(configured_snapshot["blockers"]),
+                        status=409,
+                    )
+
+                final_snapshot = configured_snapshot
+                if activate:
+                    call(lambda client: client.update_product(product_no, {"display": "T", "selling": "T"}))
+                    product_response, option_response, variant_response = fetch_snapshot()
+                    final_snapshot = validate_daily_follower_snapshot(
+                        product_response,
+                        option_response,
+                        variant_response,
+                        configured=True,
+                        activated=True,
+                    )
+                    if final_snapshot["blockers"]:
+                        raise PanelError(
+                            "Cafe24 데일리 팔로워 상품 판매 전환 검증에 실패했습니다: "
+                            + " / ".join(final_snapshot["blockers"]),
+                            status=409,
+                        )
+
+                final_product = final_snapshot["product"]
+                self._log_cafe24_event(
+                    conn,
+                    mall_id=str(integration["mall_id"]),
+                    shop_no=int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                    event_type="products.daily_follower.configure",
+                    status="success",
+                    request_payload={"productNo": product_no, "activate": activate, "actor": actor},
+                    response_payload={
+                        "productCode": final_product.get("productCode"),
+                        "price": final_product.get("price"),
+                        "display": final_product.get("display"),
+                        "selling": final_product.get("selling"),
+                        "variantCount": len(final_product.get("variants") or []),
+                    },
+                )
+                self._record_admin_audit(
+                    conn,
+                    actor=actor,
+                    action="cafe24.product.daily_follower_configure",
+                    entity_type="cafe24_product",
+                    entity_id=product_no,
+                    message="Cafe24 데일리 팔로워 상품 설정 및 검증",
+                    metadata={
+                        "productCode": DAILY_FOLLOWER_PRODUCT_CODE,
+                        "activate": activate,
+                        "basePrice": plan["basePrice"],
+                        "variantCount": len(plan["variants"]),
+                    },
+                )
+                conn.commit()
+                return {
+                    "dryRun": False,
+                    "configured": True,
+                    "activated": activate,
+                    "readiness": readiness,
+                    "plan": public_plan,
+                    "product": {
+                        "productNo": final_product.get("productNo"),
+                        "productCode": final_product.get("productCode"),
+                        "productName": final_product.get("productName"),
+                        "price": final_product.get("price"),
+                        "display": final_product.get("display"),
+                        "selling": final_product.get("selling"),
+                        "variantCount": len(final_product.get("variants") or []),
+                    },
+                    "configuredAt": now_iso(),
+                }
+            except Exception as exc:
+                if hidden_applied:
+                    try:
+                        call(lambda client: client.update_product(product_no, {"display": "F", "selling": "F"}))
+                    except Exception as rollback_exc:
+                        rollback_error = str(rollback_exc)[:500]
+                self._log_cafe24_event(
+                    conn,
+                    mall_id=str(integration["mall_id"]),
+                    shop_no=int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                    event_type="products.daily_follower.configure",
+                    status="failed",
+                    request_payload={"productNo": product_no, "activate": activate, "actor": actor},
+                    response_payload={"forcedHidden": hidden_applied and not rollback_error, "rollbackError": rollback_error},
+                    error_message=str(exc),
+                )
+                conn.commit()
+                if isinstance(exc, PanelError):
+                    raise
+                if isinstance(exc, Cafe24ApiError):
+                    lowered = str(exc).lower()
+                    if any(value in lowered for value in ("403", "scope", "permission", "forbidden")):
+                        raise PanelError(
+                            "Cafe24 상품 수정 권한이 거부되었습니다. mall.write_product 권한으로 OAuth를 다시 연결해 주세요.",
+                            status=403,
+                        ) from exc
+                    raise PanelError(f"Cafe24 데일리 팔로워 상품 수정 실패: {str(exc)[:500]}", status=502) from exc
+                raise PanelError("Cafe24 데일리 팔로워 상품 설정 중 오류가 발생해 상품을 숨김 처리했습니다.", status=500) from exc
+
     def _cafe24_variant_option_entries(
         self,
         conn: DatabaseConnection,
@@ -10322,7 +10753,7 @@ class PanelStore(PanelStoreDatabaseMixin):
         account_candidate = ""
         for label, value in option_pairs.items():
             lowered = label.lower()
-            if any(token in lowered for token in ("계정", "아이디", "id", "account", "username")):
+            if any(token in lowered for token in ("계정", "아이디", "프로필", "id", "account", "username", "profile")):
                 account_candidate = value
                 break
 
@@ -10413,7 +10844,10 @@ class PanelStore(PanelStoreDatabaseMixin):
         account_candidate = ""
         for label, value in option_pairs.items():
             lowered = label.lower()
-            if any(token in lowered for token in ("계정", "아이디", "id", "account", "username", "링크", "url")):
+            if any(
+                token in lowered
+                for token in ("계정", "아이디", "프로필", "id", "account", "username", "profile", "링크", "url")
+            ):
                 account_candidate = value
                 break
 

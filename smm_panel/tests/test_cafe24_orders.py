@@ -9,7 +9,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import bootstrap
-from backend.integrations.cafe24 import cafe24_option_entries
+from backend.integrations.cafe24 import Cafe24ApiClient, cafe24_option_entries
+from backend.integrations.cafe24_daily_follower import DAILY_FOLLOWER_VARIANTS
 from backend.integrations.cafe24_quantity import (
     cafe24_quantity_candidates_from_options,
     cafe24_quantity_candidates_from_text,
@@ -73,6 +74,114 @@ class FakeCafe24VariantQuantityClient(FakeCafe24ProductClient):
                 }
             ]
         }
+
+
+class FakeCafe24DailyFollowerProductClient:
+    def __init__(self, *, fail_on=""):
+        self.fail_on = fail_on
+        self.calls = []
+        self.product_state = {
+            "shop_no": 1,
+            "product_no": 51,
+            "product_code": "P00000BZ",
+            "custom_product_code": "",
+            "product_name": "[데일리] 한국인 팔로워 늘리기",
+            "price": "74800.00",
+            "display": "F",
+            "selling": "F",
+            "buy_unit_type": "O",
+            "buy_unit": 1,
+            "order_quantity_limit_type": "O",
+            "minimum_quantity": 1,
+            "maximum_quantity": 0,
+            "description": "old likes copy",
+            "mobile_description": "old likes copy",
+        }
+        self.option_state = {
+            "shop_no": 1,
+            "product_no": 51,
+            "has_option": "T",
+            "options": [
+                {
+                    "option_name": "1일 유입수량",
+                    "required_option": "T",
+                    "option_display_type": "R",
+                    "option_value": [{"option_text": value} for value in ("50명", "100명", "250명", "500명")],
+                },
+                {
+                    "option_name": "반복 횟수",
+                    "required_option": "T",
+                    "option_display_type": "R",
+                    "option_value": [{"option_text": value} for value in ("5회", "10회")],
+                },
+            ],
+            "use_additional_option": "T",
+            "additional_options": [
+                {
+                    "additional_option_name": "인스타그램 아이지",
+                    "additional_option_text_length": 20,
+                    "required_additional_option": "T",
+                }
+            ],
+        }
+        self.variant_state = [
+            {
+                "shop_no": 1,
+                "variant_code": variant["variantCode"],
+                "custom_product_code": f"DAILY-{variant['variantCode'][-2:]}",
+                "product_code": "P00000BZ",
+                "options": [
+                    {"name": "1일 유입수량", "value": variant["dailyQuantity"]},
+                    {"name": "반복 횟수", "value": variant["repeatCount"]},
+                ],
+                "display": "T",
+                "selling": "T",
+                "additional_amount": "0.00",
+                "quantity": 0,
+                "use_inventory": "F",
+            }
+            for variant in DAILY_FOLLOWER_VARIANTS
+        ]
+
+    @staticmethod
+    def _copy(value):
+        return json.loads(json.dumps(value, ensure_ascii=False))
+
+    def _maybe_fail(self, operation):
+        if self.fail_on == operation:
+            raise Cafe24ApiError(f"forced failure: {operation}")
+
+    def product(self, product_no):
+        self.calls.append(("product", str(product_no), None))
+        return {"product": self._copy(self.product_state)}
+
+    def product_options(self, product_no):
+        self.calls.append(("product_options", str(product_no), None))
+        return {"option": self._copy(self.option_state)}
+
+    def product_variants(self, product_no):
+        self.calls.append(("product_variants", str(product_no), None))
+        return {"variants": self._copy(self.variant_state)}
+
+    def update_product(self, product_no, updates):
+        self.calls.append(("update_product", str(product_no), self._copy(updates)))
+        self._maybe_fail("update_product")
+        self.product_state.update(self._copy(updates))
+        return {"product": self._copy(self.product_state)}
+
+    def update_product_options(self, product_no, updates):
+        self.calls.append(("update_product_options", str(product_no), self._copy(updates)))
+        self._maybe_fail("update_product_options")
+        self.option_state.update(self._copy(updates))
+        return {"option": self._copy(self.option_state)}
+
+    def update_product_variants(self, product_no, updates):
+        self.calls.append(("update_product_variants", str(product_no), self._copy(updates)))
+        self._maybe_fail("update_product_variants")
+        by_code = {variant["variant_code"]: variant for variant in self.variant_state}
+        for update in updates:
+            by_code[update["variant_code"]].update(self._copy(update))
+        return {"variants": self._copy(self.variant_state)}
 
 
 class FakeCafe24GapProductClient(FakeCafe24ProductClient):
@@ -485,6 +594,50 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         )
         self.conn.execute("UPDATE cafe24_supplier_mappings SET auto_dispatch_enabled = 1")
         self.conn.commit()
+
+    def _enable_daily_follower_product_readiness(self, *, include_write_scope=True):
+        self._enable_auto_submit_and_supplier_ready()
+        scopes = ["mall.read_order", "mall.write_order", "mall.read_product"]
+        if include_write_scope:
+            scopes.append("mall.write_product")
+        self.conn.execute(
+            "UPDATE cafe24_integrations SET scopes_json = ? WHERE id = ?",
+            (json.dumps(scopes, ensure_ascii=False), self.integration["id"]),
+        )
+        self.conn.execute(
+            """
+            UPDATE suppliers
+            SET integration_type = 'mkt24', api_url = 'https://api.mkt24.net/v3/panel'
+            WHERE id = ?
+            """,
+            ("supplier_test",),
+        )
+        self.conn.execute(
+            """
+            UPDATE supplier_services
+            SET external_service_id = '40000', min_amount = 5, max_amount = 40000, is_active = 1
+            WHERE id = ?
+            """,
+            ("supplier_service_test",),
+        )
+        self.conn.commit()
+        self.store.save_cafe24_product_mapping(
+            {
+                "mallId": "instamart",
+                "shopNo": 1,
+                "cafe24ProductNo": "51",
+                "supplierId": "supplier_test",
+                "supplierServiceId": "supplier_service_test",
+                "autoDispatchEnabled": True,
+                "fieldMapping": {
+                    "dispatchMode": {"source": "fixed", "value": "daily_split"},
+                    "targetValue": ["option:인스타그램 프로필 URL", "option:프로필 URL"],
+                    "orderedCount": {"source": "option", "label": "1일 유입수량", "extract": "quantity_number"},
+                    "dailyQuantity": {"source": "option", "label": "1일 유입수량", "extract": "quantity_number"},
+                    "durationDays": {"source": "option", "label": "반복 횟수", "extract": "positive_int"},
+                },
+            }
+        )
 
     def _enable_daily_split_mapping(self):
         self._enable_auto_submit_and_supplier_ready()
@@ -1711,6 +1864,79 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(len(parts), 3)
         self.assertEqual([part["quantity"] for part in parts], [100, 100, 100])
         self.assertEqual([part["status"] for part in parts], ["pending", "pending", "pending"])
+
+    def test_daily_follower_live_option_labels_survive_stale_target_mapping(self):
+        self._enable_auto_submit_and_supplier_ready()
+        self.conn.execute(
+            """
+            UPDATE cafe24_supplier_mappings
+            SET field_mapping_json = ?, auto_dispatch_enabled = 1
+            """,
+            (
+                json.dumps(
+                    {
+                        "dispatchMode": {"source": "fixed", "value": "daily_split"},
+                        "targetValue": "option:계정",
+                        "orderedCount": {
+                            "source": "option",
+                            "label": "1일 유입수량",
+                            "extract": "quantity_number",
+                        },
+                        "dailyQuantity": {
+                            "source": "option",
+                            "label": "1일 유입수량",
+                            "extract": "quantity_number",
+                        },
+                        "durationDays": {
+                            "source": "option",
+                            "label": "반복 횟수",
+                            "extract": "positive_int",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+            ),
+        )
+        self.conn.commit()
+        order_payload = self._daily_split_order_payload()
+        order_payload["order_id"] = "20260426-000100"
+        order_payload["items"][0]["order_item_code"] = "20260426-000100-01"
+        order_payload["items"][0]["options"] = [
+            {"name": "인스타그램 프로필 URL", "value": "https://www.instagram.com/instamart_official/"},
+            {"name": "1일 유입수량", "value": "100명"},
+            {"name": "반복 횟수", "value": "5회"},
+        ]
+
+        result = self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=True,
+            require_mapping_auto_dispatch=True,
+        )
+
+        self.assertEqual(result["status"], "split_scheduled")
+        item = self.conn.execute(
+            "SELECT * FROM cafe24_order_items WHERE cafe24_order_id = ?",
+            ("20260426-000100",),
+        ).fetchone()
+        job = self.conn.execute(
+            "SELECT * FROM cafe24_split_jobs WHERE cafe24_order_item_id = ?",
+            (item["id"],),
+        ).fetchone()
+        self.assertEqual(job["target_value"], "https://www.instagram.com/instamart_official/")
+        self.assertEqual(job["daily_quantity"], 100)
+        self.assertEqual(job["duration_days"], 5)
+        self.assertEqual(job["total_quantity"], 500)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM cafe24_split_job_parts WHERE split_job_id = ?",
+                (job["id"],),
+            ).fetchone()[0],
+            5,
+        )
 
     def test_cafe24_order_list_includes_daily_split_job_summary(self):
         self._enable_daily_split_mapping()
@@ -2984,6 +3210,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(query["client_id"][0], "client-id")
         self.assertEqual(query["redirect_uri"][0], "https://example.com/api/admin/cafe24/oauth/callback")
         self.assertIn("mall.read_order", query["scope"][0])
+        self.assertIn("mall.write_product", query["scope"][0])
         self.assertTrue(self.conn.execute("SELECT state FROM cafe24_oauth_states WHERE state = ?", (result["state"],)).fetchone())
 
     def test_cafe24_oauth_callback_exchanges_and_saves_token(self):
@@ -3010,7 +3237,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
                     "refresh_token": "new-refresh-token",
                     "expires_in": 7200,
                     "refresh_token_expires_in": 1209600,
-                    "scope": "mall.read_order,mall.write_order,mall.read_product",
+                    "scope": "mall.read_order,mall.write_order,mall.read_product,mall.write_product",
                 },
             ) as exchange:
                 result = self.store.complete_cafe24_oauth_callback({"state": state_result["state"], "code": "auth-code"})
@@ -3025,6 +3252,39 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
             (state_result["state"],),
         ).fetchone()["used_at"]
         self.assertTrue(used_at)
+
+    def test_cafe24_oauth_callback_rejects_missing_requested_product_write_scope(self):
+        with patch.dict(
+            os.environ,
+            {
+                "SMM_PANEL_CAFE24_CLIENT_ID": "client-id",
+                "SMM_PANEL_CAFE24_CLIENT_SECRET": "client-secret",
+            },
+            clear=False,
+        ):
+            state_result = self.store.create_cafe24_oauth_authorize_url(
+                {
+                    "mallId": "instamart",
+                    "shopNo": 1,
+                    "redirectUri": "https://example.com/api/admin/cafe24/oauth/callback",
+                }
+            )
+            with patch(
+                "core.Cafe24ApiClient.exchange_authorization_code",
+                return_value={
+                    "access_token": "order-only-access-token",
+                    "refresh_token": "order-only-refresh-token",
+                    "expires_in": 7200,
+                    "refresh_token_expires_in": 1209600,
+                    "scope": "mall.read_order,mall.write_order,mall.read_product",
+                },
+            ):
+                with self.assertRaises(PanelError) as raised:
+                    self.store.complete_cafe24_oauth_callback({"state": state_result["state"], "code": "auth-code"})
+
+        self.assertEqual(raised.exception.status, 403)
+        self.assertIn("상품 관리 권한", str(raised.exception))
+        self.assertIn("mall.write_product", str(raised.exception))
 
     def test_cafe24_oauth_callback_rejects_token_missing_required_scopes(self):
         with patch.dict(
@@ -3115,7 +3375,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
                     "refresh_token": "new-refresh-token",
                     "expires_in": 7200,
                     "refresh_token_expires_in": 1209600,
-                    "scope": "mall.read_order,mall.write_order,mall.read_product",
+                    "scope": "mall.read_order,mall.write_order,mall.read_product,mall.write_product",
                 },
             ):
                 result = self.store.complete_cafe24_oauth_callback({"state": state_result["state"], "code": "auth-code"})
@@ -3346,6 +3606,175 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(product["productNo"], "1001")
         self.assertEqual(product["options"][0]["name"], "수량")
         self.assertEqual(product["variants"][0]["customProductCode"], "IG-FOLLOWER-100")
+
+    def test_cafe24_product_write_client_uses_official_request_wrappers(self):
+        client = Cafe24ApiClient("instamart", "access-token")
+        with patch.object(client, "_request", return_value={}) as request:
+            client.update_product("51", {"display": "F"})
+            client.update_product_options("51", {"use_additional_option": "T"})
+            client.update_product_variants("51", [{"variant_code": "P00000BZ00CV", "additional_amount": "0.00"}])
+
+        self.assertEqual(
+            request.call_args_list[0].args,
+            ("PUT", "/admin/products/51"),
+        )
+        self.assertEqual(
+            request.call_args_list[0].kwargs["payload"],
+            {"shop_no": 1, "request": {"display": "F"}},
+        )
+        self.assertEqual(
+            request.call_args_list[1].kwargs["payload"],
+            {"shop_no": 1, "request": {"use_additional_option": "T"}},
+        )
+        self.assertEqual(
+            request.call_args_list[2].kwargs["payload"],
+            {
+                "shop_no": 1,
+                "requests": [{"variant_code": "P00000BZ00CV", "additional_amount": "0.00"}],
+            },
+        )
+
+    def test_daily_follower_product_dry_run_reports_missing_write_scope_without_mutation(self):
+        self._enable_daily_follower_product_readiness(include_write_scope=False)
+        fake_client = FakeCafe24DailyFollowerProductClient()
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client):
+            result = self.store.configure_cafe24_daily_follower_product(
+                {
+                    "integrationId": self.integration["id"],
+                    "productNo": "51",
+                    "dryRun": True,
+                    "activate": True,
+                }
+            )
+
+        self.assertTrue(result["dryRun"])
+        self.assertFalse(result["canApply"])
+        self.assertTrue(any("mall.write_product" in blocker for blocker in result["blockers"]))
+        self.assertFalse(any(call[0].startswith("update_") for call in fake_client.calls))
+
+    def test_daily_follower_product_dry_run_blocks_overlapping_variant_mapping(self):
+        self._enable_daily_follower_product_readiness()
+        self.store.save_cafe24_product_mapping(
+            {
+                "mallId": "instamart",
+                "shopNo": 1,
+                "cafe24ProductNo": "51",
+                "cafe24VariantCode": DAILY_FOLLOWER_VARIANTS[0]["variantCode"],
+                "cafe24CustomProductCode": f"DAILY-{DAILY_FOLLOWER_VARIANTS[0]['variantCode'][-2:]}",
+                "supplierId": "supplier_test",
+                "supplierServiceId": "supplier_service_test",
+                "autoDispatchEnabled": True,
+                "fieldMapping": {
+                    "dispatchMode": {"source": "fixed", "value": "daily_split"},
+                    "targetValue": ["option:인스타그램 프로필 URL"],
+                },
+            }
+        )
+        fake_client = FakeCafe24DailyFollowerProductClient()
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client):
+            result = self.store.configure_cafe24_daily_follower_product(
+                {
+                    "integrationId": self.integration["id"],
+                    "productNo": "51",
+                    "dryRun": True,
+                    "activate": True,
+                }
+            )
+
+        self.assertFalse(result["canApply"])
+        self.assertTrue(any("중복 상품/품목 매핑" in blocker for blocker in result["blockers"]))
+        self.assertFalse(any(call[0].startswith("update_") for call in fake_client.calls))
+
+    def test_daily_follower_product_dry_run_blocks_supplier_quantity_gap(self):
+        self._enable_daily_follower_product_readiness()
+        self.conn.execute(
+            "UPDATE supplier_services SET max_amount = 250 WHERE id = ?",
+            ("supplier_service_test",),
+        )
+        self.conn.commit()
+        fake_client = FakeCafe24DailyFollowerProductClient()
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client):
+            result = self.store.configure_cafe24_daily_follower_product(
+                {
+                    "integrationId": self.integration["id"],
+                    "productNo": "51",
+                    "dryRun": True,
+                    "activate": True,
+                }
+            )
+
+        self.assertFalse(result["canApply"])
+        self.assertTrue(any("옵션 50~500명" in blocker for blocker in result["blockers"]))
+        self.assertFalse(any(call[0].startswith("update_") for call in fake_client.calls))
+
+    def test_daily_follower_product_configures_verifies_and_activates(self):
+        self._enable_daily_follower_product_readiness()
+        fake_client = FakeCafe24DailyFollowerProductClient()
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client):
+            result = self.store.configure_cafe24_daily_follower_product(
+                {
+                    "integrationId": self.integration["id"],
+                    "productNo": "51",
+                    "activate": True,
+                    "_adminActor": "admin",
+                }
+            )
+
+        self.assertTrue(result["configured"])
+        self.assertTrue(result["activated"])
+        self.assertEqual(fake_client.product_state["price"], "44800.00")
+        self.assertEqual(fake_client.product_state["maximum_quantity"], 1)
+        self.assertEqual(fake_client.product_state["display"], "T")
+        self.assertEqual(fake_client.product_state["selling"], "T")
+        self.assertEqual(
+            fake_client.option_state["additional_options"],
+            [
+                {
+                    "additional_option_name": "인스타그램 프로필 URL",
+                    "additional_option_text_length": 100,
+                    "required_additional_option": "T",
+                }
+            ],
+        )
+        amounts = {variant["variant_code"]: variant["additional_amount"] for variant in fake_client.variant_state}
+        self.assertEqual(amounts["P00000BZ00CV"], "0.00")
+        self.assertEqual(amounts["P00000BZ00DC"], "855000.00")
+        update_calls = [call for call in fake_client.calls if call[0] == "update_product"]
+        self.assertEqual(update_calls[0][2], {"display": "F", "selling": "F"})
+        self.assertEqual(update_calls[-1][2], {"display": "T", "selling": "T"})
+        audit = self.conn.execute(
+            "SELECT * FROM admin_audit_logs WHERE action = ? ORDER BY created_at DESC LIMIT 1",
+            ("cafe24.product.daily_follower_configure",),
+        ).fetchone()
+        self.assertIsNotNone(audit)
+
+    def test_daily_follower_product_failure_forces_product_hidden(self):
+        self._enable_daily_follower_product_readiness()
+        fake_client = FakeCafe24DailyFollowerProductClient(fail_on="update_product_options")
+
+        with patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client):
+            with self.assertRaises(PanelError) as raised:
+                self.store.configure_cafe24_daily_follower_product(
+                    {
+                        "integrationId": self.integration["id"],
+                        "productNo": "51",
+                        "activate": True,
+                    }
+                )
+
+        self.assertEqual(raised.exception.status, 502)
+        self.assertEqual(fake_client.product_state["display"], "F")
+        self.assertEqual(fake_client.product_state["selling"], "F")
+        self.assertFalse(
+            any(
+                call[0] == "update_product" and call[2] == {"display": "T", "selling": "T"}
+                for call in fake_client.calls
+            )
+        )
 
 
 if __name__ == "__main__":
