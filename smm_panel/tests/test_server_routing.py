@@ -14,7 +14,7 @@ if str(APP_ROOT) in sys.path:
     sys.path.remove(str(APP_ROOT))
 sys.path.insert(0, str(APP_ROOT))
 
-from server import AppHandler, ROUTER, RouteRequest, cron_authorization_valid
+from server import AppHandler, ROUTER, RouteRequest, cafe24_oauth_error_message, cron_authorization_valid
 from core import PanelError, derive_order_idempotency_key
 
 
@@ -47,6 +47,14 @@ class VercelRewriteRoutingTest(unittest.TestCase):
         path = AppHandler._incoming_request_path(None, "/api/index.py?__path=/api/products&q=instagram")
 
         self.assertEqual(path, "/api/products?q=instagram")
+
+    def test_cafe24_invalid_developer_scope_error_is_actionable(self):
+        message = cafe24_oauth_error_message(
+            "The+scope+added+by+Cafe24+Developers+is+invalid.+Please+try+again."
+        )
+
+        self.assertIn("Cafe24 Developers 앱", message)
+        self.assertIn("앱 권한 관리", message)
 
 
 class VercelConfigurationTest(unittest.TestCase):
@@ -1038,12 +1046,11 @@ class RouterRegistryTest(unittest.TestCase):
         self.assertTrue(route.csrf)
         self.assertTrue(route.trusted_origin)
 
-    def test_cafe24_oauth_reconnect_requests_product_write_scope(self):
+    def test_cafe24_oauth_reconnect_keeps_optional_product_write_scope_separate(self):
         source = (APP_ROOT / "static" / "admin" / "cafe24.js").read_text()
 
-        self.assertIn('CAFE24_PRODUCT_MANAGEMENT_SCOPES', source)
-        self.assertIn('"mall.write_product"', source)
-        self.assertIn('scopes: CAFE24_PRODUCT_MANAGEMENT_SCOPES.join(",")', source)
+        self.assertNotIn('CAFE24_PRODUCT_MANAGEMENT_SCOPES', source)
+        self.assertIn('scopes: CAFE24_REQUIRED_ORDER_FLOW_SCOPES.join(",")', source)
 
     def test_cafe24_mapping_gaps_cron_route_declares_cron_auth(self):
         matched = ROUTER.match("POST", "/api/cron/cafe24/mapping-gaps")

@@ -540,7 +540,6 @@ CAFE24_ORDER_CHANNEL = ORDER_CHANNEL_CAFE24
 CAFE24_DEFAULT_SHOP_NO = 1
 CAFE24_OAUTH_STATE_TTL_SECONDS = 10 * 60
 CAFE24_DEFAULT_SCOPES = ("mall.read_order", "mall.write_order", "mall.read_product")
-CAFE24_OAUTH_DEFAULT_SCOPES = (*CAFE24_DEFAULT_SCOPES, "mall.write_product")
 CAFE24_REFRESH_LOCK_SECONDS = 90
 CAFE24_POLL_LOCK_SECONDS = 8 * 60
 CAFE24_AUTO_POLL_INTERVAL_MINUTES = 5
@@ -8786,7 +8785,7 @@ class PanelStore(PanelStoreDatabaseMixin):
         shop_no = normalize_cafe24_shop_no(payload.get("shopNo"))
         redirect_uri = str(payload.get("redirectUri") or cafe24_redirect_uri()).strip()
         scopes = normalize_cafe24_scopes(payload.get("scopes"))
-        for required_scope in CAFE24_OAUTH_DEFAULT_SCOPES:
+        for required_scope in CAFE24_DEFAULT_SCOPES:
             if required_scope not in scopes:
                 scopes.append(required_scope)
         actor = self._admin_actor(payload)
@@ -8864,9 +8863,7 @@ class PanelStore(PanelStoreDatabaseMixin):
         redirect_uri = str(state_row["redirect_uri"] or "").strip()
         actor = str(state_row["actor"] or "admin")
         token_payload = Cafe24ApiClient.exchange_authorization_code(mall_id, code, redirect_uri)
-        requested_scopes = normalize_cafe24_scopes(
-            parse_json(state_row["scopes_json"], list(CAFE24_OAUTH_DEFAULT_SCOPES))
-        )
+        requested_scopes = normalize_cafe24_scopes(parse_json(state_row["scopes_json"], list(CAFE24_DEFAULT_SCOPES)))
         raw_token_scopes = token_payload.get("scopes") or token_payload.get("scope")
         token_scopes = normalize_cafe24_scopes(raw_token_scopes if raw_token_scopes is not None else requested_scopes)
         missing_token_scopes = list(

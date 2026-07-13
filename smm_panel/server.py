@@ -68,6 +68,17 @@ def env_flag(value: str) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def cafe24_oauth_error_message(value: Any) -> str:
+    message = str(value or "").strip()
+    normalized = re.sub(r"\s+", " ", message.replace("+", " ")).lower()
+    if "the scope added by cafe24 developers is invalid" in normalized:
+        return (
+            "Cafe24 Developers 앱에 요청한 API 권한이 등록되지 않았습니다. "
+            "앱 권한 관리에서 필요한 권한을 추가한 뒤 다시 승인해 주세요."
+        )
+    return message
+
+
 def bounded_timeout_seconds(value: Any, default_seconds: float = 6.0) -> float:
     try:
         timeout = float(value or 0)
@@ -1188,12 +1199,15 @@ class AppHandler(SimpleHTTPRequestHandler):
     def _get_cafe24_oauth_callback(self, request: RouteRequest) -> None:
         error = self._query_value(request, "error")
         if error:
+            error_message = cafe24_oauth_error_message(
+                self._query_value(request, "error_description", error)
+            )
             self._redirect(
                 "/admin/cafe24?"
                 + urlencode(
                     {
                         "cafe24OAuth": "error",
-                        "message": self._query_value(request, "error_description", error),
+                        "message": error_message,
                     }
                 )
             )

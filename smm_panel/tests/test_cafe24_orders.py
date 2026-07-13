@@ -3210,7 +3210,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(query["client_id"][0], "client-id")
         self.assertEqual(query["redirect_uri"][0], "https://example.com/api/admin/cafe24/oauth/callback")
         self.assertIn("mall.read_order", query["scope"][0])
-        self.assertIn("mall.write_product", query["scope"][0])
+        self.assertNotIn("mall.write_product", query["scope"][0])
         self.assertTrue(self.conn.execute("SELECT state FROM cafe24_oauth_states WHERE state = ?", (result["state"],)).fetchone())
 
     def test_cafe24_oauth_callback_exchanges_and_saves_token(self):
@@ -3237,7 +3237,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
                     "refresh_token": "new-refresh-token",
                     "expires_in": 7200,
                     "refresh_token_expires_in": 1209600,
-                    "scope": "mall.read_order,mall.write_order,mall.read_product,mall.write_product",
+                    "scope": "mall.read_order,mall.write_order,mall.read_product",
                 },
             ) as exchange:
                 result = self.store.complete_cafe24_oauth_callback({"state": state_result["state"], "code": "auth-code"})
@@ -3266,6 +3266,12 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
                 {
                     "mallId": "instamart",
                     "shopNo": 1,
+                    "scopes": [
+                        "mall.read_order",
+                        "mall.write_order",
+                        "mall.read_product",
+                        "mall.write_product",
+                    ],
                     "redirectUri": "https://example.com/api/admin/cafe24/oauth/callback",
                 }
             )
@@ -3375,7 +3381,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
                     "refresh_token": "new-refresh-token",
                     "expires_in": 7200,
                     "refresh_token_expires_in": 1209600,
-                    "scope": "mall.read_order,mall.write_order,mall.read_product,mall.write_product",
+                    "scope": "mall.read_order,mall.write_order,mall.read_product",
                 },
             ):
                 result = self.store.complete_cafe24_oauth_callback({"state": state_result["state"], "code": "auth-code"})
