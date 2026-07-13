@@ -10372,9 +10372,15 @@ class PanelStore(PanelStoreDatabaseMixin):
                     call(lambda client: client.product_variants(product_no)),
                 )
 
-            def fetch_validated_snapshot(*, configured: bool, activated: Optional[bool]) -> Dict[str, Any]:
+            def fetch_validated_snapshot(
+                *,
+                configured: bool,
+                activated: Optional[bool],
+                attempts: int = 5,
+                delay_seconds: float = 0.8,
+            ) -> Dict[str, Any]:
                 last_snapshot: Dict[str, Any] = {}
-                for attempt in range(5):
+                for attempt in range(attempts):
                     responses = fetch_snapshot()
                     last_snapshot = validate_daily_follower_snapshot(
                         *responses,
@@ -10383,20 +10389,31 @@ class PanelStore(PanelStoreDatabaseMixin):
                     )
                     if not last_snapshot["blockers"]:
                         break
-                    if attempt < 4:
-                        time.sleep(0.8)
+                    if attempt < attempts - 1:
+                        time.sleep(delay_seconds)
                 return last_snapshot
 
-            def wait_until_hidden() -> bool:
-                for attempt in range(5):
+            def wait_until_hidden(*, guard_delayed_activation: bool) -> bool:
+                consecutive_hidden = 0
+                for attempt in range(10):
                     response = call(lambda client: client.product(product_no))
                     products = cafe24_products_from_payload(response)
+                    hidden = False
                     if products:
                         product = products[0]
-                        if str(product.get("display") or "") == "F" and str(product.get("selling") or "") == "F":
-                            return True
-                    if attempt < 4:
-                        time.sleep(0.8)
+                        hidden = (
+                            str(product.get("display") or "") == "F"
+                            and str(product.get("selling") or "") == "F"
+                        )
+                    consecutive_hidden = consecutive_hidden + 1 if hidden else 0
+                    if hidden and not guard_delayed_activation:
+                        return True
+                    if attempt >= 5 and consecutive_hidden >= 2:
+                        return True
+                    if not hidden:
+                        call(lambda client: client.update_product(product_no, {"display": "F", "selling": "F"}))
+                    if attempt < 9:
+                        time.sleep(1.0)
                 return False
 
             try:
@@ -10433,6 +10450,7 @@ class PanelStore(PanelStoreDatabaseMixin):
 
             updates = daily_follower_product_updates()
             hidden_applied = False
+            activation_attempted = False
             rollback_error = ""
             try:
                 call(lambda client: client.update_product(product_no, {"display": "F", "selling": "F"}))
@@ -10467,10 +10485,13 @@ class PanelStore(PanelStoreDatabaseMixin):
 
                 final_snapshot = configured_snapshot
                 if activate:
+                    activation_attempted = True
                     call(lambda client: client.update_product(product_no, {"display": "T", "selling": "T"}))
                     final_snapshot = fetch_validated_snapshot(
                         configured=True,
                         activated=True,
+                        attempts=15,
+                        delay_seconds=1.0,
                     )
                     if final_snapshot["blockers"]:
                         raise PanelError(
@@ -10531,7 +10552,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                 if hidden_applied:
                     try:
                         call(lambda client: client.update_product(product_no, {"display": "F", "selling": "F"}))
-                        if not wait_until_hidden():
+                        if not wait_until_hidden(guard_delayed_activation=activation_attempted):
                             rollback_error = "Cafe24 상품 숨김 상태를 확인하지 못했습니다."
                     except Exception as rollback_exc:
                         rollback_error = str(rollback_exc)[:500]

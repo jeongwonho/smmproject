@@ -234,6 +234,30 @@ class FakeCafe24EventuallyConsistentDailyFollowerProductClient(FakeCafe24DailyFo
         return super().update_product(product_no, updates)
 
 
+class FakeCafe24DelayedActivationDailyFollowerProductClient(FakeCafe24DailyFollowerProductClient):
+    def __init__(self, activation_read_delay=6):
+        super().__init__()
+        self.activation_read_delay = activation_read_delay
+        self._pending_activation = None
+
+    def product(self, product_no):
+        if self._pending_activation is not None:
+            if self.activation_read_delay <= 0:
+                self.product_state.update(self._pending_activation)
+                self._pending_activation = None
+            else:
+                self.activation_read_delay -= 1
+        return super().product(product_no)
+
+    def update_product(self, product_no, updates):
+        if updates == {"display": "T", "selling": "T"}:
+            self.calls.append(("update_product", str(product_no), self._copy(updates)))
+            self._maybe_fail("update_product")
+            self._pending_activation = self._copy(updates)
+            return {"product": {**self._copy(self.product_state), **self._copy(updates)}}
+        return super().update_product(product_no, updates)
+
+
 class FakeCafe24GapProductClient(FakeCafe24ProductClient):
     def product(self, product_no):
         return {
@@ -3882,6 +3906,29 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertTrue(result["activated"])
         self.assertEqual(fake_client.product_state["display"], "T")
         self.assertGreaterEqual(sleep.call_count, 2)
+
+    def test_daily_follower_product_allows_slow_cafe24_activation_visibility(self):
+        self._enable_daily_follower_product_readiness()
+        fake_client = FakeCafe24DelayedActivationDailyFollowerProductClient(activation_read_delay=6)
+
+        with (
+            patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client),
+            patch("core.time.sleep") as sleep,
+        ):
+            result = self.store.configure_cafe24_daily_follower_product(
+                {
+                    "integrationId": self.integration["id"],
+                    "productNo": "51",
+                    "activate": True,
+                    "_adminActor": "admin",
+                }
+            )
+
+        self.assertTrue(result["configured"])
+        self.assertTrue(result["activated"])
+        self.assertEqual(fake_client.product_state["display"], "T")
+        self.assertEqual(fake_client.product_state["selling"], "T")
+        self.assertGreaterEqual(sleep.call_count, 6)
 
     def test_daily_follower_product_failure_forces_product_hidden(self):
         self._enable_daily_follower_product_readiness()
