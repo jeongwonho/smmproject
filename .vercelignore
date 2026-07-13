@@ -1,0 +1,13 @@
+.env
+.env.*
+.github/
+.vercel/
+data/
+docs/
+tests/
+*.db
+*.sqlite
+*.sqlite3
+*.pdf
+__pycache__/
+*.pyc

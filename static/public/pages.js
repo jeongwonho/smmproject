@@ -167,23 +167,6 @@ function renderHomeHeroStats(items) {
   `;
 }
 
-function buildHomeHeroStats(formatNumber) {
-  const now = new Date();
-  const base = 12485321;
-  const dayStart = new Date(2026, 0, 1);
-  const dayOffset = Math.max(0, Math.floor((now.getTime() - dayStart.getTime()) / 86400000));
-  const purchasedCount = base + dayOffset * 173;
-  const latestCheck = now.toLocaleTimeString("ko-KR", {
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
-  return [
-    { label: "이만큼 구매했어요", value: formatNumber(purchasedCount) },
-    { label: "점검 상태", value: `최신 점검 ${latestCheck}` },
-  ];
-}
-
 function categoryMetaLabel(category) {
   const parts = [
     `${category.startingPriceLabel}부터`,
@@ -256,7 +239,10 @@ export function renderHome() {
   const compactPlatforms = (data.platforms || []).slice(0, 10);
   const featuredServices = (data.featuredServices || []).slice(0, 6);
   const supportLinks = (data.supportLinks || []).slice(0, 3);
-  const heroStats = buildHomeHeroStats(formatNumber);
+  const factualHeroStats = Array.isArray(data.heroStats) ? data.heroStats : [];
+  const heroStats = authenticated
+    ? factualHeroStats.filter((item) => ["보유 캐시", "진행 중 주문"].includes(item.label)).slice(0, 2)
+    : factualHeroStats.filter((item) => item.label === "등록 상품").slice(0, 1);
   const loginCardRoute = "/products";
 
   return renderFrame(

@@ -1,4 +1,5 @@
 import { renderCafe24OperationalAuditPanel } from "./cafe24-audit-ui.js";
+import { renderCafe24GaAnalyticsTab } from "./cafe24-analytics-ui.js";
 import { renderCafe24OpsBoard, renderCafe24QuickControls } from "./cafe24-console-ui.js";
 import { renderCafe24ProductLookupPanel } from "./cafe24-product-ui.js";
 import { cafe24OrderFlowState, formatCafe24KstDateTime, renderCafe24ManualInputForm, renderCafe24Pagination, renderCafe24PreflightSummary, renderCafe24QueueActionHint, renderCafe24QueueToolbar } from "./cafe24-queue-ui.js";
@@ -43,6 +44,7 @@ function getAdminSiteSettings(...args) { return callRuntime("getAdminSiteSetting
 function getAdminHomeBanners(...args) { return callRuntime("getAdminHomeBanners", ...args); }
 function getAdminPlatformSections(...args) { return callRuntime("getAdminPlatformSections", ...args); }
 function getAdminAnalytics(...args) { return callRuntime("getAdminAnalytics", ...args); }
+function getAdminCafe24Analytics(...args) { return callRuntime("getAdminCafe24Analytics", ...args); }
 function getAdminNotices(...args) { return callRuntime("getAdminNotices", ...args); }
 function getAdminFaqs(...args) { return callRuntime("getAdminFaqs", ...args); }
 function getAdminAuditLogs(...args) { return callRuntime("getAdminAuditLogs", ...args); }
@@ -3403,6 +3405,16 @@ function renderAnalyticsAdminSection() {
   if (activeTab === "visitors") body = renderAnalyticsVisitorsTab(windowData, daily);
   if (activeTab === "sources") body = renderAnalyticsSourcesTab(windowData);
   if (activeTab === "repurchase") body = renderAnalyticsRepurchaseTab(windowData);
+  if (activeTab === "cafe24_ga") {
+    body = renderCafe24GaAnalyticsTab({
+      analytics: getAdminCafe24Analytics(),
+      escapeHtml,
+      formatMoney,
+      formatNumber,
+      renderAnalyticsOverviewCards,
+      renderAnalyticsTable,
+    });
+  }
 
   return `
     <div class="admin-analytics-shell">

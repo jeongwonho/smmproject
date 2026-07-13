@@ -142,7 +142,7 @@ export function renderAdminAuth() {
                     <label class="form-field">
                       <span class="field-label">관리자 접근코드</span>
                       <div class="field-shell">
-                        <input class="field-input admin-passcode-input" type="text" name="adminAccessCode" autocomplete="off" autocapitalize="none" spellcheck="false" data-lpignore="true" data-1p-ignore />
+                        <input class="field-input admin-passcode-input" type="password" name="adminAccessCode" autocomplete="current-password" autocapitalize="none" spellcheck="false" />
                       </div>
                     </label>
                     <button class="admin-primary-button" type="submit">로그인</button>

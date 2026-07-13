@@ -254,7 +254,8 @@ class OrderUtilityTest(unittest.TestCase):
         self.assertEqual(payload["customerName"], "홍길동")
         self.assertEqual(payload["customerEmailMasked"], "h***@example.com")
         self.assertIn("chg-20260526-abcdef", payload["searchText"])
-        self.assertIn("hong@example.com", payload["searchText"])
+        self.assertNotIn("hong@example.com", payload["searchText"])
+        self.assertIn("h***@example.com", payload["searchText"])
         self.assertIn("계좌입금", payload["searchText"])
 
     def test_wallet_ledger_helpers_build_filters_and_entries(self):

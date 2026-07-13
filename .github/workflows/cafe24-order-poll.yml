@@ -57,3 +57,8 @@ jobs:
             echo "Cafe24 flow tick failed with HTTP ${http_code}"
             exit 1
           fi
+
+          if ! jq -e '.ok == true' "$response_file" >/dev/null; then
+            echo "Cafe24 flow tick reported a partial failure"
+            exit 1
+          fi

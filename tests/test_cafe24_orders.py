@@ -268,6 +268,31 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(raised.exception.status, 401)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM cafe24_webhook_events").fetchone()[0], 0)
 
+    def test_cafe24_order_webhook_failure_is_queued_for_operational_alert(self):
+        payload = {
+            "event_no": 90023,
+            "resource": {
+                "mall_id": "instamart",
+                "event_shop_no": "1",
+                "order_id": "20260623-0000099",
+            },
+        }
+
+        with patch.dict(os.environ, {"SMM_PANEL_CAFE24_WEBHOOK_API_KEY": "webhook-key"}, clear=False), patch.object(
+            self.store,
+            "resync_cafe24_order_by_id",
+            side_effect=PanelError("Cafe24 order lookup failed", status=503),
+        ):
+            result = self.store.process_cafe24_order_webhook(payload, provided_api_key="webhook-key")
+
+        self.assertEqual(result["status"], "review")
+        event = self.conn.execute(
+            "SELECT * FROM notification_events WHERE event_type = 'cafe24.operational_failure'"
+        ).fetchone()
+        self.assertIsNotNone(event)
+        self.assertEqual(event["status"], "pending")
+        self.assertIn("20260623-0000099", event["payload_json"])
+
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmpdir.name) / "instamart_cafe24_orders_test.db"
@@ -2614,6 +2639,82 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         row = self._integration_row()
         self.assertEqual(row["token_status"], "connected")
         self.assertTrue(row["token_last_refreshed_at"])
+
+    def test_cafe24_flow_tick_reports_partial_failure_when_poll_errors_are_returned(self):
+        with patch.object(
+            self.store,
+            "refresh_due_cafe24_tokens",
+            return_value={"checked": 1, "refreshed": 0, "failed": 0, "reconnectRequired": 0, "results": []},
+        ), patch.object(
+            self.store,
+            "poll_due_cafe24_orders",
+            return_value={
+                "processedIntegrations": 0,
+                "reconnectRequiredIntegrations": 0,
+                "errors": ["instamart/1: upstream timeout"],
+                "results": [],
+            },
+        ), patch.object(self.store, "dispatch_due_cafe24_order_items", return_value={"checked": 0, "failed": 0, "results": []}), patch.object(
+            self.store, "dispatch_due_cafe24_split_jobs", return_value={"checked": 0, "failed": 0, "results": []}
+        ), patch.object(self.store, "refresh_due_supplier_order_statuses", return_value={"checked": 0, "failed": 0, "results": []}), patch.object(
+            self.store, "refresh_due_cafe24_split_job_parts", return_value={"checked": 0, "failed": 0, "results": []}
+        ), patch.object(self.store, "complete_due_cafe24_order_items", return_value={"checked": 0, "failed": 0, "errors": 0, "results": []}):
+            result = self.store.run_cafe24_flow_tick({"actor": "cron"})
+
+        self.assertEqual(result["status"], "partial_failed")
+        self.assertEqual(result["failures"][0]["code"], "order_poll_failed")
+        self.assertEqual(result["cafe24Poll"]["errors"], ["instamart/1: upstream timeout"])
+
+    def test_operational_slack_notification_is_deduplicated(self):
+        self.store._queue_cafe24_operational_failure(
+            context="flow",
+            status="partial_failed",
+            issues=[{"code": "order_poll_failed", "count": 1, "message": "upstream timeout"}],
+        )
+        calls = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(json.loads(request.data.decode("utf-8")))
+            return FakeSlackResponse()
+
+        with patch.dict(os.environ, {"SMM_PANEL_SLACK_CAFE24_FAILURE_WEBHOOK_URL": "https://hooks.slack.test/services/abc"}, clear=False), patch(
+            "core.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            first = self.store.notify_pending_cafe24_operational_failures_to_slack(actor="cron")
+            second = self.store.notify_pending_cafe24_operational_failures_to_slack(actor="cron")
+
+        self.assertEqual(first["sent"], 1)
+        self.assertEqual(second["sent"], 0)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("Cafe24 자동화 점검 필요", calls[0]["text"])
+
+    def test_generic_supplier_dispatch_does_not_call_supplier_when_order_is_already_submitting(self):
+        order_id = "order_submitting_test"
+        timestamp = now_iso()
+        self.conn.execute(
+            """
+            INSERT INTO orders (
+                id, order_number, user_id, platform_section_id, product_category_id, product_id,
+                product_name_snapshot, option_name_snapshot, target_value, contact_phone,
+                quantity, unit_price, total_price, status, order_channel, dispatch_status,
+                created_at, updated_at
+            )
+            VALUES (?, 'SMM-SUBMITTING-TEST', 'user_test', 'platform_test', 'category_test', 'product_test',
+                    'Test product', 'Default', 'instamart_official', '',
+                    1, 1000, 1000, 'queued', 'web', 'submitting', ?, ?)
+            """,
+            (order_id, timestamp, timestamp),
+        )
+        self.conn.commit()
+
+        with patch("core.SupplierApiClient.order") as order_call:
+            result = self.store._dispatch_supplier_order(order_id, {}, {}, {})
+
+        self.assertTrue(result["duplicate"])
+        self.assertEqual(result["status"], "submitting")
+        order_call.assert_not_called()
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM supplier_orders").fetchone()[0], 0)
 
     def test_refresh_due_cafe24_tokens_skips_token_outside_window(self):
         self._set_integration_token_expiry(access_delta_seconds=2 * 60 * 60, refresh_delta_days=10)

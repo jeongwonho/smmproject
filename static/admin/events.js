@@ -31,7 +31,7 @@ export function registerAdminEvents(ctx) {
 }
 
 async function handleAdminClick(event, ctx) {
-  const { adminSectionPath, apiPost, applySupplierRecommendationToProductDraft, blankCategoryDraft, blankCustomerDraft, blankFaqDraft, blankNoticeDraft, blankPopupDraft, blankProductDraft, blankSiteSettingsDraft, blankSupplierDraft, categoryToDraft, customerToDraft, ensureAdminCustomerDetail, ensureAdminSupplierServices, ensureSelectedMkt24ProductSetting, faqToDraft, getAdminCategories, getAdminFaqs, getAdminNotices, getAdminPlatformGroups, getAdminProducts, getAdminSuppliers, getSelectedAdminCustomer, getSelectedAdminHomeBanner, getSelectedAdminPlatformSection, getSelectedAdminProduct, getSelectedAdminSupplierService, getSelectedManageProduct, homeBannerToDraft, navigate, noticeToDraft, platformSectionToDraft, productToDraft, refreshAdminData, refreshCoreData, renderRoute, resetAdminState, setAdminAnalyticsExclusion, showToast, state, supplierToDraft, updateAdminHomeBannerPreview, updateAdminPlatformSectionPreview, updateAdminPopupPreview, updateAdminSiteSettingsPreview } = ctx;
+  const { adminSectionPath, apiPost, applySupplierRecommendationToProductDraft, blankCategoryDraft, blankCustomerDraft, blankFaqDraft, blankNoticeDraft, blankPopupDraft, blankProductDraft, blankSiteSettingsDraft, blankSupplierDraft, categoryToDraft, customerToDraft, ensureAdminCustomerDetail, ensureAdminSupplierServices, ensureSelectedMkt24ProductSetting, faqToDraft, getAdminCategories, getAdminFaqs, getAdminNotices, getAdminPlatformGroups, getAdminProducts, getAdminSuppliers, getSelectedAdminCustomer, getSelectedAdminHomeBanner, getSelectedAdminPlatformSection, getSelectedAdminProduct, getSelectedAdminSupplierService, getSelectedManageProduct, homeBannerToDraft, navigate, noticeToDraft, platformSectionToDraft, productToDraft, refreshAdminData, refreshCafe24Analytics, refreshCoreData, renderRoute, resetAdminState, setAdminAnalyticsExclusion, showToast, state, supplierToDraft, updateAdminHomeBannerPreview, updateAdminPlatformSectionPreview, updateAdminPopupPreview, updateAdminSiteSettingsPreview } = ctx;
   const targetElement = event.target instanceof Element ? event.target : event.target?.parentElement;
   const closest = (selector) => targetElement?.closest(selector);
   if (await handleCafe24AdminClick(closest)) {
@@ -165,6 +165,9 @@ async function handleAdminClick(event, ctx) {
   if (adminRefreshButton) {
     try {
       await refreshAdminData({ preserveDraft: false });
+      if (state.ui.adminActiveSection === "analytics" && state.ui.adminAnalyticsTab === "cafe24_ga" && typeof refreshCafe24Analytics === "function") {
+        await refreshCafe24Analytics({ force: true });
+      }
       if (state.ui.adminSelectedCustomerId) {
         await ensureAdminCustomerDetail(state.ui.adminSelectedCustomerId, { force: true });
       }

@@ -64,6 +64,10 @@ const state = {
   adminSupplierServices: {},
   adminMkt24ProductSettings: {},
   adminCafe24OperationalAudit: null,
+  adminCafe24Analytics: null,
+  adminCafe24AnalyticsKey: "",
+  adminCafe24AnalyticsLoading: false,
+  adminCafe24AnalyticsError: "",
   adminCafe24ProductLookup: { products: [], detail: null, query: {}, warnings: [] },
   adminCustomerDetails: {},
   adminSiteSettingsDraft: null,
@@ -211,6 +215,7 @@ const analyticsTabBlueprints = [
   { id: "visitors", label: "방문자 분석", description: "방문자, 페이지뷰, 디바이스 분석" },
   { id: "sources", label: "유입/경로", description: "유입 사이트, 검색어, 이동 경로 분석" },
   { id: "repurchase", label: "재구매 분석", description: "반복 구매율과 충성 고객 분석" },
+  { id: "cafe24_ga", label: "Cafe24/GA", description: "카페24 구매 퍼널과 GA4 매체 성과" },
 ];
 const advancedOrderFieldBlueprints = {
   runs: { label: "반복 횟수", description: "드립피드/반복 실행 서비스용" },
@@ -1182,6 +1187,10 @@ function getAdminAnalytics() {
   return state.adminBootstrap?.analytics || null;
 }
 
+function getAdminCafe24Analytics() {
+  return state.adminCafe24Analytics || null;
+}
+
 function getAdminNotices() {
   return state.adminBootstrap?.notices || [];
 }
@@ -1583,6 +1592,30 @@ async function refreshAdminData({ preserveDraft = true } = {}) {
     await refreshCafe24OrderItems({ force: true });
   }
   return data;
+}
+
+function cafe24AnalyticsQueryKey() {
+  return state.ui.adminAnalyticsRange || "30d";
+}
+
+async function refreshCafe24Analytics({ force = false } = {}) {
+  const range = cafe24AnalyticsQueryKey();
+  if (!force && state.adminCafe24Analytics && state.adminCafe24AnalyticsKey === range) {
+    return state.adminCafe24Analytics;
+  }
+  state.adminCafe24AnalyticsLoading = true;
+  state.adminCafe24AnalyticsError = "";
+  try {
+    const data = await apiGet(`/api/admin/cafe24-analytics?range=${encodeURIComponent(range)}`);
+    state.adminCafe24Analytics = data;
+    state.adminCafe24AnalyticsKey = range;
+    return data;
+  } catch (error) {
+    state.adminCafe24AnalyticsError = error.message || "Cafe24/GA 분석 데이터를 불러오지 못했습니다.";
+    throw error;
+  } finally {
+    state.adminCafe24AnalyticsLoading = false;
+  }
 }
 
 async function ensureAdminSupplierServices(supplierId, { force = false } = {}) {
@@ -2985,6 +3018,7 @@ configureAdminSections({
   getAdminHomeBanners,
   getAdminPlatformSections,
   getAdminAnalytics,
+  getAdminCafe24Analytics,
   getAdminNotices,
   getAdminFaqs,
   getAdminAuditLogs,
@@ -3136,6 +3170,13 @@ async function renderRoute() {
         if (state.ui.adminCafe24Tab === "audit" && !state.adminCafe24OperationalAudit) {
           showLoading("Cafe24 운영 상태를 점검하는 중...");
           await refreshCafe24OperationalAudit();
+        }
+      }
+      if (state.ui.adminActiveSection === "analytics" && state.ui.adminAnalyticsTab === "cafe24_ga") {
+        const nextCafe24AnalyticsKey = cafe24AnalyticsQueryKey();
+        if (!state.adminCafe24Analytics || state.adminCafe24AnalyticsKey !== nextCafe24AnalyticsKey) {
+          showLoading("Cafe24/GA 분석 데이터를 불러오는 중...");
+          await refreshCafe24Analytics();
         }
       }
     }
@@ -3583,7 +3624,7 @@ const eventContext = {
   getSelectedAdminProduct, getSelectedAdminSupplier, getSelectedAdminSupplierService, getSelectedManageProduct, getSelectedProduct,
   hideAnalyticsChartTooltip, homeBannerToDraft, isLoggedIn, mkt24ProductSettingKey, navigate, noticeToDraft, openChargeDetail,
   openLoginModal, parseCurrencyInput, platformSectionToDraft, popupToDraft, postAuthRedirectPath, productToDraft, readFileAsDataUrl,
-  refreshAdminData, refreshCoreData, renderRoute, resetAdminState, resetSignupFlow, scheduleLinkPreview, setAdminAnalyticsExclusion,
+  refreshAdminData, refreshCafe24Analytics, refreshCoreData, renderRoute, resetAdminState, resetSignupFlow, scheduleLinkPreview, setAdminAnalyticsExclusion,
   setHomeBannerIndex, showToast, siteSettingsToDraft, state, supplierToDraft, updateAdminHomeBannerPreview,
   updateAdminPlatformSectionPreview, updateAdminPopupPreview, updateAdminSiteSettingsPreview, updateAnalyticsChartTooltip,
   updateLiveSummary, updateSignupPasswordFeedback,

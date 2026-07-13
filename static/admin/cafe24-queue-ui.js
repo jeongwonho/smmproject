@@ -141,12 +141,12 @@ export function renderCafe24AutoPollCards({ activeIntegration = {}, automation =
   const autoPollRisk = autoPollState.risk;
   const lastTick = automation.lastTick || {};
   const tickStatus = automation.lastTickStatus || lastTick.status || "never";
-  const tickRisk = tickStatus === "failed" || Boolean(automation.paused);
+  const tickRisk = ["failed", "partial_failed"].includes(tickStatus) || Boolean(automation.paused);
   const cafe24Dispatch = lastTick.cafe24Dispatch || {};
   const completion = lastTick.cafe24Completion || {};
   const supplierHealth = lastTick.supplierHealth || {};
   const retryQueueCount = Number(summary.failedCount || 0) + Number(summary.reviewRequiredCount || 0);
-  const lastTickLabel = formatCafe24KstDateTime(automation.lastTickAt || lastTick.finishedAt, "GitHub Actions 5분 주기");
+  const lastTickLabel = formatCafe24KstDateTime(automation.lastTickAt || lastTick.finishedAt, "실행 이력 없음");
   const lastAutoPollLabel = autoPollRisk
     ? autoPollState.message
     : activeIntegration.lastAutoPollAt
@@ -158,7 +158,7 @@ export function renderCafe24AutoPollCards({ activeIntegration = {}, automation =
   return `
     <article class="${tickRisk ? "is-risk" : tickStatus === "success" ? "is-hot" : ""}">
       <span>자동화 Tick</span>
-      <strong>${escapeHtml(automation.paused ? "긴급 중단" : tickStatus === "success" ? "정상" : tickStatus === "failed" ? "실패" : "대기")}</strong>
+      <strong>${escapeHtml(automation.paused ? "긴급 중단" : tickStatus === "success" ? "정상" : tickStatus === "partial_failed" ? "부분 실패" : tickStatus === "failed" ? "실패" : "대기")}</strong>
       <small>${escapeHtml(lastTickLabel)}</small>
     </article>
     <article class="${autoPollRisk ? "is-risk" : autoPollStatus === "success" ? "is-hot" : ""}">

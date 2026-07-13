@@ -315,7 +315,22 @@ class PanelStoreDatabaseMixin:
         )
 
     def _runtime_schema_repair_needed(self, conn: DatabaseConnection) -> bool:
-        required_tables = ("notification_events", "cafe24_split_jobs", "cafe24_split_job_parts")
+        required_tables = ("notification_events", "cafe24_split_jobs", "cafe24_split_job_parts", "security_rate_limits")
+        required_columns = {
+            "orders": {"dispatch_status", "dispatch_attempts", "supplier_last_error"},
+            "wallets": {"available_balance", "pending_balance"},
+            "cafe24_integrations": {"token_status", "cafe24_poll_lock_owner", "last_auto_poll_status"},
+            "cafe24_order_items": {
+                "auto_dispatch_approved",
+                "auto_dispatch_source",
+                "preflight_checked_at",
+                "preflight_blockers_json",
+            },
+            "notification_events": {"event_key", "event_type", "status", "attempts"},
+            "cafe24_split_jobs": {"cafe24_order_item_id", "status", "next_dispatch_at"},
+            "cafe24_split_job_parts": {"split_job_id", "sequence", "status"},
+            "security_rate_limits": {"bucket", "client_key_hash", "window_started_at", "request_count"},
+        }
         placeholders = ", ".join(["?"] * len(required_tables))
         try:
             if self.backend == "postgres":
@@ -328,6 +343,16 @@ class PanelStoreDatabaseMixin:
                     required_tables,
                 ).fetchall()
                 present = {str(row["table_name"] or "") for row in rows}
+                column_rows = conn.execute(
+                    """
+                    SELECT table_name, column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                    """
+                ).fetchall()
+                present_columns: Dict[str, set[str]] = {}
+                for row in column_rows:
+                    present_columns.setdefault(str(row["table_name"] or ""), set()).add(str(row["column_name"] or ""))
             else:
                 rows = conn.execute(
                     f"""
@@ -338,9 +363,18 @@ class PanelStoreDatabaseMixin:
                     required_tables,
                 ).fetchall()
                 present = {str(row["name"] or "") for row in rows}
+                present_columns = {
+                    table: {str(row["name"] or "") for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                    for table in required_columns
+                }
         except Exception:
             return True
-        return any(table not in present for table in required_tables)
+        if any(table not in present for table in required_tables):
+            return True
+        return any(
+            not columns.issubset(present_columns.get(table, set()))
+            for table, columns in required_columns.items()
+        )
 
     def _apply_migrations(self, conn: DatabaseConnection) -> None:
         self._ensure_column(conn, "users", "password_hash", "TEXT NOT NULL DEFAULT ''")
@@ -442,6 +476,7 @@ class PanelStoreDatabaseMixin:
         )
         self._ensure_charge_support_tables(conn)
         self._ensure_notification_events_table(conn)
+        self._ensure_security_rate_limits_table(conn)
         self._ensure_cafe24_support_tables(conn)
         self._ensure_cafe24_split_support_tables(conn)
         self._ensure_mkt24_product_settings_table(conn)
@@ -611,6 +646,20 @@ class PanelStoreDatabaseMixin:
             """
         )
 
+    def _ensure_security_rate_limits_table(self, conn: DatabaseConnection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS security_rate_limits (
+                bucket TEXT NOT NULL,
+                client_key_hash TEXT NOT NULL,
+                window_started_at BIGINT NOT NULL,
+                request_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(bucket, client_key_hash)
+            )
+            """
+        )
+
     def _ensure_cafe24_split_support_tables(self, conn: DatabaseConnection) -> None:
         conn.execute(
             """
@@ -765,19 +814,9 @@ class PanelStoreDatabaseMixin:
 
     def _ensure_column(self, conn: DatabaseConnection, table: str, column: str, definition: str) -> None:
         if self.backend == "postgres":
-            columns = {
-                row["column_name"]
-                for row in conn.execute(
-                    """
-                    SELECT column_name
-                    FROM information_schema.columns
-                    WHERE table_schema = 'public' AND table_name = ? AND column_name = ?
-                    """,
-                    (table, column),
-                ).fetchall()
-            }
-        else:
-            columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}")
+            return
+        columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if column in columns:
             return
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")

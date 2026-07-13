@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse
 from backend.auth import hash_password, verify_password
 from backend.cron_auth import cron_authorization_valid, cron_secret
 from backend.errors import PanelError
+from backend.cafe24_analytics import get_cafe24_ga4_analytics
 from backend.integrations.cafe24_manual import build_cafe24_manual_input_cron_response
 from core import APP_ROOT, DEFAULT_SITE_NAME, PanelStore
 
@@ -192,14 +193,20 @@ class AppConfig:
 
 
 class RequestRateLimiter:
-    def __init__(self, rules: Optional[Dict[str, tuple[int, int]]] = None) -> None:
+    def __init__(
+        self,
+        rules: Optional[Dict[str, tuple[int, int]]] = None,
+        persistent_enforcer: Optional[Callable[[str, str, int, int], int]] = None,
+    ) -> None:
         self.rules = rules or {
             "orders": (20, 60),
             "link_preview": (30, 60),
             "charge": (12, 60),
             "analytics": (180, 60),
             "auth": (18, 60),
+            "admin_login": (8, 15 * 60),
         }
+        self.persistent_enforcer = persistent_enforcer
         self.events: Dict[str, list[float]] = {}
         self.lock = threading.Lock()
         self.max_keys = 2000
@@ -255,6 +262,16 @@ class RequestRateLimiter:
         self.events[storage_key] = attempts
 
     def enforce(self, bucket: str, client_key: str, message: str) -> None:
+        if self.persistent_enforcer is not None:
+            try:
+                limit, window_seconds = self.rules[bucket]
+                retry_after = int(self.persistent_enforcer(bucket, client_key, limit, window_seconds) or 0)
+            except Exception as exc:
+                print(f"[rate-limit-fallback] {bucket}: {exc}")
+            else:
+                if retry_after:
+                    raise PanelError(message.format(retry_after=retry_after), status=429)
+                return
         with self.lock:
             self._trim_storage_if_needed()
             retry_after = self.retry_after(bucket, client_key)
@@ -736,8 +753,9 @@ def route(
 
 def build_runtime_context() -> RuntimeContext:
     session_secret = resolve_session_secret()
+    store = PanelStore.from_env()
     return RuntimeContext(
-        store=PanelStore.from_env(),
+        store=store,
         admin_sessions=AdminSessionStore(
             os.environ.get("SMM_PANEL_ADMIN_USERNAME", "admin"),
             os.environ.get("SMM_PANEL_ADMIN_PASSWORD", ""),
@@ -745,7 +763,7 @@ def build_runtime_context() -> RuntimeContext:
         ),
         user_sessions=UserSessionStore(session_secret),
         config=AppConfig.from_env(),
-        rate_limiter=RequestRateLimiter(),
+        rate_limiter=RequestRateLimiter(persistent_enforcer=store.shared_rate_limit_retry_after),
         public_cache=TTLResponseCache(),
     )
 
@@ -1225,6 +1243,11 @@ class AppHandler(SimpleHTTPRequestHandler):
     def _get_admin_cafe24_operational_audit(self, request: RouteRequest) -> None:
         write_json(self, 200, {"ok": True, **self._server().store.cafe24_operational_audit()})
 
+    @route("GET", "/api/admin/cafe24-analytics", auth="admin")
+    def _get_admin_cafe24_analytics(self, request: RouteRequest) -> None:
+        range_id = self._query_value(request, "range", "30d")
+        write_json(self, 200, {"ok": True, **get_cafe24_ga4_analytics(range_id)})
+
     @route("GET", "/api/cron/cafe24/operational-audit", auth="cron")
     def _get_cron_cafe24_operational_audit(self, request: RouteRequest) -> None:
         write_json(self, 200, {"ok": True, **self._server().store.cafe24_operational_audit()})
@@ -1468,7 +1491,7 @@ class AppHandler(SimpleHTTPRequestHandler):
             or self.headers.get("X-Trace-Id", "")
             or self.headers.get("X-Trace ID", ""),
         )
-        write_json(self, 200, {"ok": True, **result})
+        write_json(self, 200, {"ok": result.get("status") in {"processed", "ignored"}, **result})
 
     @route("POST", "/api/cron/suppliers/sync", auth="cron", read_json_body=True)
     def _post_cron_supplier_sync(self, request: RouteRequest) -> None:
@@ -1522,11 +1545,12 @@ class AppHandler(SimpleHTTPRequestHandler):
         payload = dict(request.payload or {})
         payload["_adminActor"] = "cron"
         result = self._server().store.run_cafe24_flow_tick(payload)
+        flow_ok = result.get("status") in {"success", "locked"}
         write_json(
             self,
             500 if result.get("status") == "failed" else 200,
             {
-                "ok": result.get("status") != "failed",
+                "ok": flow_ok,
                 **result,
             },
         )
@@ -1750,6 +1774,7 @@ class AppHandler(SimpleHTTPRequestHandler):
         password = str(request.payload.get("password") or "")
         admin_sessions = self._server().admin_sessions
         client_identity = self._client_identity()
+        self._enforce_rate_limit("admin_login", "로그인 시도가 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
         if not admin_sessions.is_configured:
             raise PanelError(
                 "관리자 보안 설정이 없습니다. SMM_PANEL_ADMIN_PASSWORD 환경변수를 설정한 뒤 서버를 다시 실행해 주세요.",

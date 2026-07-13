@@ -20,6 +20,7 @@ ORDER_CHANNEL_MANUAL = "manual"
 ORDER_CHANNELS = {ORDER_CHANNEL_WEB, ORDER_CHANNEL_CAFE24, ORDER_CHANNEL_MANUAL}
 ORDER_DISPATCH_UNMAPPED = "unmapped"
 ORDER_DISPATCH_READY = "ready"
+ORDER_DISPATCH_SUBMITTING = "submitting"
 ORDER_DISPATCH_SUBMITTED = "submitted"
 ORDER_DISPATCH_ACCEPTED = "accepted"
 ORDER_DISPATCH_IN_PROGRESS = "in_progress"
@@ -30,6 +31,7 @@ ORDER_DISPATCH_FAILED = "failed"
 ORDER_DISPATCH_STATUSES = {
     ORDER_DISPATCH_UNMAPPED,
     ORDER_DISPATCH_READY,
+    ORDER_DISPATCH_SUBMITTING,
     ORDER_DISPATCH_SUBMITTED,
     ORDER_DISPATCH_ACCEPTED,
     ORDER_DISPATCH_IN_PROGRESS,
@@ -158,6 +160,8 @@ def normalize_order_dispatch_status(raw: Any) -> str:
         return ORDER_DISPATCH_UNMAPPED
     if value in {"ready", "pending", "queued"}:
         return ORDER_DISPATCH_READY
+    if value in {"submitting", "dispatching", "sending"}:
+        return ORDER_DISPATCH_SUBMITTING
     if value in {"submitted", "success", "sent"}:
         return ORDER_DISPATCH_SUBMITTED
     if value in {"accepted"}:
