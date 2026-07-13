@@ -1530,11 +1530,13 @@ class Cafe24ApiClient:
         *,
         query: Optional[Dict[str, Any]] = None,
         payload: Optional[Dict[str, Any]] = None,
+        include_shop_no_query: bool = True,
     ) -> Any:
         normalized_path = "/" + path.lstrip("/")
         url = f"{self.base_url}{normalized_path}"
         params = dict(query or {})
-        params.setdefault("shop_no", self.shop_no)
+        if include_shop_no_query:
+            params.setdefault("shop_no", self.shop_no)
         if params:
             url = f"{url}?{urlencode({key: value for key, value in params.items() if value not in (None, '')}, doseq=True)}"
         headers = {
@@ -1755,6 +1757,7 @@ class Cafe24ApiClient:
             "PUT",
             f"/admin/products/{quote(str(product_no), safe='')}",
             payload={"shop_no": self.shop_no, "request": dict(updates or {})},
+            include_shop_no_query=False,
         )
 
     def product_options(self, product_no: str) -> Any:
@@ -1765,6 +1768,7 @@ class Cafe24ApiClient:
             "PUT",
             f"/admin/products/{quote(str(product_no), safe='')}/options",
             payload={"shop_no": self.shop_no, "request": dict(updates or {})},
+            include_shop_no_query=False,
         )
 
     def product_variants(self, product_no: str) -> Any:
@@ -1775,4 +1779,5 @@ class Cafe24ApiClient:
             "PUT",
             f"/admin/products/{quote(str(product_no), safe='')}/variants",
             payload={"shop_no": self.shop_no, "requests": [dict(update or {}) for update in updates]},
+            include_shop_no_query=False,
         )

@@ -3628,16 +3628,58 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
             request.call_args_list[0].kwargs["payload"],
             {"shop_no": 1, "request": {"display": "F"}},
         )
+        self.assertFalse(request.call_args_list[0].kwargs["include_shop_no_query"])
         self.assertEqual(
             request.call_args_list[1].kwargs["payload"],
             {"shop_no": 1, "request": {"use_additional_option": "T"}},
         )
+        self.assertFalse(request.call_args_list[1].kwargs["include_shop_no_query"])
         self.assertEqual(
             request.call_args_list[2].kwargs["payload"],
             {
                 "shop_no": 1,
                 "requests": [{"variant_code": "P00000BZ00CV", "additional_amount": "0.00"}],
             },
+        )
+        self.assertFalse(request.call_args_list[2].kwargs["include_shop_no_query"])
+
+    def test_cafe24_product_write_requests_do_not_put_shop_number_in_query_string(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        requests = []
+
+        def fake_urlopen(request, timeout):
+            requests.append(request)
+            return FakeResponse()
+
+        client = Cafe24ApiClient("instamart", "access-token", max_attempts=1)
+        with patch("backend.integrations.cafe24.urlopen", side_effect=fake_urlopen):
+            client.update_product("51", {"display": "F"})
+            client.update_product_options("51", {"use_additional_option": "T"})
+            client.update_product_variants(
+                "51",
+                [{"variant_code": "P00000BZ00CV", "additional_amount": "0.00"}],
+            )
+
+        self.assertEqual(
+            [request.full_url for request in requests],
+            [
+                "https://instamart.cafe24api.com/api/v2/admin/products/51",
+                "https://instamart.cafe24api.com/api/v2/admin/products/51/options",
+                "https://instamart.cafe24api.com/api/v2/admin/products/51/variants",
+            ],
+        )
+        self.assertTrue(all("shop_no" not in urlparse(request.full_url).query for request in requests))
+        self.assertTrue(
+            all(json.loads(request.data.decode("utf-8"))["shop_no"] == 1 for request in requests)
         )
 
     def test_daily_follower_product_dry_run_reports_missing_write_scope_without_mutation(self):
