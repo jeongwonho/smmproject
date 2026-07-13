@@ -1241,11 +1241,35 @@ def cafe24_option_entries(order_payload: Dict[str, Any], item_payload: Dict[str,
         if key and text:
             entries.append({"label": key, "value": text, "source": source})
 
+    def split_assignment(value: str) -> Optional[Tuple[str, str]]:
+        cleaned = str(value or "").strip()
+        if not cleaned or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", cleaned):
+            return None
+        for delimiter in ("=", ":"):
+            if delimiter not in cleaned:
+                continue
+            left, right = cleaned.split(delimiter, 1)
+            if left.strip() and right.strip() and "://" not in left:
+                return left.strip(), right.strip()
+        return None
+
+    def text_parts(value: str) -> List[str]:
+        # A slash is a separator only when surrounded by whitespace, so URLs stay intact.
+        return [part.strip() for part in re.split(r"[\n\r,|]+|\s+/\s+", value) if part.strip()]
+
     def consume(value: Any, prefix: str = "", source: str = "") -> None:
         if isinstance(value, dict):
             label = value.get("name") or value.get("option_name") or value.get("label") or value.get("key")
             text = value.get("value") or value.get("option_value") or value.get("text") or value.get("input_value")
-            if label or text:
+            nested_assignments = (
+                [assignment for part in text_parts(text) if (assignment := split_assignment(part))]
+                if isinstance(text, str)
+                else []
+            )
+            if nested_assignments:
+                for nested_label, nested_value in nested_assignments:
+                    add_entry(nested_label, nested_value, source or prefix or "option")
+            elif label or text:
                 add_entry(label or prefix or "option", text, source or prefix or "option")
             for nested_key, nested_value in value.items():
                 if isinstance(nested_value, (dict, list)):
@@ -1254,16 +1278,10 @@ def cafe24_option_entries(order_payload: Dict[str, Any], item_payload: Dict[str,
             for item in value:
                 consume(item, prefix, source or prefix)
         elif isinstance(value, str):
-            for part in re.split(r"[\n\r,|/]+", value):
-                cleaned = part.strip()
-                if not cleaned:
-                    continue
-                if ":" in cleaned:
-                    left, right = cleaned.split(":", 1)
-                    add_entry(left, right, source or prefix or "option")
-                elif "=" in cleaned:
-                    left, right = cleaned.split("=", 1)
-                    add_entry(left, right, source or prefix or "option")
+            for cleaned in text_parts(value):
+                assignment = split_assignment(cleaned)
+                if assignment:
+                    add_entry(assignment[0], assignment[1], source or prefix or "option")
                 else:
                     add_entry(prefix or "option", cleaned, source or prefix or "option")
 
@@ -1276,6 +1294,7 @@ def cafe24_option_entries(order_payload: Dict[str, Any], item_payload: Dict[str,
         "selected_options",
         "variant_option",
         "variant_options",
+        "additional_option_value",
         "additional_option_values",
         "additional_options",
         "input_options",
