@@ -521,6 +521,8 @@ class WorkflowConfigurationTest(unittest.TestCase):
         self.assertIn('"requestTimeoutSeconds":5', workflow)
         self.assertIn('"maxAttempts":1', workflow)
         self.assertIn('"compactResponse":true', workflow)
+        self.assertIn("jq -e '.ok == true'", workflow)
+        self.assertIn("reported a partial failure", workflow)
         self.assertNotIn("/api/cron/automation/tick", workflow)
 
     def test_cafe24_operational_audit_workflow_uses_summary_cli(self):
@@ -579,6 +581,20 @@ class WorkflowConfigurationTest(unittest.TestCase):
         self.assertIn("dispatchContract", source)
         self.assertIn("serviceIdRule", source)
         self.assertIn("발주 계약", source)
+
+    def test_admin_access_code_uses_password_input(self):
+        source = (APP_ROOT / "static" / "admin" / "pages.js").read_text()
+
+        self.assertIn('type="password" name="adminAccessCode"', source)
+        self.assertIn('autocomplete="current-password"', source)
+        self.assertNotIn('type="text" name="adminAccessCode"', source)
+
+    def test_cafe24_admin_marks_partial_flow_failure_as_risk(self):
+        for filename in ("cafe24-console-ui.js", "cafe24-queue-ui.js"):
+            with self.subTest(filename=filename):
+                source = (APP_ROOT / "static" / "admin" / filename).read_text()
+                self.assertIn('"partial_failed"', source)
+                self.assertIn("부분 실패", source)
 
     def test_cafe24_audit_environment_renders_runtime_and_db_backend(self):
         source = (APP_ROOT / "static" / "admin" / "cafe24-audit-ui.js").read_text()
@@ -987,6 +1003,15 @@ class RouterRegistryTest(unittest.TestCase):
 
     def test_cafe24_operational_audit_route_requires_admin_auth(self):
         matched = ROUTER.match("GET", "/api/admin/cafe24/operational-audit")
+
+        self.assertIsNotNone(matched)
+        route, params = matched
+        self.assertEqual(params, {})
+        self.assertEqual(route.auth, "admin")
+        self.assertFalse(route.csrf)
+
+    def test_cafe24_analytics_route_requires_admin_auth(self):
+        matched = ROUTER.match("GET", "/api/admin/cafe24-analytics")
 
         self.assertIsNotNone(matched)
         route, params = matched

@@ -266,7 +266,6 @@ def admin_charge_order_payload(
     row_map = dict(row)
     payload = charge_order_payload(row_map, created_label=created_label)
     customer_name = str(row_map.get("customer_name") or "")
-    customer_email = str(row_map.get("customer_email") or "")
     payload.update(
         {
             "customerId": row_map.get("user_id", ""),
@@ -278,7 +277,7 @@ def admin_charge_order_payload(
                     [
                         str(payload.get("orderCode") or ""),
                         customer_name,
-                        customer_email,
+                        customer_email_masked,
                         str(payload.get("depositorName") or ""),
                         str(payload.get("reference") or ""),
                         str(payload.get("status") or ""),

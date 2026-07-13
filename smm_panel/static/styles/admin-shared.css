@@ -1753,7 +1753,7 @@
 
 .admin-analytics-subnav {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 12px;
 }
 
@@ -2028,6 +2028,157 @@
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
+}
+
+.cafe24-ga-source-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.cafe24-ga-source-grid article,
+.cafe24-ga-event-grid article,
+.cafe24-ga-checklist article,
+.cafe24-ga-insight {
+  min-width: 0;
+  border: 1px solid #e3e9f6;
+  border-radius: 16px;
+  background: #fbfdff;
+}
+
+.cafe24-ga-source-grid article {
+  padding: 14px 16px;
+}
+
+.cafe24-ga-source-grid span,
+.cafe24-ga-event-grid span,
+.cafe24-ga-event-grid em,
+.cafe24-ga-checklist p,
+.cafe24-ga-insight p,
+.cafe24-ga-funnel__step span,
+.cafe24-ga-funnel__step em,
+.cafe24-ga-bars__item span,
+.cafe24-ga-bars__item small {
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+}
+
+.cafe24-ga-source-grid strong,
+.cafe24-ga-event-grid strong,
+.cafe24-ga-checklist strong,
+.cafe24-ga-insight strong {
+  display: block;
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+}
+
+.cafe24-ga-error {
+  color: #b42318;
+}
+
+.cafe24-ga-insight-list,
+.cafe24-ga-funnel,
+.cafe24-ga-checklist {
+  display: grid;
+  gap: 10px;
+}
+
+.cafe24-ga-insight {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px;
+}
+
+.cafe24-ga-insight p,
+.cafe24-ga-checklist p {
+  margin: 6px 0 0;
+  line-height: 1.55;
+}
+
+.cafe24-ga-funnel__step {
+  display: grid;
+  gap: 8px;
+}
+
+.cafe24-ga-funnel__step div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.cafe24-ga-funnel__step i {
+  display: block;
+  height: 12px;
+  border-radius: 999px;
+  background: #e8eef8;
+  overflow: hidden;
+}
+
+.cafe24-ga-funnel__step b {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #1f5cff;
+}
+
+.cafe24-ga-bars {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(42px, 1fr));
+  align-items: end;
+  gap: 10px;
+  min-height: 220px;
+}
+
+.cafe24-ga-bars__item {
+  display: grid;
+  grid-template-rows: 20px 150px 20px;
+  align-items: end;
+  min-width: 0;
+  text-align: center;
+}
+
+.cafe24-ga-bars__item i {
+  display: flex;
+  align-items: flex-end;
+  height: 150px;
+  border-radius: 12px;
+  background: #eef3fb;
+  overflow: hidden;
+}
+
+.cafe24-ga-bars__item b {
+  display: block;
+  width: 100%;
+  border-radius: 12px 12px 0 0;
+  background: #18324d;
+}
+
+.cafe24-ga-event-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+}
+
+.cafe24-ga-event-grid article {
+  padding: 12px;
+}
+
+.cafe24-ga-event-grid span,
+.cafe24-ga-event-grid em {
+  display: block;
+  margin-top: 6px;
+  font-style: normal;
+}
+
+.cafe24-ga-checklist article {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
 }
 
 .admin-service-selectbox {

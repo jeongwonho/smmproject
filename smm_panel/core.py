@@ -54,6 +54,7 @@ try:
         ORDER_DISPATCH_IN_PROGRESS,
         ORDER_DISPATCH_PARTIAL,
         ORDER_DISPATCH_READY,
+        ORDER_DISPATCH_SUBMITTING,
         ORDER_DISPATCH_STATUSES,
         ORDER_DISPATCH_SUBMITTED,
         ORDER_DISPATCH_UNMAPPED,
@@ -260,6 +261,7 @@ except ImportError:  # pragma: no cover - top-level script runtime
         ORDER_DISPATCH_IN_PROGRESS,
         ORDER_DISPATCH_PARTIAL,
         ORDER_DISPATCH_READY,
+        ORDER_DISPATCH_SUBMITTING,
         ORDER_DISPATCH_STATUSES,
         ORDER_DISPATCH_SUBMITTED,
         ORDER_DISPATCH_UNMAPPED,
@@ -1554,6 +1556,15 @@ CREATE TABLE IF NOT EXISTS notification_events (
 CREATE INDEX IF NOT EXISTS idx_notification_events_status_updated_at
     ON notification_events(channel, status, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS security_rate_limits (
+    bucket TEXT NOT NULL,
+    client_key_hash TEXT NOT NULL,
+    window_started_at BIGINT NOT NULL,
+    request_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(bucket, client_key_hash)
+);
+
 CREATE TABLE IF NOT EXISTS admin_audit_logs (
     id TEXT PRIMARY KEY,
     actor TEXT NOT NULL DEFAULT 'admin',
@@ -1572,7 +1583,7 @@ CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_entity
     ON admin_audit_logs(entity_type, entity_id, created_at DESC);
 """
 
-RUNTIME_SCHEMA_VERSION = "2026-07-07-01"
+RUNTIME_SCHEMA_VERSION = "2026-07-13-01"
 
 
 class PreviewHTMLParser(HTMLParser):
@@ -7811,8 +7822,8 @@ class PanelStore(PanelStoreDatabaseMixin):
                             None,
                             [
                                 str(row["name"] or ""),
-                                str(row["email"] or ""),
-                                str(row["phone"] or ""),
+                                mask_email(row["email"]),
+                                mask_phone(row["phone"]),
                                 str(row["tier"] or ""),
                                 str(row["role"] or ""),
                                 str(row["notes"] or ""),
@@ -8062,7 +8073,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                             [
                                 str(row["order_number"] or ""),
                                 str(row["customer_name"] or ""),
-                                str(row["customer_email"] or ""),
+                                mask_email(row["customer_email"]),
                                 str(row["product_name_snapshot"] or ""),
                                 str(row["option_name_snapshot"] or ""),
                                 str(row["target_value"] or ""),
@@ -8533,9 +8544,55 @@ class PanelStore(PanelStoreDatabaseMixin):
             "cafe24SplitStatusRefresh",
             "cafe24Completion",
             "slackNotifications",
+            "operationalSlackNotifications",
         ):
             compacted[key] = compact_section(compacted.get(key))
         return compacted
+
+    def _cafe24_flow_failure_details(self, result: Dict[str, Any]) -> List[Dict[str, Any]]:
+        issues: List[Dict[str, Any]] = []
+
+        def add(code: str, count: Any, message: str) -> None:
+            try:
+                safe_count = int(count or 0)
+            except (TypeError, ValueError):
+                safe_count = 0
+            if safe_count <= 0:
+                return
+            issues.append({"code": code, "count": safe_count, "message": str(message or "")[:1000]})
+
+        token_refresh = result.get("cafe24TokenRefresh") if isinstance(result.get("cafe24TokenRefresh"), dict) else {}
+        add("token_refresh_failed", token_refresh.get("failed"), "Cafe24 토큰 자동 갱신 실패")
+        add("token_reconnect_required", token_refresh.get("reconnectRequired"), "Cafe24 OAuth 재연결 필요")
+
+        poll = result.get("cafe24Poll") if isinstance(result.get("cafe24Poll"), dict) else {}
+        poll_errors = poll.get("errors") if isinstance(poll.get("errors"), list) else []
+        if poll_errors:
+            issues.append(
+                {
+                    "code": "order_poll_failed",
+                    "count": len(poll_errors),
+                    "message": " | ".join(str(error)[:300] for error in poll_errors[:3]),
+                }
+            )
+        add(
+            "order_poll_reconnect_required",
+            poll.get("reconnectRequiredIntegrations"),
+            "주문 수집 대상 Cafe24 연동 재연결 필요",
+        )
+
+        # Supplier dispatch/status failures already have order-specific Slack
+        # notifications. Only add failures that otherwise had no alert path.
+        for section_key, code, label in (
+            ("cafe24Completion", "cafe24_completion_failed", "Cafe24 구매확정 처리 실패"),
+        ):
+            section = result.get(section_key) if isinstance(result.get(section_key), dict) else {}
+            add(code, section.get("failed"), label)
+            add(f"{code}_errors", section.get("errors"), f"{label} 예외")
+
+        if result.get("error"):
+            issues.append({"code": "flow_exception", "count": 1, "message": str(result.get("error"))[:1000]})
+        return issues
 
     def _cafe24_split_jobs_for_order_items(
         self,
@@ -10960,7 +11017,12 @@ class PanelStore(PanelStoreDatabaseMixin):
             conn.commit()
             dispatch = self._dispatch_supplier_order(internal_order_id, product, normalized_fields, supplier_mapping)
             with self._connect() as dispatch_conn:
-                next_status = "supplier_submitted" if dispatch["status"] in {"submitted", "accepted"} else "failed"
+                if dispatch["status"] in {"submitted", "accepted"}:
+                    next_status = "supplier_submitted"
+                elif dispatch["status"] == ORDER_DISPATCH_SUBMITTING and dispatch.get("duplicate"):
+                    next_status = "submitting"
+                else:
+                    next_status = "failed"
                 dispatch_conn.execute(
                     """
                     UPDATE cafe24_order_items
@@ -10972,7 +11034,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                         next_status,
                         dispatch.get("id") or "",
                         dispatch.get("supplierExternalOrderId") or "",
-                        "" if next_status == "supplier_submitted" else "공급사 발주 실패",
+                        "" if next_status in {"supplier_submitted", "submitting"} else "공급사 발주 실패",
                         now_iso(),
                         now_iso(),
                         current["id"],
@@ -11691,6 +11753,15 @@ class PanelStore(PanelStoreDatabaseMixin):
                     result=result,
                 )
                 conn.commit()
+            try:
+                self._queue_cafe24_operational_failure(
+                    context="webhook",
+                    status="review",
+                    issues=[{"code": "webhook_order_id_missing", "count": 1, "message": result["message"]}],
+                    actor=actor,
+                )
+            except Exception:
+                pass
             return {**result, "webhookEventId": event_id}
 
         integration_id = ""
@@ -11764,6 +11835,17 @@ class PanelStore(PanelStoreDatabaseMixin):
                 result=result,
             )
             conn.commit()
+        if status == "review":
+            try:
+                self._queue_cafe24_operational_failure(
+                    context="webhook",
+                    status=status,
+                    issues=[{"code": "webhook_order_processing_failed", "count": 1, "message": message}],
+                    order_id=order_id,
+                    actor=actor,
+                )
+            except Exception:
+                pass
         return {**result, "webhookEventId": event_id}
 
     def reconcile_cafe24_email_order_witness(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -12896,6 +12978,53 @@ class PanelStore(PanelStoreDatabaseMixin):
         actor = str((payload or {}).get("_adminActor") or "").strip()
         return actor or "admin"
 
+    def shared_rate_limit_retry_after(
+        self,
+        bucket: str,
+        client_key: str,
+        limit: int,
+        window_seconds: int,
+    ) -> int:
+        safe_bucket = re.sub(r"[^a-z0-9_.:-]", "", str(bucket or "").strip().lower())[:80]
+        safe_limit = max(1, int(limit or 1))
+        safe_window = max(1, int(window_seconds or 1))
+        if not safe_bucket or not client_key:
+            return 0
+        client_key_hash = hashlib.sha256(str(client_key).encode("utf-8")).hexdigest()
+        now_seconds = int(time.time())
+        window_started_at = now_seconds - (now_seconds % safe_window)
+        timestamp = now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO security_rate_limits (
+                    bucket, client_key_hash, window_started_at, request_count, updated_at
+                ) VALUES (?, ?, ?, 1, ?)
+                ON CONFLICT(bucket, client_key_hash) DO UPDATE SET
+                    request_count = CASE
+                        WHEN security_rate_limits.window_started_at = excluded.window_started_at
+                            THEN security_rate_limits.request_count + 1
+                        ELSE 1
+                    END,
+                    window_started_at = excluded.window_started_at,
+                    updated_at = excluded.updated_at
+                """,
+                (safe_bucket, client_key_hash, window_started_at, timestamp),
+            )
+            row = conn.execute(
+                """
+                SELECT request_count
+                FROM security_rate_limits
+                WHERE bucket = ? AND client_key_hash = ?
+                """,
+                (safe_bucket, client_key_hash),
+            ).fetchone()
+            conn.commit()
+        request_count = int((row or {}).get("request_count") or 0)
+        if request_count <= safe_limit:
+            return 0
+        return max(1, window_started_at + safe_window - now_seconds)
+
     def _record_admin_audit(
         self,
         conn: DatabaseConnection,
@@ -12945,6 +13074,26 @@ class PanelStore(PanelStoreDatabaseMixin):
         return f"{origin}/admin?section=cafe24&q={quote(order_id)}"
 
     def _slack_failure_text(self, payload: Dict[str, Any]) -> str:
+        if str(payload.get("kind") or "") == "cafe24_operational":
+            context = str(payload.get("context") or "flow")
+            order_id = str(payload.get("orderId") or "").strip()
+            issue_lines = []
+            for issue in payload.get("issues") or []:
+                if not isinstance(issue, dict):
+                    continue
+                code = str(issue.get("code") or "unknown")
+                message = str(issue.get("message") or "").strip()[:500]
+                count = int(issue.get("count") or 1)
+                issue_lines.append(f"- {code} ({count}건): {message or '-'}")
+            details = "\n".join(issue_lines) or "- 상세 오류 없음"
+            order_line = f"\n주문번호: {order_id}" if order_id else ""
+            return (
+                f"[Cafe24 자동화 점검 필요]\n"
+                f"구간: {context}"
+                f"{order_line}\n"
+                f"상태: {payload.get('status') or 'partial_failed'}\n"
+                f"{details}"
+            )
         order_id = str(payload.get("orderId") or "-")
         item_code = str(payload.get("orderItemCode") or "-")
         product = str(payload.get("productName") or payload.get("productNo") or "-")
@@ -12974,10 +13123,15 @@ class PanelStore(PanelStoreDatabaseMixin):
 
     def _send_slack_notification(self, webhook_url: str, payload: Dict[str, Any]) -> None:
         text = self._slack_failure_text(payload)
+        title = (
+            "Cafe24 자동화 점검 필요"
+            if str(payload.get("kind") or "") == "cafe24_operational"
+            else "Cafe24 공급사 발주 실패"
+        )
         body = {
             "text": text,
             "blocks": [
-                {"type": "header", "text": {"type": "plain_text", "text": "Cafe24 공급사 발주 실패", "emoji": False}},
+                {"type": "header", "text": {"type": "plain_text", "text": title, "emoji": False}},
                 {"type": "section", "text": {"type": "mrkdwn", "text": text}},
             ],
         }
@@ -13036,15 +13190,31 @@ class PanelStore(PanelStoreDatabaseMixin):
             return None
         if int(row["attempts"] or 0) >= SLACK_NOTIFICATION_MAX_ATTEMPTS:
             return None
-        conn.execute(
+        stale_sending_before = (
+            dt.datetime.now().astimezone() - dt.timedelta(minutes=10)
+        ).isoformat(timespec="seconds")
+        cursor = conn.execute(
             """
             UPDATE notification_events
             SET status = 'sending', attempts = COALESCE(attempts, 0) + 1,
                 payload_json = ?, last_error = '', updated_at = ?
             WHERE id = ?
+              AND COALESCE(attempts, 0) < ?
+              AND (
+                status IN ('pending', 'failed')
+                OR (status = 'sending' AND updated_at < ?)
+              )
             """,
-            (as_json(redact_external_payload(payload)), timestamp, row["id"]),
+            (
+                as_json(redact_external_payload(payload)),
+                timestamp,
+                row["id"],
+                SLACK_NOTIFICATION_MAX_ATTEMPTS,
+                stale_sending_before,
+            ),
         )
+        if cursor.rowcount != 1:
+            return None
         updated = dict(row)
         updated["attempts"] = int(row["attempts"] or 0) + 1
         updated["payload_json"] = as_json(redact_external_payload(payload))
@@ -13262,6 +13432,127 @@ class PanelStore(PanelStoreDatabaseMixin):
         return {
             "enabled": True,
             "checked": len(candidates),
+            "sent": sent,
+            "failed": failed,
+            "skipped": skipped,
+            "results": results,
+            "ranAt": now_iso(),
+        }
+
+    def _queue_cafe24_operational_failure(
+        self,
+        *,
+        context: str,
+        status: str,
+        issues: List[Dict[str, Any]],
+        order_id: str = "",
+        actor: str = "cron",
+    ) -> Dict[str, Any]:
+        safe_issues = [redact_external_payload(issue) for issue in issues if isinstance(issue, dict)]
+        if not safe_issues:
+            return {"queued": False, "reason": "no_issues"}
+        signature = hashlib.sha256(
+            as_json({"context": context, "orderId": order_id, "issues": safe_issues}).encode("utf-8")
+        ).hexdigest()[:16]
+        if order_id:
+            event_key = f"cafe24:operational:{context}:{order_id}:{signature}"
+        else:
+            hour_bucket = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H")
+            event_key = f"cafe24:operational:{context}:{hour_bucket}:{signature}"
+        payload = {
+            "kind": "cafe24_operational",
+            "context": context,
+            "status": status,
+            "orderId": order_id,
+            "issues": safe_issues,
+            "actor": actor,
+            "queuedAt": now_iso(),
+        }
+        timestamp = now_iso()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO notification_events (
+                    id, channel, event_key, event_type, entity_type, entity_id,
+                    status, attempts, payload_json, last_error, sent_at, created_at, updated_at
+                ) VALUES (?, 'slack', ?, 'cafe24.operational_failure', ?, ?, 'pending', 0, ?, '', '', ?, ?)
+                ON CONFLICT(channel, event_key) DO NOTHING
+                """,
+                (
+                    f"notif_{uuid4().hex[:16]}",
+                    event_key,
+                    "cafe24_order" if order_id else "cafe24_flow",
+                    order_id or context,
+                    as_json(payload),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            conn.commit()
+        return {"queued": cursor.rowcount == 1, "eventKey": event_key}
+
+    def notify_pending_cafe24_operational_failures_to_slack(
+        self,
+        *,
+        actor: str = "cron",
+        limit: int = 10,
+    ) -> Dict[str, Any]:
+        webhook_url = slack_cafe24_failure_webhook_url()
+        if not webhook_url:
+            return {"enabled": False, "skipped": True, "reason": "slack_webhook_not_configured", "sent": 0, "failed": 0, "checked": 0}
+        max_items = max(1, min(int(limit or 10), 50))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM notification_events
+                WHERE channel = 'slack'
+                  AND event_type = 'cafe24.operational_failure'
+                  AND status IN ('pending', 'failed', 'sending')
+                  AND COALESCE(attempts, 0) < ?
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (SLACK_NOTIFICATION_MAX_ATTEMPTS, max_items),
+            ).fetchall()
+
+        sent = 0
+        failed = 0
+        skipped = 0
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            payload = parse_json(row["payload_json"], {})
+            payload["actor"] = actor
+            with self._connect() as conn:
+                event = self._claim_notification_event(
+                    conn,
+                    event_key=str(row["event_key"]),
+                    event_type="cafe24.operational_failure",
+                    entity_type=str(row["entity_type"] or "cafe24_flow"),
+                    entity_id=str(row["entity_id"] or ""),
+                    payload=payload,
+                )
+                conn.commit()
+            if event is None:
+                skipped += 1
+                continue
+            event_id = str(event["id"])
+            try:
+                self._send_slack_notification(webhook_url, payload)
+                with self._connect() as conn:
+                    self._mark_notification_event_sent(conn, event_id)
+                    conn.commit()
+                sent += 1
+                results.append({"eventKey": row["event_key"], "status": "sent"})
+            except Exception as exc:
+                failed += 1
+                with self._connect() as conn:
+                    self._mark_notification_event_failed(conn, event_id, str(exc))
+                    conn.commit()
+                results.append({"eventKey": row["event_key"], "status": "failed", "error": str(exc)[:1000]})
+        return {
+            "enabled": True,
+            "checked": len(rows),
             "sent": sent,
             "failed": failed,
             "skipped": skipped,
@@ -15670,6 +15961,7 @@ class PanelStore(PanelStoreDatabaseMixin):
             "cafe24SplitStatusRefresh": {"skipped": paused},
             "cafe24Completion": {"skipped": paused},
             "slackNotifications": {},
+            "operationalSlackNotifications": {},
             "settings": {
                 "lookbackMinutes": lookback_minutes,
                 "useCursor": True,
@@ -15741,6 +16033,24 @@ class PanelStore(PanelStoreDatabaseMixin):
             message = str(exc)
             result["error"] = message
         finally:
+            failures = self._cafe24_flow_failure_details(result)
+            if failures:
+                result["failures"] = failures
+                if status == "success":
+                    status = "partial_failed"
+                    message = f"Cafe24 flow completed with {len(failures)} issue(s)"
+                try:
+                    result["operationalNotificationQueued"] = self._queue_cafe24_operational_failure(
+                        context="flow",
+                        status=status,
+                        issues=failures,
+                        actor=actor,
+                    )
+                except Exception as exc:
+                    result["operationalNotificationQueued"] = {
+                        "queued": False,
+                        "error": str(exc)[:1000],
+                    }
             try:
                 result["slackNotifications"] = self.notify_cafe24_supplier_failures_to_slack(
                     actor=actor,
@@ -15748,6 +16058,13 @@ class PanelStore(PanelStoreDatabaseMixin):
                 )
             except Exception as exc:
                 result["slackNotifications"] = {"enabled": True, "status": "failed", "error": str(exc)[:1000]}
+            try:
+                result["operationalSlackNotifications"] = self.notify_pending_cafe24_operational_failures_to_slack(
+                    actor=actor,
+                    limit=int_option("operationalSlackNotificationLimit", 10, minimum=1, maximum=50),
+                )
+            except Exception as exc:
+                result["operationalSlackNotifications"] = {"enabled": True, "status": "failed", "error": str(exc)[:1000]}
             result["finishedAt"] = now_iso()
             result["durationMs"] = int((time.perf_counter() - started_perf) * 1000)
             result["status"] = status
@@ -16079,14 +16396,22 @@ class PanelStore(PanelStoreDatabaseMixin):
 
         timestamp = now_iso()
         with self._connect() as conn:
-            user = conn.execute("SELECT balance FROM users WHERE id = ?", (customer_id,)).fetchone()
+            user = conn.execute("SELECT id FROM users WHERE id = ?", (customer_id,)).fetchone()
             if user is None:
                 raise PanelError("고객을 찾을 수 없습니다.", status=404)
-            balance_after = int(user["balance"]) + amount
-            if balance_after < 0:
-                raise PanelError("잔액이 0원보다 작아질 수 없습니다.")
-            conn.execute("UPDATE users SET balance = ?, updated_at = ? WHERE id = ?", (balance_after, timestamp, customer_id))
-            self._set_wallet_balances(conn, customer_id, available_balance=balance_after)
+            balance_before = self._wallet_balances(conn, customer_id)["available"]
+            try:
+                balance_after = self._change_wallet_available_balance(
+                    conn,
+                    customer_id,
+                    amount,
+                    require_sufficient=amount < 0,
+                    timestamp=timestamp,
+                )
+            except PanelError as exc:
+                if amount < 0:
+                    raise PanelError("잔액이 0원보다 작아질 수 없습니다.") from exc
+                raise
             conn.execute(
                 """
                 INSERT INTO balance_transactions (id, user_id, amount, balance_after, kind, memo, created_at)
@@ -16111,7 +16436,12 @@ class PanelStore(PanelStoreDatabaseMixin):
                 entity_type="customer",
                 entity_id=customer_id,
                 message="고객 보유금액 수동 조정",
-                metadata={"amount": amount, "balanceAfter": balance_after, "memo": memo},
+                metadata={
+                    "amount": amount,
+                    "balanceBefore": balance_before,
+                    "balanceAfter": balance_after,
+                    "memo": memo,
+                },
             )
             conn.commit()
         return {"customer": self._customer_by_id(customer_id), "balanceAfter": balance_after, "balanceAfterLabel": money(balance_after)}
@@ -17684,6 +18014,7 @@ class PanelStore(PanelStoreDatabaseMixin):
         fields: Dict[str, Any],
         mapping: Dict[str, Any],
     ) -> Dict[str, Any]:
+        timestamp = now_iso()
         with self._connect() as conn:
             existing = conn.execute(
                 """
@@ -17697,7 +18028,7 @@ class PanelStore(PanelStoreDatabaseMixin):
             ).fetchone()
             if existing is not None and (
                 str(existing["supplier_external_order_id"] or "").strip()
-                or str(existing["status"] or "") in {"submitted", "accepted", "in_progress", "completed"}
+                or str(existing["status"] or "") in {"pending", "submitting", "submitted", "accepted", "in_progress", "completed"}
             ):
                 return {
                     "id": existing["id"],
@@ -17705,15 +18036,44 @@ class PanelStore(PanelStoreDatabaseMixin):
                     "supplierExternalOrderId": existing["supplier_external_order_id"] or "",
                     "duplicate": True,
                 }
+            claim = conn.execute(
+                """
+                UPDATE orders
+                SET dispatch_status = ?, supplier_last_error = '', updated_at = ?
+                WHERE id = ? AND dispatch_status IN (?, ?)
+                """,
+                (
+                    ORDER_DISPATCH_SUBMITTING,
+                    timestamp,
+                    order_id,
+                    ORDER_DISPATCH_READY,
+                    ORDER_DISPATCH_FAILED,
+                ),
+            )
+            if claim.rowcount != 1:
+                order_row = conn.execute(
+                    "SELECT dispatch_status FROM orders WHERE id = ?",
+                    (order_id,),
+                ).fetchone()
+                if order_row is None:
+                    raise PanelError("발주할 주문을 찾을 수 없습니다.", status=404)
+                current_status = str(order_row["dispatch_status"] or ORDER_DISPATCH_UNMAPPED)
+                return {
+                    "id": existing["id"] if existing is not None else "",
+                    "status": normalize_order_dispatch_status(current_status),
+                    "supplierExternalOrderId": existing["supplier_external_order_id"] if existing is not None else "",
+                    "duplicate": True,
+                }
+            conn.commit()
         supplier_order_id = f"sord_{uuid4().hex[:12]}"
-        timestamp = now_iso()
-        request_payload = self._build_supplier_order_payload(product, fields, mapping)
+        request_payload: Dict[str, Any] = {}
         supplier_external_order_id = ""
         status = "pending"
         response_payload: Any = {}
         supplier_last_error = ""
 
         try:
+            request_payload = self._build_supplier_order_payload(product, fields, mapping)
             api_key = decrypt_secret_value(mapping["api_key"])
             bearer_token = decrypt_secret_value(mapping.get("bearer_token") or "")
             client = SupplierApiClient(

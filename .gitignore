@@ -1,4 +1,5 @@
 __pycache__/
 *.pyc
+.DS_Store
 studio_data/
 smm_panel/data/

@@ -22,12 +22,12 @@ export function renderCafe24OpsBoard({ state = {}, orderItems = [], mappings = [
   const automation = state.adminBootstrap?.automation || {};
   const lastTick = automation.lastTick || {};
   const tickStatus = automation.lastTickStatus || lastTick.status || "never";
-  const tickRisk = tickStatus === "failed" || Boolean(automation.paused);
+  const tickRisk = ["failed", "partial_failed"].includes(tickStatus) || Boolean(automation.paused);
   const autoPollState = cafe24AutoPollState(activeIntegration);
   const autoPollStatus = autoPollState.status;
   const autoPollRisk = autoPollState.risk;
   const autoPollLabel = autoPollState.label;
-  const lastTickLabel = formatCafe24KstDateTime(automation.lastTickAt || lastTick.finishedAt, "GitHub Actions 5분 주기");
+  const lastTickLabel = formatCafe24KstDateTime(automation.lastTickAt || lastTick.finishedAt, "실행 이력 없음");
   const lastAutoPollLabel = autoPollRisk
     ? autoPollState.message
     : activeIntegration.lastAutoPollAt
@@ -41,8 +41,8 @@ export function renderCafe24OpsBoard({ state = {}, orderItems = [], mappings = [
         <small>${escapeHtml(orderFlowState.risk ? orderFlowState.message : activeIntegration.mallId || "OAuth 연결 필요")}</small>
       </article>
       <article class="${tickRisk ? "is-risk" : tickStatus === "success" ? "is-hot" : ""}">
-        <span>5분 자동화</span>
-        <strong>${escapeHtml(automation.paused ? "긴급 중단" : tickStatus === "success" ? "정상" : tickStatus === "failed" ? "실패" : "대기")}</strong>
+        <span>자동화 Tick</span>
+        <strong>${escapeHtml(automation.paused ? "긴급 중단" : tickStatus === "success" ? "정상" : tickStatus === "partial_failed" ? "부분 실패" : tickStatus === "failed" ? "실패" : "대기")}</strong>
         <small>${escapeHtml(lastTickLabel)}</small>
       </article>
       <article class="${autoPollRisk ? "is-risk" : autoPollStatus === "success" ? "is-hot" : ""}">
@@ -99,7 +99,7 @@ export function renderCafe24QuickControls({ activeIntegration = {}, escapeHtml, 
       <input type="hidden" name="scopes" value="${escapeHtml(requiredScopes.join(","))}" />
       <div class="section-head section-head--compact">
         <h3>주문번호 빠른 확인</h3>
-        <p>메일에는 왔는데 큐에 없는 주문은 주문번호를 넣어 단건 재수집합니다. 자동 발주는 안전 조건을 통과한 품주만 서버 Tick에서 처리됩니다.</p>
+        <p>큐에서 찾을 수 없는 주문은 주문번호로 단건 재수집합니다. 자동 발주는 안전 조건을 통과한 품주만 서버 Tick에서 처리됩니다.</p>
       </div>
       <div class="cafe24-quick-lookup">
         <label class="form-field cafe24-control-grid__wide">

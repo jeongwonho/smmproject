@@ -91,6 +91,7 @@
     { "source": "/api", "destination": "/api/index.py?__path=/api" },
     { "source": "/api/:path*", "destination": "/api/index.py?__path=/api/:path*" },
     { "source": "/admin", "destination": "/admin.html" },
+    { "source": "/admin/", "destination": "/admin.html" },
     { "source": "/admin/:path*", "destination": "/admin.html" },
     { "source": "/:path*", "destination": "/index.html" }
   ]
