@@ -175,6 +175,15 @@ class FakeCafe24DailyFollowerProductClient:
         self.option_state.update(self._copy(updates))
         return {"option": self._copy(self.option_state)}
 
+    def update_product_variant(self, product_no, variant_code, updates):
+        self.calls.append(
+            ("update_product_variant", str(product_no), str(variant_code), self._copy(updates))
+        )
+        self._maybe_fail("update_product_variant")
+        by_code = {variant["variant_code"]: variant for variant in self.variant_state}
+        by_code[str(variant_code)].update(self._copy(updates))
+        return {"variant": self._copy(by_code[str(variant_code)])}
+
     def update_product_variants(self, product_no, updates):
         self.calls.append(("update_product_variants", str(product_no), self._copy(updates)))
         self._maybe_fail("update_product_variants")
@@ -182,6 +191,47 @@ class FakeCafe24DailyFollowerProductClient:
         for update in updates:
             by_code[update["variant_code"]].update(self._copy(update))
         return {"variants": self._copy(self.variant_state)}
+
+
+class FakeCafe24EventuallyConsistentDailyFollowerProductClient(FakeCafe24DailyFollowerProductClient):
+    def __init__(self):
+        super().__init__()
+        self._staged_stale_snapshot = None
+        self._serving_stale_snapshot = None
+
+    def _snapshot(self):
+        return {
+            "product": self._copy(self.product_state),
+            "option": self._copy(self.option_state),
+            "variants": self._copy(self.variant_state),
+        }
+
+    def product(self, product_no):
+        if self._staged_stale_snapshot is None:
+            self._serving_stale_snapshot = None
+            return super().product(product_no)
+        self.calls.append(("product", str(product_no), None))
+        self._serving_stale_snapshot = self._staged_stale_snapshot
+        self._staged_stale_snapshot = None
+        return {"product": self._copy(self._serving_stale_snapshot["product"])}
+
+    def product_options(self, product_no):
+        if self._serving_stale_snapshot is None:
+            return super().product_options(product_no)
+        self.calls.append(("product_options", str(product_no), None))
+        return {"option": self._copy(self._serving_stale_snapshot["option"])}
+
+    def product_variants(self, product_no):
+        if self._serving_stale_snapshot is None:
+            return super().product_variants(product_no)
+        self.calls.append(("product_variants", str(product_no), None))
+        response = {"variants": self._copy(self._serving_stale_snapshot["variants"])}
+        self._serving_stale_snapshot = None
+        return response
+
+    def update_product(self, product_no, updates):
+        self._staged_stale_snapshot = self._snapshot()
+        return super().update_product(product_no, updates)
 
 
 class FakeCafe24GapProductClient(FakeCafe24ProductClient):
@@ -3618,6 +3668,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         with patch.object(client, "_request", return_value={}) as request:
             client.update_product("51", {"display": "F"})
             client.update_product_options("51", {"use_additional_option": "T"})
+            client.update_product_variant("51", "P00000BZ00CV", {"additional_amount": "0.00"})
             client.update_product_variants("51", [{"variant_code": "P00000BZ00CV", "additional_amount": "0.00"}])
 
         self.assertEqual(
@@ -3636,12 +3687,17 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertFalse(request.call_args_list[1].kwargs["include_shop_no_query"])
         self.assertEqual(
             request.call_args_list[2].kwargs["payload"],
+            {"shop_no": 1, "request": {"additional_amount": "0.00"}},
+        )
+        self.assertFalse(request.call_args_list[2].kwargs["include_shop_no_query"])
+        self.assertEqual(
+            request.call_args_list[3].kwargs["payload"],
             {
                 "shop_no": 1,
                 "requests": [{"variant_code": "P00000BZ00CV", "additional_amount": "0.00"}],
             },
         )
-        self.assertFalse(request.call_args_list[2].kwargs["include_shop_no_query"])
+        self.assertFalse(request.call_args_list[3].kwargs["include_shop_no_query"])
 
     def test_cafe24_product_write_requests_do_not_put_shop_number_in_query_string(self):
         class FakeResponse:
@@ -3664,6 +3720,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         with patch("backend.integrations.cafe24.urlopen", side_effect=fake_urlopen):
             client.update_product("51", {"display": "F"})
             client.update_product_options("51", {"use_additional_option": "T"})
+            client.update_product_variant("51", "P00000BZ00CV", {"additional_amount": "0.00"})
             client.update_product_variants(
                 "51",
                 [{"variant_code": "P00000BZ00CV", "additional_amount": "0.00"}],
@@ -3674,6 +3731,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
             [
                 "https://instamart.cafe24api.com/api/v2/admin/products/51",
                 "https://instamart.cafe24api.com/api/v2/admin/products/51/options",
+                "https://instamart.cafe24api.com/api/v2/admin/products/51/variants/P00000BZ00CV",
                 "https://instamart.cafe24api.com/api/v2/admin/products/51/variants",
             ],
         )
@@ -3791,6 +3849,9 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         amounts = {variant["variant_code"]: variant["additional_amount"] for variant in fake_client.variant_state}
         self.assertEqual(amounts["P00000BZ00CV"], "0.00")
         self.assertEqual(amounts["P00000BZ00DC"], "855000.00")
+        variant_update_calls = [call for call in fake_client.calls if call[0] == "update_product_variant"]
+        self.assertEqual(len(variant_update_calls), 8)
+        self.assertEqual(variant_update_calls[-1][2], "P00000BZ00DC")
         update_calls = [call for call in fake_client.calls if call[0] == "update_product"]
         self.assertEqual(update_calls[0][2], {"display": "F", "selling": "F"})
         self.assertEqual(update_calls[-1][2], {"display": "T", "selling": "T"})
@@ -3799,6 +3860,28 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
             ("cafe24.product.daily_follower_configure",),
         ).fetchone()
         self.assertIsNotNone(audit)
+
+    def test_daily_follower_product_waits_for_cafe24_write_consistency(self):
+        self._enable_daily_follower_product_readiness()
+        fake_client = FakeCafe24EventuallyConsistentDailyFollowerProductClient()
+
+        with (
+            patch.object(self.store, "_cafe24_client_for_row", return_value=fake_client),
+            patch("core.time.sleep") as sleep,
+        ):
+            result = self.store.configure_cafe24_daily_follower_product(
+                {
+                    "integrationId": self.integration["id"],
+                    "productNo": "51",
+                    "activate": True,
+                    "_adminActor": "admin",
+                }
+            )
+
+        self.assertTrue(result["configured"])
+        self.assertTrue(result["activated"])
+        self.assertEqual(fake_client.product_state["display"], "T")
+        self.assertGreaterEqual(sleep.call_count, 2)
 
     def test_daily_follower_product_failure_forces_product_hidden(self):
         self._enable_daily_follower_product_readiness()

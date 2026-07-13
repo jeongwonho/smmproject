@@ -1774,6 +1774,17 @@ class Cafe24ApiClient:
     def product_variants(self, product_no: str) -> Any:
         return self._request("GET", f"/admin/products/{quote(str(product_no), safe='')}/variants")
 
+    def update_product_variant(self, product_no: str, variant_code: str, updates: Dict[str, Any]) -> Any:
+        return self._request(
+            "PUT",
+            (
+                f"/admin/products/{quote(str(product_no), safe='')}/variants/"
+                f"{quote(str(variant_code), safe='')}"
+            ),
+            payload={"shop_no": self.shop_no, "request": dict(updates or {})},
+            include_shop_no_query=False,
+        )
+
     def update_product_variants(self, product_no: str, updates: List[Dict[str, Any]]) -> Any:
         return self._request(
             "PUT",

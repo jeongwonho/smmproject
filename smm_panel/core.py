@@ -10372,6 +10372,33 @@ class PanelStore(PanelStoreDatabaseMixin):
                     call(lambda client: client.product_variants(product_no)),
                 )
 
+            def fetch_validated_snapshot(*, configured: bool, activated: Optional[bool]) -> Dict[str, Any]:
+                last_snapshot: Dict[str, Any] = {}
+                for attempt in range(5):
+                    responses = fetch_snapshot()
+                    last_snapshot = validate_daily_follower_snapshot(
+                        *responses,
+                        configured=configured,
+                        activated=activated,
+                    )
+                    if not last_snapshot["blockers"]:
+                        break
+                    if attempt < 4:
+                        time.sleep(0.8)
+                return last_snapshot
+
+            def wait_until_hidden() -> bool:
+                for attempt in range(5):
+                    response = call(lambda client: client.product(product_no))
+                    products = cafe24_products_from_payload(response)
+                    if products:
+                        product = products[0]
+                        if str(product.get("display") or "") == "F" and str(product.get("selling") or "") == "F":
+                            return True
+                    if attempt < 4:
+                        time.sleep(0.8)
+                return False
+
             try:
                 product_response, option_response, variant_response = fetch_snapshot()
             except Cafe24ApiError as exc:
@@ -10412,13 +10439,22 @@ class PanelStore(PanelStoreDatabaseMixin):
                 hidden_applied = True
                 call(lambda client: client.update_product(product_no, updates["product"]))
                 call(lambda client: client.update_product_options(product_no, updates["options"]))
-                call(lambda client: client.update_product_variants(product_no, updates["variants"]))
+                for variant_update in updates["variants"]:
+                    variant_code = str(variant_update.get("variant_code") or "").strip()
+                    variant_fields = {
+                        key: value
+                        for key, value in variant_update.items()
+                        if key != "variant_code"
+                    }
+                    call(
+                        lambda client, code=variant_code, fields=variant_fields: client.update_product_variant(
+                            product_no,
+                            code,
+                            fields,
+                        )
+                    )
 
-                product_response, option_response, variant_response = fetch_snapshot()
-                configured_snapshot = validate_daily_follower_snapshot(
-                    product_response,
-                    option_response,
-                    variant_response,
+                configured_snapshot = fetch_validated_snapshot(
                     configured=True,
                     activated=False,
                 )
@@ -10432,11 +10468,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                 final_snapshot = configured_snapshot
                 if activate:
                     call(lambda client: client.update_product(product_no, {"display": "T", "selling": "T"}))
-                    product_response, option_response, variant_response = fetch_snapshot()
-                    final_snapshot = validate_daily_follower_snapshot(
-                        product_response,
-                        option_response,
-                        variant_response,
+                    final_snapshot = fetch_validated_snapshot(
                         configured=True,
                         activated=True,
                     )
@@ -10499,6 +10531,8 @@ class PanelStore(PanelStoreDatabaseMixin):
                 if hidden_applied:
                     try:
                         call(lambda client: client.update_product(product_no, {"display": "F", "selling": "F"}))
+                        if not wait_until_hidden():
+                            rollback_error = "Cafe24 상품 숨김 상태를 확인하지 못했습니다."
                     except Exception as rollback_exc:
                         rollback_error = str(rollback_exc)[:500]
                 self._log_cafe24_event(
