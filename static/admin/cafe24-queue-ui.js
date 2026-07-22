@@ -154,7 +154,7 @@ export function renderCafe24AutoPollCards({ activeIntegration = {}, automation =
     : activeIntegration.lastAutoPollMessage || "외부 스케줄러 미호출";
   const nextAutoPollLabel = activeIntegration.nextAutoPollAt
     ? formatCafe24KstDateTime(activeIntegration.nextAutoPollAt)
-    : "5분 주기";
+    : "10분 주기";
   return `
     <article class="${tickRisk ? "is-risk" : tickStatus === "success" ? "is-hot" : ""}">
       <span>자동화 Tick</span>
@@ -198,9 +198,9 @@ export function renderCafe24SchedulerNotice({ origin, escapeHtml }) {
   const cronEndpoint = `${origin}/api/cron/cafe24/flow-tick`;
   return `
     <div class="admin-inline-note">
-      <strong>5분 Cafe24 주문 처리 설정</strong><br />
-      GitHub Actions 외부 스케줄러가 <code>POST ${escapeHtml(cronEndpoint)}</code>를 5분마다 호출하도록 구성되어 있습니다.
-      GitHub Actions는 서명된 OIDC 토큰을 사용하고, 다른 스케줄러를 추가할 때는 헤더 <code>Authorization: Bearer &lt;CRON_SECRET&gt;</code>를 사용하세요.
+      <strong>10분 Cafe24 주문 처리 설정</strong><br />
+      cron-job.org 외부 스케줄러가 <code>POST ${escapeHtml(cronEndpoint)}</code>를 10분마다 호출하도록 구성되어 있습니다.
+      GitHub Actions는 수동 복구 실행만 유지하며, 외부 스케줄러는 헤더 <code>Authorization: Bearer &lt;CRON_SECRET&gt;</code>를 사용하세요.
       증분 수집, preflight, 자동 발주, 공급사 상태 조회, Cafe24 구매확정을 순서대로 실행합니다.
     </div>
   `;

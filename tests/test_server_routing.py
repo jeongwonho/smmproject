@@ -505,11 +505,10 @@ class WorkflowConfigurationTest(unittest.TestCase):
         self.assertIn("warning_count", workflow)
         self.assertIn("mapping gap detail lookup returned", workflow)
 
-    def test_cafe24_order_poll_workflow_runs_flow_tick_every_five_minutes(self):
+    def test_cafe24_order_poll_workflow_is_manual_fallback_only(self):
         workflow = (APP_ROOT / ".github" / "workflows" / "cafe24-order-poll.yml").read_text()
 
-        self.assertIn("schedule:", workflow)
-        self.assertIn('cron: "*/5 * * * *"', workflow)
+        self.assertNotIn("schedule:", workflow)
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("/api/cron/cafe24/flow-tick", workflow)
         self.assertIn('"lookbackMinutes":180', workflow)
@@ -639,10 +638,11 @@ class WorkflowConfigurationTest(unittest.TestCase):
         self.assertIn("FastTraffic", source)
         self.assertIn("classic SMM", source)
 
-    def test_cafe24_scheduler_notice_mentions_github_oidc(self):
+    def test_cafe24_scheduler_notice_mentions_cron_job_secret_auth(self):
         source = (APP_ROOT / "static" / "admin" / "cafe24-queue-ui.js").read_text()
 
-        self.assertIn("OIDC", source)
+        self.assertIn("cron-job.org", source)
+        self.assertIn("10분", source)
         self.assertIn("CRON_SECRET", source)
         self.assertIn("Authorization: Bearer", source)
 

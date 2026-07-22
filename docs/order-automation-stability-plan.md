@@ -6,7 +6,7 @@
 
 ```mermaid
 flowchart LR
-    A["GitHub Actions 5분 Cafe24 Flow Tick"] --> B["/api/cron/cafe24/flow-tick"]
+    A["cron-job.org 10분 Cafe24 Flow Tick"] --> B["/api/cron/cafe24/flow-tick"]
     B --> C["Cafe24 cursor 기반 증분 수집"]
     C --> D["결제/취소/매핑/필드 검증"]
     D --> E["preflight 통과 주문 자동 발주"]
@@ -37,10 +37,12 @@ flowchart LR
 
 ## Cron 운영 기준
 
-### GitHub Actions
+### 외부 스케줄러
 
 - `smm_panel/.github/workflows/cafe24-order-poll.yml`
-  - 5분마다 `/api/cron/cafe24/flow-tick` 호출
+  - GitHub Actions 자동 스케줄은 비활성화하고 `workflow_dispatch` 수동 복구만 유지
+- cron-job.org
+  - 10분마다 `/api/cron/cafe24/flow-tick` 호출
   - 운영 payload:
     - `lookbackMinutes=180`
     - `useCursor=true`
@@ -106,7 +108,7 @@ flowchart LR
 
 - `/api/health`가 HTTP 200을 반환한다.
 - GitHub Actions `Cafe24 Flow Tick` 최근 실행이 success다.
-- 관리자 Cafe24 탭의 마지막 자동 수집 시각이 5분 단위로 갱신된다.
+- 관리자 Cafe24 탭의 마지막 자동 수집 시각이 10분 단위로 갱신된다.
 - Cafe24 flow tick의 증분 수집 결과 `responseOrderCount`, `storedOrderItemCount`가 실제 신규 주문과 일치한다.
 - `reviewRequiredCount`가 존재하면 매핑/필드/서비스 ID를 우선 점검한다.
 - MKT24 공급사 서비스 동기화 결과가 service count `0`이 아니다.
