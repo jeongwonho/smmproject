@@ -214,6 +214,8 @@ class RequestRateLimiter:
             "link_preview": (30, 60),
             "charge": (12, 60),
             "analytics": (180, 60),
+            "order_progress": (6, 60),
+            "order_progress_active": (6, 60),
             "auth": (18, 60),
             "admin_login": (8, 15 * 60),
         }
@@ -578,10 +580,18 @@ def render_index_html(store: PanelStore, request_path: str, config: AppConfig) -
     favicon_url = str(settings.get("faviconUrl") or "").strip()
     share_image_url = str(settings.get("shareImageUrl") or "").strip()
     is_admin = request_path == "/admin" or request_path.startswith("/admin/")
-    title = f"{site_name} Admin Console" if is_admin else site_name
+    is_order_progress = request_path == "/order-progress" or request_path.startswith("/order-progress/")
+    is_private_page = is_admin or is_order_progress
+    title = (
+        f"{site_name} Admin Console"
+        if is_admin
+        else f"주문 진행 현황 | {site_name}"
+        if is_order_progress
+        else site_name
+    )
 
     head_parts = ['<meta name="theme-color" content="#4c76ff" />']
-    if is_admin:
+    if is_private_page:
         head_parts.append('<meta name="robots" content="noindex, nofollow, noarchive, nosnippet, noimageindex" />')
         head_parts.append('<meta name="googlebot" content="noindex, nofollow, noarchive, nosnippet, noimageindex" />')
     else:
@@ -631,6 +641,8 @@ def render_index_html(store: PanelStore, request_path: str, config: AppConfig) -
             '<link rel="stylesheet" href="/static/styles/public.css" data-surface-style="public" />',
             '<link rel="stylesheet" href="/static/styles/admin.css" data-surface-style="admin" />',
         )
+    elif is_order_progress:
+        document = document.replace('data-route-surface="public"', 'data-route-surface="order-progress"')
     return document.replace("<!-- SMM_MANAGED_HEAD -->", head_markup)
 
 
@@ -802,7 +814,13 @@ class AppHandler(SimpleHTTPRequestHandler):
 
     def _robots_blocked_path(self) -> bool:
         request_path = self._request_path or "/"
-        return request_path == "/admin" or request_path.startswith("/admin/") or request_path.startswith("/api/admin/")
+        return (
+            request_path == "/admin"
+            or request_path.startswith("/admin/")
+            or request_path == "/order-progress"
+            or request_path.startswith("/order-progress/")
+            or request_path.startswith("/api/admin/")
+        )
 
     def _disable_static_cache(self) -> bool:
         request_path = self._request_path or "/"
@@ -1260,7 +1278,8 @@ class AppHandler(SimpleHTTPRequestHandler):
     @route("GET", "/api/admin/cafe24-analytics", auth="admin")
     def _get_admin_cafe24_analytics(self, request: RouteRequest) -> None:
         range_id = self._query_value(request, "range", "30d")
-        write_json(self, 200, {"ok": True, **get_cafe24_ga4_analytics(range_id)})
+        customer_mix = self._server().store.cafe24_customer_mix(range_id)
+        write_json(self, 200, {"ok": True, **get_cafe24_ga4_analytics(range_id, customer_mix)})
 
     @route("GET", "/api/cron/cafe24/operational-audit", auth="cron")
     def _get_cron_cafe24_operational_audit(self, request: RouteRequest) -> None:
@@ -1733,6 +1752,40 @@ class AppHandler(SimpleHTTPRequestHandler):
         user_id = str(request.public_session["user"]["id"]) if request.public_session else ""
         write_json(self, 200, self._server().store.create_order(request.payload, user_id))
 
+    @route("POST", "/api/order-progress/lookup", trusted_origin=True, read_json_body=True)
+    def _post_order_progress_lookup(self, request: RouteRequest) -> None:
+        self._enforce_rate_limit(
+            "order_progress",
+            "조회 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.",
+        )
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                **self._server().store.lookup_public_order_progress(request.payload),
+            },
+            cache_control="no-store",
+        )
+
+    @route("POST", "/api/order-progress/active", trusted_origin=True, read_json_body=True)
+    def _post_active_order_progress_lookup(self, request: RouteRequest) -> None:
+        self._enforce_rate_limit(
+            "order_progress_active",
+            "전체 주문 조회 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.",
+        )
+        write_json(
+            self,
+            200,
+            {
+                "ok": True,
+                **self._server().store.lookup_public_active_order_progress(
+                    request.payload
+                ),
+            },
+            cache_control="no-store",
+        )
+
     @route("POST", "/api/charge-orders", auth="public", csrf=True, trusted_origin=True, read_json_body=True)
     def _post_charge_orders(self, request: RouteRequest) -> None:
         self._enforce_rate_limit("charge", "충전 요청이 너무 많습니다. {retry_after}초 후 다시 시도해 주세요.")
@@ -1937,6 +1990,10 @@ class AppHandler(SimpleHTTPRequestHandler):
     @route("POST", "/api/admin/cafe24/order-items/dispatch", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
     def _post_admin_cafe24_order_items_dispatch(self, request: RouteRequest) -> None:
         self._write_store_result("dispatch_cafe24_order_item", request.payload)
+
+    @route("POST", "/api/admin/cafe24/order-items/correction-dispatch", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_order_items_correction_dispatch(self, request: RouteRequest) -> None:
+        self._write_store_result("dispatch_cafe24_correction_order", request.payload)
 
     @route("POST", "/api/admin/cafe24/order-items/resync", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
     def _post_admin_cafe24_order_items_resync(self, request: RouteRequest) -> None:

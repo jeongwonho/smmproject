@@ -7,11 +7,12 @@ from backend.cafe24_analytics import get_cafe24_ga4_analytics
 
 class Cafe24AnalyticsTest(unittest.TestCase):
     def test_missing_configuration_returns_empty_unavailable_payload(self):
+        customer_mix = {"segments": [{"key": "new", "orders": 2}], "knownOrders": 2}
         with patch(
             "backend.cafe24_analytics._analytics_config",
             return_value={"propertyId": "", "clientEmail": "", "privateKey": ""},
         ):
-            payload = get_cafe24_ga4_analytics("30d")
+            payload = get_cafe24_ga4_analytics("30d", customer_mix)
 
         self.assertEqual(payload["source"], "unavailable")
         self.assertFalse(payload["connected"])
@@ -19,6 +20,7 @@ class Cafe24AnalyticsTest(unittest.TestCase):
         self.assertEqual(payload["overview"]["revenue"], 0)
         self.assertEqual(payload["channels"], [])
         self.assertEqual(payload["trend"], [])
+        self.assertEqual(payload["customerMix"], customer_mix)
 
     def test_ga4_reports_are_requested_in_parallel(self):
         barrier = threading.Barrier(6)

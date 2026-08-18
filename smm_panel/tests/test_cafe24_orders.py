@@ -753,6 +753,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
 
     def test_cafe24_item_normalizes_to_supplier_payload_without_internal_product(self):
         order_payload = self._order_payload()
+        order_payload["first_order"] = "T"
         result = self.store._process_cafe24_item(
             self.conn,
             integration=self._integration_row(),
@@ -771,6 +772,7 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(item["payment_method"], "card")
         self.assertEqual(item["payment_amount"], 15000)
         self.assertEqual(item["payment_paid_at"], "2026-04-27T10:11:00+09:00")
+        self.assertEqual(item["first_order"], "T")
         self.assertEqual(item["payment_reference"], "TID-123")
         self.assertEqual(item["supplier_id"], "supplier_test")
         self.assertEqual(item["supplier_service_id"], "supplier_service_test")
@@ -780,6 +782,41 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertNotIn("username", supplier_payload)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM balance_transactions").fetchone()[0], 0)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM wallet_ledger").fetchone()[0], 0)
+
+    def test_customer_mix_counts_orders_once_and_separates_new_returning(self):
+        recent_paid_at = dt.datetime.now().astimezone().replace(microsecond=0)
+        first = self._order_payload()
+        first["first_order"] = "T"
+        first["payment"]["paid_amount"] = "15000"
+        first["payment"]["payment_date"] = (recent_paid_at - dt.timedelta(days=1)).isoformat()
+        first["items"].append({**first["items"][0], "order_item_code": "20260426-000001-02"})
+        second = self._order_payload()
+        second["order_id"] = "20260427-000002"
+        second["first_order"] = "F"
+        second["payment"]["paid_amount"] = "24000"
+        second["payment"]["payment_date"] = recent_paid_at.isoformat()
+        second["items"][0]["order_item_code"] = "20260427-000002-01"
+
+        for order_payload in (first, second):
+            for index, item_payload in enumerate(order_payload["items"]):
+                self.store._process_cafe24_item(
+                    self.conn,
+                    integration=self._integration_row(),
+                    order_payload=order_payload,
+                    item_payload=item_payload,
+                    index=index,
+                    submit_ready=False,
+                )
+        self.conn.commit()
+
+        mix = self.store.cafe24_customer_mix("90d")
+        segments = {segment["key"]: segment for segment in mix["segments"]}
+
+        self.assertEqual(segments["new"]["orders"], 1)
+        self.assertEqual(segments["new"]["revenue"], 15000)
+        self.assertEqual(segments["returning"]["orders"], 1)
+        self.assertEqual(segments["returning"]["revenue"], 24000)
+        self.assertEqual(mix["repeatOrderRate"], 0.5)
 
     def test_cafe24_quantity_option_text_extracts_ordered_count(self):
         samples = {
@@ -923,6 +960,131 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         supplier_payload = json.loads(item["supplier_payload_json"])
         self.assertEqual(normalized_fields["orderedCount"], "250")
         self.assertEqual(supplier_payload["quantity"], "250")
+
+    def test_cafe24_option_quantity_multiplies_line_item_quantity(self):
+        self.conn.execute(
+            """
+            UPDATE cafe24_supplier_mappings
+            SET field_mapping_json = ?
+            WHERE mall_id = ?
+            """,
+            (
+                json.dumps(
+                    {
+                        "targetValue": "option:계정",
+                        "orderedCount": {
+                            "source": "option",
+                            "label": "횟수",
+                            "extract": "quantity_number",
+                            "fallback": "item.quantity",
+                        },
+                    }
+                ),
+                "instamart",
+            ),
+        )
+        self.conn.commit()
+        order_payload = self._order_payload()
+        order_payload["items"][0]["quantity"] = 2
+        order_payload["items"][0]["options"] = [
+            {"name": "계정", "value": "instamart_official"},
+            {"name": "횟수", "value": "1000회"},
+        ]
+
+        result = self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+
+        self.assertEqual(result["status"], "ready_to_submit")
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        normalized_fields = json.loads(item["normalized_fields_json"])
+        supplier_payload = json.loads(item["supplier_payload_json"])
+        self.assertEqual(normalized_fields["orderedCount"], "2000")
+        self.assertEqual(supplier_payload["quantity"], "2000")
+
+    def test_cafe24_auto_detected_option_quantity_multiplies_line_item_quantity(self):
+        self.conn.execute(
+            """
+            UPDATE cafe24_supplier_mappings
+            SET field_mapping_json = ?
+            WHERE mall_id = ?
+            """,
+            (json.dumps({"targetValue": "option:계정"}), "instamart"),
+        )
+        self.conn.commit()
+        order_payload = self._order_payload()
+        order_payload["items"][0]["quantity"] = 2
+        order_payload["items"][0]["options"] = [
+            {"name": "계정", "value": "instamart_official"},
+            {"name": "횟수", "value": "1000회"},
+        ]
+
+        result = self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+
+        self.assertEqual(result["status"], "ready_to_submit")
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        normalized_fields = json.loads(item["normalized_fields_json"])
+        supplier_payload = json.loads(item["supplier_payload_json"])
+        self.assertEqual(normalized_fields["orderedCount"], "2000")
+        self.assertEqual(supplier_payload["quantity"], "2000")
+
+    def test_cafe24_item_quantity_mapping_is_not_multiplied_twice(self):
+        self.conn.execute(
+            """
+            UPDATE cafe24_supplier_mappings
+            SET field_mapping_json = ?
+            WHERE mall_id = ?
+            """,
+            (
+                json.dumps(
+                    {
+                        "targetValue": "option:계정",
+                        "orderedCount": {
+                            "source": "item",
+                            "field": "quantity",
+                        },
+                    }
+                ),
+                "instamart",
+            ),
+        )
+        self.conn.commit()
+        order_payload = self._order_payload()
+        order_payload["items"][0]["quantity"] = 2
+        order_payload["items"][0]["options"] = [
+            {"name": "계정", "value": "instamart_official"},
+        ]
+
+        result = self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+
+        self.assertEqual(result["status"], "ready_to_submit")
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        normalized_fields = json.loads(item["normalized_fields_json"])
+        supplier_payload = json.loads(item["supplier_payload_json"])
+        self.assertEqual(normalized_fields["orderedCount"], "2")
+        self.assertEqual(supplier_payload["quantity"], "2")
 
     def test_cafe24_duplicate_quantity_options_require_manual_review(self):
         self.conn.execute(
@@ -1566,6 +1728,125 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(item["supplier_order_uuid"], "SUP-1001")
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM orders WHERE order_channel = 'cafe24'").fetchone()[0], 0)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM wallet_ledger").fetchone()[0], 0)
+
+    def test_completed_cafe24_item_correction_dispatches_missing_quantity_once(self):
+        self.conn.execute(
+            "UPDATE cafe24_supplier_mappings SET field_mapping_json = ? WHERE mall_id = ?",
+            (
+                json.dumps(
+                    {
+                        "targetValue": "option:계정",
+                        "orderedCount": {"source": "option", "label": "횟수", "extract": "quantity_number"},
+                    }
+                ),
+                "instamart",
+            ),
+        )
+        self.conn.commit()
+        order_payload = self._order_payload()
+        order_payload["items"][0]["quantity"] = 2
+        order_payload["items"][0]["options"] = [
+            {"name": "계정", "value": "https://www.instagram.com/reel/example/"},
+            {"name": "횟수", "value": "1000회"},
+        ]
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        normalized_fields = json.loads(item["normalized_fields_json"])
+        supplier_payload = json.loads(item["supplier_payload_json"])
+        normalized_fields["orderedCount"] = "1000"
+        supplier_payload["quantity"] = "1000"
+        self.conn.execute(
+            """
+            UPDATE cafe24_order_items
+            SET normalized_fields_json = ?, supplier_payload_json = ?, standard_status = 'completed',
+                supplier_order_uuid = 'ORIGINAL-1', supplier_response_json = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps(normalized_fields),
+                json.dumps(supplier_payload),
+                json.dumps({"order": "ORIGINAL-1", "status": "completed", "remains": 0}),
+                item["id"],
+            ),
+        )
+        self.conn.commit()
+        request = {
+            "itemId": item["id"],
+            "expectedTotal": 2000,
+            "correctionQuantity": 1000,
+            "reason": "Cafe24 품목 수량 곱셈 누락 보정",
+            "confirmCorrectionDispatch": True,
+            "_adminActor": "qa",
+        }
+
+        with patch("core.SupplierApiClient.order", return_value={"order": "CORRECTION-1"}) as order_call:
+            result = self.store.dispatch_cafe24_correction_order(request)
+            duplicate = self.store.dispatch_cafe24_correction_order(request)
+
+        self.assertTrue(result["submitted"])
+        self.assertFalse(result["duplicate"])
+        self.assertEqual(result["supplierOrderUuid"], "CORRECTION-1")
+        self.assertTrue(duplicate["submitted"])
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(duplicate["supplierOrderUuid"], "CORRECTION-1")
+        order_call.assert_called_once()
+        correction_payload = order_call.call_args.args[0]
+        self.assertEqual(correction_payload["quantity"], "1000")
+        self.assertEqual(correction_payload["service"], "svc-1001")
+        saved_item = self.conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item["id"],)).fetchone()
+        self.assertEqual(saved_item["standard_status"], "completed")
+        self.assertEqual(saved_item["supplier_order_uuid"], "ORIGINAL-1")
+        event = self.conn.execute(
+            "SELECT * FROM cafe24_api_events WHERE event_type = 'supplier.correction_dispatch'"
+        ).fetchone()
+        self.assertEqual(event["status"], "success")
+
+    def test_cafe24_correction_dispatch_rejects_quantity_mismatch(self):
+        order_payload = self._order_payload()
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        item_id = self.conn.execute("SELECT id FROM cafe24_order_items").fetchone()["id"]
+        self.conn.execute(
+            """
+            UPDATE cafe24_order_items
+            SET standard_status = 'completed', supplier_order_uuid = 'ORIGINAL-1'
+            WHERE id = ?
+            """,
+            (item_id,),
+        )
+        self.conn.commit()
+
+        with patch("core.SupplierApiClient.order") as order_call:
+            with self.assertRaises(PanelError) as raised:
+                self.store.dispatch_cafe24_correction_order(
+                    {
+                        "itemId": item_id,
+                        "expectedTotal": 2,
+                        "correctionQuantity": 1,
+                        "reason": "잘못된 보정",
+                        "confirmCorrectionDispatch": True,
+                    }
+                )
+
+        self.assertEqual(raised.exception.status, 409)
+        order_call.assert_not_called()
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM cafe24_api_events WHERE event_type = 'supplier.correction_dispatch'").fetchone()[0],
+            0,
+        )
 
     def test_instagram_panel_payload_converts_bare_dotted_account_to_profile_url(self):
         payload = self.store._build_supplier_order_payload(

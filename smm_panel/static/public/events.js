@@ -1,3 +1,9 @@
+import {
+  handleOrderProgressInput,
+  handleOrderProgressSubmit,
+  handleOrderProgressViewClick,
+} from "./order-progress.js";
+
 const PUBLIC_EVENT_HANDLED = "__instamartPublicHandled";
 
 function markHandled(event) {
@@ -35,6 +41,9 @@ export function registerPublicEvents(ctx) {
 }
 
 async function handlePublicClick(event, ctx) {
+  if (await handleOrderProgressViewClick(event, ctx)) {
+    return true;
+  }
   const {
     apiPost, blankChargeDraft, calculateSummary, chargeAmountSummary, chargeMethodConfig, clearPublicSessionState,
     closeChargeDetail, closeLoginModal, closePopupForSession, createOrderIdempotencyKey, currentSignupState,
@@ -294,6 +303,9 @@ async function handlePublicClick(event, ctx) {
 }
 
 function handlePublicInput(event, ctx) {
+  if (handleOrderProgressInput(event, ctx)) {
+    return true;
+  }
   const { closeChargeDetail, ensureChargeDraft, ensureSelection, getPreviewSource, getRoute, getSelectedProduct, parseCurrencyInput, renderRoute, scheduleLinkPreview, state, updateLiveSummary, updateSignupPasswordFeedback, currentSignupState } = ctx;
   const target = event.target;
   if (target.matches("[data-signup-email-input]")) {
@@ -412,6 +424,9 @@ function handlePublicChange(event, ctx) {
 }
 
 async function handlePublicSubmit(event, ctx) {
+  if (await handleOrderProgressSubmit(event, ctx)) {
+    return true;
+  }
   const { apiPost, blankChargeDraft, calculateSummary, chargeAmountSummary, chargeMethodConfig, closeLoginModal, createOrderIdempotencyKey, currentSignupState, ensureChargeDraft, ensureSelection, formatMoney, getOrderValidationState, getRoute, isLoggedIn, navigate, openChargeDetail, postAuthRedirectPath, refreshCoreData, renderRoute, resetSignupFlow, showToast, state } = ctx;
   const form = event.target;
   if (form.matches("[data-public-login-form]")) {

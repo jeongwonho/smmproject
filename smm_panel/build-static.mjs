@@ -24,6 +24,11 @@ const adminManagedHead = [
   '<meta name="googlebot" content="noindex, nofollow, noarchive, nosnippet, noimageindex" />',
   '<meta name="description" content="인스타마트 관리자 콘솔" />',
 ].join("\n    ");
+const orderProgressManagedHead = [
+  '<meta name="robots" content="noindex, nofollow, noarchive, nosnippet, noimageindex" />',
+  '<meta name="googlebot" content="noindex, nofollow, noarchive, nosnippet, noimageindex" />',
+  '<meta name="theme-color" content="#2c5de5" />',
+].join("\n    ");
 
 async function build() {
   await runArchitectureCheck({ root: __dirname });
@@ -54,6 +59,12 @@ async function build() {
       '<link rel="stylesheet" href="/static/styles/admin.css" data-surface-style="admin" />'
     );
   await writeFile(path.join(distDir, "admin.html"), adminHtml, "utf8");
+
+  const orderProgressHtml = indexHtml
+    .replace("<title>인스타마트</title>", "<title>주문 진행 현황 | 인스타마트</title>")
+    .replace(publicManagedHead, orderProgressManagedHead)
+    .replaceAll('data-route-surface="public"', 'data-route-surface="order-progress"');
+  await writeFile(path.join(distDir, "order-progress.html"), orderProgressHtml, "utf8");
 }
 
 build().catch((error) => {

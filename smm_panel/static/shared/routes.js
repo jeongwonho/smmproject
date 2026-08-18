@@ -10,6 +10,7 @@ export function parseRoute(pathname, normalizeAdminSectionId) {
   if (normalizedPath.startsWith("/products/")) return { name: "detail", id: decodeURIComponent(normalizedPath.split("/")[2]) };
   if (normalizedPath === "/auth") return { name: "auth", mode: "login" };
   if (normalizedPath === "/auth/signup") return { name: "auth", mode: "signup" };
+  if (normalizedPath === "/order-progress") return { name: "orderProgress" };
   if (normalizedPath === "/help") return { name: "help" };
   if (normalizedPath === "/legal/terms") return { name: "legal", documentKey: "terms" };
   if (normalizedPath === "/legal/privacy") return { name: "legal", documentKey: "privacy" };

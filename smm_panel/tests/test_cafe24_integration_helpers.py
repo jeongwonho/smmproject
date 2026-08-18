@@ -14,6 +14,7 @@ from backend.integrations.cafe24 import (
     cafe24_auto_poll_due,
     cafe24_dispatch_request_context,
     cafe24_enriched_product_payload,
+    cafe24_first_order_from_payload,
     cafe24_integration_payload_from_row,
     cafe24_missing_required_order_flow_scopes,
     cafe24_item_identity,
@@ -107,6 +108,11 @@ from backend.integrations.supplier_targets import (
 
 
 class Cafe24IntegrationHelperTest(unittest.TestCase):
+    def test_first_order_normalizes_supported_cafe24_values(self):
+        self.assertEqual(cafe24_first_order_from_payload({"first_order": "T"}), "T")
+        self.assertEqual(cafe24_first_order_from_payload({"firstOrder": False}), "F")
+        self.assertEqual(cafe24_first_order_from_payload({"first_order": "unknown"}), "")
+
     def test_audit_runtime_mode_does_not_label_vercel_production_as_local(self):
         self.assertEqual(
             resolve_cafe24_audit_runtime_mode("", production_runtime=True),

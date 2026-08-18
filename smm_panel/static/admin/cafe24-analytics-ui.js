@@ -61,6 +61,11 @@ export function renderCafe24GaAnalyticsTab({
   const eventHealth = Array.isArray(analytics.eventHealth) ? analytics.eventHealth : [];
   const recommendations = Array.isArray(analytics.recommendations) ? analytics.recommendations : [];
   const setupChecklist = Array.isArray(analytics.setupChecklist) ? analytics.setupChecklist : [];
+  const customerMix = analytics.customerMix || {};
+  const customerSegments = Array.isArray(customerMix.segments) ? customerMix.segments : [];
+  const newCustomers = customerSegments.find((item) => item.key === "new") || {};
+  const returningCustomers = customerSegments.find((item) => item.key === "returning") || {};
+  const unknownCustomers = customerSegments.find((item) => item.key === "unknown") || {};
   const beginCheckout = funnel.find((item) => item.key === "begin_checkout")?.count || 0;
   const purchaseCount = overview.purchaseCount || funnel.find((item) => item.key === "purchase")?.count || 0;
   const checkoutToPurchaseRate = beginCheckout ? purchaseCount / beginCheckout : 0;
@@ -77,6 +82,15 @@ export function renderCafe24GaAnalyticsTab({
         { label: "결제시작 → 구매", value: formatRatioPercent(checkoutToPurchaseRate, 1), detail: `결제시작 ${formatNumber(beginCheckout)}건` },
         { label: "광고비", value: formatMoney(adSpend), detail: `CPA ${formatMoney(overview.costPerPurchase || 0)}` },
         { label: "ROAS", value: `${roas.toFixed(roas >= 10 ? 0 : 2)}x`, detail: adSpend > 0 ? "광고비 대비 매출" : "광고비 데이터 대기" },
+      ])}
+
+      ${renderAnalyticsOverviewCards([
+        { label: "신규 고객 주문", value: `${formatNumber(newCustomers.orders || 0)}건`, detail: `매출 ${formatMoney(newCustomers.revenue || 0)}` },
+        { label: "재구매 주문", value: `${formatNumber(returningCustomers.orders || 0)}건`, detail: `매출 ${formatMoney(returningCustomers.revenue || 0)}` },
+        { label: "재구매율", value: formatRatioPercent(customerMix.repeatOrderRate || 0, 1), detail: `판정 완료 ${formatNumber(customerMix.knownOrders || 0)}건 기준` },
+        { label: "신규 객단가", value: formatMoney(newCustomers.averageOrderValue || 0), detail: "Cafe24 실결제 기준" },
+        { label: "재구매 객단가", value: formatMoney(returningCustomers.averageOrderValue || 0), detail: "Cafe24 실결제 기준" },
+        { label: "판정 대기", value: `${formatNumber(unknownCustomers.orders || 0)}건`, detail: "기존 적재 주문 또는 API 값 없음" },
       ])}
 
       <div class="admin-analytics-grid admin-analytics-grid--split">

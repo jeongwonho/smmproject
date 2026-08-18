@@ -19,6 +19,7 @@ from .cafe24_quantity import (
     Cafe24QuantityAmbiguousError,
     coerce_cafe24_ordered_count_mapping_value,
     default_cafe24_ordered_count,
+    multiply_cafe24_ordered_count_for_item,
     resolve_cafe24_quantity_candidates,
 )
 
@@ -44,6 +45,13 @@ def coerce_cafe24_ordered_count_mapping_value_for_panel(value: Any, *, label: st
 def default_cafe24_ordered_count_for_panel(item_payload: Dict[str, Any], option_entries: List[Dict[str, str]]) -> str:
     try:
         return default_cafe24_ordered_count(item_payload, option_entries)
+    except Cafe24QuantityAmbiguousError as exc:
+        raise PanelError(str(exc)) from exc
+
+
+def multiply_cafe24_ordered_count_for_item_for_panel(value: Any, item_payload: Dict[str, Any]) -> str:
+    try:
+        return multiply_cafe24_ordered_count_for_item(value, item_payload)
     except Cafe24QuantityAmbiguousError as exc:
         raise PanelError(str(exc)) from exc
 

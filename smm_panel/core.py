@@ -109,6 +109,7 @@ try:
         cafe24_default_poll_window as _cafe24_default_poll_window,
         cafe24_dispatch_request_context,
         cafe24_enriched_product_payload,
+        cafe24_first_order_from_payload,
         cafe24_integration_payload_from_row,
         cafe24_item_identity,
         cafe24_missing_required_order_flow_scopes,
@@ -193,6 +194,7 @@ try:
         cafe24_validate_manual_input_supplier_for_panel,
         coerce_cafe24_ordered_count_mapping_value_for_panel,
         default_cafe24_ordered_count_for_panel,
+        multiply_cafe24_ordered_count_for_item_for_panel,
         resolve_cafe24_quantity_candidates_for_panel,
         validate_cafe24_direct_fields_for_panel,
     )
@@ -201,6 +203,15 @@ try:
         build_cafe24_order_item_preflight,
         cafe24_preflight_quantity,
         redact_cafe24_preview_value,
+    )
+    from .backend.integrations.cafe24_progress import (
+        PUBLIC_ACTIVE_ORDER_CANDIDATE_LIMIT,
+        PUBLIC_ACTIVE_ORDER_LOOKUP_MAX_ITEMS,
+        PUBLIC_ACTIVE_ORDER_LOOKUP_MAX_ORDERS,
+        PUBLIC_ORDER_LOOKUP_MAX_ITEMS,
+        build_public_order_progress_item,
+        normalize_public_order_lookup,
+        public_order_identity_matches,
     )
     from .backend.integrations.cafe24_quantity import (
         cafe24_quantity_candidates_from_options,
@@ -328,6 +339,7 @@ except ImportError:  # pragma: no cover - top-level script runtime
         cafe24_default_poll_window as _cafe24_default_poll_window,
         cafe24_dispatch_request_context,
         cafe24_enriched_product_payload,
+        cafe24_first_order_from_payload,
         cafe24_integration_payload_from_row,
         cafe24_item_identity,
         cafe24_missing_required_order_flow_scopes,
@@ -412,6 +424,7 @@ except ImportError:  # pragma: no cover - top-level script runtime
         cafe24_validate_manual_input_supplier_for_panel,
         coerce_cafe24_ordered_count_mapping_value_for_panel,
         default_cafe24_ordered_count_for_panel,
+        multiply_cafe24_ordered_count_for_item_for_panel,
         resolve_cafe24_quantity_candidates_for_panel,
         validate_cafe24_direct_fields_for_panel,
     )
@@ -420,6 +433,15 @@ except ImportError:  # pragma: no cover - top-level script runtime
         build_cafe24_order_item_preflight,
         cafe24_preflight_quantity,
         redact_cafe24_preview_value,
+    )
+    from backend.integrations.cafe24_progress import (
+        PUBLIC_ACTIVE_ORDER_CANDIDATE_LIMIT,
+        PUBLIC_ACTIVE_ORDER_LOOKUP_MAX_ITEMS,
+        PUBLIC_ACTIVE_ORDER_LOOKUP_MAX_ORDERS,
+        PUBLIC_ORDER_LOOKUP_MAX_ITEMS,
+        build_public_order_progress_item,
+        normalize_public_order_lookup,
+        public_order_identity_matches,
     )
     from backend.integrations.cafe24_quantity import (
         cafe24_quantity_candidates_from_options,
@@ -1352,6 +1374,7 @@ CREATE TABLE IF NOT EXISTS cafe24_order_items (
     cafe24_variant_code TEXT NOT NULL DEFAULT '',
     cafe24_custom_product_code TEXT NOT NULL DEFAULT '',
     cafe24_order_date TEXT NOT NULL DEFAULT '',
+    first_order TEXT NOT NULL DEFAULT '',
     buyer_name TEXT NOT NULL DEFAULT '',
     buyer_email TEXT NOT NULL DEFAULT '',
     buyer_phone TEXT NOT NULL DEFAULT '',
@@ -4419,6 +4442,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                 cafe24_variant_code TEXT NOT NULL DEFAULT '',
                 cafe24_custom_product_code TEXT NOT NULL DEFAULT '',
                 cafe24_order_date TEXT NOT NULL DEFAULT '',
+                first_order TEXT NOT NULL DEFAULT '',
                 buyer_name TEXT NOT NULL DEFAULT '',
                 buyer_email TEXT NOT NULL DEFAULT '',
                 buyer_phone TEXT NOT NULL DEFAULT '',
@@ -8693,6 +8717,411 @@ class PanelStore(PanelStoreDatabaseMixin):
             }
         return result
 
+    def _public_order_progress_rows_for_lookup(
+        self,
+        conn: DatabaseConnection,
+        lookup: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        integrations = conn.execute(
+            """
+            SELECT mall_id, shop_no
+            FROM cafe24_integrations
+            GROUP BY mall_id, shop_no
+            ORDER BY MAX(is_active) DESC, MAX(updated_at) DESC
+            """
+        ).fetchall()
+        rows: List[Dict[str, Any]] = []
+        for integration in integrations:
+            remaining = PUBLIC_ORDER_LOOKUP_MAX_ITEMS - len(rows)
+            if remaining <= 0:
+                break
+            matched = conn.execute(
+                """
+                SELECT
+                    coi.*,
+                    p.name AS internal_product_name,
+                    p.option_name AS internal_option_name
+                FROM cafe24_order_items coi
+                LEFT JOIN products p ON p.id = coi.product_id
+                WHERE coi.mall_id = ?
+                  AND coi.shop_no = ?
+                  AND coi.cafe24_order_id = ?
+                ORDER BY coi.updated_at DESC, coi.cafe24_order_item_code ASC
+                LIMIT ?
+                """,
+                (
+                    integration["mall_id"],
+                    int(integration["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                    lookup["orderNumber"],
+                    remaining,
+                ),
+            ).fetchall()
+            rows.extend(dict(row) for row in matched)
+        if integrations:
+            return rows
+        return [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT
+                    coi.*,
+                    p.name AS internal_product_name,
+                    p.option_name AS internal_option_name
+                FROM cafe24_order_items coi
+                LEFT JOIN products p ON p.id = coi.product_id
+                WHERE coi.cafe24_order_id = ?
+                ORDER BY coi.updated_at DESC, coi.cafe24_order_item_code ASC
+                LIMIT ?
+                """,
+                (lookup["orderNumber"], PUBLIC_ORDER_LOOKUP_MAX_ITEMS),
+            ).fetchall()
+        ]
+
+    def _public_order_progress_identity_group(
+        self,
+        rows: List[Dict[str, Any]],
+        lookup: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        grouped_rows: Dict[Tuple[str, int], List[Dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            group_key = (
+                str(row.get("mall_id") or ""),
+                int(row.get("shop_no") or CAFE24_DEFAULT_SHOP_NO),
+            )
+            grouped_rows[group_key].append(row)
+        for group in grouped_rows.values():
+            identity_rows = [
+                row
+                for row in group
+                if str(row.get("buyer_name") or "").strip()
+                and str(row.get("buyer_phone") or "").strip()
+            ]
+            if identity_rows and all(
+                public_order_identity_matches(
+                    row,
+                    buyer_name=lookup["buyerName"],
+                    phone_number=lookup["phoneNumber"],
+                )
+                for row in identity_rows
+            ):
+                return group
+        return []
+
+    def _public_order_progress_split_jobs(
+        self,
+        conn: DatabaseConnection,
+        item_ids: List[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        clean_ids = [
+            str(item_id or "").strip()
+            for item_id in item_ids
+            if str(item_id or "").strip()
+        ]
+        if not clean_ids:
+            return {}
+        placeholders = ",".join("?" for _ in clean_ids)
+        job_rows = conn.execute(
+            f"""
+            SELECT *
+            FROM cafe24_split_jobs
+            WHERE cafe24_order_item_id IN ({placeholders})
+            """,
+            clean_ids,
+        ).fetchall()
+        job_ids = [str(job["id"]) for job in job_rows]
+        parts_by_job: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        if job_ids:
+            part_placeholders = ",".join("?" for _ in job_ids)
+            part_rows = conn.execute(
+                f"""
+                SELECT *
+                FROM cafe24_split_job_parts
+                WHERE split_job_id IN ({part_placeholders})
+                ORDER BY split_job_id ASC, sequence ASC
+                """,
+                job_ids,
+            ).fetchall()
+            for raw_part in part_rows:
+                part = dict(raw_part)
+                part["supplier_response"] = parse_json(
+                    part.get("supplier_response_json"),
+                    {},
+                )
+                parts_by_job[str(part.get("split_job_id") or "")].append(part)
+        split_jobs: Dict[str, Dict[str, Any]] = {}
+        for raw_job in job_rows:
+            job = dict(raw_job)
+            job["parts"] = parts_by_job.get(str(job.get("id") or ""), [])
+            split_jobs[str(job.get("cafe24_order_item_id") or "")] = job
+        return split_jobs
+
+    def _public_order_progress_item(
+        self,
+        row: Dict[str, Any],
+        split_job: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        item_row = dict(row)
+        item_row["normalized_fields"] = parse_json(
+            item_row.get("normalized_fields_json"),
+            {},
+        )
+        item_row["supplier_payload"] = parse_json(
+            item_row.get("supplier_payload_json"),
+            {},
+        )
+        item_row["supplier_response"] = parse_json(
+            item_row.get("supplier_response_json"),
+            {},
+        )
+        item_row["raw_payload"] = parse_json(item_row.get("raw_payload_json"), {})
+        return build_public_order_progress_item(item_row, split_job=split_job)
+
+    def _public_order_progress_order_payload(
+        self,
+        order_number: str,
+        rows: List[Dict[str, Any]],
+        split_jobs: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        ordered_rows = sorted(
+            rows,
+            key=lambda row: (
+                str(row.get("cafe24_order_item_code") or ""),
+                str(row.get("created_at") or ""),
+            ),
+        )
+        order_date = next(
+            (
+                str(row.get("cafe24_order_date") or "").strip()
+                for row in ordered_rows
+                if str(row.get("cafe24_order_date") or "").strip()
+            ),
+            "",
+        )
+        return {
+            "orderNumber": order_number,
+            "orderDate": order_date,
+            "items": [
+                self._public_order_progress_item(
+                    row,
+                    split_jobs.get(str(row.get("id") or "")),
+                )
+                for row in ordered_rows
+            ],
+        }
+
+    def lookup_public_order_progress(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            lookup = normalize_public_order_lookup(payload)
+        except ValueError as exc:
+            raise PanelError(str(exc), status=400) from exc
+
+        with self._connect() as conn:
+            rows = self._public_order_progress_rows_for_lookup(conn, lookup)
+            matched_rows = self._public_order_progress_identity_group(rows, lookup)
+            if not matched_rows:
+                return {"found": False}
+            split_jobs = self._public_order_progress_split_jobs(
+                conn,
+                [str(row.get("id") or "") for row in matched_rows],
+            )
+
+        return {
+            "found": True,
+            "order": self._public_order_progress_order_payload(
+                lookup["orderNumber"],
+                matched_rows,
+                split_jobs,
+            ),
+        }
+
+    def lookup_public_active_order_progress(
+        self,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        try:
+            lookup = normalize_public_order_lookup(payload)
+        except ValueError as exc:
+            raise PanelError(str(exc), status=400) from exc
+
+        with self._connect() as conn:
+            reference_rows = self._public_order_progress_rows_for_lookup(conn, lookup)
+            reference_group = self._public_order_progress_identity_group(
+                reference_rows,
+                lookup,
+            )
+            if not reference_group:
+                return {"found": False}
+
+            identity_row = next(
+                row
+                for row in reference_group
+                if str(row.get("buyer_name") or "").strip()
+                and str(row.get("buyer_phone") or "").strip()
+            )
+            mall_id = str(identity_row.get("mall_id") or "")
+            shop_no = int(
+                identity_row.get("shop_no") or CAFE24_DEFAULT_SHOP_NO
+            )
+            candidate_rows_by_id: Dict[str, Dict[str, Any]] = {}
+            select_sql = """
+                SELECT
+                    coi.*,
+                    p.name AS internal_product_name,
+                    p.option_name AS internal_option_name
+                FROM cafe24_order_items coi
+                LEFT JOIN products p ON p.id = coi.product_id
+                WHERE coi.mall_id = ?
+                  AND coi.shop_no = ?
+                  AND coi.payment_gate_status = 'payment_confirmed'
+                  AND coi.standard_status NOT IN ('completed', 'done', 'cancelled')
+            """
+            for column, value in (
+                ("buyer_phone", str(identity_row.get("buyer_phone") or "").strip()),
+                ("buyer_name", str(identity_row.get("buyer_name") or "").strip()),
+            ):
+                if not value:
+                    continue
+                rows = conn.execute(
+                    f"""
+                    {select_sql}
+                      AND coi.{column} = ?
+                    ORDER BY COALESCE(
+                        NULLIF(coi.cafe24_order_date, ''),
+                        NULLIF(coi.updated_at, ''),
+                        coi.created_at
+                    ) DESC
+                    LIMIT ?
+                    """,
+                    (
+                        mall_id,
+                        shop_no,
+                        value,
+                        PUBLIC_ACTIVE_ORDER_LOOKUP_MAX_ITEMS,
+                    ),
+                ).fetchall()
+                for row in rows:
+                    row_payload = dict(row)
+                    candidate_rows_by_id[str(row_payload.get("id") or "")] = row_payload
+
+            recent_rows = conn.execute(
+                f"""
+                {select_sql}
+                ORDER BY COALESCE(
+                    NULLIF(coi.cafe24_order_date, ''),
+                    NULLIF(coi.updated_at, ''),
+                    coi.created_at
+                ) DESC
+                LIMIT ?
+                """,
+                (
+                    mall_id,
+                    shop_no,
+                    PUBLIC_ACTIVE_ORDER_CANDIDATE_LIMIT,
+                ),
+            ).fetchall()
+            for row in recent_rows:
+                row_payload = dict(row)
+                candidate_rows_by_id[str(row_payload.get("id") or "")] = row_payload
+
+            identity_rows = [
+                row
+                for row in candidate_rows_by_id.values()
+                if public_order_identity_matches(
+                    row,
+                    buyer_name=lookup["buyerName"],
+                    phone_number=lookup["phoneNumber"],
+                )
+            ]
+            identity_rows.sort(
+                key=lambda row: (
+                    str(
+                        row.get("cafe24_order_date")
+                        or row.get("updated_at")
+                        or row.get("created_at")
+                        or ""
+                    ),
+                    str(row.get("cafe24_order_id") or ""),
+                    str(row.get("cafe24_order_item_code") or ""),
+                ),
+                reverse=True,
+            )
+            item_limit_reached = (
+                len(identity_rows) > PUBLIC_ACTIVE_ORDER_LOOKUP_MAX_ITEMS
+            )
+            identity_rows = identity_rows[:PUBLIC_ACTIVE_ORDER_LOOKUP_MAX_ITEMS]
+            split_jobs = self._public_order_progress_split_jobs(
+                conn,
+                [str(row.get("id") or "") for row in identity_rows],
+            )
+
+        grouped_orders: Dict[str, Dict[str, Any]] = {}
+        for row in identity_rows:
+            item = self._public_order_progress_item(
+                row,
+                split_jobs.get(str(row.get("id") or "")),
+            )
+            if item.get("status") != "in_progress":
+                continue
+            order_number = str(row.get("cafe24_order_id") or "").strip()
+            if not order_number:
+                continue
+            group = grouped_orders.setdefault(
+                order_number,
+                {
+                    "orderNumber": order_number,
+                    "orderDate": str(row.get("cafe24_order_date") or "").strip(),
+                    "sortKey": str(
+                        row.get("cafe24_order_date")
+                        or row.get("updated_at")
+                        or row.get("created_at")
+                        or ""
+                    ),
+                    "items": [],
+                },
+            )
+            group["items"].append(
+                (
+                    str(row.get("cafe24_order_item_code") or ""),
+                    item,
+                )
+            )
+
+        ordered_groups = sorted(
+            grouped_orders.values(),
+            key=lambda group: (
+                str(group.get("sortKey") or ""),
+                str(group.get("orderNumber") or ""),
+            ),
+            reverse=True,
+        )
+        order_limit_reached = (
+            len(ordered_groups) > PUBLIC_ACTIVE_ORDER_LOOKUP_MAX_ORDERS
+        )
+        orders = [
+            {
+                "orderNumber": group["orderNumber"],
+                "orderDate": group["orderDate"],
+                "items": [
+                    item
+                    for _, item in sorted(
+                        group["items"],
+                        key=lambda entry: entry[0],
+                    )
+                ],
+            }
+            for group in ordered_groups[:PUBLIC_ACTIVE_ORDER_LOOKUP_MAX_ORDERS]
+        ]
+        return {
+            "found": True,
+            "view": "active",
+            "orders": orders,
+            "summary": {
+                "orderCount": len(orders),
+                "itemCount": sum(len(order["items"]) for order in orders),
+                "truncated": item_limit_reached or order_limit_reached,
+            },
+        }
+
     def list_cafe24_order_items(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         options = cafe24_order_item_list_options(payload)
         page = int(options["page"])
@@ -8778,6 +9207,46 @@ class PanelStore(PanelStoreDatabaseMixin):
                 "status": options["statusFilter"] or "all",
                 "search": options["search"],
             },
+        }
+
+    def cafe24_customer_mix(self, range_id: str = "30d") -> Dict[str, Any]:
+        days = {"7d": 7, "14d": 14, "30d": 30, "90d": 90}.get(str(range_id or "30d"), 30)
+        cutoff = (dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=days - 1)).isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    cafe24_order_id,
+                    MAX(first_order) AS first_order,
+                    MAX(payment_amount) AS revenue
+                FROM cafe24_order_items
+                WHERE payment_gate_status = 'payment_confirmed'
+                  AND SUBSTR(COALESCE(NULLIF(cafe24_order_date, ''), created_at), 1, 10) >= ?
+                GROUP BY cafe24_order_id
+                """,
+                (cutoff,),
+            ).fetchall()
+
+        segments = {
+            "new": {"key": "new", "label": "신규 고객", "orders": 0, "revenue": 0},
+            "returning": {"key": "returning", "label": "재구매 고객", "orders": 0, "revenue": 0},
+            "unknown": {"key": "unknown", "label": "판정 대기", "orders": 0, "revenue": 0},
+        }
+        for row in rows:
+            first_order = str(row["first_order"] or "")
+            key = "new" if first_order == "T" else "returning" if first_order == "F" else "unknown"
+            segments[key]["orders"] += 1
+            segments[key]["revenue"] += int(row["revenue"] or 0)
+        for segment in segments.values():
+            segment["averageOrderValue"] = round(segment["revenue"] / segment["orders"]) if segment["orders"] else 0
+
+        known_orders = segments["new"]["orders"] + segments["returning"]["orders"]
+        return {
+            "range": range_id if range_id in {"7d", "14d", "30d", "90d"} else "30d",
+            "segments": list(segments.values()),
+            "knownOrders": known_orders,
+            "unknownOrders": segments["unknown"]["orders"],
+            "repeatOrderRate": round(segments["returning"]["orders"] / known_orders, 6) if known_orders else 0,
         }
 
     def create_cafe24_oauth_authorize_url(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -10699,7 +11168,10 @@ class PanelStore(PanelStoreDatabaseMixin):
                         "",
                     )
             if value:
-                return str(value).strip()
+                normalized_value = str(value).strip()
+                if field_key == "orderedCount" and source_type == "option":
+                    return multiply_cafe24_ordered_count_for_item_for_panel(normalized_value, item_payload)
+                return normalized_value
             if fallback:
                 return self._resolve_cafe24_mapping_source(
                     fallback,
@@ -10734,7 +11206,10 @@ class PanelStore(PanelStoreDatabaseMixin):
                 value = option_pairs.get(text, "")
             if value:
                 if field_key == "orderedCount":
-                    return coerce_cafe24_ordered_count_mapping_value_for_panel(value, label=text, source=text)
+                    ordered_count = coerce_cafe24_ordered_count_mapping_value_for_panel(value, label=text, source=text)
+                    if text.startswith("option:") or text in option_pairs:
+                        return multiply_cafe24_ordered_count_for_item_for_panel(ordered_count, item_payload)
+                    return ordered_count
                 return str(value).strip()
         return ""
 
@@ -11199,6 +11674,7 @@ class PanelStore(PanelStoreDatabaseMixin):
         payment_gate_status = cafe24_payment_gate_status(source_status, payment_status)
         payment_snapshot = cafe24_payment_snapshot_from_payload(order_payload, item_payload)
         order_date = cafe24_order_date_from_payload(order_payload, item_payload)
+        first_order = cafe24_first_order_from_payload(order_payload)
         status = normalize_cafe24_status(source_status)
         error_message = ""
         mapping_row = self._match_cafe24_mapping(conn, mall_id, shop_no, identity)
@@ -11364,19 +11840,20 @@ class PanelStore(PanelStoreDatabaseMixin):
             INSERT INTO cafe24_order_items (
                 id, mall_id, shop_no, cafe24_order_id, cafe24_order_item_code,
                 cafe24_product_no, cafe24_variant_code, cafe24_custom_product_code,
-                cafe24_order_date, buyer_name, buyer_email, buyer_phone, receiver_name, order_status_code,
+                cafe24_order_date, first_order, buyer_name, buyer_email, buyer_phone, receiver_name, order_status_code,
                 payment_status, payment_status_source, payment_gate_status, payment_method, payment_amount,
                 payment_paid_at, payment_reference, payment_snapshot_json, source_status, standard_status,
                 mapping_id, product_id, supplier_id, supplier_service_id, supplier_external_service_id,
                 normalized_fields_json, supplier_payload_json, raw_payload_json,
                 error_message, last_synced_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(mall_id, shop_no, cafe24_order_id, cafe24_order_item_code)
             DO UPDATE SET
                 cafe24_product_no = excluded.cafe24_product_no,
                 cafe24_variant_code = excluded.cafe24_variant_code,
                 cafe24_custom_product_code = excluded.cafe24_custom_product_code,
                 cafe24_order_date = excluded.cafe24_order_date,
+                first_order = excluded.first_order,
                 buyer_name = excluded.buyer_name,
                 buyer_email = excluded.buyer_email,
                 buyer_phone = excluded.buyer_phone,
@@ -11418,6 +11895,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                 identity["variantCode"],
                 identity["customProductCode"],
                 order_date,
+                first_order,
                 cafe24_payload_value(buyer, ("name", "buyer_name")),
                 cafe24_payload_value(buyer, ("email", "buyer_email")),
                 cafe24_payload_value(buyer, ("cellphone", "phone", "mobile")),
@@ -12892,6 +13370,227 @@ class PanelStore(PanelStoreDatabaseMixin):
             "supplierOrderUuid": supplier_external_order_id,
             "errorMessage": error_message,
         }
+
+    def dispatch_cafe24_correction_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        item_id = str(payload.get("itemId") or payload.get("id") or "").strip()
+        actor = self._admin_actor(payload)
+        if not item_id:
+            raise PanelError("보정 발주할 Cafe24 주문 품주를 선택해 주세요.", status=400)
+        if payload.get("confirmCorrectionDispatch") is not True:
+            raise PanelError("보정 발주 확인값(confirmCorrectionDispatch=true)이 필요합니다.", status=400)
+
+        expected_total = self._cafe24_positive_int(payload.get("expectedTotal"))
+        correction_quantity = self._cafe24_positive_int(payload.get("correctionQuantity"))
+        reason = str(payload.get("reason") or "").strip()
+        if expected_total <= 0 or correction_quantity <= 0:
+            raise PanelError("기대 총수량과 보정 수량은 1 이상의 숫자여야 합니다.", status=400)
+        if not reason:
+            raise PanelError("보정 발주 사유를 입력해 주세요.", status=400)
+
+        event_identity = f"{item_id}:{expected_total}"
+        event_id = f"cafe24_corr_{hashlib.sha256(event_identity.encode('utf-8')).hexdigest()[:24]}"
+        timestamp = now_iso()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    coi.*,
+                    s.name AS supplier_name,
+                    s.api_url,
+                    s.integration_type,
+                    s.api_key,
+                    s.bearer_token,
+                    s.is_active AS supplier_is_active,
+                    ss.is_active AS supplier_service_is_active
+                FROM cafe24_order_items coi
+                JOIN suppliers s ON s.id = coi.supplier_id
+                LEFT JOIN supplier_services ss ON ss.id = coi.supplier_service_id
+                WHERE coi.id = ?
+                """,
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                raise PanelError("Cafe24 주문 품주 또는 공급사 정보를 찾을 수 없습니다.", status=404)
+            if str(row["payment_gate_status"] or "") != "payment_confirmed":
+                raise PanelError("Cafe24 결제완료가 확인되지 않아 보정 발주할 수 없습니다.", status=409)
+            if str(row["standard_status"] or "") != "completed":
+                raise PanelError("공급사 완료가 확인된 주문만 수량 보정 발주할 수 있습니다.", status=409)
+            original_supplier_order_uuid = str(row["supplier_order_uuid"] or "").strip()
+            if not original_supplier_order_uuid:
+                raise PanelError("기존 공급사 주문번호가 없어 보정 발주할 수 없습니다.", status=409)
+            if not bool(row["supplier_is_active"]):
+                raise PanelError("연결된 공급사가 비활성 상태입니다.", status=409)
+            if str(row["supplier_service_id"] or "").strip() and not bool(row["supplier_service_is_active"]):
+                raise PanelError("연결된 공급사 서비스가 비활성 상태입니다.", status=409)
+
+            supplier_payload = parse_json(row["supplier_payload_json"], {})
+            raw_payload = parse_json(row["raw_payload_json"], {})
+            order_payload = raw_payload.get("order") if isinstance(raw_payload.get("order"), dict) else {}
+            item_payload = raw_payload.get("item") if isinstance(raw_payload.get("item"), dict) else {}
+            if not isinstance(supplier_payload, dict) or not supplier_payload:
+                raise PanelError("기존 공급사 발주 payload가 없어 보정 발주할 수 없습니다.", status=409)
+            if not order_payload or not item_payload:
+                raise PanelError("Cafe24 원본 주문 payload가 없어 총수량을 검증할 수 없습니다.", status=409)
+
+            detected_total = self._cafe24_positive_int(
+                default_cafe24_ordered_count_for_panel(
+                    item_payload,
+                    cafe24_option_entries(order_payload, item_payload),
+                )
+            )
+            original_quantity = cafe24_preflight_quantity(
+                parse_json(row["normalized_fields_json"], {}),
+                supplier_payload,
+            )
+            missing_quantity = detected_total - original_quantity
+            if detected_total != expected_total:
+                raise PanelError(
+                    f"Cafe24 원본 수량 검증 실패: 요청 {expected_total}회, 원본 계산 {detected_total}회입니다.",
+                    status=409,
+                )
+            if missing_quantity <= 0 or correction_quantity != missing_quantity:
+                raise PanelError(
+                    f"보정 수량 검증 실패: 기존 {original_quantity}회, 총 {detected_total}회, 부족 {max(missing_quantity, 0)}회입니다.",
+                    status=409,
+                )
+
+            existing_event = conn.execute(
+                "SELECT * FROM cafe24_api_events WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+            if existing_event is not None:
+                existing_response = parse_json(existing_event["response_json"], {})
+                return {
+                    "itemId": item_id,
+                    "eventId": event_id,
+                    "duplicate": True,
+                    "submitted": bool(existing_response.get("submitted")),
+                    "status": str(existing_response.get("status") or existing_event["status"] or ""),
+                    "expectedTotal": expected_total,
+                    "originalQuantity": original_quantity,
+                    "correctionQuantity": correction_quantity,
+                    "originalSupplierOrderUuid": original_supplier_order_uuid,
+                    "supplierOrderUuid": str(existing_response.get("supplierOrderUuid") or ""),
+                    "errorMessage": str(existing_response.get("errorMessage") or existing_event["error_message"] or ""),
+                }
+
+            correction_payload = dict(supplier_payload)
+            correction_payload["quantity"] = str(correction_quantity)
+            request_audit_payload = {
+                "itemId": item_id,
+                "expectedTotal": expected_total,
+                "originalQuantity": original_quantity,
+                "correctionQuantity": correction_quantity,
+                "originalSupplierOrderUuid": original_supplier_order_uuid,
+                "reason": reason[:500],
+                "supplierPayload": redact_external_payload(correction_payload),
+            }
+            claim = conn.execute(
+                """
+                INSERT INTO cafe24_api_events (
+                    id, mall_id, shop_no, event_type, status,
+                    request_json, response_json, error_message, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (
+                    event_id,
+                    str(row["mall_id"]),
+                    int(row["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                    "supplier.correction_dispatch",
+                    "submitting",
+                    as_json(request_audit_payload),
+                    "{}",
+                    "",
+                    timestamp,
+                ),
+            )
+            if claim.rowcount != 1:
+                raise PanelError("동일한 수량 보정 발주가 이미 처리 중입니다.", status=409)
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="cafe24.order_item_correction_dispatch_started",
+                entity_type="cafe24_order_item",
+                entity_id=item_id,
+                message=f"Cafe24 주문 품주 수량 보정 발주 시작: {correction_quantity}회",
+                metadata={
+                    "eventId": event_id,
+                    "expectedTotal": expected_total,
+                    "originalQuantity": original_quantity,
+                    "correctionQuantity": correction_quantity,
+                    "originalSupplierOrderUuid": original_supplier_order_uuid,
+                    "reason": reason[:500],
+                },
+            )
+            conn.commit()
+
+        response_payload: Any = {}
+        supplier_external_order_id = ""
+        next_status = "failed"
+        error_message = ""
+        try:
+            client = SupplierApiClient(
+                str(row["api_url"]),
+                decrypt_secret_value(row["api_key"]),
+                integration_type=str(row["integration_type"] or SUPPLIER_INTEGRATION_CLASSIC),
+                bearer_token=decrypt_secret_value(row["bearer_token"] or ""),
+            )
+            response_payload = client.order(correction_payload)
+            outcome = cafe24_supplier_dispatch_outcome(response_payload)
+            supplier_external_order_id = outcome["supplierExternalOrderId"]
+            next_status = outcome["status"]
+            error_message = outcome["errorMessage"]
+        except Exception as exc:
+            response_payload = {"error": str(exc)}
+            error_message = str(exc)
+
+        result = {
+            "itemId": item_id,
+            "eventId": event_id,
+            "duplicate": False,
+            "submitted": next_status == "supplier_submitted",
+            "status": next_status,
+            "expectedTotal": expected_total,
+            "originalQuantity": original_quantity,
+            "correctionQuantity": correction_quantity,
+            "originalSupplierOrderUuid": original_supplier_order_uuid,
+            "supplierOrderUuid": supplier_external_order_id,
+            "errorMessage": error_message,
+        }
+        event_status = "success" if result["submitted"] else "failed"
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE cafe24_api_events
+                SET status = ?, response_json = ?, error_message = ?
+                WHERE id = ?
+                """,
+                (event_status, as_json(result), error_message[:1000], event_id),
+            )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action=(
+                    "cafe24.order_item_correction_dispatch"
+                    if result["submitted"]
+                    else "cafe24.order_item_correction_dispatch_failed"
+                ),
+                entity_type="cafe24_order_item",
+                entity_id=item_id,
+                message=f"Cafe24 주문 품주 수량 보정 발주: {next_status}",
+                metadata={
+                    "eventId": event_id,
+                    "expectedTotal": expected_total,
+                    "originalQuantity": original_quantity,
+                    "correctionQuantity": correction_quantity,
+                    "originalSupplierOrderUuid": original_supplier_order_uuid,
+                    "supplierOrderUuid": supplier_external_order_id,
+                    "status": next_status,
+                },
+            )
+            conn.commit()
+        return result
 
     def resync_cafe24_order_item(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         item_id = str(payload.get("itemId") or payload.get("id") or "").strip()

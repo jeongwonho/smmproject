@@ -14,7 +14,7 @@ if str(APP_ROOT) in sys.path:
     sys.path.remove(str(APP_ROOT))
 sys.path.insert(0, str(APP_ROOT))
 
-from server import AppHandler, ROUTER, RouteRequest, cafe24_oauth_error_message, cron_authorization_valid
+from server import AppHandler, ROUTER, RequestRateLimiter, RouteRequest, cafe24_oauth_error_message, cron_authorization_valid, render_index_html
 from core import PanelError, derive_order_idempotency_key
 
 
@@ -62,6 +62,35 @@ class VercelConfigurationTest(unittest.TestCase):
         config = json.loads((APP_ROOT / "vercel.json").read_text())
 
         self.assertEqual(config.get("regions"), ["icn1"])
+
+    def test_order_progress_uses_private_static_document_and_noindex_header(self):
+        config = json.loads((APP_ROOT / "vercel.json").read_text())
+        rewrites = {
+            item.get("source"): item.get("destination")
+            for item in config.get("rewrites", [])
+        }
+        header_rules = {
+            item.get("source"): item.get("headers", [])
+            for item in config.get("headers", [])
+        }
+        build_source = (APP_ROOT / "build-static.mjs").read_text()
+
+        self.assertEqual(rewrites.get("/order-progress"), "/order-progress.html")
+        self.assertEqual(rewrites.get("/order-progress/"), "/order-progress.html")
+        self.assertIn("X-Robots-Tag", json.dumps(header_rules.get("/order-progress", [])))
+        self.assertIn("order-progress.html", build_source)
+        self.assertIn("orderProgressManagedHead", build_source)
+
+    def test_order_progress_meter_uses_csp_safe_value_and_percentage_tones(self):
+        source = (APP_ROOT / "static/public/order-progress.js").read_text()
+        styles = (APP_ROOT / "static/styles/order-progress.css").read_text()
+
+        self.assertIn("<progress", source)
+        self.assertIn('value="${safePercent}"', source)
+        self.assertNotIn('style="width: ${safePercent}%"', source)
+        for tone in ("is-starting", "is-building", "is-advanced", "is-complete"):
+            self.assertIn(tone, source)
+            self.assertIn(f".order-progress-meter.{tone}", styles)
 
 
 class OrderIdempotencyTest(unittest.TestCase):
@@ -891,6 +920,149 @@ class CronAuthorizationTest(unittest.TestCase):
 
 
 class RouterRegistryTest(unittest.TestCase):
+    def test_public_order_progress_rate_limit_buckets_are_registered(self):
+        limiter = RequestRateLimiter()
+
+        self.assertEqual(limiter.rules["order_progress"], (6, 60))
+        self.assertEqual(limiter.rules["order_progress_active"], (6, 60))
+
+    def test_order_progress_document_is_private_and_uses_dedicated_surface(self):
+        class FakeStore:
+            def public_site_settings(self):
+                return {
+                    "siteSettings": {
+                        "siteName": "인스타마트",
+                        "siteDescription": "공개 설명",
+                        "faviconUrl": "",
+                        "shareImageUrl": "",
+                    }
+                }
+
+        document = render_index_html(
+            FakeStore(),
+            "/order-progress",
+            SimpleNamespace(public_api_base_url=""),
+        )
+
+        self.assertIn("<title>주문 진행 현황 | 인스타마트</title>", document)
+        self.assertIn('data-route-surface="order-progress"', document)
+        self.assertIn('name="robots" content="noindex, nofollow', document)
+        self.assertIn('/static/styles/order-progress.css', document)
+        self.assertNotIn('name="description" content="공개 설명"', document)
+
+    def test_public_order_progress_route_is_origin_checked_without_session_auth(self):
+        matched = ROUTER.match("POST", "/api/order-progress/lookup")
+
+        self.assertIsNotNone(matched)
+        route, params = matched
+        self.assertEqual(params, {})
+        self.assertEqual(route.auth, "none")
+        self.assertFalse(route.csrf)
+        self.assertTrue(route.trusted_origin)
+        self.assertTrue(route.read_json_body)
+
+        active_matched = ROUTER.match("POST", "/api/order-progress/active")
+        self.assertIsNotNone(active_matched)
+        active_route, active_params = active_matched
+        self.assertEqual(active_params, {})
+        self.assertEqual(active_route.auth, "none")
+        self.assertFalse(active_route.csrf)
+        self.assertTrue(active_route.trusted_origin)
+        self.assertTrue(active_route.read_json_body)
+
+    def test_public_order_progress_handler_enforces_rate_limit_and_returns_store_result(self):
+        class FakeStore:
+            def lookup_public_order_progress(self, payload):
+                self.payload = payload
+                return {"found": True, "order": {"orderNumber": payload["orderNumber"], "items": []}}
+
+        class FakeHandler:
+            def __init__(self):
+                self.store = FakeStore()
+                self.rate_limit_calls = []
+
+            def _server(self):
+                return SimpleNamespace(store=self.store)
+
+            def _enforce_rate_limit(self, bucket, message):
+                self.rate_limit_calls.append((bucket, message))
+
+        handler = FakeHandler()
+        request = RouteRequest(
+            path="/api/order-progress/lookup",
+            parsed=None,
+            query={},
+            params={},
+            payload={
+                "orderNumber": "20260724-0000087",
+                "buyerName": "홍길동",
+                "phoneNumber": "01012345678",
+            },
+        )
+
+        with patch("server.write_json") as write_json_mock:
+            AppHandler._post_order_progress_lookup(handler, request)
+
+        self.assertEqual(handler.rate_limit_calls[0][0], "order_progress")
+        self.assertEqual(handler.store.payload, request.payload)
+        _, status, response = write_json_mock.call_args.args
+        self.assertEqual(status, 200)
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["found"])
+        self.assertEqual(write_json_mock.call_args.kwargs["cache_control"], "no-store")
+
+    def test_public_active_order_progress_handler_is_rate_limited_and_private(self):
+        class FakeStore:
+            def lookup_public_active_order_progress(self, payload):
+                self.payload = payload
+                return {
+                    "found": True,
+                    "view": "active",
+                    "orders": [],
+                    "summary": {"orderCount": 0, "itemCount": 0},
+                }
+
+        class FakeHandler:
+            def __init__(self):
+                self.store = FakeStore()
+                self.rate_limit_calls = []
+
+            def _server(self):
+                return SimpleNamespace(store=self.store)
+
+            def _enforce_rate_limit(self, bucket, message):
+                self.rate_limit_calls.append((bucket, message))
+
+        handler = FakeHandler()
+        request = RouteRequest(
+            path="/api/order-progress/active",
+            parsed=None,
+            query={},
+            params={},
+            payload={
+                "orderNumber": "20260724-0000087",
+                "buyerName": "홍길동",
+                "phoneNumber": "01012345678",
+            },
+        )
+
+        with patch("server.write_json") as write_json_mock:
+            AppHandler._post_active_order_progress_lookup(handler, request)
+
+        self.assertEqual(
+            handler.rate_limit_calls[0][0],
+            "order_progress_active",
+        )
+        self.assertEqual(handler.store.payload, request.payload)
+        _, status, response = write_json_mock.call_args.args
+        self.assertEqual(status, 200)
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["orders"], [])
+        self.assertEqual(
+            write_json_mock.call_args.kwargs["cache_control"],
+            "no-store",
+        )
+
     def test_dynamic_public_route_declares_auth_and_csrf(self):
         matched = ROUTER.match("POST", "/api/charge-orders/charge_123/start-payment")
 
@@ -1069,6 +1241,17 @@ class RouterRegistryTest(unittest.TestCase):
         self.assertEqual(params, {})
         self.assertEqual(route.auth, "admin")
         self.assertTrue(route.csrf)
+
+    def test_cafe24_correction_dispatch_route_requires_admin_csrf_and_trusted_origin(self):
+        matched = ROUTER.match("POST", "/api/admin/cafe24/order-items/correction-dispatch")
+
+        self.assertIsNotNone(matched)
+        route, params = matched
+        self.assertEqual(params, {})
+        self.assertEqual(route.auth, "admin")
+        self.assertTrue(route.csrf)
+        self.assertTrue(route.trusted_origin)
+        self.assertTrue(route.read_json_body)
 
     def test_cafe24_manual_input_preview_admin_route_declares_admin_auth_and_csrf(self):
         matched = ROUTER.match("POST", "/api/admin/cafe24/order-items/manual-input/preview")

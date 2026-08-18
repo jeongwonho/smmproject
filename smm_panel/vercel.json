@@ -85,6 +85,24 @@
           "value": "noindex, nofollow, noarchive, nosnippet, noimageindex"
         }
       ]
+    },
+    {
+      "source": "/order-progress",
+      "headers": [
+        {
+          "key": "X-Robots-Tag",
+          "value": "noindex, nofollow, noarchive, nosnippet, noimageindex"
+        }
+      ]
+    },
+    {
+      "source": "/order-progress/",
+      "headers": [
+        {
+          "key": "X-Robots-Tag",
+          "value": "noindex, nofollow, noarchive, nosnippet, noimageindex"
+        }
+      ]
     }
   ],
   "rewrites": [
@@ -93,6 +111,8 @@
     { "source": "/admin", "destination": "/admin.html" },
     { "source": "/admin/", "destination": "/admin.html" },
     { "source": "/admin/:path*", "destination": "/admin.html" },
+    { "source": "/order-progress", "destination": "/order-progress.html" },
+    { "source": "/order-progress/", "destination": "/order-progress.html" },
     { "source": "/:path*", "destination": "/index.html" }
   ]
 }

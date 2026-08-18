@@ -323,6 +323,7 @@ class PanelStoreDatabaseMixin:
             "cafe24_order_items": {
                 "auto_dispatch_approved",
                 "auto_dispatch_source",
+                "first_order",
                 "preflight_checked_at",
                 "preflight_blockers_json",
             },
@@ -500,6 +501,7 @@ class PanelStoreDatabaseMixin:
         self._ensure_column(conn, "cafe24_integrations", "last_auto_poll_status", "TEXT NOT NULL DEFAULT 'never'")
         self._ensure_column(conn, "cafe24_integrations", "last_auto_poll_message", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "cafe24_order_date", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "cafe24_order_items", "first_order", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "payment_status", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "payment_status_source", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "cafe24_order_items", "payment_gate_status", "TEXT NOT NULL DEFAULT 'unverified'")

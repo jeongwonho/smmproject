@@ -863,6 +863,16 @@ def cafe24_orders_from_payload(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def cafe24_first_order_from_payload(order_payload: Dict[str, Any]) -> str:
+    value = cafe24_payload_value(order_payload, ("first_order", "firstOrder"))
+    normalized = str(value or "").strip().upper()
+    if normalized in {"T", "TRUE", "Y", "YES", "1"}:
+        return "T"
+    if normalized in {"F", "FALSE", "N", "NO", "0"}:
+        return "F"
+    return ""
+
+
 def cafe24_order_items_from_order(order_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     for key in ("items", "item", "order_items", "orderItems"):
         value = order_payload.get(key)
@@ -1131,6 +1141,14 @@ def cafe24_order_item_payload_from_row(
         "variantCode": _cafe24_row_value(row, "cafe24_variant_code"),
         "customProductCode": _cafe24_row_value(row, "cafe24_custom_product_code"),
         "orderDate": _cafe24_row_value(row, "cafe24_order_date"),
+        "firstOrder": _cafe24_row_value(row, "first_order"),
+        "customerType": (
+            "new"
+            if _cafe24_row_value(row, "first_order") == "T"
+            else "returning"
+            if _cafe24_row_value(row, "first_order") == "F"
+            else "unknown"
+        ),
         "buyerName": _cafe24_row_value(row, "buyer_name"),
         "buyerEmailMasked": _cafe24_mask_email(_cafe24_row_value(row, "buyer_email")),
         "buyerPhoneMasked": _cafe24_mask_phone(_cafe24_row_value(row, "buyer_phone")),

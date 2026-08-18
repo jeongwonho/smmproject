@@ -110,11 +110,24 @@ def coerce_cafe24_ordered_count_mapping_value(value: Any, *, label: str = "", so
     return text
 
 
+def multiply_cafe24_ordered_count_for_item(value: Any, item_payload: Dict[str, Any]) -> str:
+    ordered_count = coerce_cafe24_ordered_count_mapping_value(value)
+    if not re.fullmatch(r"\d+", ordered_count):
+        return ordered_count
+    raw_item_quantity = cafe24_payload_value(item_payload, ("quantity", "qty", "order_quantity")) or "1"
+    try:
+        item_quantity = int(str(raw_item_quantity).replace(",", "").strip())
+    except (TypeError, ValueError):
+        item_quantity = 1
+    return str(int(ordered_count) * max(item_quantity, 1))
+
+
 def default_cafe24_ordered_count(item_payload: Dict[str, Any], option_entries: List[Dict[str, str]]) -> str:
     candidates = cafe24_quantity_candidates_from_options(option_entries)
     if candidates:
         try:
-            return resolve_cafe24_quantity_candidates(candidates)
+            ordered_count = resolve_cafe24_quantity_candidates(candidates)
+            return multiply_cafe24_ordered_count_for_item(ordered_count, item_payload)
         except Cafe24QuantityAmbiguousError as exc:
             raise Cafe24QuantityAmbiguousError(f"{exc} Cafe24 매핑에서 주문 수량 source를 명시해 주세요.") from exc
     return cafe24_payload_value(item_payload, ("quantity", "qty", "order_quantity")) or "1"

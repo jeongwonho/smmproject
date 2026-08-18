@@ -35,6 +35,10 @@ import {
 import { configureCafe24AdminActions, cafe24OrderItemsQueryKey, refreshCafe24OperationalAudit, refreshCafe24OrderItems } from "./admin/cafe24.js";
 import { registerAdminEvents } from "./admin/events.js";
 import { registerPublicEvents } from "./public/events.js";
+import {
+  blankOrderProgressState,
+  renderOrderProgressPage,
+} from "./public/order-progress.js";
 import { parseRoute } from "./shared/routes.js";
 import { createRuntimeConfig } from "./shared/runtime.js";
 import { blankPublicAuthState, blankSignupState, evaluatePublicPasswordStrength } from "./public/auth-state.js";
@@ -53,6 +57,7 @@ const state = {
   categoryCache: {},
   orders: [],
   orderCounts: { all: 0, queued: 0, in_progress: 0, completed: 0 },
+  orderProgress: blankOrderProgressState(),
   transactions: [],
   wallet: null,
   walletLedger: [],
@@ -1717,28 +1722,35 @@ function syncShellMode(route) {
   const deviceShell = document.querySelector(".device-shell");
   const appRoot = document.getElementById("app");
   const isAdmin = route.name === "admin";
+  const surface = isAdmin ? "admin" : route.name === "orderProgress" ? "order-progress" : "public";
   if (deviceShell) {
-    deviceShell.dataset.routeSurface = isAdmin ? "admin" : "public";
+    deviceShell.dataset.routeSurface = surface;
   }
   if (appRoot) {
-    appRoot.dataset.routeSurface = isAdmin ? "admin" : "public";
+    appRoot.dataset.routeSurface = surface;
   }
-  document.body.dataset.routeSurface = isAdmin ? "admin" : "public";
+  document.body.dataset.routeSurface = surface;
   applySitePresentation(route);
 }
 
 function applySitePresentation(route) {
   const isAdmin = route.name === "admin";
+  const isOrderProgress = route.name === "orderProgress";
+  const isPrivatePage = isAdmin || isOrderProgress;
   const siteSettings = state.adminBootstrap?.siteSettings || state.bootstrap?.siteSettings || {};
   const siteName = String(siteSettings.siteName || DEFAULT_SITE_NAME).trim() || DEFAULT_SITE_NAME;
   const siteDescription = String(siteSettings.siteDescription || "").trim();
   const faviconUrl = String(siteSettings.faviconUrl || "").trim();
   const shareImageUrl = String(siteSettings.shareImageUrl || "").trim();
-  document.title = isAdmin ? `${siteName} Admin Console` : siteName;
+  document.title = isAdmin
+    ? `${siteName} Admin Console`
+    : isOrderProgress
+    ? `주문 진행 현황 | ${siteName}`
+    : siteName;
 
   const robots = ensureMetaTag("robots");
   const googlebot = ensureMetaTag("googlebot");
-  if (isAdmin) {
+  if (isPrivatePage) {
     robots.setAttribute("content", "noindex, nofollow, noarchive, nosnippet, noimageindex");
     googlebot.setAttribute("content", "noindex, nofollow, noarchive, nosnippet, noimageindex");
   } else {
@@ -1756,7 +1768,7 @@ function applySitePresentation(route) {
   const ogImage = ensurePropertyMetaTag("og:image");
   const twitterImage = ensureMetaTag("twitter:image");
 
-  if (isAdmin) {
+  if (isPrivatePage) {
     descriptionMeta.remove();
     twitterTitle.remove();
     twitterDescription.remove();
@@ -2119,7 +2131,7 @@ function consumeCafe24OAuthNotice() {
 
 function routeCanUsePublicShell(route) {
   if (!route) return true;
-  return ["home", "products", "detail", "admin"].includes(route.name);
+  return ["home", "products", "detail", "orderProgress", "admin"].includes(route.name);
 }
 
 function routeNeedsFullBootstrap(route) {
@@ -3204,7 +3216,13 @@ async function renderRoute() {
       return;
     }
 
-    if (route.name === "home") {
+    if (route.name === "orderProgress") {
+      app.innerHTML = renderOrderProgressPage({
+        state,
+        escapeHtml,
+        logoUrl: DEFAULT_LIGHT_BRAND_LOGO_URL,
+      });
+    } else if (route.name === "home") {
       app.innerHTML = renderHome();
     } else if (route.name === "auth") {
       app.innerHTML = renderAuthPage();
@@ -3464,6 +3482,7 @@ function analyticsSessionId() {
 function analyticsPageLabel(route) {
   if (route.name === "home") return "홈";
   if (route.name === "auth") return route.mode === "signup" ? "회원가입" : "로그인";
+  if (route.name === "orderProgress") return "주문 진행 현황";
   if (route.name === "help") return "도움말 허브";
   if (route.name === "legal") return "약관/정책";
   if (route.name === "products") return "상품 목록";

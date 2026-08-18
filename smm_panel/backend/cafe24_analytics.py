@@ -126,7 +126,13 @@ def _manual_ad_spend() -> Dict[str, Dict[str, float]]:
     return entries
 
 
-def _unavailable_payload(range_id: str = "30d", *, message: str = "", error: str = "") -> Dict[str, Any]:
+def _unavailable_payload(
+    range_id: str = "30d",
+    *,
+    message: str = "",
+    error: str = "",
+    customer_mix: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     selected_range = RANGE_OPTIONS.get(range_id, RANGE_OPTIONS["30d"])
     payload = {
         "source": "unavailable",
@@ -153,6 +159,7 @@ def _unavailable_payload(range_id: str = "30d", *, message: str = "", error: str
         "channels": [],
         "pages": [],
         "trend": [],
+        "customerMix": customer_mix or {"segments": [], "knownOrders": 0, "unknownOrders": 0, "repeatOrderRate": 0},
         "recommendations": [],
         "setupChecklist": _setup_checklist(False, {}, error),
     }
@@ -322,7 +329,13 @@ def _setup_checklist(connected: bool, event_counts: Dict[str, int], error: str =
     ]
 
 
-def _build_payload(range_id: str, range_label: str, property_id: str, reports: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+def _build_payload(
+    range_id: str,
+    range_label: str,
+    property_id: str,
+    reports: Dict[str, Dict[str, Any]],
+    customer_mix: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     event_rows = _rows(reports["events"], ["eventName"], ["eventCount", "totalUsers", "totalRevenue", "conversions"])
     event_counts = {str(row.get("eventName")): _int(row.get("eventCount")) for row in event_rows}
     overview_row = (_rows(reports["overview"], [], ["sessions", "totalUsers", "eventCount", "conversions", "totalRevenue"]) or [{}])[0]
@@ -444,17 +457,18 @@ def _build_payload(range_id: str, range_label: str, property_id: str, reports: D
         "channels": channels,
         "pages": pages,
         "trend": trend,
+        "customerMix": customer_mix or {"segments": [], "knownOrders": 0, "unknownOrders": 0, "repeatOrderRate": 0},
         "recommendations": _recommendations(event_counts, overview, channels),
         "setupChecklist": _setup_checklist(True, event_counts),
     }
 
 
-def get_cafe24_ga4_analytics(range_id: str = "30d") -> Dict[str, Any]:
+def get_cafe24_ga4_analytics(range_id: str = "30d", customer_mix: Dict[str, Any] | None = None) -> Dict[str, Any]:
     range_id = range_id if range_id in RANGE_OPTIONS else "30d"
     selected_range = RANGE_OPTIONS[range_id]
     config = _analytics_config()
     if not _is_configured(config):
-        return _unavailable_payload(range_id)
+        return _unavailable_payload(range_id, customer_mix=customer_mix)
 
     try:
         token = _access_token(config)
@@ -482,10 +496,11 @@ def get_cafe24_ga4_analytics(range_id: str = "30d") -> Dict[str, Any]:
                 reports["channelCosts"] = {}
         if "channelCosts" not in reports:
             reports["channelCosts"] = {}
-        return _build_payload(range_id, selected_range["label"], config["propertyId"], reports)
+        return _build_payload(range_id, selected_range["label"], config["propertyId"], reports, customer_mix)
     except Exception as exc:
         return _unavailable_payload(
             range_id,
             message="GA4 API 호출에 실패해 실적 데이터를 표시하지 않습니다.",
             error=str(exc),
+            customer_mix=customer_mix,
         )
