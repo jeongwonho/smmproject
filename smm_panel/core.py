@@ -11672,6 +11672,23 @@ class PanelStore(PanelStoreDatabaseMixin):
         source_status = identity["statusCode"]
         payment_status, payment_status_source = cafe24_payment_status_with_source(order_payload, item_payload, source_status)
         payment_gate_status = cafe24_payment_gate_status(source_status, payment_status)
+        existing_payment_override = conn.execute(
+            """
+            SELECT payment_status_source, payment_gate_status
+            FROM cafe24_order_items
+            WHERE mall_id = ? AND shop_no = ? AND cafe24_order_id = ? AND cafe24_order_item_code = ?
+            """,
+            (mall_id, shop_no, identity["orderId"], identity["orderItemCode"]),
+        ).fetchone()
+        if (
+            existing_payment_override is not None
+            and str(existing_payment_override["payment_status_source"] or "") == "manual_admin_confirmation"
+            and str(existing_payment_override["payment_gate_status"] or "") == "payment_confirmed"
+            and not cafe24_status_is_cancelled(source_status)
+        ):
+            payment_status = "paid"
+            payment_status_source = "manual_admin_confirmation"
+            payment_gate_status = "payment_confirmed"
         payment_snapshot = cafe24_payment_snapshot_from_payload(order_payload, item_payload)
         order_date = cafe24_order_date_from_payload(order_payload, item_payload)
         first_order = cafe24_first_order_from_payload(order_payload)
@@ -13370,6 +13387,195 @@ class PanelStore(PanelStoreDatabaseMixin):
             "supplierOrderUuid": supplier_external_order_id,
             "errorMessage": error_message,
         }
+
+    def dispatch_cafe24_order_item_with_manual_payment_confirmation(
+        self,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        item_id = str(payload.get("itemId") or payload.get("id") or "").strip()
+        actor = self._admin_actor(payload)
+        reason = str(payload.get("reason") or "").strip()
+        expected_quantity = cafe24_expected_quantity_from_payload_for_panel(payload)
+        if not item_id:
+            raise PanelError("수동 결제 확인 후 발주할 Cafe24 주문 품주를 선택해 주세요.", status=400)
+        if payload.get("confirmManualPaymentDispatch") is not True:
+            raise PanelError("수동 결제 확인값(confirmManualPaymentDispatch=true)이 필요합니다.", status=400)
+        if not reason:
+            raise PanelError("수동 결제 확인 및 발주 사유를 입력해 주세요.", status=400)
+        if expected_quantity <= 0:
+            raise PanelError("수동 결제 확인 발주에는 예상 수량이 필요합니다.", status=400)
+
+        event_id = f"cafe24_manual_paid_{hashlib.sha256(item_id.encode('utf-8')).hexdigest()[:24]}"
+        timestamp = now_iso()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM cafe24_order_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                raise PanelError("Cafe24 주문 품주를 찾을 수 없습니다.", status=404)
+            supplier_order_uuid = str(row["supplier_order_uuid"] or "").strip()
+            if supplier_order_uuid:
+                return {
+                    "itemId": item_id,
+                    "eventId": event_id,
+                    "duplicate": True,
+                    "submitted": True,
+                    "status": str(row["standard_status"] or "supplier_submitted"),
+                    "expectedQuantity": expected_quantity,
+                    "supplierOrderUuid": supplier_order_uuid,
+                    "errorMessage": "",
+                }
+            if str(row["payment_gate_status"] or "") == "cancelled" or str(row["standard_status"] or "") == "cancelled":
+                raise PanelError("취소된 Cafe24 주문은 수동 결제 확인으로 발주할 수 없습니다.", status=409)
+
+            existing_event = conn.execute(
+                "SELECT * FROM cafe24_api_events WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+            if existing_event is not None:
+                existing_response = parse_json(existing_event["response_json"], {})
+                return {
+                    "itemId": item_id,
+                    "eventId": event_id,
+                    "duplicate": True,
+                    "submitted": bool(existing_response.get("submitted")),
+                    "status": str(existing_response.get("status") or existing_event["status"] or ""),
+                    "expectedQuantity": expected_quantity,
+                    "supplierOrderUuid": str(existing_response.get("supplierOrderUuid") or ""),
+                    "errorMessage": str(existing_response.get("errorMessage") or existing_event["error_message"] or ""),
+                }
+
+            claim = conn.execute(
+                """
+                INSERT INTO cafe24_api_events (
+                    id, mall_id, shop_no, event_type, status,
+                    request_json, response_json, error_message, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (
+                    event_id,
+                    str(row["mall_id"]),
+                    int(row["shop_no"] or CAFE24_DEFAULT_SHOP_NO),
+                    "supplier.manual_payment_dispatch",
+                    "submitting",
+                    as_json(
+                        {
+                            "itemId": item_id,
+                            "orderId": str(row["cafe24_order_id"] or ""),
+                            "orderItemCode": str(row["cafe24_order_item_code"] or ""),
+                            "expectedQuantity": expected_quantity,
+                            "originalPaymentStatus": str(row["payment_status"] or ""),
+                            "originalPaymentStatusSource": str(row["payment_status_source"] or ""),
+                            "originalPaymentGateStatus": str(row["payment_gate_status"] or ""),
+                            "reason": reason[:500],
+                        }
+                    ),
+                    "{}",
+                    "",
+                    timestamp,
+                ),
+            )
+            if claim.rowcount != 1:
+                raise PanelError("동일한 수동 결제 확인 발주가 이미 처리 중입니다.", status=409)
+            conn.execute(
+                """
+                UPDATE cafe24_order_items
+                SET payment_status = 'paid',
+                    payment_status_source = 'manual_admin_confirmation',
+                    payment_gate_status = 'payment_confirmed',
+                    error_message = '', updated_at = ?
+                WHERE id = ? AND supplier_order_uuid = ''
+                """,
+                (timestamp, item_id),
+            )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action="cafe24.order_item_manual_payment_confirmed",
+                entity_type="cafe24_order_item",
+                entity_id=item_id,
+                message="Cafe24 주문 품주 수동 결제 확인 후 발주 승인",
+                metadata={
+                    "eventId": event_id,
+                    "expectedQuantity": expected_quantity,
+                    "originalPaymentGateStatus": str(row["payment_gate_status"] or ""),
+                    "reason": reason[:500],
+                },
+            )
+            conn.commit()
+
+        try:
+            workflow = self.dispatch_single_cafe24_order_item(
+                {
+                    "itemId": item_id,
+                    "expectedQuantity": expected_quantity,
+                    "_adminActor": actor,
+                }
+            )
+            dispatch = workflow.get("dispatch") if isinstance(workflow.get("dispatch"), dict) else {}
+            result = {
+                "itemId": item_id,
+                "eventId": event_id,
+                "duplicate": bool(dispatch.get("duplicate")),
+                "submitted": bool(dispatch.get("submitted")),
+                "status": str(dispatch.get("status") or ""),
+                "expectedQuantity": expected_quantity,
+                "normalizedQuantity": int(workflow.get("normalizedQuantity") or 0),
+                "supplierOrderUuid": str(dispatch.get("supplierOrderUuid") or ""),
+                "errorMessage": str(dispatch.get("errorMessage") or ""),
+            }
+        except Exception as exc:
+            error_message = str(exc)
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE cafe24_api_events SET status = 'failed', error_message = ? WHERE id = ?",
+                    (error_message[:1000], event_id),
+                )
+                self._record_admin_audit(
+                    conn,
+                    actor=actor,
+                    action="cafe24.order_item_manual_payment_dispatch_failed",
+                    entity_type="cafe24_order_item",
+                    entity_id=item_id,
+                    message=f"Cafe24 수동 결제 확인 발주 실패: {error_message[:160]}",
+                    metadata={"eventId": event_id, "expectedQuantity": expected_quantity},
+                )
+                conn.commit()
+            raise
+
+        event_status = "success" if result["submitted"] else "failed"
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE cafe24_api_events
+                SET status = ?, response_json = ?, error_message = ?
+                WHERE id = ?
+                """,
+                (event_status, as_json(result), result["errorMessage"][:1000], event_id),
+            )
+            self._record_admin_audit(
+                conn,
+                actor=actor,
+                action=(
+                    "cafe24.order_item_manual_payment_dispatch"
+                    if result["submitted"]
+                    else "cafe24.order_item_manual_payment_dispatch_failed"
+                ),
+                entity_type="cafe24_order_item",
+                entity_id=item_id,
+                message=f"Cafe24 수동 결제 확인 발주: {result['status']}",
+                metadata={
+                    "eventId": event_id,
+                    "expectedQuantity": expected_quantity,
+                    "normalizedQuantity": result["normalizedQuantity"],
+                    "supplierOrderUuid": result["supplierOrderUuid"],
+                    "status": result["status"],
+                },
+            )
+            conn.commit()
+        return result
 
     def dispatch_cafe24_correction_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         item_id = str(payload.get("itemId") or payload.get("id") or "").strip()

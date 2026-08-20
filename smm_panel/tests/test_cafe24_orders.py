@@ -1808,6 +1808,102 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(event["status"], "success")
 
+    def test_manual_payment_confirmation_dispatches_once_and_survives_unpaid_resync(self):
+        self.conn.execute(
+            """
+            UPDATE cafe24_supplier_mappings
+            SET field_mapping_json = ?, auto_dispatch_enabled = 1
+            WHERE mall_id = ?
+            """,
+            (
+                json.dumps(
+                    {
+                        "orderedCount": {"source": "fixed", "value": "50"},
+                    }
+                ),
+                "instamart",
+            ),
+        )
+        self.conn.commit()
+        order_payload = self._order_payload()
+        order_payload["payment_status"] = "unpaid"
+        order_payload["items"][0]["options"] = [{"name": "팔로워 수", "value": "50명"}]
+        order_payload["items"][0]["additional_option_value"] = "인스타그램 아이디=yulkuku"
+        order_payload["items"][0]["additional_option_values"] = [
+            {
+                "key": "item_option_add",
+                "type": "text",
+                "name": "additional_options",
+                "value": "인스타그램 아이디=yulkuku",
+            }
+        ]
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+        item_id = self.conn.execute("SELECT id FROM cafe24_order_items").fetchone()["id"]
+        request = {
+            "itemId": item_id,
+            "expectedQuantity": 50,
+            "reason": "관리자가 Cafe24 결제를 별도 확인함",
+            "confirmManualPaymentDispatch": True,
+            "_adminActor": "qa",
+        }
+
+        with patch("core.SupplierApiClient.order", return_value={"order": "MANUAL-PAID-1"}) as order_call:
+            result = self.store.dispatch_cafe24_order_item_with_manual_payment_confirmation(request)
+            duplicate = self.store.dispatch_cafe24_order_item_with_manual_payment_confirmation(request)
+
+        self.assertTrue(result["submitted"])
+        self.assertFalse(result["duplicate"])
+        self.assertEqual(result["normalizedQuantity"], 50)
+        self.assertEqual(result["supplierOrderUuid"], "MANUAL-PAID-1")
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(duplicate["supplierOrderUuid"], "MANUAL-PAID-1")
+        order_call.assert_called_once()
+        self.assertEqual(order_call.call_args.args[0]["quantity"], "50")
+        self.assertEqual(order_call.call_args.args[0]["link"], "https://www.instagram.com/yulkuku/")
+
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+        saved = self.conn.execute("SELECT * FROM cafe24_order_items WHERE id = ?", (item_id,)).fetchone()
+        self.assertEqual(saved["payment_status"], "paid")
+        self.assertEqual(saved["payment_status_source"], "manual_admin_confirmation")
+        self.assertEqual(saved["payment_gate_status"], "payment_confirmed")
+        self.assertEqual(saved["standard_status"], "supplier_submitted")
+        self.assertEqual(saved["supplier_id"], "supplier_test")
+        self.assertEqual(saved["supplier_order_uuid"], "MANUAL-PAID-1")
+        self.assertEqual(json.loads(saved["supplier_payload_json"])["quantity"], "50")
+        event = self.conn.execute(
+            "SELECT * FROM cafe24_api_events WHERE event_type = 'supplier.manual_payment_dispatch'"
+        ).fetchone()
+        self.assertEqual(event["status"], "success")
+
+    def test_manual_payment_confirmation_dispatch_requires_explicit_confirmation(self):
+        with self.assertRaises(PanelError) as raised:
+            self.store.dispatch_cafe24_order_item_with_manual_payment_confirmation(
+                {
+                    "itemId": "cafe24_item_missing",
+                    "expectedQuantity": 50,
+                    "reason": "관리자 확인",
+                }
+            )
+
+        self.assertEqual(raised.exception.status, 400)
+        self.assertIn("confirmManualPaymentDispatch=true", str(raised.exception))
+
     def test_cafe24_correction_dispatch_rejects_quantity_mismatch(self):
         order_payload = self._order_payload()
         self.store._process_cafe24_item(

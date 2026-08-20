@@ -1253,6 +1253,17 @@ class RouterRegistryTest(unittest.TestCase):
         self.assertTrue(route.trusted_origin)
         self.assertTrue(route.read_json_body)
 
+    def test_cafe24_manual_payment_dispatch_route_requires_admin_csrf_and_trusted_origin(self):
+        matched = ROUTER.match("POST", "/api/admin/cafe24/order-items/manual-payment-dispatch")
+
+        self.assertIsNotNone(matched)
+        route, params = matched
+        self.assertEqual(params, {})
+        self.assertEqual(route.auth, "admin")
+        self.assertTrue(route.csrf)
+        self.assertTrue(route.trusted_origin)
+        self.assertTrue(route.read_json_body)
+
     def test_cafe24_manual_input_preview_admin_route_declares_admin_auth_and_csrf(self):
         matched = ROUTER.match("POST", "/api/admin/cafe24/order-items/manual-input/preview")
 

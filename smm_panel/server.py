@@ -1991,6 +1991,13 @@ class AppHandler(SimpleHTTPRequestHandler):
     def _post_admin_cafe24_order_items_dispatch(self, request: RouteRequest) -> None:
         self._write_store_result("dispatch_cafe24_order_item", request.payload)
 
+    @route("POST", "/api/admin/cafe24/order-items/manual-payment-dispatch", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
+    def _post_admin_cafe24_order_items_manual_payment_dispatch(self, request: RouteRequest) -> None:
+        self._write_store_result(
+            "dispatch_cafe24_order_item_with_manual_payment_confirmation",
+            request.payload,
+        )
+
     @route("POST", "/api/admin/cafe24/order-items/correction-dispatch", auth="admin", csrf=True, trusted_origin=True, read_json_body=True)
     def _post_admin_cafe24_order_items_correction_dispatch(self, request: RouteRequest) -> None:
         self._write_store_result("dispatch_cafe24_correction_order", request.payload)
