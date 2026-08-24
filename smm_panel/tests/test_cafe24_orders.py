@@ -1008,6 +1008,100 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(normalized_fields["orderedCount"], "2000")
         self.assertEqual(supplier_payload["quantity"], "2000")
 
+    def test_cafe24_fixed_quantity_multiplies_line_item_quantity(self):
+        self.conn.execute(
+            """
+            UPDATE cafe24_supplier_mappings
+            SET field_mapping_json = ?
+            WHERE mall_id = ?
+            """,
+            (
+                json.dumps(
+                    {
+                        "targetValue": "option:계정",
+                        "orderedCount": {"source": "fixed", "value": "1000"},
+                    }
+                ),
+                "instamart",
+            ),
+        )
+        self.conn.commit()
+        order_payload = self._order_payload()
+        order_payload["items"][0]["quantity"] = 2
+        order_payload["items"][0]["options"] = [{"name": "계정", "value": "instamart_official"}]
+
+        result = self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        self.conn.commit()
+
+        self.assertEqual(result["status"], "ready_to_submit")
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        normalized_fields = json.loads(item["normalized_fields_json"])
+        supplier_payload = json.loads(item["supplier_payload_json"])
+        self.assertEqual(normalized_fields["orderedCount"], "2000")
+        self.assertEqual(supplier_payload["quantity"], "2000")
+
+    def test_cafe24_fixed_quantity_invariant_blocks_stale_under_dispatch_payload(self):
+        self._enable_auto_submit_and_supplier_ready()
+        self.conn.execute(
+            """
+            UPDATE cafe24_supplier_mappings
+            SET field_mapping_json = ?
+            WHERE mall_id = ?
+            """,
+            (
+                json.dumps(
+                    {
+                        "targetValue": "option:계정",
+                        "orderedCount": {"source": "fixed", "value": "1000"},
+                    }
+                ),
+                "instamart",
+            ),
+        )
+        self.conn.commit()
+        order_payload = self._order_payload()
+        order_payload["items"][0]["quantity"] = 2
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        item = self.conn.execute("SELECT * FROM cafe24_order_items").fetchone()
+        normalized_fields = json.loads(item["normalized_fields_json"])
+        supplier_payload = json.loads(item["supplier_payload_json"])
+        normalized_fields["orderedCount"] = "1000"
+        supplier_payload["quantity"] = "1000"
+        self.conn.execute(
+            """
+            UPDATE cafe24_order_items
+            SET normalized_fields_json = ?, supplier_payload_json = ?
+            WHERE id = ?
+            """,
+            (json.dumps(normalized_fields), json.dumps(supplier_payload), item["id"]),
+        )
+        self.conn.commit()
+
+        preflight = self.store.preflight_single_cafe24_order_item({"itemId": item["id"]})
+        self.assertFalse(preflight["canDispatch"])
+        self.assertEqual(preflight["quantity"]["mappingExpected"], 2000)
+        self.assertFalse(preflight["quantity"]["matchesMapping"])
+        self.assertIn("mapping_quantity_mismatch", preflight["blockingReasons"])
+
+        with patch("core.SupplierApiClient.order") as order_call:
+            with self.assertRaises(PanelError):
+                self.store.dispatch_cafe24_order_item({"itemId": item["id"], "_adminActor": "qa"})
+        order_call.assert_not_called()
+
     def test_cafe24_auto_detected_option_quantity_multiplies_line_item_quantity(self):
         self.conn.execute(
             """
@@ -2209,6 +2303,46 @@ class Cafe24OrderIntegrationTest(unittest.TestCase):
         self.assertEqual(supplier_payload["quantity"], "50")
         mapping = self.conn.execute("SELECT field_mapping_json FROM cafe24_supplier_mappings").fetchone()
         self.assertEqual(json.loads(mapping["field_mapping_json"])["orderedCount"]["value"], "50")
+
+    def test_single_cafe24_dispatch_persists_per_unit_fixed_quantity_for_multiple_items(self):
+        order_payload = self._order_payload()
+        order_payload["items"][0]["quantity"] = 2
+        order_payload["items"][0]["options"] = [{"name": "계정", "value": "instamart_official"}]
+        self.store._process_cafe24_item(
+            self.conn,
+            integration=self._integration_row(),
+            order_payload=order_payload,
+            item_payload=order_payload["items"][0],
+            index=0,
+            submit_ready=False,
+        )
+        item_id = self.conn.execute("SELECT id FROM cafe24_order_items").fetchone()["id"]
+        self.conn.execute(
+            """
+            UPDATE cafe24_order_items
+            SET standard_status = 'supplier_range_error', supplier_payload_json = '{}',
+                error_message = '수량 매핑 보정 필요'
+            WHERE id = ?
+            """,
+            (item_id,),
+        )
+        self.conn.commit()
+
+        with patch("core.SupplierApiClient.order", return_value={"order": "SUP-FIXED-2000"}) as order_call:
+            result = self.store.dispatch_single_cafe24_order_item(
+                {
+                    "itemId": item_id,
+                    "expectedQuantity": 2000,
+                    "allowExpectedQuantityMappingUpdate": True,
+                    "_adminActor": "cron",
+                }
+            )
+
+        self.assertTrue(result["mappingUpdated"])
+        self.assertEqual(result["normalizedQuantity"], 2000)
+        self.assertEqual(order_call.call_args.args[0]["quantity"], "2000")
+        mapping = self.conn.execute("SELECT field_mapping_json FROM cafe24_supplier_mappings").fetchone()
+        self.assertEqual(json.loads(mapping["field_mapping_json"])["orderedCount"]["value"], "1000")
 
     def test_mkt24_token_expired_dispatch_requires_manual_token_refresh(self):
         order_payload = self._order_payload()

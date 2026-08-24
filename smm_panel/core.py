@@ -11169,7 +11169,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                     )
             if value:
                 normalized_value = str(value).strip()
-                if field_key == "orderedCount" and source_type == "option":
+                if field_key == "orderedCount" and source_type in {"fixed", "option"}:
                     return multiply_cafe24_ordered_count_for_item_for_panel(normalized_value, item_payload)
                 return normalized_value
             if fallback:
@@ -11212,6 +11212,44 @@ class PanelStore(PanelStoreDatabaseMixin):
                     return ordered_count
                 return str(value).strip()
         return ""
+
+    def _cafe24_fixed_quantity_invariant(
+        self,
+        conn: DatabaseConnection,
+        item_row: Dict[str, Any],
+    ) -> Dict[str, int]:
+        if str(item_row.get("auto_dispatch_source") or "").strip() == "manual_input":
+            return {"baseQuantity": 0, "itemQuantity": 0, "expectedQuantity": 0}
+        mapping_id = str(item_row.get("mapping_id") or "").strip()
+        if not mapping_id:
+            return {"baseQuantity": 0, "itemQuantity": 0, "expectedQuantity": 0}
+        mapping_row = conn.execute(
+            "SELECT field_mapping_json FROM cafe24_supplier_mappings WHERE id = ?",
+            (mapping_id,),
+        ).fetchone()
+        if mapping_row is None:
+            return {"baseQuantity": 0, "itemQuantity": 0, "expectedQuantity": 0}
+        field_mapping = parse_json(mapping_row["field_mapping_json"], {})
+        source = field_mapping.get("orderedCount") if isinstance(field_mapping, dict) else None
+        if not isinstance(source, dict):
+            return {"baseQuantity": 0, "itemQuantity": 0, "expectedQuantity": 0}
+        source_type = str(source.get("source") or source.get("type") or "").strip()
+        if source_type != "fixed":
+            return {"baseQuantity": 0, "itemQuantity": 0, "expectedQuantity": 0}
+        base_quantity = self._cafe24_positive_int(
+            source.get("value") if source.get("value") is not None else source.get("defaultValue")
+        )
+        if base_quantity <= 0:
+            return {"baseQuantity": 0, "itemQuantity": 0, "expectedQuantity": 0}
+        raw_payload = parse_json(item_row.get("raw_payload_json"), {})
+        item_payload = raw_payload.get("item") if isinstance(raw_payload.get("item"), dict) else {}
+        raw_item_quantity = cafe24_payload_value(item_payload, ("quantity", "qty", "order_quantity")) or "1"
+        item_quantity = self._cafe24_positive_int(raw_item_quantity) or 1
+        return {
+            "baseQuantity": base_quantity,
+            "itemQuantity": item_quantity,
+            "expectedQuantity": base_quantity * item_quantity,
+        }
 
     def _match_cafe24_mapping(
         self,
@@ -12980,8 +13018,21 @@ class PanelStore(PanelStoreDatabaseMixin):
                         str(mapping_row["cafe24_variant_code"] or "").strip()
                         or str(mapping_row["cafe24_custom_product_code"] or "").strip()
                     ):
+                        raw_payload = parse_json(row["raw_payload_json"], {})
+                        item_payload = raw_payload.get("item") if isinstance(raw_payload.get("item"), dict) else {}
+                        raw_item_quantity = cafe24_payload_value(
+                            item_payload,
+                            ("quantity", "qty", "order_quantity"),
+                        ) or "1"
+                        item_quantity = self._cafe24_positive_int(raw_item_quantity) or 1
+                        if expected_quantity % item_quantity:
+                            raise PanelError(
+                                "Cafe24 예상 총수량을 품목 구매 개수로 나눌 수 없어 고정 수량 매핑을 저장하지 않았습니다.",
+                                status=409,
+                            )
+                        fixed_unit_quantity = expected_quantity // item_quantity
                         field_mapping = parse_json(mapping_row["field_mapping_json"], {})
-                        field_mapping["orderedCount"] = {"source": "fixed", "value": str(expected_quantity)}
+                        field_mapping["orderedCount"] = {"source": "fixed", "value": str(fixed_unit_quantity)}
                         conn.execute(
                             "UPDATE cafe24_supplier_mappings SET field_mapping_json = ?, updated_at = ? WHERE id = ?",
                             (as_json(field_mapping), now_iso(), mapping_id),
@@ -13069,6 +13120,7 @@ class PanelStore(PanelStoreDatabaseMixin):
                     supplier_id=str(row["supplier_id"]),
                     supplier_service_id=str(row.get("supplier_service_id") or ""),
                 )
+            fixed_quantity = self._cafe24_fixed_quantity_invariant(conn, row)
 
         return build_cafe24_order_item_preflight(
             item_id=item_id,
@@ -13077,6 +13129,7 @@ class PanelStore(PanelStoreDatabaseMixin):
             supplier_payload=supplier_payload,
             readiness=readiness,
             expected_quantity=expected_quantity,
+            mapped_expected_quantity=fixed_quantity["expectedQuantity"],
             checked_at=now_iso(),
         )
 
@@ -13257,6 +13310,22 @@ class PanelStore(PanelStoreDatabaseMixin):
             if dispatch_context["duplicate"]:
                 return dispatch_context["response"]
             request_payload = dispatch_context["requestPayload"]
+            fixed_quantity = self._cafe24_fixed_quantity_invariant(conn, row)
+            normalized_quantity = cafe24_preflight_quantity(
+                parse_json(row["normalized_fields_json"], {}),
+                request_payload,
+            )
+            if (
+                fixed_quantity["expectedQuantity"]
+                and normalized_quantity != fixed_quantity["expectedQuantity"]
+            ):
+                raise PanelError(
+                    "Cafe24 구매 개수 반영 검증 실패: "
+                    f"단위 {fixed_quantity['baseQuantity']}회 × 구매 {fixed_quantity['itemQuantity']}개 = "
+                    f"{fixed_quantity['expectedQuantity']}회이나 발주 수량은 {normalized_quantity}회입니다. "
+                    "공급사 발주를 중단했습니다.",
+                    status=409,
+                )
             cursor = conn.execute(
                 """
                 UPDATE cafe24_order_items

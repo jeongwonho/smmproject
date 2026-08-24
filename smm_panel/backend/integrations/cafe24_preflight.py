@@ -151,6 +151,7 @@ def cafe24_preflight_blocking_reasons(
     readiness: Dict[str, Any],
     quantity: int,
     expected_quantity: int,
+    mapped_expected_quantity: int = 0,
 ) -> List[str]:
     blocking_reasons: List[str] = []
     has_item_level_supplier_payload = bool(item["supplierId"] and item["supplierServiceId"] and supplier_payload)
@@ -168,6 +169,8 @@ def cafe24_preflight_blocking_reasons(
         blocking_reasons.append("supplier_order_already_exists")
     if expected_quantity and quantity != expected_quantity:
         blocking_reasons.append("quantity_mismatch")
+    if mapped_expected_quantity and quantity != mapped_expected_quantity:
+        blocking_reasons.append("mapping_quantity_mismatch")
     if not readiness.get("ok"):
         blocking_reasons.append(str(readiness.get("code") or "supplier_not_ready"))
     return blocking_reasons
@@ -182,6 +185,7 @@ def build_cafe24_order_item_preflight(
     readiness: Dict[str, Any],
     expected_quantity: int,
     checked_at: str,
+    mapped_expected_quantity: int = 0,
 ) -> Dict[str, Any]:
     quantity = cafe24_preflight_quantity(normalized_fields, supplier_payload)
     blocking_reasons = cafe24_preflight_blocking_reasons(
@@ -190,6 +194,7 @@ def build_cafe24_order_item_preflight(
         readiness=readiness,
         quantity=quantity,
         expected_quantity=expected_quantity,
+        mapped_expected_quantity=mapped_expected_quantity,
     )
     supplier_payload_keys = sorted(str(key) for key in supplier_payload.keys())
     return {
@@ -218,8 +223,10 @@ def build_cafe24_order_item_preflight(
         },
         "quantity": {
             "expected": expected_quantity,
+            "mappingExpected": mapped_expected_quantity,
             "normalized": quantity,
             "matchesExpected": not expected_quantity or quantity == expected_quantity,
+            "matchesMapping": not mapped_expected_quantity or quantity == mapped_expected_quantity,
         },
         "supplierPayload": {
             "keys": supplier_payload_keys,
